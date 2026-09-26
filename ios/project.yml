@@ -1,0 +1,51 @@
+# XcodeGen spec. Generate the (gitignored) project with:  cd ios && xcodegen generate
+name: OmiNotes
+options:
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+packages:
+  OmiKit:
+    path: Packages/OmiKit
+targets:
+  OmiNotes:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    # Bundle id, team and versions come from the xcconfig so a personal Local.xcconfig can override them.
+    configFiles:
+      Debug: Config/Base.xcconfig
+      Release: Config/Base.xcconfig
+    sources:
+      - path: OmiNotes
+    dependencies:
+      - package: OmiKit
+        product: OmiProtocol
+      - package: OmiKit
+        product: OmiCapture
+      - package: OmiKit
+        product: OmiBLE
+    settings:
+      base:
+        INFOPLIST_FILE: OmiNotes/Resources/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MACCATALYST: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
+        ENABLE_PREVIEWS: YES
+        SWIFT_VERSION: "6.0"
+        ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: NO
+schemes:
+  OmiNotes:
+    build:
+      targets:
+        OmiNotes: all
+    run:
+      config: Debug
+    archive:
+      config: Release

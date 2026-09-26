@@ -1,0 +1,48 @@
+[
+  {
+    "file": "live_ble_opus21.omnc",
+    "sha256": "554228aa71e54b1dbf5b99cf05b428ed3c9483834c7a08c6a0a33983c6ae182e",
+    "bytes": 33426,
+    "source": "live_ble",
+    "payload_format": "ble_notifications_v1",
+    "record_count": 737,
+    "decoded_pieces": [
+      {
+        "start_offset_s": 0.045,
+        "samples": 207680
+      },
+      {
+        "start_offset_s": 15.045,
+        "samples": 32000
+      }
+    ]
+  },
+  {
+    "file": "device_ring.omnc",
+    "sha256": "38a302e394f148f00c07598a8853fb96ccd846b8ef763d99a3c623d7ef142e1e",
+    "bytes": 19353,
+    "source": "device_ring",
+    "payload_format": "ring_records_v1",
+    "record_count": 42,
+    "decoded_pieces": [
+      {
+        "start_offset_s": -3600.123,
+        "samples": 64000
+      }
+    ]
+  },
+  {
+    "file": "wav_replay_pcm.omnc",
+    "sha256": "9e65310cdab04b806cb844ec7363dde99f3ee52ebd4977a02c2786f0978604a5",
+    "bytes": 32607,
+    "source": "wav_replay",
+    "payload_format": "pcm16le_v1",
+    "record_count": 16000,
+    "decoded_pieces": [
+      {
+        "start_offset_s": 0.0,
+        "samples": 16000
+      }
+    ]
+  }
+]

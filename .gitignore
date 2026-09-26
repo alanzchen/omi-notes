@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local config / data
+.env
+backend/.env
+data/
+backend/data/
+backend/models/*.onnx
+
+# Xcode
+ios/*.xcodeproj
+ios/Config/Local.xcconfig
+DerivedData/
+build/
+.build/
+.swiftpm/
+xcuserdata/

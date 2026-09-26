@@ -1,0 +1,35 @@
+{
+  "metadata": {
+    "transaction_key": "deprecated",
+    "request_id": "5c7e3b1a-1d2f-4c3b-9a8e-0f1e2d3c4b5a",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "created": "2026-09-26T19:45:00.000Z",
+    "duration": 15.5,
+    "channels": 1,
+    "models": ["2187e11a-3532-4498-b076-81fa530bdd49"],
+    "model_info": {"2187e11a-3532-4498-b076-81fa530bdd49": {"name": "general-nova-3", "version": "2025-01-01.0", "arch": "nova-3"}}
+  },
+  "results": {
+    "channels": [
+      {
+        "alternatives": [
+          {
+            "transcript": "Hi Daniel, thanks for making time. I wanted to go over the launch plan. Sure, I finished the pairing screen.",
+            "confidence": 0.98,
+            "words": [
+              {"word": "hi", "start": 0.5, "end": 0.7, "confidence": 0.99, "speaker": 0, "speaker_confidence": 0.9, "punctuated_word": "Hi"},
+              {"word": "daniel", "start": 0.7, "end": 1.1, "confidence": 0.97, "speaker": 0, "speaker_confidence": 0.9, "punctuated_word": "Daniel,"},
+              {"word": "sure", "start": 10.6, "end": 10.9, "confidence": 0.99, "speaker": 1, "speaker_confidence": 0.8, "punctuated_word": "Sure,"}
+            ]
+          }
+        ]
+      }
+    ],
+    "utterances": [
+      {"start": 0.5, "end": 4.0, "confidence": 0.97, "channel": 0, "transcript": "Hi Daniel, thanks for making time.", "words": [], "speaker": 0, "id": "a1"},
+      {"start": 4.8, "end": 9.5, "confidence": 0.95, "channel": 0, "transcript": "I wanted to go over the launch plan.", "words": [], "speaker": 0, "id": "a2"},
+      {"start": 10.6, "end": 15.0, "confidence": 0.93, "channel": 0, "transcript": "Sure, I finished the pairing screen.", "words": [], "speaker": 1, "id": "a3"},
+      {"start": 15.1, "end": 15.3, "confidence": 0.5, "channel": 0, "transcript": "   ", "words": [], "speaker": 1, "id": "a4"}
+    ]
+  }
+}

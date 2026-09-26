@@ -1,0 +1,8 @@
+{
+  "device_id" : "8d3b5f2e-1a4c-4e6f-9b7d-2c1e0f3a4b5c",
+  "end_offset_us" : 1432000,
+  "ended_at" : "2026-09-26T19:32:06.554Z",
+  "last_chunk_sequence" : 0,
+  "reason" : "ble_disconnected",
+  "source" : "live_ble"
+}
