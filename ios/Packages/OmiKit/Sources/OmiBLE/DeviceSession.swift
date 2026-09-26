@@ -400,26 +400,23 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
 
     private func handleAudioSubscription(enabled: Bool, error: Error?) {
         if case .refused = phase { return }
-        if let error {
-            log(.error, "ble", "audio subscribe failed: \(error.localizedDescription)")
-            if subscribeAttempts < Self.maxSubscribeAttempts { requestAudioSubscription() } else { requestReconnect("could not subscribe to audio") }
-            return
-        }
         guard enabled else {
-            // The firmware drops audio while unsubscribed: coverage ends now. Seal the capture and
-            // restore the subscription (bounded), then reconnect if that fails.
-            let hadCapture = recorder.isActive
-            audioSubscribed = false
-            if hadCapture {
-                log(.warning, "ble", "audio notifications turned off; sealing capture \(recorder.captureId ?? "?")")
-                recorder.finish(reason: .bleDisconnected)
-                delegate?.sessionDidChange(self)
-            }
-            if audioSubscribeRequested {
+            // Not notifying (turned off, or a failed subscribe): the firmware drops audio while
+            // unsubscribed, so coverage ends now, error or not. Seal the capture, then restore the
+            // subscription (bounded) and reconnect if that fails.
+            endAudioCoverage()
+            if let error {
+                log(.error, "ble", "audio subscribe failed: \(error.localizedDescription)")
+                if subscribeAttempts < Self.maxSubscribeAttempts { requestAudioSubscription() } else { requestReconnect("could not subscribe to audio") }
+            } else if audioSubscribeRequested {
                 subscribeAttempts = 0
                 requestAudioSubscription()
             }
             return
+        }
+        if let error {
+            // Still notifying despite the error: audio flows, so treat it as subscribed.
+            log(.warning, "ble", "audio subscribe reported \(error.localizedDescription) but notifications are on")
         }
         if audioSubscribed { return }
         audioSubscribed = true
@@ -427,6 +424,14 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
         subscribedAtMono = clock.monotonicNanoseconds()
         beginCaptureIfNeeded()
         startConfigurationIfReady()
+    }
+
+    private func endAudioCoverage() {
+        audioSubscribed = false
+        guard recorder.isActive else { return }
+        log(.warning, "ble", "audio notifications are off; sealing capture \(recorder.captureId ?? "?")")
+        recorder.finish(reason: .bleDisconnected)
+        delegate?.sessionDidChange(self)
     }
 
     private func beginCaptureIfNeeded() {

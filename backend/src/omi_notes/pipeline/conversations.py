@@ -131,6 +131,7 @@ class ConversationPipeline:
         self.providers = providers
         self.vad_label = vad_label
         self.vad_warning = vad_warning
+        self._move_retries: dict[str, tuple[int, float]] = {}
 
     # -- paths / days ----------------------------------------------------------------------------
 
@@ -179,7 +180,13 @@ class ConversationPipeline:
             (now, limit),
         )
         for row in rows:
-            self.advance(row["id"], now)
+            try:
+                self.advance(row["id"], now)
+            except Exception as exc:  # one bad row must never stall the others
+                log.exception("conversation %s could not be advanced", row["id"])
+                current = self._row(row["id"])
+                self._set(row["id"], attempts=current["attempts"] + 1, error=f"{type(exc).__name__}: {exc}"[:500],
+                          next_attempt_at=now + backoff(current["attempts"] + 1))  # fmt: skip
         return len(rows)
 
     def advance(self, conv_id: str, now: float) -> None:
@@ -545,15 +552,31 @@ class ConversationPipeline:
 
     # -- stubs, dailies, status ------------------------------------------------------------------
 
-    def reconcile_moves(self) -> None:
+    def reconcile_moves(self, now: float) -> None:
         """Finish note moves a crash interrupted: the new path is committed, the old file may
-        still exist. It is removed durably before the marker is cleared."""
-        for row in self.db.query("SELECT id, stale_note_path FROM conversations WHERE stale_note_path IS NOT NULL"):
-            remove(self.settings.notes_dir / row["stale_note_path"])
+        still exist. It is removed durably before the marker is cleared. A removal that fails
+        keeps the marker, shows in `_status.md` and is retried with backoff."""
+        for row in self.db.query("SELECT id, status, error_kind, stale_note_path FROM conversations WHERE stale_note_path IS NOT NULL"):
+            attempts, retry_at = self._move_retries.get(row["id"], (0, 0.0))
+            if now < retry_at:
+                continue
+            try:
+                remove(self.settings.notes_dir / row["stale_note_path"])
+            except OSError as exc:
+                attempts += 1
+                self._move_retries[row["id"]] = (attempts, now + backoff(attempts))
+                log.warning("could not remove old note copy %s (attempt %d): %s", row["stale_note_path"], attempts, exc)
+                if row["status"] != "failed":
+                    self._set(row["id"], error=f"could not remove the old copy {row['stale_note_path']}: {exc}"[:500],
+                              error_kind="move")  # fmt: skip
+                continue
+            self._move_retries.pop(row["id"], None)
             self.db.execute(
                 "UPDATE conversations SET stale_note_path=NULL WHERE id=? AND stale_note_path=?",
                 (row["id"], row["stale_note_path"]),
             )
+            if row["error_kind"] == "move":
+                self._set(row["id"], error=None, error_kind=None)
 
     def render_stubs(self) -> None:
         keep: set[str] = set()
@@ -561,23 +584,34 @@ class ConversationPipeline:
             "SELECT * FROM conversations WHERE status IN ('open','closed','transcribing','summarizing','failed') AND note_path IS NULL"
         )
         for row in rows:
-            relpath = stub_relpath(self._local(row["start"]), row["id"].replace("-", "")[-6:])
-            content = render_stub(
-                conv_id=row["id"], status=row["status"], start=row["start"], end=row["end"], tz=self.settings.tz,
-                speech_seconds=row["speech_seconds"], waiting_for=row["waiting_for"], error=row["error"],
-            )  # fmt: skip
-            if write_if_changed(self.settings.notes_dir / relpath, content) or row["stub_path"] != relpath:
-                self.mark_day(row["start"])
-            if row["stub_path"] and row["stub_path"] != relpath:
-                remove(self.settings.notes_dir / row["stub_path"])
-            if row["stub_path"] != relpath:
-                self._set(row["id"], stub_path=relpath)
-            keep.add(relpath)
+            try:
+                keep.add(self._render_stub(row))
+            except OSError:
+                log.exception("could not write the in-progress stub for %s", row["id"])
+                if row["stub_path"]:
+                    keep.add(row["stub_path"])
         stub_dir = self.settings.notes_dir / "_in-progress"
         if stub_dir.exists():
             for path in stub_dir.glob("*.md"):
                 if f"_in-progress/{path.name}" not in keep:
-                    remove(path)
+                    try:
+                        remove(path)
+                    except OSError:
+                        log.exception("could not remove stale stub %s", path)
+
+    def _render_stub(self, row: sqlite3.Row) -> str:
+        relpath = stub_relpath(self._local(row["start"]), row["id"].replace("-", "")[-6:])
+        content = render_stub(
+            conv_id=row["id"], status=row["status"], start=row["start"], end=row["end"], tz=self.settings.tz,
+            speech_seconds=row["speech_seconds"], waiting_for=row["waiting_for"], error=row["error"],
+        )  # fmt: skip
+        if write_if_changed(self.settings.notes_dir / relpath, content) or row["stub_path"] != relpath:
+            self.mark_day(row["start"])
+        if row["stub_path"] and row["stub_path"] != relpath:
+            remove(self.settings.notes_dir / row["stub_path"])
+        if row["stub_path"] != relpath:
+            self._set(row["id"], stub_path=relpath)
+        return relpath
 
     def render_dailies(self, days: set[date] | None = None) -> None:
         """Render queued (or the given) days; a day leaves the queue only after its file is written."""
@@ -606,10 +640,14 @@ class ConversationPipeline:
                     )
                 )  # fmt: skip
             path = self.settings.notes_dir / "Daily" / f"{day.isoformat()}.md"
-            if entries:
-                write_if_changed(path, daily_mod.render_daily(day, entries, tz))
-            else:
-                remove(path)
+            try:
+                if entries:
+                    write_if_changed(path, daily_mod.render_daily(day, entries, tz))
+                else:
+                    remove(path)
+            except OSError:
+                log.exception("could not write the daily index for %s; it stays queued", day)
+                continue
             self.db.execute("DELETE FROM dirty_days WHERE day=?", (day.isoformat(),))
 
     def render_status(self, server_version: str) -> None:
@@ -637,7 +675,7 @@ class ConversationPipeline:
         open_convs = [dict(r) for r in db.query("SELECT * FROM conversations WHERE status='open' ORDER BY start")]
         failed = [dict(r) for r in db.query("SELECT * FROM conversations WHERE status='failed' ORDER BY start DESC LIMIT 20")]
         attention = [dict(r) for r in db.query(
-            "SELECT * FROM conversations WHERE status<>'failed' AND error_kind IN ('notes','io') ORDER BY start DESC LIMIT 20"
+            "SELECT * FROM conversations WHERE status<>'failed' AND error_kind IN ('notes','io','move') ORDER BY start DESC LIMIT 20"
         )]  # fmt: skip
         failed_chunks = [dict(r) for r in db.query("SELECT * FROM chunks WHERE status='failed' LIMIT 20")]
         snapshot = StatusSnapshot(

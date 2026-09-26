@@ -33,6 +33,9 @@ targets:
       base:
         INFOPLIST_FILE: OmiNotes/Resources/Info.plist
         GENERATE_INFOPLIST_FILE: NO
+        # Info.plist is preprocessed so the ATS local-networking exception exists only in Debug
+        # (release builds are HTTPS-only, matching ServerURLPolicy).
+        INFOPLIST_PREPROCESS: YES
         TARGETED_DEVICE_FAMILY: "1"
         SUPPORTS_MACCATALYST: NO
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
@@ -40,6 +43,9 @@ targets:
         ENABLE_PREVIEWS: YES
         SWIFT_VERSION: "6.0"
         ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: NO
+      configs:
+        Debug:
+          INFOPLIST_PREPROCESSOR_DEFINITIONS: OMI_ALLOW_LOCAL_HTTP=1
 schemes:
   OmiNotes:
     build:

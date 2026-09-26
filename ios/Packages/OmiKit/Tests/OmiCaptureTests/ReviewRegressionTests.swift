@@ -332,3 +332,135 @@ extension TestEnv {
         #expect(ledger.heldReason(bSeal) != nil, "B's sync_complete is held behind interrupted A")
     }
 }
+
+// MARK: - Verification pass (Astra round 2)
+
+@Suite struct RecoveryVerificationRegressionTests {
+    /// Starts a live capture, rotates chunk 0 (published + committed), and returns its directory.
+    func publishedChunkZero(_ t: TestEnv) throws -> (String, URL) {
+        let r = LiveCaptureRecorder(env: t.env)
+        let id = try r.begin(meta: CaptureDeviceMeta(deviceId: "dev-1", codec: .opus20ms))
+        r.append(notification(seq: 1))
+        t.clock.advance(2)
+        r.rotateNow(reason: .forced)
+        return (id, t.dirs.journalLive.appendingPathComponent(id))
+    }
+
+    func rewindManifest(_ dir: URL) throws {
+        var m = try #require(JSONFile.load(CaptureManifest.self, from: dir.appendingPathComponent("capture.json")))
+        m.openChunkSequence = 0
+        m.openChunkStartOffsetUs = 0
+        try JSONFile.save(m, to: dir.appendingPathComponent("capture.json"))
+    }
+
+    /// #1: an unreadable journal is not "no journal": nothing is sealed or deleted until it can be read.
+    @Test func unreadableJournalIsKeptAndRetried() throws {
+        let t = TestEnv()
+        let (id, dir) = try publishedChunkZero(t)
+        let journal = dir.appendingPathComponent("chunk-000001.journal")
+        try BLERecord(tOffsetUs: 0, flags: 0, bytes: notification(seq: 2)).encoded().write(to: journal)
+        chmod(journal.path, 0o000)
+        _ = CaptureRecovery.run(env: t.env)
+        #expect(t.seal(id) == nil, "no terminal seal while the journal is unreadable")
+        #expect(FileIO.exists(journal), "journal kept")
+        chmod(journal.path, 0o644)
+        _ = CaptureRecovery.run(env: t.env)
+        let seal = try #require(t.seal(id))
+        #expect(seal.lastChunkSequence == 1, "the journal became chunk 1 once readable")
+    }
+
+    /// #2: after a failed manifest commit, retention must not delete the envelope recovery needs.
+    @Test func retentionPinsChunksAnUncommittedManifestStillNeeds() throws {
+        let t = TestEnv()
+        let (id, dir) = try publishedChunkZero(t)
+        let chunk0 = OutboxKind.chunk(captureId: id, sequence: 0)
+        #expect(!CaptureRecovery.isPinned(chunk0, pins: CaptureRecovery.retentionPins(env: t.env)), "committed past chunk 0")
+        try rewindManifest(dir)
+        #expect(CaptureRecovery.isPinned(chunk0, pins: CaptureRecovery.retentionPins(env: t.env)), "manifest still at 0")
+        try Data("{".utf8).write(to: dir.appendingPathComponent("capture.json"))
+        #expect(CaptureRecovery.isPinned(chunk0, pins: CaptureRecovery.retentionPins(env: t.env)), "unknown progress pins everything")
+    }
+
+    /// #2 safety net: a later journal that the manifest/outbox can't explain is quarantined, not deleted.
+    @Test func unaccountedLaterJournalIsQuarantinedNotDeleted() throws {
+        let t = TestEnv()
+        let (id, dir) = try publishedChunkZero(t)
+        try rewindManifest(dir)
+        // Chunk 0's envelope is gone (as if retention removed it) while chunk 1's journal holds audio.
+        let item = try #require(t.outbox.pending().first { $0.kind == .chunk(captureId: id, sequence: 0) })
+        try FileManager.default.removeItem(at: item.url)
+        try BLERecord(tOffsetUs: 0, flags: 0, bytes: notification(seq: 2)).encoded()
+            .write(to: dir.appendingPathComponent("chunk-000001.journal"))
+        let report = CaptureRecovery.run(env: t.env)
+        #expect(t.seal(id) == nil, "no seal claiming the capture ended at -1")
+        #expect(report.quarantined.contains(id))
+        let kept = t.dirs.journalQuarantine.appendingPathComponent(id).appendingPathComponent("chunk-000001.journal")
+        #expect(FileIO.fileSize(kept) > 0, "audio preserved in quarantine")
+    }
+
+    /// An unknown codec quarantines the capture instead of discarding its journal.
+    @Test func unknownCodecQuarantinesInsteadOfDiscarding() throws {
+        let t = TestEnv()
+        let r = LiveCaptureRecorder(env: t.env)
+        let id = try r.begin(meta: CaptureDeviceMeta(deviceId: "dev-1", codec: nil))
+        let dir = t.dirs.journalLive.appendingPathComponent(id)
+        try BLERecord(tOffsetUs: 0, flags: 1, bytes: notification(seq: 1)).encoded()
+            .write(to: dir.appendingPathComponent("chunk-000000.journal"))
+        let report = CaptureRecovery.run(env: t.env)
+        #expect(t.seal(id) == nil)
+        #expect(report.quarantined.contains(id))
+    }
+}
+
+@Suite struct LedgerVerificationRegressionTests {
+    /// Verification #3: an unreadable ledger must fail closed, not become an empty ledger.
+    @Test func unreadableLedgerFailsClosed() throws {
+        let h = RingHarness()
+        let ledger = RingCaptureLedger(dirs: h.t.dirs, outbox: h.t.outbox)
+        h.engine.writer.ledger = ledger
+        h.startThroughInfoRequest(unread: 2)
+        h.feed([RingWire.info(read: 0, write: 2), RingWire.readBegin(0, 2), RingWire.data([ringRecord(seq: 0)])[0]])
+        h.engine.handleDisconnect()  // A interrupted, still pending
+        let h2 = RingHarness(t: h.t)
+        h2.engine.writer.ledger = ledger
+        h2.startThroughInfoRequest(unread: 0)
+        h2.feed([RingWire.info(read: 2, write: 2)])  // B: empty sync_complete
+        let bId = try #require(ledger.snapshot.map(\.captureId).last)
+        let bSeal = try #require(h2.t.outbox.pendingItem(named: OutboxKind.seal(captureId: bId).fileName))
+
+        try Data("not json".utf8).write(to: h.t.dirs.state.appendingPathComponent("ring-ledger.json"))
+        let reopened = RingCaptureLedger(dirs: h.t.dirs, outbox: h.t.outbox)
+        #expect(reopened.degraded)
+        #expect(!reopened.mayUpload(bSeal), "B stays held while A's audio is unacknowledged")
+
+        // Once A is fully acknowledged, B is released and the ledger leaves degraded mode.
+        for item in h.t.outbox.pending() where item.kind.captureId != bId {
+            try h.t.outbox.markSent(item.name)
+            reopened.didAcknowledge(item)
+        }
+        for dir in FileIO.contents(of: h.t.dirs.journalRing) { try FileManager.default.removeItem(at: dir) }
+        #expect(reopened.mayUpload(bSeal))
+        try h.t.outbox.markSent(bSeal.name)
+        reopened.didAcknowledge(bSeal)
+        #expect(!reopened.degraded)
+    }
+
+    /// Two held seals never wait on each other in degraded mode: the older one goes first.
+    @Test func degradedHeldSealsDoNotDeadlock() throws {
+        let t = TestEnv()
+        func writeSeal(_ id: String) throws -> OutboxItem {
+            let seal = SealBody(lastChunkSequence: -1, reason: .syncComplete, endedAt: "2026-09-26T19:40:00.000Z",
+                                endOffsetUs: 0, deviceId: "dev-1", source: .deviceRing)
+            return try t.outbox.write(try ContractJSON.encode(seal), kind: .seal(captureId: id))
+        }
+        let older = try writeSeal("aaaaaaaa-0000-0000-0000-000000000001")
+        t.clock.advance(5)
+        Thread.sleep(forTimeInterval: 0.02)
+        let newer = try writeSeal("bbbbbbbb-0000-0000-0000-000000000002")
+        try Data("{".utf8).write(to: t.dirs.state.appendingPathComponent("ring-ledger.json"))
+        let ledger = RingCaptureLedger(dirs: t.dirs, outbox: t.outbox)
+        #expect(ledger.degraded)
+        #expect(ledger.mayUpload(older))
+        #expect(!ledger.mayUpload(newer))
+    }
+}

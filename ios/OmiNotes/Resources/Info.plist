@@ -33,11 +33,13 @@
 	</array>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+#if OMI_ALLOW_LOCAL_HTTP
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+#endif
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Omi Notes connects to your Omi pendant to receive its audio and forward it to your own server.</string>
 	<key>NSLocalNetworkUsageDescription</key>

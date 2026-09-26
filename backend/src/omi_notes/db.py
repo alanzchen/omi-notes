@@ -243,6 +243,8 @@ def _migration_3(conn: sqlite3.Connection) -> None:
         "ALTER TABLE conversations ADD COLUMN reprocess_request INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE conversations ADD COLUMN reprocess_handled INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE captures ADD COLUMN dropped_reconciled INTEGER NOT NULL DEFAULT 0",
+        # v2 queued `reprocess` work only as force flags: turn it into pending requests.
+        "UPDATE conversations SET reprocess_request = 1 WHERE force_restt = 1 OR force_llm = 1",
     ):
         conn.execute(statement)
     rows = conn.execute(

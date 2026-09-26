@@ -26,7 +26,7 @@ from omi_notes.pipeline.worker import Worker
 from omi_notes.providers.fake import FakeLlm
 
 from .conftest import AUTH, DEVICE, cli_env, make_settings, put_chunk, upload_all
-from .helpers import STARTED, T0, convs, event, iso, live, live_seal, replay, ring_seal, ring_sync, silence
+from .helpers import STARTED, T0, convs, event, iso, live, live_seal, replay, ring_seal, ring_sync, silence, timedelta
 
 SPEECH = np.concatenate([silence(1), synth_speech_like(10), silence(2)])
 
@@ -287,3 +287,103 @@ def test_r8_same_backend_restores_its_state(settings):
     restored = VadStream(RnnStyleVad(), stream.to_state())
     assert restored.model_state == stream.model_state
     assert VadStream(EnergyVad(), stream.to_state()).model_state == EnergyVad().initial_state()
+
+
+# round 2 follow-up ---------------------------------------------------------------------------------
+
+
+def test_r2b_1_an_undeletable_stale_note_never_blocks_other_work(client, worker, settings):
+    replay(client, SPEECH)
+    worker.tick(T0 + 200)
+    (row,) = convs(worker)
+    old = settings.notes_dir / "_discarded" / "undeletable.md"
+    old.parent.mkdir(exist_ok=True)
+    old.write_text("old copy")
+    worker.db.execute("UPDATE conversations SET stale_note_path=? WHERE id=?", ("_discarded/undeletable.md", row["id"]))
+    later = replay(client, SPEECH, start=STARTED + timedelta(hours=1))
+    old.parent.chmod(0o555)  # a real permission error, not a mocked remover
+    try:
+        worker.tick(T0 + 4000)
+        worker.tick(T0 + 4005)
+        statuses = [r["status"] for r in worker.db.query("SELECT status FROM chunks WHERE capture_id=?", (later,))]
+        assert statuses and set(statuses) == {"processed"}
+        assert worker.db.one("SELECT stale_note_path FROM conversations WHERE id=?", (row["id"],))[0] is not None
+        assert "undeletable.md" in (settings.notes_dir / "_status.md").read_text()
+    finally:
+        old.parent.chmod(0o755)
+    worker.tick(T0 + 4010)  # still backing off
+    assert old.exists()
+    worker.tick(T0 + 4100)
+    assert not old.exists()
+    assert worker.db.one("SELECT stale_note_path, error FROM conversations WHERE id=?", (row["id"],))[:] == (None, None)
+
+
+@pytest.mark.parametrize("step", ["segment_device", "advance"])
+def test_r2b_1_one_bad_row_does_not_stall_the_rest(client, worker, monkeypatch, step):
+    replay(client, SPEECH)
+    replay(client, SPEECH, start=STARTED + timedelta(hours=1))
+    if step == "segment_device":
+        other = "22222222-2222-4333-8444-555555555555"
+        capture = str(uuid.uuid4())
+        envs = pcm_envelopes(SPEECH, capture_id=capture, device_id=other, started_at=STARTED)
+        upload_all(client, capture, envs)
+        real = worker.segment_device
+        monkeypatch.setattr(worker, "segment_device", lambda d, now: (_ for _ in ()).throw(RuntimeError("boom"))
+                            if d == DEVICE else real(d, now))  # fmt: skip
+        worker.tick(T0 + 5000)
+        assert [r["device_id"] for r in convs(worker)] == [other]
+    else:
+        worker.pipeline.run = lambda now, limit=20: 0
+        worker.tick(T0 + 5000)
+        del worker.pipeline.run
+        first, second = convs(worker)
+        real = worker.pipeline._advance
+        monkeypatch.setattr(worker.pipeline, "_advance", lambda cid, now: (_ for _ in ()).throw(PermissionError("cache"))
+                            if cid == first["id"] else real(cid, now))  # fmt: skip
+        worker.tick(T0 + 5010)
+        assert [r["status"] for r in convs(worker)] == ["closed", "done"]
+
+
+def test_r2b_2_migration_turns_queued_force_flags_into_requests(tmp_path):
+    path = tmp_path / "v2.sqlite3"
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.executescript("BEGIN;" + dbmod.MIGRATIONS[0] + "; PRAGMA user_version=1; COMMIT;")
+    conn.executescript("BEGIN;" + dbmod.MIGRATIONS[1] + "; PRAGMA user_version=2; COMMIT;")
+    for cid, flags in (("queued-llm", (0, 1)), ("queued-stt", (1, 0)), ("idle", (0, 0))):
+        conn.execute(
+            """INSERT INTO conversations (id, device_id, start, end, status, created_at, updated_at, force_restt, force_llm)
+               VALUES (?,?,1,2,'summarizing',1,1,?,?)""",
+            (cid, DEVICE, *flags),
+        )
+    conn.close()
+    db = Database(path)
+    rows = {r["id"]: (r["reprocess_request"], r["reprocess_handled"]) for r in db.query("SELECT * FROM conversations")}
+    assert rows == {"queued-llm": (1, 0), "queued-stt": (1, 0), "idle": (0, 0)}
+
+
+class CountingLlm(FakeLlm):
+    calls = 0
+
+    def summarize(self, request):
+        CountingLlm.calls += 1
+        return super().summarize(request)
+
+
+def test_r2b_3_late_loss_evidence_updates_a_finalized_note_without_provider_calls(client, worker, settings):
+    gen1, n1 = ring_capture_with_dropped(client, offset=-5000, first_sequence=0, dropped=100)
+    ring_seal(client, gen1, last_chunk_sequence=n1 - 1, covers_until=T0 - 4800, info_read_seq=0)
+    worker.tick(T0 - 4700)
+    gen2, n2 = ring_capture_with_dropped(client, offset=0, first_sequence=0, dropped=100)
+    CountingLlm.calls = 0
+    worker.providers._llm = CountingLlm()
+    worker.tick(T0 + 1600)  # finalized provisionally before its seal says "generation 2"
+    row = next(r for r in convs(worker) if r["start"] >= T0)
+    assert row["status"] == "done" and row["lost_seconds"] == 0
+    calls = CountingLlm.calls
+    ring_seal(client, gen2, last_chunk_sequence=n2 - 1, covers_until=T0 + 200, info_read_seq=0, ring={"generation": 2})
+    worker.tick(T0 + 1700)
+    row = next(r for r in convs(worker) if r["start"] >= T0)
+    assert row["lost_seconds"] > 5 and json.loads(row["gaps_json"])
+    text = (settings.notes_dir / row["note_path"]).read_text()
+    assert "Audio missing" in text and "audio_lost_s: 0.0" not in text
+    assert CountingLlm.calls == calls and row["revision"] == 2

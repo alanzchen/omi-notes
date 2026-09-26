@@ -207,13 +207,20 @@ public enum ServerURLVerdict: Equatable, Sendable {
     }
 }
 
-/// HTTPS is required. Plain http is accepted (with a warning) only for hosts that cannot be on the
-/// public internet: loopback (`localhost`, 127/8, ::1), RFC 1918 (10/8, 172.16/12, 192.168/16),
-/// link-local (169.254/16, fe80::/10), CGNAT 100.64/10 (Tailscale's WireGuard-encrypted IPs),
-/// IPv6 unique-local fc00::/7 (Tailscale IPv6), and mDNS `*.local` names. IP literals are parsed,
-/// not pattern-matched.
+/// HTTPS is required. In Debug builds only, plain http is accepted (with a warning) for hosts that
+/// cannot be on the public internet: loopback (`localhost`, 127/8, ::1), RFC 1918 (10/8, 172.16/12,
+/// 192.168/16), link-local (169.254/16, fe80::/10), CGNAT 100.64/10 (Tailscale's WireGuard-encrypted
+/// IPs), IPv6 unique-local fc00::/7 (Tailscale IPv6), and mDNS `*.local` names. IP literals are
+/// parsed, not pattern-matched. Release builds are HTTPS-only (the Info.plist ATS exception is also
+/// Debug-only).
 public enum ServerURLPolicy {
-    public static func evaluate(_ raw: String) -> (url: URL?, verdict: ServerURLVerdict) {
+    #if DEBUG
+    public static let allowsInsecureLocalByDefault = true
+    #else
+    public static let allowsInsecureLocalByDefault = false
+    #endif
+
+    public static func evaluate(_ raw: String, allowInsecureLocal: Bool = allowsInsecureLocalByDefault) -> (url: URL?, verdict: ServerURLVerdict) {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let comps = URLComponents(string: trimmed), let scheme = comps.scheme?.lowercased(),
               let rawHost = comps.host, !rawHost.isEmpty else {
@@ -227,10 +234,12 @@ public enum ServerURLPolicy {
         case "https":
             return (url, .ok)
         case "http":
-            if isLocal(rawHost) {
+            if allowInsecureLocal, isLocal(rawHost) {
                 return (url, .insecureLocal("Plain http: the token and audio travel unencrypted on this network. Use only for local development."))
             }
-            return (nil, .rejected("Use https (e.g. `tailscale serve`); plain http is only allowed for local-network hosts"))
+            return (nil, .rejected(allowInsecureLocal
+                ? "Use https (e.g. `tailscale serve`); plain http is only allowed for local-network hosts"
+                : "Use https (e.g. `tailscale serve`); plain http is only allowed in development builds"))
         default:
             return (nil, .rejected("Unsupported scheme \(scheme)"))
         }

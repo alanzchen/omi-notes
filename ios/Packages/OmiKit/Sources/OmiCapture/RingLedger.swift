@@ -35,14 +35,26 @@ public final class RingCaptureLedger: UploadGate, @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [Entry]
     private var nextOrder: Int
+    /// The ledger file exists but could not be read or decoded, so the order of older ring captures
+    /// is unknown. Fail closed: hold `sync_complete` seals while any other unacknowledged ring audio
+    /// of the device is on the phone (see `degradedBlockers`). Cleared once none is left.
+    public private(set) var degraded = false
 
     public init(dirs: CaptureDirectories, outbox: Outbox) {
         self.dirs = dirs
         self.outbox = outbox
         url = dirs.state.appendingPathComponent("ring-ledger.json")
-        let stored = JSONFile.load(Stored.self, from: url)
-        entries = stored?.entries ?? []
-        nextOrder = stored?.nextOrder ?? 1
+        entries = []
+        nextOrder = 1
+        guard FileIO.exists(url) else { return }  // fresh install: nothing to order
+        do {
+            let stored = try JSONDecoder().decode(Stored.self, from: Data(contentsOf: url))
+            entries = stored.entries
+            nextOrder = stored.nextOrder
+        } catch {
+            degraded = true
+            log(.error, "ring", "ring ledger unreadable (\(error)); holding sync_complete seals until older ring audio is acknowledged")
+        }
     }
 
     public var snapshot: [Entry] {
@@ -108,20 +120,82 @@ public final class RingCaptureLedger: UploadGate, @unchecked Sendable {
     public func mayUpload(_ item: OutboxItem) -> Bool { heldReason(item) == nil }
 
     public func heldReason(_ item: OutboxItem) -> String? {
-        guard case .seal(let cid) = item.kind, isRingSyncComplete(item) else { return nil }
+        guard case .seal(let cid) = item.kind, let seal = ringSyncCompleteSeal(item) else { return nil }
+        if degraded {
+            let b = degradedBlockers(of: cid, deviceId: seal.deviceId, sealDate: item.modified)
+            if b.isEmpty {
+                return nil
+            }
+            return "ring ledger unreadable: sync_complete seal waits for other ring capture(s) \(b.joined(separator: ", "))"
+        }
         let b = blockers(of: cid)
         return b.isEmpty ? nil : "sync_complete seal waits for earlier ring capture(s) \(b.joined(separator: ", "))"
     }
 
-    public func didAcknowledge(_ item: OutboxItem) {
-        if item.kind.captureId != nil { prune() }
+    /// Fail-closed ordering when the ledger is unreadable: every other ring capture of the device
+    /// (or of an unknown device) with unacknowledged artifacts on the phone blocks. Captures whose
+    /// only outstanding artifact is their own held `sync_complete` seal are ordered by seal file age,
+    /// so two held seals can never wait on each other.
+    func degradedBlockers(of captureId: String, deviceId: String, sealDate: Date) -> [String] {
+        var blockers: [String] = []
+        for (other, info) in unacknowledgedRingCaptures() where other != captureId {
+            if let d = info.deviceId, d != deviceId { continue }
+            if info.onlyHeldSeal, let otherSeal = info.sealDate, otherSeal > sealDate { continue }
+            blockers.append(other)
+        }
+        return blockers.sorted()
     }
 
-    private func isRingSyncComplete(_ item: OutboxItem) -> Bool {
-        guard let data = try? Data(contentsOf: item.url), let seal = try? JSONDecoder().decode(SealBody.self, from: data) else {
-            return false
+    private struct RingArtifacts {
+        var deviceId: String?
+        var onlyHeldSeal = true
+        var sealDate: Date?
+    }
+
+    /// Ring captures with anything on the phone that the server hasn't acknowledged: journal or
+    /// quarantined directories, and pending or quarantined outbox chunks and seals.
+    private func unacknowledgedRingCaptures() -> [String: RingArtifacts] {
+        var found: [String: RingArtifacts] = [:]
+        for dir in FileIO.contents(of: dirs.journalRing) + FileIO.contents(of: dirs.journalQuarantine) where dir.hasDirectoryPath {
+            let m = JSONFile.load(CaptureManifest.self, from: dir.appendingPathComponent(CaptureManifest.fileName))
+            if let m, m.source != .deviceRing { continue }
+            let id = m?.captureId ?? dir.lastPathComponent
+            found[id, default: RingArtifacts()].deviceId = m?.deviceId
+            found[id]?.onlyHeldSeal = false
         }
-        return seal.source == .deviceRing && seal.reason == .syncComplete
+        for item in outbox.pending() + outbox.quarantined() {
+            guard let id = item.kind.captureId, let data = try? Data(contentsOf: item.url) else { continue }
+            switch item.kind {
+            case .seal:
+                guard let seal = try? JSONDecoder().decode(SealBody.self, from: data), seal.source == .deviceRing else { continue }
+                found[id, default: RingArtifacts()].deviceId = seal.deviceId
+                if seal.reason == .syncComplete { found[id]?.sealDate = item.modified } else { found[id]?.onlyHeldSeal = false }
+            default:
+                guard let env = try? Envelope.parse(data), env.header.source == .deviceRing else { continue }
+                found[id, default: RingArtifacts()].deviceId = env.header.deviceId
+                found[id]?.onlyHeldSeal = false
+            }
+        }
+        return found
+    }
+
+    public func didAcknowledge(_ item: OutboxItem) {
+        guard item.kind.captureId != nil else { return }
+        prune()
+        if degraded, unacknowledgedRingCaptures().isEmpty {
+            // Everything older has been acknowledged: the ledger is complete again.
+            lock.lock(); defer { lock.unlock() }
+            if (try? persistLocked()) != nil {
+                degraded = false
+                log(.info, "ring", "ring ledger rebuilt; normal seal ordering resumed")
+            }
+        }
+    }
+
+    private func ringSyncCompleteSeal(_ item: OutboxItem) -> SealBody? {
+        guard let data = try? Data(contentsOf: item.url), let seal = try? JSONDecoder().decode(SealBody.self, from: data),
+              seal.source == .deviceRing, seal.reason == .syncComplete else { return nil }
+        return seal
     }
 
     private func persistLocked() throws {

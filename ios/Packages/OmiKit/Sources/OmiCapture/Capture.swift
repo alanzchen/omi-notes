@@ -38,6 +38,10 @@ public struct CaptureManifest: Codable, Equatable, Sendable {
     static let fileName = "capture.json"
 
     static func journalName(_ seq: Int) -> String { "chunk-\(String(format: "%06d", seq)).journal" }
+    static func journalSequence(_ name: String) -> Int? {
+        guard name.hasPrefix("chunk-"), name.hasSuffix(".journal") else { return nil }
+        return Int(name.dropFirst("chunk-".count).dropLast(".journal".count))
+    }
 
     func header(
         chunkSequence: Int, codecId: Int, startUs: Int64, endUs: Int64, recordCount: Int, payloadBytes: Int,
@@ -742,7 +746,32 @@ public final class RingCaptureWriter {
 /// A directory whose manifest is missing or corrupt is **quarantined** (moved to
 /// `journal/quarantine/`) unless its journals are demonstrably empty; an unreadable manifest
 /// (e.g. protected data unavailable) leaves the directory untouched for the next launch.
+enum RecoveryError: Error { case codecUnknown }
+
 public enum CaptureRecovery {
+    /// Sent chunks that recovery may still need, per capture: every `sent/` chunk of a capture whose
+    /// journal directory still exists and whose committed manifest has not moved past it (all of
+    /// them when the manifest can't be read). Retention must not delete these: after a failed
+    /// manifest commit, recovery relies on the published envelope to know the rotation happened.
+    public static func retentionPins(env: CaptureEnvironment) -> [String: Int] {
+        var pins: [String: Int] = [:]
+        for root in [env.dirs.journalLive, env.dirs.journalRing] {
+            for dir in FileIO.contents(of: root) where dir.hasDirectoryPath {
+                switch loadManifest(dir.appendingPathComponent(CaptureManifest.fileName)) {
+                case .ok(let m): pins[m.captureId] = min(pins[m.captureId] ?? .max, m.openChunkSequence)
+                default: pins[dir.lastPathComponent] = 0  // unknown progress: pin every chunk
+                }
+            }
+        }
+        return pins
+    }
+
+    /// True if retention must keep this sent chunk (see `retentionPins`).
+    public static func isPinned(_ kind: OutboxKind, pins: [String: Int]) -> Bool {
+        guard case .chunk(let captureId, let sequence) = kind, let from = pins[captureId] else { return false }
+        return sequence >= from
+    }
+
     public struct Report: Sendable, Equatable {
         public var liveRecovered: [String] = []
         public var ringRecovered: [String] = []
@@ -853,14 +882,39 @@ public enum CaptureRecovery {
         }
         var endUs = m.openChunkStartOffsetUs
         let seq = m.openChunkSequence
-        let journalURL = dir.appendingPathComponent(CaptureManifest.journalName(seq))
-        if let raw = try? Data(contentsOf: journalURL), !raw.isEmpty {
+        let journalName = CaptureManifest.journalName(seq)
+        let journalURL = dir.appendingPathComponent(journalName)
+        // Journals below `seq` belong to published envelopes. A later journal holding data means the
+        // manifest and outbox don't account for it (e.g. a published predecessor is gone): never seal
+        // over it or delete it.
+        let unaccounted = FileIO.contents(of: dir).filter {
+            guard $0.pathExtension == "journal", FileIO.fileSize($0) > 0 else { return false }
+            guard let n = CaptureManifest.journalSequence($0.lastPathComponent) else { return true }
+            return n > seq
+        }
+        if !unaccounted.isEmpty {
+            quarantine(dir, env: env, why: "journals not accounted for by the manifest: \(unaccounted.map(\.lastPathComponent))", report: &report)
+            return false
+        }
+        var raw = Data()
+        if FileIO.exists(journalURL) {
+            do { raw = try Data(contentsOf: journalURL) } catch {
+                // Unreadable is not absent: keep everything and try again next launch.
+                report.skipped.append(dir.lastPathComponent)
+                log(.warning, "recovery", "journal of \(dir.lastPathComponent) unreadable (\(error)); will retry next launch")
+                return false
+            }
+        }
+        if !raw.isEmpty {
             do {
                 if let written = try finalizeRecovered(manifest: m, raw: raw, env: env, codecFallback: codecFallback, report: &report) {
                     endUs = written
                     m.openChunkSequence = seq + 1
                     report.chunksWritten += 1
                 }
+            } catch RecoveryError.codecUnknown {
+                quarantine(dir, env: env, why: "codec unknown for \(m.captureId)", report: &report)
+                return false
             } catch {
                 log(.error, "recovery", "could not rebuild chunk \(seq) of \(m.captureId): \(error)")
                 return false
@@ -883,10 +937,7 @@ public enum CaptureRecovery {
 
     /// Returns the chunk end offset if a chunk was written.
     private static func finalizeRecovered(manifest m: CaptureManifest, raw: Data, env: CaptureEnvironment, codecFallback: (String) -> Int?, report: inout Report) throws -> Int64? {
-        guard let codec = m.codecId ?? codecFallback(m.deviceId) else {
-            log(.error, "recovery", "codec unknown for \(m.captureId); journal discarded")
-            return nil
-        }
+        guard let codec = m.codecId ?? codecFallback(m.deviceId) else { throw RecoveryError.codecUnknown }
         let seq = m.openChunkSequence
         switch m.source {
         case .deviceRing:

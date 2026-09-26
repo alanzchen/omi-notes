@@ -29,6 +29,16 @@ import OmiProtocol
     }
 }
 
+@Suite struct ReleaseURLPolicyTests {
+    /// Verification #5: release builds are HTTPS-only, even for local hosts.
+    @Test func releasePolicyRejectsAllPlainHttp() {
+        for u in ["http://192.168.1.25:8000", "http://localhost:8765", "http://100.64.0.1", "http://[::1]:8765", "http://studio.local"] {
+            #expect(!ServerURLPolicy.evaluate(u, allowInsecureLocal: false).verdict.isAcceptable, "\(u)")
+        }
+        #expect(ServerURLPolicy.evaluate("https://mac.tail1234.ts.net", allowInsecureLocal: false).verdict == .ok)
+    }
+}
+
 @Suite struct ConfigureLinkTests {
     @Test func parsesPairingQR() throws {
         let url = URL(string: "omi-notes://configure?url=https%3A%2F%2Fmac.tail1234.ts.net&token=0123456789abcdef")!

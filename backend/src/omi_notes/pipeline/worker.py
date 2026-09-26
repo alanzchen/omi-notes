@@ -88,16 +88,19 @@ class Worker:
         if not self._reconciled:
             self.pipeline.reconcile_days()  # daily indexes may be stale after a crash
             self._reconciled = True
-        self.pipeline.reconcile_moves()
+        self.pipeline.reconcile_moves(now)
         chunks = self.process_chunks(now)
         self.finalize_sealed(now)
-        self.reconcile_dropped()
+        self.reconcile_dropped(now)
         self.apply_late_events(now)
         changed = self.segment_all(now)
         advanced = self.pipeline.run(now)
         self.pipeline.render_stubs()
         self.pipeline.render_dailies()
-        self.pipeline.render_status(__version__)
+        try:
+            self.pipeline.render_status(__version__)
+        except OSError:
+            log.exception("could not write _status.md")
         if now - self._last_retention >= RETENTION_INTERVAL:
             self.retention(now)
             self._last_retention = now
@@ -137,8 +140,12 @@ class Worker:
             if not ready:
                 break
             for row in ready:
-                if self.process_chunk(row["capture_id"], row["chunk_sequence"], now):
-                    done += 1
+                try:
+                    ok = self.process_chunk(row["capture_id"], row["chunk_sequence"], now)
+                except Exception as exc:  # e.g. a storage error while committing: retry later
+                    self._chunk_failed(row["capture_id"], row["chunk_sequence"], exc, now)
+                    ok = False
+                done += int(ok)
         return done
 
     def _restore(self, capture, carry_seq: int) -> tuple[CaptureTimeline, VadStream]:
@@ -164,13 +171,7 @@ class Worker:
             result = timeline.decode_chunk(env, final=final)
             speech, open_segment = self._detect(vad, result, final)
         except Exception as exc:  # VAD/IO errors are retryable, never "silence"
-            attempts = chunk["attempts"] + 1
-            status = "failed" if attempts >= MAX_CHUNK_ATTEMPTS else "pending"
-            log.warning("chunk %s#%d failed (attempt %d): %s", capture_id, seq, attempts, exc)
-            self.db.execute(
-                "UPDATE chunks SET attempts=?, status=?, error=?, next_attempt_at=? WHERE capture_id=? AND chunk_sequence=?",
-                (attempts, status, f"{type(exc).__name__}: {exc}"[:500], now + backoff(attempts), capture_id, seq),
-            )
+            self._chunk_failed(capture_id, seq, exc, now)
             return False
 
         losses = list(result.losses)
@@ -188,6 +189,17 @@ class Worker:
             while len(self._decoders) > TIMELINE_CACHE:
                 self._decoders.popitem(last=False)
         return True
+
+    def _chunk_failed(self, capture_id: str, seq: int, exc: Exception, now: float) -> None:
+        self._decoders.pop(capture_id, None)
+        chunk = self.db.one("SELECT attempts FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq))
+        attempts = chunk["attempts"] + 1
+        status = "failed" if attempts >= MAX_CHUNK_ATTEMPTS else "pending"
+        log.warning("chunk %s#%d failed (attempt %d): %s", capture_id, seq, attempts, exc)
+        self.db.execute(
+            "UPDATE chunks SET attempts=?, status=?, error=?, next_attempt_at=? WHERE capture_id=? AND chunk_sequence=?",
+            (attempts, status, f"{type(exc).__name__}: {exc}"[:500], now + backoff(attempts), capture_id, seq),
+        )
 
     @staticmethod
     def _detect(vad: VadStream, result: ChunkDecode, final: bool):
@@ -228,7 +240,7 @@ class Worker:
              capture_id, seq),
         )  # fmt: skip
 
-    def reconcile_dropped(self) -> None:
+    def reconcile_dropped(self, now: float) -> None:
         """Losses for records the device overwrote before a sync could read them. INFO `dropped` is
         treated as a cumulative counter: the loss is the increase over the device's previous sync
         (a decrease, or a different generation, means storage was reset). Until both seals have
@@ -238,35 +250,62 @@ class Worker:
             """SELECT * FROM captures WHERE source='device_ring' AND ring_dropped IS NOT NULL
                AND dropped_reconciled=0 AND capture_started_at IS NOT NULL"""
         ):
-            first_audio = self.db.one(
-                "SELECT MIN(audio_start) AS t FROM chunks WHERE capture_id=? AND status='processed'", (capture["capture_id"],)
-            )["t"]
-            if first_audio is None:
-                continue
-            previous = self.db.one(
-                """SELECT ring_dropped, ring_generation, seal_json FROM captures WHERE device_id=? AND source='device_ring'
-                   AND capture_id<>? AND ring_dropped IS NOT NULL AND capture_started_at < ?
-                   ORDER BY capture_started_at DESC LIMIT 1""",
-                (capture["device_id"], capture["capture_id"], capture["capture_started_at"]),
-            )
-            current, baseline = capture["ring_dropped"], 0
-            if previous is not None and previous["ring_dropped"] <= current:
-                generations = (previous["ring_generation"], capture["ring_generation"])
-                if None in generations or generations[0] == generations[1]:
-                    baseline = previous["ring_dropped"]
-            delta = current - baseline
-            complete = capture["seal_json"] is not None and (previous is None or previous["seal_json"] is not None)
-            with self.db.tx() as conn:
-                conn.execute("DELETE FROM losses WHERE capture_id=? AND kind='ring_dropped'", (capture["capture_id"],))
-                if delta > 0:
-                    conn.execute(
-                        """INSERT INTO losses (device_id, start, end, kind, count, capture_id, chunk_sequence)
-                           VALUES (?,?,?,?,?,?,0)""",
-                        (capture["device_id"], first_audio - delta * RING_RECORD_SECONDS, first_audio, "ring_dropped",
-                         delta, capture["capture_id"]),
-                    )  # fmt: skip
-                if complete:
-                    conn.execute("UPDATE captures SET dropped_reconciled=1 WHERE capture_id=?", (capture["capture_id"],))
+            try:
+                self._reconcile_dropped(capture, now)
+            except Exception:
+                log.exception("could not reconcile dropped records for capture %s", capture["capture_id"])
+
+    def _reconcile_dropped(self, capture, now: float) -> None:
+        capture_id = capture["capture_id"]
+        first_audio = self.db.one(
+            "SELECT MIN(audio_start) AS t FROM chunks WHERE capture_id=? AND status='processed'", (capture_id,)
+        )["t"]
+        if first_audio is None:
+            return
+        previous = self.db.one(
+            """SELECT ring_dropped, ring_generation, seal_json FROM captures WHERE device_id=? AND source='device_ring'
+               AND capture_id<>? AND ring_dropped IS NOT NULL AND capture_started_at < ?
+               ORDER BY capture_started_at DESC LIMIT 1""",
+            (capture["device_id"], capture_id, capture["capture_started_at"]),
+        )
+        current, baseline = capture["ring_dropped"], 0
+        if previous is not None and previous["ring_dropped"] <= current:
+            generations = (previous["ring_generation"], capture["ring_generation"])
+            if None in generations or generations[0] == generations[1]:
+                baseline = previous["ring_dropped"]
+        delta = current - baseline
+        loss = (first_audio - delta * RING_RECORD_SECONDS, first_audio) if delta > 0 else None
+        complete = capture["seal_json"] is not None and (previous is None or previous["seal_json"] is not None)
+        before = self.db.one("SELECT start, end, count FROM losses WHERE capture_id=? AND kind='ring_dropped'", (capture_id,))
+        with self.db.tx() as conn:
+            conn.execute("DELETE FROM losses WHERE capture_id=? AND kind='ring_dropped'", (capture_id,))
+            if loss:
+                conn.execute(
+                    """INSERT INTO losses (device_id, start, end, kind, count, capture_id, chunk_sequence)
+                       VALUES (?,?,?,?,?,?,0)""",
+                    (capture["device_id"], *loss, "ring_dropped", delta, capture_id),
+                )
+            if complete:
+                conn.execute("UPDATE captures SET dropped_reconciled=1 WHERE capture_id=?", (capture_id,))
+        old = (before["start"], before["end"]) if before else None
+        if old != loss:
+            self.refresh_losses(capture["device_id"], [x for x in (old, loss) if x], now)
+
+    def refresh_losses(self, device: str, intervals: list[tuple[float, float]], now: float) -> None:
+        """Loss evidence changed after conversations near it were finalized: recompute their
+        `audio_gaps`/`lost_seconds` and queue a cached re-render (no provider calls)."""
+        gap = self.params.gap
+        lo, hi = min(a for a, _ in intervals) - gap, max(b for _, b in intervals) + gap
+        for conv in self.db.query(
+            "SELECT * FROM conversations WHERE device_id=? AND status<>'open' AND end >= ? AND start <= ?", (device, lo, hi)
+        ):
+            timeline = seg.DeviceTimeline(speech=[], **self._evidence(device, conv["start"] - gap - 5, conv["end"] + gap + 5, now))
+            gaps, lost = seg.window_evidence(timeline, conv["start"], conv["end"], now, self.params)
+            if json.dumps(gaps) != conv["gaps_json"] or abs(lost - conv["lost_seconds"]) > 1e-6:
+                self.db.execute(
+                    "UPDATE conversations SET gaps_json=?, lost_seconds=?, needs_render=(note_path IS NOT NULL), updated_at=? WHERE id=?",
+                    (json.dumps(gaps), lost, now, conv["id"]),
+                )
 
     def finalize_sealed(self, now: float) -> None:
         """Flush what an already-processed last chunk still held (pending BLE frame, open speech)."""
@@ -274,40 +313,40 @@ class Worker:
             """SELECT * FROM captures WHERE seal_json IS NOT NULL AND finalized=0
                AND processed_through >= last_chunk_sequence"""
         ):
-            last = capture["last_chunk_sequence"]
-            if last < 0:
-                self.db.execute("UPDATE captures SET finalized=1 WHERE capture_id=?", (capture["capture_id"],))
-                continue
-            chunk = self.db.one(
-                "SELECT * FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture["capture_id"], last)
-            )
-            timeline, vad = self._restore(capture, last)
             try:
-                flushed = timeline.finish(capture["capture_started_at"] or 0.0)
-                speech, _ = self._detect(vad, flushed, final=True)
+                self._finalize(capture)
             except Exception:
                 log.exception("could not finalize capture %s", capture["capture_id"])
-                continue
-            self._decoders.pop(capture["capture_id"], None)
-            with self.db.tx() as conn:
-                store_speech(conn, capture["device_id"], capture["capture_id"], last, speech, None)
-                conn.executemany(
-                    "INSERT INTO losses (device_id, start, end, kind, count, capture_id, chunk_sequence) VALUES (?,?,?,?,?,?,?)",
-                    [(capture["device_id"], a, b, kind, n, capture["capture_id"], last) for a, b, kind, n in flushed.losses],
-                )
-                runs = json.loads(chunk["runs_json"] or "[]") + [[p.start, len(p.pcm)] for p in flushed.pieces]
-                stats = json.loads(chunk["stats_json"] or "{}")
-                stats["frames"] = stats.get("frames", 0) + flushed.stats["frames"]
-                stats["final"] = True
-                ends = [x for x in [chunk["audio_end"], *(p.end for p in flushed.pieces)] if x is not None]
-                starts = [x for x in [chunk["audio_start"], *(p.start for p in flushed.pieces)] if x is not None]
-                conn.execute(
-                    """UPDATE chunks SET runs_json=?, stats_json=?, carry_json=?, audio_start=?, audio_end=?
-                       WHERE capture_id=? AND chunk_sequence=?""",
-                    (json.dumps(runs), json.dumps(stats), json.dumps(flushed.carry | {"vad": vad.to_state()}),
-                     min(starts, default=None), max(ends, default=None), capture["capture_id"], last),
-                )  # fmt: skip
-                conn.execute("UPDATE captures SET finalized=1 WHERE capture_id=?", (capture["capture_id"],))
+
+    def _finalize(self, capture) -> None:
+        last = capture["last_chunk_sequence"]
+        if last < 0:
+            self.db.execute("UPDATE captures SET finalized=1 WHERE capture_id=?", (capture["capture_id"],))
+            return
+        chunk = self.db.one("SELECT * FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture["capture_id"], last))
+        timeline, vad = self._restore(capture, last)
+        flushed = timeline.finish(capture["capture_started_at"] or 0.0)
+        speech, _ = self._detect(vad, flushed, final=True)
+        self._decoders.pop(capture["capture_id"], None)
+        with self.db.tx() as conn:
+            store_speech(conn, capture["device_id"], capture["capture_id"], last, speech, None)
+            conn.executemany(
+                "INSERT INTO losses (device_id, start, end, kind, count, capture_id, chunk_sequence) VALUES (?,?,?,?,?,?,?)",
+                [(capture["device_id"], a, b, kind, n, capture["capture_id"], last) for a, b, kind, n in flushed.losses],
+            )
+            runs = json.loads(chunk["runs_json"] or "[]") + [[p.start, len(p.pcm)] for p in flushed.pieces]
+            stats = json.loads(chunk["stats_json"] or "{}")
+            stats["frames"] = stats.get("frames", 0) + flushed.stats["frames"]
+            stats["final"] = True
+            ends = [x for x in [chunk["audio_end"], *(p.end for p in flushed.pieces)] if x is not None]
+            starts = [x for x in [chunk["audio_start"], *(p.start for p in flushed.pieces)] if x is not None]
+            conn.execute(
+                """UPDATE chunks SET runs_json=?, stats_json=?, carry_json=?, audio_start=?, audio_end=?
+                   WHERE capture_id=? AND chunk_sequence=?""",
+                (json.dumps(runs), json.dumps(stats), json.dumps(flushed.carry | {"vad": vad.to_state()}),
+                 min(starts, default=None), max(ends, default=None), capture["capture_id"], last),
+            )  # fmt: skip
+            conn.execute("UPDATE captures SET finalized=1 WHERE capture_id=?", (capture["capture_id"],))
 
     # -- late events -----------------------------------------------------------------------------
 
@@ -315,34 +354,46 @@ class Worker:
         """Bookmarks and double taps that land in an already finished note annotate it (it is
         re-rendered, never reopened)."""
         for ev in self.db.query("SELECT * FROM event_times WHERE type='button' AND code IN (1, 2) AND applied=0"):
-            t = ev["t"]
-            if ev["code"] == 1:
-                owner = bookmark_owner(self.db, ev["device_id"], t)
-                conv = self.db.one("SELECT * FROM conversations WHERE id=?", (owner,)) if owner else None
-            else:
-                conv = self.db.one(
-                    "SELECT * FROM conversations WHERE device_id=? AND start < ? AND end > ? AND status<>'open'",
-                    (ev["device_id"], t, t),
-                )
-                if conv is None and self.db.one(
-                    "SELECT 1 FROM conversations WHERE device_id=? AND (abs(start - ?) < 0.001 OR abs(end - ?) < 0.001)",
-                    (ev["device_id"], t, t),
-                ):
-                    self.db.execute("UPDATE events SET applied=1 WHERE event_id=?", (ev["event_id"],))  # used as a split
-                    continue
-            if conv is not None and conv["status"] != "open":
-                if conv["note_path"]:
-                    self.db.execute("UPDATE conversations SET needs_render=1 WHERE id=?", (conv["id"],))
-                self.db.execute("UPDATE events SET applied=1 WHERE event_id=?", (ev["event_id"],))
-            elif now - t > LATE_EVENT_HORIZON:
-                self.db.execute("UPDATE events SET applied=1 WHERE event_id=?", (ev["event_id"],))
+            try:
+                self._apply_late_event(ev, now)
+            except Exception:
+                log.exception("could not apply button event %s", ev["event_id"])
+
+    def _apply_late_event(self, ev, now: float) -> None:
+        t = ev["t"]
+        if ev["code"] == 1:
+            owner = bookmark_owner(self.db, ev["device_id"], t)
+            conv = self.db.one("SELECT * FROM conversations WHERE id=?", (owner,)) if owner else None
+        else:
+            conv = self.db.one(
+                "SELECT * FROM conversations WHERE device_id=? AND start < ? AND end > ? AND status<>'open'",
+                (ev["device_id"], t, t),
+            )
+            if conv is None and self.db.one(
+                "SELECT 1 FROM conversations WHERE device_id=? AND (abs(start - ?) < 0.001 OR abs(end - ?) < 0.001)",
+                (ev["device_id"], t, t),
+            ):
+                self.db.execute("UPDATE events SET applied=1 WHERE event_id=?", (ev["event_id"],))  # used as a split
+                return
+        if conv is not None and conv["status"] != "open":
+            if conv["note_path"]:
+                self.db.execute("UPDATE conversations SET needs_render=1 WHERE id=?", (conv["id"],))
+            self.db.execute("UPDATE events SET applied=1 WHERE event_id=?", (ev["event_id"],))
+        elif now - t > LATE_EVENT_HORIZON:
+            self.db.execute("UPDATE events SET applied=1 WHERE event_id=?", (ev["event_id"],))
 
     # -- segmentation ----------------------------------------------------------------------------
 
     def segment_all(self, now: float) -> int:
         devices = {r["device_id"] for r in self.db.query("SELECT DISTINCT device_id FROM speech WHERE claimed_by IS NULL")}
         devices |= {r["device_id"] for r in self.db.query("SELECT DISTINCT device_id FROM conversations WHERE status='open'")}
-        return sum(self.segment_device(device, now) for device in sorted(devices))
+        changes = 0
+        for device in sorted(devices):
+            try:
+                changes += self.segment_device(device, now)
+            except Exception:  # one device's bad data must not stall the others
+                log.exception("segmentation failed for device %s", device)
+        return changes
 
     def device_timeline(self, device: str, now: float) -> tuple[seg.DeviceTimeline, int] | None:
         rows = self.db.query(
@@ -361,6 +412,17 @@ class Worker:
                 (device, lo - gap, hi + gap),
             )
         ]
+        timeline = seg.DeviceTimeline(
+            speech=[seg.Speech(r["id"], r["start"], r["end"]) for r in rows],
+            splits=self.effective_splits(device, lo - gap, hi + gap),
+            finalized=finalized,
+            **self._evidence(device, lo, hi, now),
+        )
+        return timeline, watermark
+
+    def _evidence(self, device: str, lo: float, hi: float, now: float) -> dict:
+        """Coverage, capture spans, sync watermark, policy and losses around [lo, hi]."""
+        gap = self.params.gap
         coverage = [
             (r["start"], r["end"])
             for r in self.db.query(
@@ -385,18 +447,14 @@ class Worker:
                 "SELECT start, end FROM losses WHERE device_id=? AND end >= ? AND start <= ?", (device, lo - gap, hi + gap)
             )
         ]
-        timeline = seg.DeviceTimeline(
-            speech=[seg.Speech(r["id"], r["start"], r["end"]) for r in rows],
-            coverage=coverage,
-            live_spans=self._live_spans(device, lo, hi),
-            ring_resolved_until=self.ring_watermark(device, now),
-            outside_policy=self._outside_policy(device),
-            live_open=self._live_open(device),
-            splits=self.effective_splits(device, lo - gap, hi + gap),
-            finalized=finalized,
-            losses=losses,
-        )
-        return timeline, watermark
+        return {
+            "coverage": coverage,
+            "live_spans": self._live_spans(device, lo, hi),
+            "ring_resolved_until": self.ring_watermark(device, now),
+            "outside_policy": self._outside_policy(device),
+            "live_open": self._live_open(device),
+            "losses": losses,
+        }
 
     def _live_spans(self, device: str, lo: float, hi: float) -> list[seg.Span]:
         """Spans of live/replay captures near [lo, hi], using monotonic seal ends."""
@@ -586,7 +644,11 @@ class Worker:
         ):
             if (chunk["capture_id"], chunk["chunk_sequence"]) in protected:
                 continue
-            Path(chunk["path"]).unlink(missing_ok=True)
+            try:
+                Path(chunk["path"]).unlink(missing_ok=True)
+            except OSError:
+                log.exception("retention: could not delete %s", chunk["path"])
+                continue
             self.db.execute(
                 "UPDATE chunks SET raw_deleted=1 WHERE capture_id=? AND chunk_sequence=?",
                 (chunk["capture_id"], chunk["chunk_sequence"]),

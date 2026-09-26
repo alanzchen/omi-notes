@@ -46,6 +46,24 @@ import OmiProtocol
         #expect(BLERecord.scan(parsed.payload).records.first?.isSessionStart == true)
     }
 
+    /// Verification #4: a not-notifying callback that also carries an error must end coverage too.
+    @Test func subscriptionLossWithErrorEndsCoverage() throws {
+        let h = SessionHarness()
+        h.connectFully()
+        for i in 0..<3 { h.transport.audio(Data([UInt8(i), 0, 0, 0xB8])); h.clock.advance(0.02) }
+        let firstCapture = try #require(h.session.recorder.captureId)
+        h.clock.advance(2)
+        struct Lost: Error {}
+        h.transport.delegate?.transport(h.transport, didUpdateNotificationStateFor: .audioData, enabled: false, error: Lost())
+        #expect(!h.session.recorder.isActive, "no coverage while unsubscribed, even on the error path")
+        #expect(try #require(seals(h).first).reason == .bleDisconnected)
+        #expect(h.transport.calls.filter { $0 == "notify audioData true" }.count == 2, "bounded re-subscribe requested")
+        h.clock.advance(180)
+        h.session.tick()
+        #expect(chunks(h).allSatisfy { $0.captureId == firstCapture })
+        #expect(chunks(h).allSatisfy { $0.chunkEndOffsetUs <= 2_100_000 }, "no chunk claims the unsubscribed time")
+    }
+
     @Test func subscriptionThatCannotBeRestoredReconnects() {
         let h = SessionHarness()
         h.connectFully()

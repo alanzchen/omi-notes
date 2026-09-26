@@ -66,9 +66,10 @@ parses them.
    confirmation sheet with the destination host and a masked token. Tap **Save**. The token goes
    into the Keychain (readable after first unlock, so background uploads work). You can also
    enter the URL and token by hand in Settings, and **Test connection** calls `GET /v1/status`.
-   - Use the `https://<mac>.<tailnet>.ts.net` URL that `tailscale serve` provides. Plain `http`
-     is only accepted for local-network development hosts (`localhost`, `*.local`, private IPs),
-     and the app warns about it.
+   - Use the `https://<mac>.<tailnet>.ts.net` URL that `tailscale serve` provides. Release builds
+     accept only `https`. Debug builds (the default when you run from Xcode) also accept plain
+     `http` for local-network hosts (`localhost`, `*.local`, private and Tailscale IPs) with a
+     warning.
 2. **Bluetooth.** Allow Bluetooth when asked. The app keeps a Bluetooth connection in the
    background (`bluetooth-central`).
 3. **Device.** Onboarding, or Settings › Pair a device, lists nearby Omi pendants. Tap yours. The

@@ -345,9 +345,7 @@ def segment(tl: DeviceTimeline, now: float, p: Params | None = None) -> list[Can
         lo = start if g.start_explicit else float("-inf")
         hi = end if g.end_explicit else float("inf")
         blocks = pad_blocks([(x.start, x.end) for x in g.pieces], p, lo, hi)
-        # Losses inside the conversation, or just around it (it may have begun/ended in them).
-        near = [(a, b) for a, b in merge_exact(tl.losses) if b > start - p.gap and a < end + p.gap]
-        lost = sum(min(b, end + p.gap) - max(a, start - p.gap) for a, b in near)
+        gaps, lost = window_evidence(tl, start, end, now, p)
         candidates.append(
             Candidate(
                 start=start,
@@ -361,12 +359,21 @@ def segment(tl: DeviceTimeline, now: float, p: Params | None = None) -> list[Can
                 related_id=late[0] if late else None,
                 start_explicit=g.start_explicit,
                 end_explicit=g.end_explicit,
-                audio_gaps=union(audio_gaps(tl, start, end, now) + [(a, b) for a, b in near if b - a >= MIN_REPORTED_GAP]),
+                audio_gaps=gaps,
                 waiting_for=waiting_for,
-                lost_seconds=round(lost, 3),
+                lost_seconds=lost,
             )
         )
     return candidates
+
+
+def window_evidence(tl: DeviceTimeline, start: float, end: float, now: float, p: Params) -> tuple[list[Interval], float]:
+    """A conversation's reported audio gaps and seconds of known loss. Losses inside it or just
+    around it count (it may have begun or ended in them); sub-second ones are only counted."""
+    near = [(a, b) for a, b in merge_exact(tl.losses) if b > start - p.gap and a < end + p.gap]
+    lost = sum(min(b, end + p.gap) - max(a, start - p.gap) for a, b in near)
+    gaps = union(audio_gaps(tl, start, end, now) + [(a, b) for a, b in near if b - a >= MIN_REPORTED_GAP])
+    return [(a, b) for a, b in gaps], round(lost, 3)
 
 
 def pad_blocks(speech: list[Interval], p: Params, lo: float = float("-inf"), hi: float = float("inf")) -> list[Interval]:

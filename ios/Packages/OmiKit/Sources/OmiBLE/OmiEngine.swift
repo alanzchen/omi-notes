@@ -779,7 +779,8 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     }
 
     private func applyRetention() {
-        let sent = sentFiles()
+        let pins = CaptureRecovery.retentionPins(env: env)
+        let sent = sentFiles().filter { !CaptureRecovery.isPinned($0.kind, pins: pins) }
         let names = retentionPolicy.filesToDelete(sent: sent, processedThrough: processedThrough, now: config.clock.wallNow())
         for n in names { outbox.deleteSent(n) }
         if !names.isEmpty { log(.info, "retention", "deleted \(names.count) acknowledged file(s) from sent/") }
