@@ -27,6 +27,9 @@ public final class RingCaptureLedger: UploadGate, @unchecked Sendable {
     private struct Stored: Codable {
         var entries: [Entry]
         var nextOrder: Int
+        /// Persisted so degraded mode survives relaunches: once the ledger is rewritten after a read
+        /// failure it holds only newer captures, and older ones remain unordered until acknowledged.
+        var degraded: Bool?
     }
 
     private let url: URL
@@ -51,6 +54,7 @@ public final class RingCaptureLedger: UploadGate, @unchecked Sendable {
             let stored = try JSONDecoder().decode(Stored.self, from: Data(contentsOf: url))
             entries = stored.entries
             nextOrder = stored.nextOrder
+            degraded = stored.degraded ?? false
         } catch {
             degraded = true
             log(.error, "ring", "ring ledger unreadable (\(error)); holding sync_complete seals until older ring audio is acknowledged")
@@ -185,9 +189,11 @@ public final class RingCaptureLedger: UploadGate, @unchecked Sendable {
         if degraded, unacknowledgedRingCaptures().isEmpty {
             // Everything older has been acknowledged: the ledger is complete again.
             lock.lock(); defer { lock.unlock() }
+            degraded = false
             if (try? persistLocked()) != nil {
-                degraded = false
                 log(.info, "ring", "ring ledger rebuilt; normal seal ordering resumed")
+            } else {
+                degraded = true
             }
         }
     }
@@ -199,6 +205,6 @@ public final class RingCaptureLedger: UploadGate, @unchecked Sendable {
     }
 
     private func persistLocked() throws {
-        try JSONFile.save(Stored(entries: entries, nextOrder: nextOrder), to: url)
+        try JSONFile.save(Stored(entries: entries, nextOrder: nextOrder, degraded: degraded ? true : nil), to: url)
     }
 }

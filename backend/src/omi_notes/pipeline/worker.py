@@ -285,11 +285,14 @@ class Worker:
                        VALUES (?,?,?,?,?,?,0)""",
                     (capture["device_id"], *loss, "ring_dropped", delta, capture_id),
                 )
-            if complete:
-                conn.execute("UPDATE captures SET dropped_reconciled=1 WHERE capture_id=?", (capture_id,))
         old = (before["start"], before["end"]) if before else None
-        if old != loss:
-            self.refresh_losses(capture["device_id"], [x for x in (old, loss) if x], now)
+        if old != loss or complete:
+            # Refresh before freezing: if we crash in between, the next tick recomputes and refreshes
+            # again (idempotent). On completion always refresh around the capture's first audio, so an
+            # update lost to an earlier crash is still applied.
+            self.refresh_losses(capture["device_id"], [x for x in (old, loss) if x] + [(first_audio, first_audio)], now)
+        if complete:
+            self.db.execute("UPDATE captures SET dropped_reconciled=1 WHERE capture_id=?", (capture_id,))
 
     def refresh_losses(self, device: str, intervals: list[tuple[float, float]], now: float) -> None:
         """Loss evidence changed after conversations near it were finalized: recompute their

@@ -445,6 +445,17 @@ extension TestEnv {
         #expect(!reopened.degraded)
     }
 
+    /// Degraded mode survives a relaunch after the ledger was rewritten with only newer captures.
+    @Test func degradedModeSurvivesRelaunch() throws {
+        let t = TestEnv()
+        try Data("not json".utf8).write(to: t.dirs.state.appendingPathComponent("ring-ledger.json"))
+        let first = RingCaptureLedger(dirs: t.dirs, outbox: t.outbox)
+        #expect(first.degraded)
+        try first.register(captureId: "cccccccc-0000-0000-0000-000000000003", deviceId: "dev-1", generation: 1)
+        let relaunched = RingCaptureLedger(dirs: t.dirs, outbox: t.outbox)
+        #expect(relaunched.degraded, "the rewritten ledger remembers that older captures are unordered")
+    }
+
     /// Two held seals never wait on each other in degraded mode: the older one goes first.
     @Test func degradedHeldSealsDoNotDeadlock() throws {
         let t = TestEnv()

@@ -387,3 +387,56 @@ def test_r2b_3_late_loss_evidence_updates_a_finalized_note_without_provider_call
     text = (settings.notes_dir / row["note_path"]).read_text()
     assert "Audio missing" in text and "audio_lost_s: 0.0" not in text
     assert CountingLlm.calls == calls and row["revision"] == 2
+
+
+# round 3 follow-up ---------------------------------------------------------------------------------
+
+
+def test_r3b_2_migration_4_repairs_force_flags_stranded_by_an_earlier_migration_3(tmp_path):
+    path = tmp_path / "v3.sqlite3"
+    conn = sqlite3.connect(path, isolation_level=None)
+    for version, migration in enumerate(dbmod.MIGRATIONS[:3], start=1):
+        if callable(migration):
+            conn.execute("BEGIN")
+            migration(conn)
+            conn.execute(f"PRAGMA user_version={version}")
+            conn.execute("COMMIT")
+        else:
+            conn.executescript(f"BEGIN;{migration}; PRAGMA user_version={version}; COMMIT;")
+    # What the earlier migration 3 left behind: a force flag with no pending request.
+    conn.execute(
+        """INSERT INTO conversations (id, device_id, start, end, status, created_at, updated_at, force_llm,
+           reprocess_request, reprocess_handled) VALUES ('stranded', ?, 1, 2, 'done', 1, 1, 1, 0, 0)""",
+        (DEVICE,),
+    )
+    conn.execute(
+        """INSERT INTO conversations (id, device_id, start, end, status, created_at, updated_at, force_llm,
+           reprocess_request, reprocess_handled) VALUES ('pending', ?, 1, 2, 'done', 1, 1, 1, 3, 2)""",
+        (DEVICE,),
+    )
+    conn.close()
+    db = Database(path)
+    rows = {r["id"]: (r["reprocess_request"], r["reprocess_handled"]) for r in db.query("SELECT * FROM conversations")}
+    assert rows == {"stranded": (1, 0), "pending": (3, 2)}
+
+
+def test_r3b_3_crash_before_refresh_does_not_skip_the_late_loss_update(client, worker, settings, monkeypatch):
+    gen1, n1 = ring_capture_with_dropped(client, offset=-5000, first_sequence=0, dropped=100)
+    ring_seal(client, gen1, last_chunk_sequence=n1 - 1, covers_until=T0 - 4800, info_read_seq=0)
+    worker.tick(T0 - 4700)
+    gen2, n2 = ring_capture_with_dropped(client, offset=0, first_sequence=0, dropped=100)
+    worker.tick(T0 + 1600)  # finalized before its seal says "generation 2"
+    ring_seal(client, gen2, last_chunk_sequence=n2 - 1, covers_until=T0 + 200, info_read_seq=0, ring={"generation": 2})
+
+    # Crash right after the loss rows are committed, before finalized conversations are refreshed.
+    real = worker.refresh_losses
+    monkeypatch.setattr(worker, "refresh_losses", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("crash")))
+    worker.tick(T0 + 1700)
+    assert worker.db.one("SELECT dropped_reconciled FROM captures WHERE capture_id=?", (gen2,))["dropped_reconciled"] == 0
+    monkeypatch.setattr(worker, "refresh_losses", real)
+
+    worker.tick(T0 + 1800)  # "after restart": the evidence is complete, so the refresh is redone
+    row = next(r for r in convs(worker) if r["start"] >= T0)
+    assert row["lost_seconds"] > 5 and json.loads(row["gaps_json"])
+    assert "Audio missing" in (settings.notes_dir / row["note_path"]).read_text()
+    assert worker.db.one("SELECT dropped_reconciled FROM captures WHERE capture_id=?", (gen2,))["dropped_reconciled"] == 1

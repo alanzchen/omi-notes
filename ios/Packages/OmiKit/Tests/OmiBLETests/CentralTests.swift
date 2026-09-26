@@ -83,9 +83,18 @@ struct CentralHarness {
 
     func on(_ body: () -> Void) { queue.sync(execute: body) }
 
+    /// Lets scheduled work (reconnect timers of `reconnectDelay`) run. Waits until nothing new has
+    /// happened on the backend for a quiet period, so a loaded machine can't make the test flaky.
     func drain(after seconds: Double = 0.05) {
         Thread.sleep(forTimeInterval: seconds)
-        queue.sync {}
+        var last = queue.sync { backend.connects.count }
+        var quietSince = Date()
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline, Date().timeIntervalSince(quietSince) < 0.2 {
+            Thread.sleep(forTimeInterval: 0.02)
+            let now = queue.sync { backend.connects.count }
+            if now != last { last = now; quietSince = Date() }
+        }
     }
 }
 

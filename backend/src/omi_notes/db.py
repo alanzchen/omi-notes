@@ -274,8 +274,18 @@ def _migration_3(conn: sqlite3.Connection) -> None:
                 conn.execute("UPDATE captures SET finalized=1 WHERE capture_id=?", (capture_id,))
 
 
+def _migration_4(conn: sqlite3.Connection) -> None:
+    """Repair databases that ran an earlier migration 3 which didn't convert v2 force flags: a force
+    flag without a pending request would never be picked up (consuming a request clears the flags,
+    so a set flag always means unfinished work)."""
+    conn.execute(
+        """UPDATE conversations SET reprocess_request = reprocess_handled + 1
+           WHERE (force_restt = 1 OR force_llm = 1) AND reprocess_request <= reprocess_handled"""
+    )
+
+
 # Applied in order; `PRAGMA user_version` records how many have run.
-MIGRATIONS: list[str | Callable[[sqlite3.Connection], None]] = [*_SQL_MIGRATIONS, _migration_3]
+MIGRATIONS: list[str | Callable[[sqlite3.Connection], None]] = [*_SQL_MIGRATIONS, _migration_3, _migration_4]
 
 
 class Database:
