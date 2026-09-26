@@ -70,6 +70,25 @@ parses them.
 5. With a free Personal Team the provisioning profile expires after 7 days. Run from Xcode again
    to renew it. Your recordings are kept; the app just won't launch until you re-sign it.
 
+## TestFlight
+
+`make testflight` (or `ios/Tools/testflight.sh`) archives a Release build and uploads it to App Store
+Connect. Signing is automatic and cloud-managed through an App Store Connect API key, so no
+certificates or profiles need to be set up by hand. One-time setup, in App Store Connect:
+
+1. **API key:** Users and Access › Integrations › App Store Connect API › Team Keys › generate a key
+   with the **App Manager** role. Save `AuthKey_<KEY_ID>.p8` to `~/.appstoreconnect/private_keys/`
+   and note the Key ID and Issuer ID.
+2. **App record:** Apps › + › New App (iOS, any available name, bundle ID from
+   `PRODUCT_BUNDLE_IDENTIFIER`, default `dev.omi-notes.app`; register it under Identifiers first if
+   it isn't offered). Any SKU.
+
+Then `ASC_KEY_ID=… ASC_ISSUER_ID=… make testflight`. The build number is a UTC timestamp, so every
+upload is newer. After processing, add yourself under TestFlight › Internal Testing. Internal
+testing needs no Beta App Review; external testers do. The app ships with an original icon
+(`Tools/make_app_icon.swift`), a privacy manifest, and `ITSAppUsesNonExemptEncryption = NO`
+(HTTPS only).
+
 ## Pairing
 
 1. **Server.** Set up Tailscale on the Mac and the iPhone so both are on the same tailnet. On the

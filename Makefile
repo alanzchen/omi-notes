@@ -1,4 +1,4 @@
-.PHONY: setup server test test-backend test-ios ios ios-build pair doctor
+.PHONY: setup server test test-backend test-ios ios ios-build pair doctor testflight
 
 setup:
 	brew list opus >/dev/null 2>&1 || brew install opus
@@ -29,3 +29,7 @@ ios:
 ios-build:
 	cd ios && xcodegen generate && xcodebuild -project OmiNotes.xcodeproj -scheme OmiNotes \
 		-destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+
+# Needs ASC_KEY_ID / ASC_ISSUER_ID and an App Store Connect app record: see ios/Tools/testflight.sh
+testflight:
+	ios/Tools/testflight.sh
