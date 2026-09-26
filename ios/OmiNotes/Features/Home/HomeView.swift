@@ -8,16 +8,33 @@ struct HomeView: View {
 
     private var s: EngineSnapshot { model.snapshot }
 
+    /// Simulator automation only (debug builds): `-OmiNotesDebugHomeBottom YES` scrolls Home to the
+    /// upload/server/notes sections after launch (a headless simulator can't scroll).
+    private static var debugScrollToBottom: Bool {
+        #if DEBUG
+        return UserDefaults.standard.bool(forKey: "OmiNotesDebugHomeBottom")
+        #else
+        return false
+        #endif
+    }
+
     var body: some View {
-        List {
-            statusSection
-            if !s.attention.isEmpty { attentionSection }
-            deviceSection
-            liveSection
-            offlineSection
-            uploadSection
-            serverSection
-            conversationsSection
+        ScrollViewReader { proxy in
+            List {
+                statusSection
+                if !s.attention.isEmpty { attentionSection }
+                deviceSection
+                liveSection
+                offlineSection
+                uploadSection
+                serverSection
+                conversationsSection.id("conversations")
+            }
+            .task {
+                guard Self.debugScrollToBottom else { return }
+                try? await Task.sleep(for: .seconds(3))
+                proxy.scrollTo("conversations", anchor: .bottom)
+            }
         }
         .navigationTitle("Omi Notes")
         .refreshable { await model.refreshServer() }

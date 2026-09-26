@@ -9,6 +9,18 @@ Contract: [`docs/capture-format-v1.md`](../docs/capture-format-v1.md). Device fa
 [`docs/device-protocol.md`](../docs/device-protocol.md). Design decisions:
 [`docs/architecture.md`](../docs/architecture.md).
 
+## Screenshots
+
+Simulator with the simulated pendant, uploading to a local backend (fake STT/LLM providers):
+
+| Welcome | Pairing link | Pair device | Recording |
+|---|---|---|---|
+| ![](../docs/screenshots/01-onboarding.png) | ![](../docs/screenshots/02-pairing-confirm.png) | ![](../docs/screenshots/03-pair-device.png) | ![](../docs/screenshots/04-home-recording.png) |
+
+| Uploads and notes | Settings | Debug |
+|---|---|---|
+| ![](../docs/screenshots/05-home-uploads-and-notes.png) | ![](../docs/screenshots/06-settings.png) | ![](../docs/screenshots/07-debug.png) |
+
 ## Layout
 
 ```
@@ -129,7 +141,9 @@ shows the (token-redacted) log.
   neither save the token nor start background uploads.
 - Debug builds accept automation launch arguments:
   `-OmiNotesDebugServerURL http://localhost:8765 -OmiNotesDebugToken <token>` to configure the
-  server, and `-OmiNotesDebugOpenURL 'omi-notes://configure?…'` to open the pairing sheet.
+  server, `-OmiNotesDebugOpenURL 'omi-notes://configure?…'` to open the pairing sheet,
+  `-OmiNotesDebugTab home|settings|debug|pairing` to open a screen, and
+  `-OmiNotesDebugHomeBottom YES` to scroll Home to the upload/notes sections.
   `xcrun simctl spawn booted defaults write <bundle-id> omi.simulatedDevice -bool YES` turns on
   the simulated device before launch.
 
