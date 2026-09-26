@@ -167,15 +167,20 @@ public final class RingCaptureLedger: UploadGate, @unchecked Sendable {
             found[id, default: RingArtifacts()].deviceId = m?.deviceId
             found[id]?.onlyHeldSeal = false
         }
+        // An item we can't read or decode might be earlier ring audio of any device: it blocks.
+        func unknown(_ id: String) { found[id, default: RingArtifacts()].onlyHeldSeal = false }
         for item in outbox.pending() + outbox.quarantined() {
-            guard let id = item.kind.captureId, let data = try? Data(contentsOf: item.url) else { continue }
+            guard let id = item.kind.captureId else { continue }
+            guard let data = try? Data(contentsOf: item.url) else { unknown(id); continue }
             switch item.kind {
             case .seal:
-                guard let seal = try? JSONDecoder().decode(SealBody.self, from: data), seal.source == .deviceRing else { continue }
+                guard let seal = try? JSONDecoder().decode(SealBody.self, from: data) else { unknown(id); continue }
+                guard seal.source == .deviceRing else { continue }
                 found[id, default: RingArtifacts()].deviceId = seal.deviceId
                 if seal.reason == .syncComplete { found[id]?.sealDate = item.modified } else { found[id]?.onlyHeldSeal = false }
             default:
-                guard let env = try? Envelope.parse(data), env.header.source == .deviceRing else { continue }
+                guard let env = try? Envelope.parse(data) else { unknown(id); continue }
+                guard env.header.source == .deviceRing else { continue }
                 found[id, default: RingArtifacts()].deviceId = env.header.deviceId
                 found[id]?.onlyHeldSeal = false
             }

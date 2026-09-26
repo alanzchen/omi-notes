@@ -456,6 +456,21 @@ extension TestEnv {
         #expect(relaunched.degraded, "the rewritten ledger remembers that older captures are unordered")
     }
 
+    /// In degraded mode an unreadable outstanding item counts as possibly-earlier ring audio.
+    @Test func degradedModeTreatsUnreadableItemsAsBlockers() throws {
+        let t = TestEnv()
+        let seal = SealBody(lastChunkSequence: -1, reason: .syncComplete, endedAt: "2026-09-26T19:40:00.000Z",
+                            endOffsetUs: 0, deviceId: "dev-1", source: .deviceRing)
+        let b = try t.outbox.write(try ContractJSON.encode(seal), kind: .seal(captureId: "bbbbbbbb-0000-0000-0000-000000000002"))
+        let a = try t.outbox.write(Data("garbage".utf8), kind: .chunk(captureId: "aaaaaaaa-0000-0000-0000-000000000001", sequence: 0))
+        try Data("{".utf8).write(to: t.dirs.state.appendingPathComponent("ring-ledger.json"))
+        let ledger = RingCaptureLedger(dirs: t.dirs, outbox: t.outbox)
+        #expect(!ledger.mayUpload(b), "an undecodable pending chunk still blocks")
+        chmod(a.url.path, 0o000)
+        defer { chmod(a.url.path, 0o644) }
+        #expect(!ledger.mayUpload(b), "an unreadable pending chunk still blocks")
+    }
+
     /// Two held seals never wait on each other in degraded mode: the older one goes first.
     @Test func degradedHeldSealsDoNotDeadlock() throws {
         let t = TestEnv()
