@@ -20,8 +20,10 @@ Omi pendant → iPhone app (`ios/`) → your server (`backend/`) → Markdown no
 
 - **Contract changes are three-part:** update `docs/capture-format-v1.md`, the backend, and the phone
   together, and regenerate fixtures (`swift test` writes `contracts/fixtures/swift/`;
-  `backend/scripts/make_contract_fixtures.py` writes `contracts/fixtures/python/`). Each side's tests
-  parse the other side's fixtures.
+  `backend/scripts/make_contract_fixtures.py` writes `contracts/fixtures/python/`). Coverage is one
+  way: the backend tests parse and decode the Swift fixtures (and post their seals and events through
+  the API), and Swift golden tests pin the bytes the phone writes. The phone never parses
+  server-built envelopes, so nothing on the Swift side reads the Python fixtures.
 - **Durability invariants (never weaken):**
   - The phone journals every notification before anything else and never deletes audio the server
     hasn't acknowledged. Unreadable or unexplained state is quarantined or retried, never deleted.

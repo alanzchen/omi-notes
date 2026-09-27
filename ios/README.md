@@ -77,13 +77,14 @@ Connect. Signing is automatic and cloud-managed through an App Store Connect API
 certificates or profiles need to be set up by hand. One-time setup, in App Store Connect:
 
 1. **API key:** Users and Access › Integrations › App Store Connect API › Team Keys › generate a key
-   with the **App Manager** role. Save `AuthKey_<KEY_ID>.p8` to `~/.appstoreconnect/private_keys/`
-   and note the Key ID and Issuer ID.
+   with the **Admin** role (cloud-managed distribution signing requires it; an App Manager key fails
+   at export). Save `AuthKey_<KEY_ID>.p8` to `~/.appstoreconnect/private_keys/` and note the Key ID
+   and Issuer ID.
 2. **App record:** Apps › + › New App (iOS, any available name, bundle ID from
    `PRODUCT_BUNDLE_IDENTIFIER`, default `dev.omi-notes.app`; register it under Identifiers first if
    it isn't offered). Any SKU.
 
-Then `ASC_KEY_ID=… ASC_ISSUER_ID=… make testflight`. The build number is a UTC timestamp, so every
+Then `ASC_KEY_ID=… ASC_ISSUER_ID=… make testflight`. The build number is a UTC timestamp to the second, so every
 upload is newer. After processing, add yourself under TestFlight › Internal Testing. Internal
 testing needs no Beta App Review; external testers do. The app ships with an original icon
 (`Tools/make_app_icon.swift`), a privacy manifest, and `ITSAppUsesNonExemptEncryption = NO`

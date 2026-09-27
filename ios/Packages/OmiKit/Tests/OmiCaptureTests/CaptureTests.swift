@@ -172,13 +172,24 @@ import OmiProtocol
         #expect(t.seal(id)?.endOffsetUs == 61_000_000)
     }
 
-    @Test func abortDiscards() throws {
+    /// An unsupported codec uploads nothing, but the journaled audio is quarantined, never deleted.
+    @Test func abortQuarantinesInsteadOfDeleting() throws {
         let t = TestEnv()
-        let (r, _) = try recorder(t, codec: nil)
+        let (r, id) = try recorder(t, codec: nil)
         r.append(notification(seq: 1))
         r.abort()
         #expect(t.outbox.pending().isEmpty)
         #expect(FileIO.contents(of: t.dirs.journalLive).isEmpty)
+        let kept = t.dirs.journalQuarantine.appendingPathComponent(id).appendingPathComponent("chunk-000000.journal")
+        #expect(FileIO.fileSize(kept) > 0)
+    }
+
+    @Test func abortWithoutAudioLeavesNothing() throws {
+        let t = TestEnv()
+        let (r, _) = try recorder(t, codec: nil)
+        r.abort()
+        #expect(FileIO.contents(of: t.dirs.journalLive).isEmpty)
+        #expect(FileIO.contents(of: t.dirs.journalQuarantine).isEmpty)
     }
 
     @Test func unknownCodecAtFinish() throws {
@@ -186,10 +197,20 @@ import OmiProtocol
         let (r, id) = try recorder(t, codec: nil)
         r.append(notification(seq: 1))
         t.clock.advance(1)
-        let seal = try #require(r.finish(reason: .bleDisconnected))
-        #expect(seal.lastChunkSequence == -1)
+        // The codec was never read: nothing can be uploaded yet, but the audio stays in the journal.
+        #expect(r.finish(reason: .bleDisconnected) == nil)
         #expect(t.pendingChunks().isEmpty)
-        #expect(t.seal(id) != nil)
+        #expect(t.seal(id) == nil)
+        // Next launch, once the device's codec is known, recovery turns it into a chunk + seal.
+        _ = CaptureRecovery.run(env: t.env, codecFallback: { _ in 21 })
+        #expect(t.pendingChunks().first { $0.1.captureId == id }?.1.codecId == 21)
+        #expect(t.seal(id)?.lastChunkSequence == 0)
+
+        // Without audio, an unknown codec still seals an empty capture (coverage evidence).
+        let (r0, id0) = try recorder(t, codec: nil)
+        t.clock.advance(1)
+        #expect(r0.finish(reason: .bleDisconnected)?.lastChunkSequence == -1)
+        #expect(t.seal(id0) != nil)
 
         let (r2, _) = try recorder(t, codec: nil)
         r2.codecFallback = { _ in 21 }

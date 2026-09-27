@@ -440,3 +440,25 @@ def test_r3b_3_crash_before_refresh_does_not_skip_the_late_loss_update(client, w
     assert row["lost_seconds"] > 5 and json.loads(row["gaps_json"])
     assert "Audio missing" in (settings.notes_dir / row["note_path"]).read_text()
     assert worker.db.one("SELECT dropped_reconciled FROM captures WHERE capture_id=?", (gen2,))["dropped_reconciled"] == 1
+
+
+def test_r4_crash_while_a_loss_estimate_shrinks_leaves_no_stale_warning(client, worker, settings, monkeypatch):
+    # No earlier capture is known yet, so gen2's cumulative dropped counter reads as 100 new losses.
+    gen2, n2 = ring_capture_with_dropped(client, offset=0, first_sequence=0, dropped=100)
+    worker.tick(T0 + 1600)
+    row = next(r for r in convs(worker) if r["start"] >= T0)
+    assert row["status"] == "done" and row["lost_seconds"] > 5
+
+    # The earlier capture of the same generation arrives: its counter was already 100, so the
+    # estimate shrinks to nothing. Crash while refreshing the finalized note.
+    gen1, n1 = ring_capture_with_dropped(client, offset=-5000, first_sequence=0, dropped=100)
+    ring_seal(client, gen1, last_chunk_sequence=n1 - 1, covers_until=T0 - 4800, info_read_seq=0)
+    real = worker.refresh_losses
+    monkeypatch.setattr(worker, "refresh_losses", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("crash")))
+    worker.tick(T0 + 1700)
+    monkeypatch.setattr(worker, "refresh_losses", real)
+
+    worker.tick(T0 + 1800)  # "after restart"
+    row = next(r for r in convs(worker) if r["start"] >= T0)
+    assert row["lost_seconds"] == 0, "the shrunk loss must be removed from the finalized note"
+    assert "Audio missing" not in (settings.notes_dir / row["note_path"]).read_text()

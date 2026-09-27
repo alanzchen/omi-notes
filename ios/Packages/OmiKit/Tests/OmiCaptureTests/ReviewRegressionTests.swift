@@ -471,6 +471,24 @@ extension TestEnv {
         #expect(!ledger.mayUpload(b), "an unreadable pending chunk still blocks")
     }
 
+    /// Equal seal timestamps (e.g. unreadable metadata) still give a total order: exactly one goes first.
+    @Test func degradedHeldSealsWithEqualTimestampsDoNotDeadlock() throws {
+        let t = TestEnv()
+        func writeSeal(_ id: String) throws -> OutboxItem {
+            let seal = SealBody(lastChunkSequence: -1, reason: .syncComplete, endedAt: "2026-09-26T19:40:00.000Z",
+                                endOffsetUs: 0, deviceId: "dev-1", source: .deviceRing)
+            return try t.outbox.write(try ContractJSON.encode(seal), kind: .seal(captureId: id))
+        }
+        let a = try writeSeal("aaaaaaaa-0000-0000-0000-000000000001")
+        let b = try writeSeal("bbbbbbbb-0000-0000-0000-000000000002")
+        let same = Date(timeIntervalSince1970: 1_790_000_000)
+        for item in [a, b] { try FileManager.default.setAttributes([.modificationDate: same], ofItemAtPath: item.url.path) }
+        try Data("{".utf8).write(to: t.dirs.state.appendingPathComponent("ring-ledger.json"))
+        let ledger = RingCaptureLedger(dirs: t.dirs, outbox: t.outbox)
+        let items = t.outbox.pending().filter { if case .seal = $0.kind { return true } else { return false } }
+        #expect(items.filter { ledger.mayUpload($0) }.count == 1, "exactly one of two equal-age held seals may go")
+    }
+
     /// Two held seals never wait on each other in degraded mode: the older one goes first.
     @Test func degradedHeldSealsDoNotDeadlock() throws {
         let t = TestEnv()

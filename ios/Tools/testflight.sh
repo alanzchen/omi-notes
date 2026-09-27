@@ -3,7 +3,8 @@
 #
 # One-time setup (App Store Connect, needs your Apple login):
 #   1. Users and Access › Integrations › App Store Connect API › Team Keys: generate a key with the
-#      "App Manager" (or Admin) role. Download AuthKey_<KEY_ID>.p8 to
+#      **Admin** role (cloud-managed distribution signing needs it; an App Manager key can upload but
+#      fails export with a "Cloud signing permission error"). Download AuthKey_<KEY_ID>.p8 to
 #      ~/.appstoreconnect/private_keys/ and note the Key ID and the Issuer ID.
 #   2. Apps › + › New App: platform iOS, name "Omi Notes" (or any available name), bundle ID
 #      $BUNDLE_ID (register it first under Certificates, Identifiers & Profiles if it isn't
@@ -33,8 +34,8 @@ setting() {
 TEAM_ID="${TEAM_ID:-$(setting DEVELOPMENT_TEAM)}"
 BUNDLE_ID="${BUNDLE_ID:-$(setting PRODUCT_BUNDLE_IDENTIFIER)}"
 [[ -n $TEAM_ID ]] || { echo "No team id: set TEAM_ID or DEVELOPMENT_TEAM in Config/Local.xcconfig" >&2; exit 1; }
-# Must increase with every upload of the same version.
-BUILD_NUMBER="${BUILD_NUMBER:-$(date -u +%Y%m%d.%H%M)}"
+# Must increase with every upload of the same version (second resolution: an archive takes minutes).
+BUILD_NUMBER="${BUILD_NUMBER:-$(date -u +%Y%m%d.%H%M%S)}"
 
 AUTH=(-allowProvisioningUpdates
       -authenticationKeyPath "$KEY_PATH"

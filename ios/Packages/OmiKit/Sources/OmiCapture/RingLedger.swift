@@ -138,13 +138,13 @@ public final class RingCaptureLedger: UploadGate, @unchecked Sendable {
 
     /// Fail-closed ordering when the ledger is unreadable: every other ring capture of the device
     /// (or of an unknown device) with unacknowledged artifacts on the phone blocks. Captures whose
-    /// only outstanding artifact is their own held `sync_complete` seal are ordered by seal file age,
-    /// so two held seals can never wait on each other.
+    /// only outstanding artifact is their own held `sync_complete` seal are ordered by
+    /// (seal file age, capture id), a total order, so two held seals can never wait on each other.
     func degradedBlockers(of captureId: String, deviceId: String, sealDate: Date) -> [String] {
         var blockers: [String] = []
         for (other, info) in unacknowledgedRingCaptures() where other != captureId {
             if let d = info.deviceId, d != deviceId { continue }
-            if info.onlyHeldSeal, let otherSeal = info.sealDate, otherSeal > sealDate { continue }
+            if info.onlyHeldSeal, let otherSeal = info.sealDate, (otherSeal, other) > (sealDate, captureId) { continue }
             blockers.append(other)
         }
         return blockers.sorted()

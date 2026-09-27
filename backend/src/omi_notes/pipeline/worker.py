@@ -277,6 +277,11 @@ class Worker:
         loss = (first_audio - delta * RING_RECORD_SECONDS, first_audio) if delta > 0 else None
         complete = capture["seal_json"] is not None and (previous is None or previous["seal_json"] is not None)
         before = self.db.one("SELECT start, end, count FROM losses WHERE capture_id=? AND kind='ring_dropped'", (capture_id,))
+        old = (before["start"], before["end"]) if before else None
+        # One transaction: the loss rows, the finalized conversations they affect, and the frozen flag
+        # commit together. (`refresh_losses` runs on this thread's connection, inside the transaction.)
+        # A crash rolls everything back, so the next tick still sees the old interval and refreshes
+        # both it and the new one, whether the estimate grew, shrank or disappeared.
         with self.db.tx() as conn:
             conn.execute("DELETE FROM losses WHERE capture_id=? AND kind='ring_dropped'", (capture_id,))
             if loss:
@@ -285,14 +290,10 @@ class Worker:
                        VALUES (?,?,?,?,?,?,0)""",
                     (capture["device_id"], *loss, "ring_dropped", delta, capture_id),
                 )
-        old = (before["start"], before["end"]) if before else None
-        if old != loss or complete:
-            # Refresh before freezing: if we crash in between, the next tick recomputes and refreshes
-            # again (idempotent). On completion always refresh around the capture's first audio, so an
-            # update lost to an earlier crash is still applied.
-            self.refresh_losses(capture["device_id"], [x for x in (old, loss) if x] + [(first_audio, first_audio)], now)
-        if complete:
-            self.db.execute("UPDATE captures SET dropped_reconciled=1 WHERE capture_id=?", (capture_id,))
+            if old != loss or complete:
+                self.refresh_losses(capture["device_id"], [x for x in (old, loss) if x] + [(first_audio, first_audio)], now)
+            if complete:
+                conn.execute("UPDATE captures SET dropped_reconciled=1 WHERE capture_id=?", (capture_id,))
 
     def refresh_losses(self, device: str, intervals: list[tuple[float, float]], now: float) -> None:
         """Loss evidence changed after conversations near it were finalized: recompute their

@@ -366,13 +366,15 @@ public final class LiveCaptureRecorder {
     public func finish(reason: SealReason) -> SealBody? {
         guard let anchor, manifest != nil else { return nil }
         let endUs = anchor.offsetUs(env.clock.monotonicNanoseconds())
-        if let m = manifest, m.codecId == nil, codecFallback(m.deviceId) == nil, let dir {
-            // The connection ended before the codec was read: the audio cannot be interpreted.
-            log(.warning, "capture", "codec never read for \(m.captureId); discarding \(chunkRecordCount) unreadable records")
+        if let m = manifest, m.codecId == nil, codecFallback(m.deviceId) == nil, chunkRecordCount > 0 {
+            // The connection ended before the codec was read. The pendant already sent this audio, so
+            // it must not be dropped: leave the capture in the journal. Launch recovery rebuilds it
+            // with the codec remembered for this device (or quarantines it if still unknown).
+            if let journal { try? env.sync(journal, full: true) }
+            log(.warning, "capture", "codec never read for \(m.captureId); kept \(chunkRecordCount) records for recovery")
             journal?.close()
-            journal = nil
-            try? FileManager.default.removeItem(at: dir.appendingPathComponent(CaptureManifest.journalName(m.openChunkSequence)))
-            chunkRecordCount = 0
+            reset()
+            return nil
         }
         if let m = manifest, chunkRecordCount > 0 || endUs > m.openChunkStartOffsetUs, m.codecId ?? codecFallback(m.deviceId) != nil {
             let ends = policy.closingEnds(chunkStartUs: m.openChunkStartOffsetUs, nowUs: endUs)
@@ -407,12 +409,21 @@ public final class LiveCaptureRecorder {
         }
     }
 
-    /// Discards the capture without uploading anything (unsupported codec: the audio is undecodable).
+    /// Stops the capture without uploading anything (unsupported codec: the server can't decode it).
+    /// The journal is quarantined, not deleted: unacknowledged audio is never thrown away.
     public func abort() {
         guard let m = manifest else { return }
+        if let journal { try? env.sync(journal, full: true) }
         journal?.close()
-        if let dir { try? FileManager.default.removeItem(at: dir) }
-        log(.warning, "capture", "live capture \(m.captureId) discarded")
+        if let dir {
+            if CaptureRecovery.isDemonstrablyEmpty(dir) {
+                try? FileManager.default.removeItem(at: dir)
+            } else {
+                var report = CaptureRecovery.Report()
+                CaptureRecovery.quarantine(dir, env: env, why: "unsupported codec", report: &report)
+            }
+        }
+        log(.warning, "capture", "live capture \(m.captureId) stopped without upload (unsupported codec)")
         reset()
     }
 
