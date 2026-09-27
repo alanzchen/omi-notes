@@ -73,11 +73,12 @@ struct HealthCard: View {
     let health: SystemHealth
     var onFix: (SystemHealth.Fix) -> Void
     @State private var expanded = false
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Button { withAnimation { expanded.toggle() } } label: {
-                HStack(alignment: .top, spacing: 12) {
+                AdaptiveStack(vertical: typeSize.isAccessibilitySize, spacing: 12) {
                     Image(systemName: health.level.symbol).font(.title2).foregroundStyle(health.level.color)
                         .accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 3) {
@@ -86,9 +87,11 @@ struct HealthCard: View {
                             Text(detail).font(.subheadline).foregroundStyle(.secondary)
                         }
                     }
-                    Spacer(minLength: 0)
-                    Image(systemName: "chevron.down").rotationEffect(.degrees(expanded ? 180 : 0))
-                        .foregroundStyle(.tertiary).accessibilityHidden(true)
+                    if !typeSize.isAccessibilitySize {
+                        Spacer(minLength: 0)
+                        Image(systemName: "chevron.down").rotationEffect(.degrees(expanded ? 180 : 0))
+                            .foregroundStyle(.tertiary).accessibilityHidden(true)
+                    }
                 }
                 .contentShape(Rectangle())
             }
@@ -110,10 +113,13 @@ struct HealthCard: View {
 struct StepRow: View {
     let step: SystemHealth.Step
     var onFix: (SystemHealth.Fix) -> Void
+    @Environment(\.dynamicTypeSize) private var typeSize
+    @ScaledMetric private var iconWidth: CGFloat = 22
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: step.level.symbol).foregroundStyle(step.level.color).frame(width: 22).accessibilityHidden(true)
+        AdaptiveStack(vertical: typeSize.isAccessibilitySize, spacing: 10) {
+            Image(systemName: step.level.symbol).foregroundStyle(step.level.color)
+                .frame(width: typeSize.isAccessibilitySize ? nil : iconWidth).accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 Text(step.area.title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 Text(step.title).font(.subheadline)
@@ -133,7 +139,7 @@ struct StateChip: View {
     let state: ConversationFlag
 
     var body: some View {
-        Text(label).font(.caption2.weight(.semibold)).padding(.horizontal, 7).padding(.vertical, 2)
+        Text(label).font(.caption2.weight(.semibold)).lineLimit(1).fixedSize().padding(.horizontal, 7).padding(.vertical, 2)
             .foregroundStyle(color).background(color.opacity(0.14), in: .capsule)
             .accessibilityLabel(state.message)
     }
@@ -181,5 +187,18 @@ extension Fmt {
         if cal.isDateInToday(date) { return "Today" }
         if cal.isDateInYesterday(date) { return "Yesterday" }
         return date.formatted(.dateTime.weekday(.wide).month(.abbreviated).day())
+    }
+}
+
+/// A row that becomes a column at accessibility text sizes (so text isn't squeezed beside icons).
+struct AdaptiveStack<Content: View>: View {
+    var vertical: Bool
+    var spacing: CGFloat = 8
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        let layout = vertical ? AnyLayout(VStackLayout(alignment: .leading, spacing: spacing))
+                              : AnyLayout(HStackLayout(alignment: .top, spacing: spacing))
+        layout(content)
     }
 }

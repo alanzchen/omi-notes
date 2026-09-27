@@ -165,14 +165,15 @@ struct ConversationLink: View {
 
 struct ConversationRow: View {
     let conversation: ConversationSummary
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     private var c: ConversationSummary { conversation }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(title).font(.body.weight(.medium)).lineLimit(2)
-                Spacer(minLength: 8)
+            AdaptiveStack(vertical: typeSize.isAccessibilitySize) {
+                Text(title).font(.body.weight(.medium)).lineLimit(typeSize.isAccessibilitySize ? 4 : 2)
+                if !typeSize.isAccessibilitySize { Spacer(minLength: 8) }
                 if c.displayState.code != "ready" { StateChip(state: c.displayState) }
             }
             Text(meta).font(.caption).foregroundStyle(.secondary)

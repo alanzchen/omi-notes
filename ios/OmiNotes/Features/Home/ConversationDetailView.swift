@@ -13,6 +13,7 @@ struct ConversationDetailView: View {
     @State private var error: String?
     @State private var loadingMore = false
     @State private var showTranscript = false
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     private var detail: ConversationDetail? { model.details[summary.id] }
     private var entry: ConversationSummary { detail?.entry ?? summary }
@@ -71,7 +72,7 @@ struct ConversationDetailView: View {
                 }
                 Text(when).font(.subheadline).foregroundStyle(.secondary)
                 if entry.displayState.code != "ready" {
-                    HStack(spacing: 8) {
+                    AdaptiveStack(vertical: typeSize.isAccessibilitySize, spacing: 8) {
                         StateChip(state: entry.displayState)
                         Text(entry.displayState.message).font(.footnote).foregroundStyle(.secondary)
                     }
