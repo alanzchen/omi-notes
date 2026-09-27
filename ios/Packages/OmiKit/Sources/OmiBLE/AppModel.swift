@@ -53,6 +53,8 @@ public final class AppModel {
     /// A short outcome to show next to a retry button (by conversation id; "chunks" for audio files).
     public internal(set) var retryMessages: [String: String] = [:]
     let retryStore: RetryStore
+    /// Opt-in alerts for problems this phone observes (Settings).
+    public let problemAlerts = ProblemAlerts()
     public let noteCache: NoteCache
     /// Bumped when the cache is cleared or the server changes: an answer that started before then
     /// is not saved (it would bring cleared notes back).
@@ -77,7 +79,10 @@ public final class AppModel {
         speakers = SpeakersModel(engine: engine)
         retryStore = RetryStore(url: engine.config.dirs.root.appendingPathComponent("app-retries.json"))
         engine.setSnapshotSink { [weak self] s in
-            Task { @MainActor [weak self] in self?.snapshot = s }
+            Task { @MainActor [weak self] in
+                self?.snapshot = s
+                self?.problemAlerts.update(s)
+            }
         }
     }
 

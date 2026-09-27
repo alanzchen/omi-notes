@@ -21,6 +21,7 @@ struct SettingsView: View {
                 Text("Audio goes from the pendant to this phone, then to your own server. This app sends it nowhere else. Your server decides which services receive your audio and transcripts; see Server → Configuration.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
+            AlertsSection(model: model)
             ObsidianSection(model: model)
             SavedNotesSection(model: model)
             Section("About") {
@@ -34,6 +35,36 @@ struct SettingsView: View {
     static var version: String {
         let info = Bundle.main.infoDictionary
         return "\(info?["CFBundleShortVersionString"] as? String ?? "?") (\(info?["CFBundleVersion"] as? String ?? "?"))"
+    }
+}
+
+/// Opt-in alerts for problems this phone notices while you're not looking at it.
+struct AlertsSection: View {
+    let model: AppModel
+    @State private var on = false
+    @State private var message: String?
+
+    var body: some View {
+        Section {
+            Toggle("Alert me when recording or uploads stop", isOn: Binding(get: { on }, set: { value in
+                Task {
+                    if value, !(await LocalAlerts.requestPermission()) {
+                        message = "Notifications are turned off for Omi Notes in the iPhone Settings app."
+                        on = false
+                        return
+                    }
+                    model.problemAlerts.enabled = value
+                    on = value
+                    message = nil
+                }
+            }))
+            if let message { Text(message).font(.footnote).foregroundStyle(.orange) }
+        } header: {
+            Text("Alerts")
+        } footer: {
+            Text("For problems this phone can see: recording stopped because storage is full, audio that couldn't be uploaded, or uploads paused. Alerts never include what was said, and go away once fixed. They may arrive late: iOS decides when the app runs in the background.")
+        }
+        .onAppear { on = model.problemAlerts.enabled }
     }
 }
 

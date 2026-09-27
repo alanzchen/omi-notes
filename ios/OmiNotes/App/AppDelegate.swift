@@ -9,6 +9,7 @@ import UIKit
 final class AppDelegate: NSObject, UIApplicationDelegate {
     private(set) var model: AppModel!
     private var backgroundTasks: UIKitBackgroundTasks!
+    private let alerts = LocalAlerts()
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         backgroundTasks = UIKitBackgroundTasks(application: application)
@@ -22,6 +23,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             simulatedTrace: trace)
         let engine = OmiEngine(config: config, settings: SettingsStore(), background: backgroundTasks)
         model = AppModel(engine: engine)
+        model.problemAlerts.sink = alerts
         #if DEBUG
         // Simulator automation only (debug builds): `-OmiNotesDebugServerURL <url> -OmiNotesDebugToken <token>`.
         if let raw = UserDefaults.standard.string(forKey: "OmiNotesDebugServerURL"),
