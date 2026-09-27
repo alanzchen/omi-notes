@@ -10,6 +10,8 @@ import OmiProtocol
 public final class SpeakersModel {
     public enum Enrollment: Equatable {
         case idle
+        /// Asking the server whether it supports voice enrollment (nothing started yet).
+        case checking
         /// Reading prompts; the window is open on the live capture.
         case reading(id: String, prompt: Int)
         /// Window closed; the server is waiting for / processing the audio.
@@ -166,18 +168,37 @@ public final class SpeakersModel {
 
     public static let serverTooOld = "Update the Omi Notes server first: this one doesn't support voice enrollment, so your reading would be transcribed as a conversation."
 
+    private var startAttempt: UUID?
+
     /// Asks the server it is about to talk to (not a remembered answer): only one that knows the
-    /// enrollment events keeps the reading out of transcripts.
+    /// enrollment events keeps the reading out of transcripts. The answer only counts for this
+    /// attempt, if it wasn't cancelled meanwhile, and for the server that is still configured.
     public func startEnrollment() async {
+        switch enrollment {
+        case .idle, .failed, .finished: break
+        case .checking, .reading, .waiting: return  // one attempt at a time
+        }
+        let attempt = UUID()
+        startAttempt = attempt
+        enrollment = .checking
+        let endpoint = engine.settings.endpoint
+        var supported: Bool?
+        var failure: String?
         do {
-            serverSupportsEnrollment = try await api().status().supportsVoiceEnrollment
+            guard let endpoint else { throw APIError.notConfigured }
+            supported = try await APIClient(endpoint: endpoint, session: session).status().supportsVoiceEnrollment
         } catch {
-            serverSupportsEnrollment = nil
-            enrollment = .failed("Couldn't reach the server to check it supports voice enrollment (\(Self.describe(error))).")
+            failure = "Couldn't reach the server to check it supports voice enrollment (\(Self.describe(error)))."
+        }
+        guard startAttempt == attempt else { return }  // cancelled (or superseded) while asking
+        startAttempt = nil
+        guard engine.settings.endpoint == endpoint else {
+            enrollment = .failed("The server changed while it was being checked; try again.")
             return
         }
-        guard serverSupportsEnrollment == true else {
-            enrollment = .failed(Self.serverTooOld)
+        serverSupportsEnrollment = supported
+        guard supported == true else {
+            enrollment = .failed(failure ?? Self.serverTooOld)
             return
         }
         do {
@@ -205,6 +226,7 @@ public final class SpeakersModel {
     }
 
     public func cancelEnrollment() {
+        startAttempt = nil
         pollTask?.cancel()
         if case .reading = enrollment { engine.finishVoiceEnrollment(outcome: .cancelled) }
         enrollment = .idle

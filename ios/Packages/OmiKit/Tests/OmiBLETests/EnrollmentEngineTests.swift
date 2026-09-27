@@ -70,6 +70,60 @@ import OmiProtocol
         #expect(model.serverSupportsEnrollment == false && !model.canStartEnrollment)
     }
 
+    @MainActor func waitOnMain(_ timeout: TimeInterval, _ condition: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return condition()
+    }
+
+    @MainActor func streamingModel() async throws -> (OmiEngine, SpeakersModel, URL) {
+        let (engine, _, root) = try makeEngine()
+        engine.setSimulatedMode(true)
+        #expect(await waitOnMain(10) { engine.snapshotNow().connection == .streaming })
+        ServerStub.routes = ["/v1/status": (200, #"{"ok":true,"features":["voice_enrollment"]}"#)]
+        ServerStub.delay = 0.5
+        return (engine, speakers(engine), root)
+    }
+
+    func startEvents(_ root: URL) -> [[String: Any]] { events(root).filter { $0["type"] as? String == "voice_enrollment_start" } }
+
+    @MainActor @Test func cancellingWhileTheServerIsCheckedStartsNothing() async throws {
+        let (engine, model, root) = try await streamingModel()
+        defer { ServerStub.delay = 0 }
+        let attempt = Task { await model.startEnrollment() }
+        #expect(await waitOnMain(2) { model.enrollment == .checking })
+        await model.startEnrollment()  // a second tap while checking is ignored
+        model.cancelEnrollment()
+        await attempt.value
+        #expect(model.enrollment == .idle && engine.snapshotNow().activeEnrollmentId == nil)
+        #expect(startEvents(root).isEmpty)
+    }
+
+    @MainActor @Test func aServerChangedWhileItWasCheckedStartsNothing() async throws {
+        let (engine, model, root) = try await streamingModel()
+        defer { ServerStub.delay = 0 }
+        let attempt = Task { await model.startEnrollment() }
+        #expect(await waitOnMain(2) { model.enrollment == .checking })
+        try engine.configureServer(url: URL(string: "https://older.tail1234.ts.net")!, token: "tok-older")
+        await attempt.value
+        guard case .failed(let reason) = model.enrollment else { Issue.record("started for another server"); return }
+        #expect(reason.contains("changed"))
+        #expect(engine.snapshotNow().activeEnrollmentId == nil && startEvents(root).isEmpty)
+    }
+
+    @MainActor @Test func aCheckedServerStartsTheEnrollment() async throws {
+        let (engine, model, root) = try await streamingModel()
+        defer { ServerStub.delay = 0 }
+        await model.startEnrollment()
+        guard case .reading(let id, 0) = model.enrollment else { Issue.record("\(model.enrollment)"); return }
+        #expect(engine.snapshotNow().activeEnrollmentId == id)
+        #expect(await waitOnMain(2) { !startEvents(root).isEmpty })
+        model.cancelEnrollment()
+    }
+
     @Test func enrollmentWindowIsMarkedAndItsAudioHeldUntilTheStartIsAcknowledged() async throws {
         let (engine, uploads, root) = try makeEngine()
         #expect(throws: OmiEngine.EnrollmentError.notRecording) { try engine.startVoiceEnrollment() }
@@ -125,15 +179,20 @@ import OmiProtocol
 /// Canned JSON by path for `SpeakersModel` (404 otherwise).
 final class ServerStub: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var routes: [String: (Int, String)] = [:]
+    /// Seconds before answering (a slow server).
+    nonisolated(unsafe) static var delay: TimeInterval = 0
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         let (status, body) = Self.routes[request.url?.path ?? ""] ?? (404, #"{"error":"not_found","detail":"no route"}"#)
         let resp = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
-        client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data(body.utf8))
-        client?.urlProtocolDidFinishLoading(self)
+        let answer: @Sendable () -> Void = { [self] in
+            client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: Data(body.utf8))
+            client?.urlProtocolDidFinishLoading(self)
+        }
+        if Self.delay > 0 { DispatchQueue.global().asyncAfter(deadline: .now() + Self.delay, execute: answer) } else { answer() }
     }
     override func stopLoading() {}
 }

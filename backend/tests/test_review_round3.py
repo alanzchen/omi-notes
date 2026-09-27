@@ -675,3 +675,88 @@ def test_identification_uses_the_voices_known_after_embedding(env, monkeypatch):
     monkeypatch.setattr(conversations_mod, "embed_voices", forgetting)
     fresh = talk(client, worker, dialogue(ALAN, PRIYA, seed=40), day=1)
     assert forgot and labels(client, fresh["id"])["S1"]["person_id"] is None
+
+
+# == third pass (review of 00da03c) ===================================================================
+
+
+def test_obsolete_voices_files_are_removed_by_the_sweep_and_by_forget(env):
+    settings, client, worker = env
+    acknowledge(client)
+    row = talk(client, worker, dialogue(ALAN, PRIYA))
+    priya = new_person(client, "Priya", attest_knows=True)
+    assert name_label(client, row["id"], "S2", priya).json()["sample"] == "created"
+    conv_dir = worker.vault.conversation_dir(row["id"])
+    (current,) = conv_dir.glob("voices-*.json")
+    stale = conv_dir / (current.name[: -len("00000000.json")] + "0badc0de.json")  # an earlier transcript's
+    stale.write_bytes(current.read_bytes())  # left behind by a crash before the cleanup
+    open_index(settings, Vault.open(settings))  # a restart sweeps it
+    assert not stale.exists() and current.exists()
+    stale.write_bytes(current.read_bytes())
+    assert client.delete(f"/v1/people/{priya}", headers=AUTH).status_code == 200
+    assert not stale.exists(), "forget covers every voices generation"
+
+
+class OnlyFirstVoiceStt(FakeStt):
+    """Transcribes only the first voice's turns (S1)."""
+
+    def transcribe(self, request):
+        response = super().transcribe(request)
+        response["results"]["utterances"] = [u for u in response["results"]["utterances"] if u["speaker"] == 0]
+        return response
+
+
+def test_forgetting_survives_a_transcript_without_that_voice(env):
+    _, client, worker = env
+    acknowledge(client, unknown=True)
+    row = talk(client, worker, dialogue(ALAN, PRIYA))
+    me = new_person(client, "Alan", me=True)
+    name_label(client, row["id"], "S1", me)
+    priya = new_person(client, "Priya", attest_knows=True)
+    name_label(client, row["id"], "S2", priya)
+    assert client.delete(f"/v1/people/{priya}", headers=AUTH).status_code == 200
+
+    def retranscribe(stt, at):
+        worker.providers._stt = stt
+        worker.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1, force_restt = 1 WHERE id=?",
+                          (row["id"],))  # fmt: skip
+        worker.tick(at)
+        worker.tick(at + 10)
+
+    retranscribe(OnlyFirstVoiceStt(), T0 + 800)  # Priya isn't in this transcript at all
+    assert set(voices_file(worker, row["id"])["labels"]) == {"S1"}
+    retranscribe(CountingStt(), T0 + 900)  # …and is back in this one, as S2
+    stored = voices_file(worker, row["id"])["labels"]
+    assert "vector_b64" not in stored["S2"], "the forgotten voice was stored again"
+
+
+def test_relabeling_never_moves_labels_to_a_transcript_they_were_not_made_for(env, monkeypatch):
+    settings, client, worker = env
+    acknowledge(client, unknown=True)
+    row = talk(client, worker, dialogue(ALAN, PRIYA))
+    me = new_person(client, "Alan", me=True)
+    name_label(client, row["id"], "S1", me)
+    store = worker.pipeline.speakers
+    real = store.write_labels
+    calls = {"n": 0}
+
+    def failing(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("crashed after the voices file")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(store, "write_labels", failing)
+    worker.providers._stt = LaterStt()  # Priya's voice becomes S1
+    worker.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1, force_restt = 1 WHERE id=?", (row["id"],))
+    worker.tick(T0 + 800)
+    assert calls["n"] == 1
+    db = open_index(settings, Vault.open(settings), force_rebuild=True)
+    fresh = Worker(settings, db)
+    fresh.providers._embedder, fresh.providers._llm = FakeEmbedder(), CountingLlm()
+    db.set_meta("relabel_pending", "1")  # relabel runs before the summary
+    fresh.tick(T0 + 900)
+    fresh.tick(T0 + 910)
+    s1 = db.one("SELECT person_id FROM speaker_labels WHERE conversation_id=? AND label='S1'", (row["id"],))
+    assert s1 is None or s1["person_id"] is None, "Priya's voice is S1 now"
+    assert "[[Alan]]" not in (settings.vault_dir / row["note_path"]).read_text()

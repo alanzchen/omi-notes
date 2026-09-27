@@ -519,12 +519,14 @@ class ConversationPipeline:
         label states always move to a new transcript (`_carry_over`), voices or not."""
         embedder = self.providers.embedder
         voices, name, fresh = None, None, False
-        if embedder is not None and clips and consistent and audio is not None and self.speakers.any_samples():
+        if embedder is not None and consistent and audio_sha and self.speakers.any_samples():
             # keyed by everything the voices depend on: a new transcript may number the voices differently
             name = voices_name(embedder, audio_sha, transcript_sha)
             fresh = not (self.conv_dir(conv_id) / name).exists()
-            if fresh:
+            if fresh and audio is not None and clips:
                 voices = embed_voices(clips, audio.pcm, embedder)  # outside the lock: the slow part
+            elif fresh:
+                name, fresh = None, False  # no audio in hand (a recovery path): nothing to compute
         with self.speakers.lock:
             stored = self.speakers.labels(conv_id)
             previous = self.speakers.labels_transcript(conv_id)
@@ -533,7 +535,7 @@ class ConversationPipeline:
             if name is not None and not fresh:  # a retried stage: finish it with the stored voices
                 self.speakers.index_voices(conv_id, name)
                 voices = self.speakers.voices(conv_id)
-            current = self._carry_over(stored, old_voices, voices, labels) if moved else stored
+            current = self._carry_over(stored, old_voices, voices, labels, self.speakers.had_forgotten(conv_id)) if moved else stored
             states = current
             if voices is not None:
                 samples = self.speakers.samples(embedder.model, embedder.model_sha)  # as of now, not before embedding
@@ -554,20 +556,22 @@ class ConversationPipeline:
         segments = transcript.get("segments") or []
         sha = sha256_hex(canonical_json(segments).encode())
         if self.speakers.labels_transcript(conv_id) not in (None, sha):
-            self.identify(conv_id, None, None, {}, sha, {s["speaker"] for s in segments})
+            self.identify(conv_id, None, transcript.get("audio_sha"), {}, sha, {s["speaker"] for s in segments},
+                          consistent=transcript.get("speaker_labels_consistent", True))  # fmt: skip
 
-    def _carry_over(self, current: dict, old_voices: dict, new_voices: dict | None, labels: set[str]) -> dict:
+    def _carry_over(self, current: dict, old_voices: dict, new_voices: dict | None, labels: set[str],
+                    had_forgotten: bool = False) -> dict:  # fmt: skip
         """Label states of the previous transcript that still apply: only where the label has the
         same voice (a user's assignment or block survives a re-transcription that kept it). A
-        forgotten voice has no vector to follow, so every label that didn't carry over may be it
-        and is marked forgotten too."""
+        forgotten voice has no vector to follow, so in a conversation where one was ever forgotten
+        every label that didn't carry over may be it and is marked forgotten too."""
         out = {}
         for label, state in current.items():
             old, new = old_voices.get(label), (new_voices or {}).get(label)
             if (not state.get("forgotten") and old is not None and new is not None and old.vector is not None
                     and new.vector is not None and cosine_distance(old.vector, new.vector) < self.operating.threshold):  # fmt: skip
                 out[label] = state
-        if any(state.get("forgotten") for state in current.values()):
+        if had_forgotten or any(state.get("forgotten") for state in current.values()):
             for label in labels | set(new_voices or {}):
                 out.setdefault(label, {"forgotten": True})
         return out
@@ -616,7 +620,7 @@ class ConversationPipeline:
                               st | {"person_id": None, "source": None}) for label, st in states.items()}  # fmt: skip
             differs = self.speakers.persisted(states) != self.speakers.persisted(current)
             if differs:
-                self.speakers.write_labels(conv_id, states, transcript_sha=row["transcript_sha"])
+                self.speakers.write_labels(conv_id, states)  # still tagged with the transcript they were made for
                 changed.append(conv_id)
             named = any(s.get("person_id") for s in (states | current).values())
             if (differs or names_changed) and row["note_path"] and named:

@@ -68,7 +68,8 @@ relative to `/Users/alan/Developer/_ref/omi`.
 ## Enrollment (wearer, through the pendant)
 
 1. The app requires a live, flowing capture and a server whose `/v1/status` lists the
-   `voice_enrollment` feature — asked again right before starting, never a remembered answer (an
+   `voice_enrollment` feature — asked again right before starting, never a remembered answer, and
+   only used if the attempt wasn't cancelled and the configured server is still the one asked (an
    older server would transcribe the reading) — shows consent text, then ~6 sentences (~50 s).
 2. At start the phone journals an outbox event `voice_enrollment_start` (`capture_id`, `offset_us`,
    `enrollment_id`) and **holds that capture's chunks from the start offset until the start event
@@ -115,9 +116,12 @@ exists → "Is this you?". Dismissals persist with a 7-day cooldown (cf. Omi
   every retention pass and after every settings change, so a cleanup a crash interrupted finishes.
 - A voices file is keyed by model, model hash, audio and transcript: a new transcript gets new
   voices, and an earlier assignment survives only where its label still has the same voice. A
-  forgotten voice has no vector to follow, so after a re-transcription every label that didn't
-  carry over is forgotten too. Label states are moved before anything renders or summarizes a new
-  transcript, also after a crash between the two.
+  forgotten voice has no vector to follow, so once a voice in a conversation was forgotten
+  (`speakers.json` `forgotten`, durable whatever later transcripts contain) every label that
+  doesn't carry over is forgotten too. Label states stay tagged with the transcript they were made
+  for; only that move re-tags them, and it happens before anything renders, summarizes, relabels
+  or assigns against a new transcript, also after a crash between the two. Voices files of other
+  transcripts are removed by the startup sweep and by every forget.
 - A note records the `speakers.json` revision it was rendered from (`render.speakers_revision`);
   any other revision re-renders it, however the labels changed (a correction during a render, a
   recovered file, a rebuild).

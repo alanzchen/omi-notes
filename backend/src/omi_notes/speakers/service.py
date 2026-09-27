@@ -99,10 +99,11 @@ class SpeakerService:
                     for label, s in self.store.labels(conv_id).items()
                 }
                 row = self.db.one("SELECT transcript_sha, note_path FROM conversations WHERE id=?", (conv_id,))
-                self.store.write_labels(conv_id, states, transcript_sha=row["transcript_sha"] if row else None)
+                self.store.write_labels(conv_id, states)
                 if row and row["note_path"]:
                     self.pipeline._set(conv_id, needs_render=1, next_attempt_at=None)
             self.store.reconcile_vectors()
+            self.store.remove_obsolete_voices_everywhere()  # older voices generations may hold their vector too
             self.store.forget_voice(person_id, delete_note=delete_note)
             self.db.set_meta("relabel_pending", "1")
         return affected
@@ -179,6 +180,8 @@ class SpeakerService:
             self.store.sync_samples()
             row = self._conversation(conv_id)
             transcript = self._transcript(conv_id)
+            self.pipeline.move_labels(conv_id, transcript)  # states of an earlier transcript don't apply
+            row = self._conversation(conv_id)
             if label not in {s["speaker"] for s in transcript.get("segments") or []}:
                 raise ApiError(404, "not_found", f"conversation has no speaker {label}")
             done = self.store.request_result(conv_id, request_id)
@@ -211,7 +214,7 @@ class SpeakerService:
                 # the user took this label back from `previous`: so is the voiceprint it gave them
                 removed = self.store.remove_samples(conv_id, label, previous)
             states[label] = state
-            revision = self.store.write_labels(conv_id, states, transcript_sha=row["transcript_sha"],
+            revision = self.store.write_labels(conv_id, states,
                                                request=(request_id, {"label": label, "person_id": person_id, "sample": sample}))  # fmt: skip
             if row["note_path"]:
                 self.pipeline._set(conv_id, needs_render=1, next_attempt_at=None)

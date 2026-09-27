@@ -39,6 +39,12 @@ struct EnrollmentView: View {
         switch speakers.enrollment {
         case .idle:
             if speakers.me == nil { nameStep } else { introStep }
+        case .checking:
+            VStack(spacing: 16) {
+                ProgressView()
+                Text("Checking that your server supports voice enrollment…").multilineTextAlignment(.center)
+            }
+            .padding(.top, 40)
         case .reading(_, let prompt):
             readingStep(prompt)
         case .waiting(_, let status):

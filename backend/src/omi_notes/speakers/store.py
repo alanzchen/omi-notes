@@ -30,6 +30,7 @@ from ..db import Database
 from ..lock import SpeakerLock
 from ..notes.writer import remove, sanitize_title, write_if_changed
 from ..spool import atomic_write_bytes, fsync_dir
+from ..util import canonical_json, sha256_hex
 from ..vault import Vault
 from .match import Sample
 from .voices import LabelVoice, decode_vector, encode_vector
@@ -443,17 +444,22 @@ class SpeakerStore:
             for r in self.db.query("SELECT * FROM speaker_labels WHERE conversation_id=?", (conv_id,))
         }  # fmt: skip
 
-    def write_labels(self, conv_id: str, states: dict[str, dict], *, transcript_sha: str | None,
+    def write_labels(self, conv_id: str, states: dict[str, dict], *, transcript_sha: str | None = None,
                      request: tuple[str, dict] | None = None) -> int:  # fmt: skip
         """Persist label assignments (speakers.json, then the index); returns the new revision.
-        `request`: an app request id and its result, remembered so a retry is answered, not redone."""
-        row = self.db.one("SELECT speakers_revision FROM conversations WHERE id=?", (conv_id,))
+        `transcript_sha`: only when the states were moved to that transcript (`identify`);
+        otherwise they stay tagged with the transcript they were made for. `request`: an app
+        request id and its result, remembered so a retry is answered, not redone."""
+        row = self.db.one("SELECT speakers_revision, transcript_sha FROM conversations WHERE id=?", (conv_id,))
         kept = self.persisted(states)
         path = self.conv_dir(conv_id) / "speakers.json"
         data = Vault.read_json(path) or {}
         # the file is the truth: its revision may be ahead of an index write that failed
         revision = max(row["speakers_revision"] if row else 0, int(data.get("revision") or 0)) + 1
-        data.update(revision=revision, transcript_sha=transcript_sha, labels=kept)
+        tag = transcript_sha or data.get("transcript_sha") or (row["transcript_sha"] if row else None)
+        # once a voice here was forgotten, that stays true whatever later transcripts contain
+        forgotten = bool(data.get("forgotten")) or any(s.get("forgotten") for s in kept.values())
+        data.update(revision=revision, transcript_sha=tag, labels=kept, forgotten=forgotten)
         if request is not None:
             requests = dict(data.get("requests") or {})
             requests[request[0]] = request[1] | {"revision": revision}
@@ -501,6 +507,8 @@ class SpeakerStore:
         row = self.db.one("SELECT speakers_revision FROM conversations WHERE id=?", (conv_id,))
         if data and row is not None and int(data.get("revision") or 0) != row["speakers_revision"]:
             self.index_labels(conv_id, data.get("labels") or {}, int(data.get("revision") or 0))
+            changed = True
+        if self.remove_obsolete_voices(conv_id):
             changed = True
         name = self.voices_file(conv_id)
         indexed = self.db.one("SELECT file FROM voices WHERE conversation_id=? LIMIT 1", (conv_id,))
@@ -552,6 +560,42 @@ class SpeakerStore:
         if indexed is None or indexed["file"] == not_file or re.search(r"-[0-9a-f]{8}\.json$", indexed["file"] or ""):
             return {}
         return self.voices(conv_id)  # a voices file from before transcript-keyed names
+
+    def had_forgotten(self, conv_id: str) -> bool:
+        """A voice in this conversation was forgotten (durable, independent of today's labels)."""
+        data = Vault.read_json(self.conv_dir(conv_id) / "speakers.json")
+        return bool(data and (data.get("forgotten") or any((s or {}).get("forgotten") for s in (data.get("labels") or {}).values())))
+
+    def current_transcript_sha(self, conv_id: str) -> str | None:
+        data = Vault.read_json(self.conv_dir(conv_id) / "transcript.json")
+        return sha256_hex(canonical_json(data.get("segments") or []).encode()) if data else None
+
+    def remove_obsolete_voices(self, conv_id: str) -> bool:
+        """Voices files of another transcript than transcript.json (an interrupted
+        re-transcription's leftovers). An untagged (older-format) file goes once a current one exists."""
+        files = list(self.conv_dir(conv_id).glob("voices-*.json"))
+        sha = self.current_transcript_sha(conv_id) if files else None
+        if sha is None:
+            return False
+        tag = re.compile(r"-([0-9a-f]{8})\.json$")
+        current = any((m := tag.search(p.name)) and m.group(1) == sha[:8] for p in files)
+        removed = False
+        for path in files:
+            m = tag.search(path.name)
+            if (m and m.group(1) != sha[:8]) or (not m and current):
+                remove(path)
+                removed = True
+        if removed:
+            name = self.voices_file(conv_id)
+            if name:
+                self.index_voices(conv_id, name)
+            else:
+                self.db.execute("DELETE FROM voices WHERE conversation_id=?", (conv_id,))
+        return removed
+
+    def remove_obsolete_voices_everywhere(self) -> int:
+        with self.lock:
+            return sum(self.remove_obsolete_voices(r["id"]) for r in self.db.query("SELECT id FROM conversations WHERE status <> 'open'"))
 
     def labels_transcript(self, conv_id: str) -> str | None:
         """The transcript the stored label states were made for (None: no states yet)."""
