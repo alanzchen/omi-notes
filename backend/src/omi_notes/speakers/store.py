@@ -448,25 +448,6 @@ class SpeakerStore:
             for r in self.db.query("SELECT * FROM speaker_labels WHERE conversation_id=?", (conv_id,))
         }  # fmt: skip
 
-    def labels_for_update(self, conv_id: str) -> dict[str, dict]:
-        """Label states for a read-modify-write. States written before they listed their samples
-        get them from the samples' own conversation/label tags — before anything may move them to
-        another label number, and never an id another state already lists."""
-        states = self.labels(conv_id)
-        data = Vault.read_json(self.conv_dir(conv_id) / "speakers.json") or {}
-        if data.get("samples_tracked") or not states:
-            return states
-        listed = {sid for state in states.values() for sid in state.get("samples") or []}
-        for label, state in sorted(states.items()):
-            if state.get("person_id") and state.get("source") == "user" and not state.get("samples"):
-                found = [r["id"] for r in self.db.query(
-                    "SELECT id FROM samples WHERE conversation_id=? AND label=? AND person_id=? ORDER BY id",
-                    (conv_id, label, state["person_id"])) if r["id"] not in listed]  # fmt: skip
-                if found:
-                    state["samples"] = found
-                    listed |= set(found)
-        return states
-
     def write_labels(self, conv_id: str, states: dict[str, dict], *, transcript_sha: str | None = None,
                      voices: str | None | object = _KEEP, request: tuple[str, dict] | None = None) -> int:  # fmt: skip
         """Persist label assignments (speakers.json, then the index); returns the new revision.
@@ -482,7 +463,7 @@ class SpeakerStore:
         tag = transcript_sha or data.get("transcript_sha") or (row["transcript_sha"] if row else None)
         # once a voice here was forgotten, that stays true whatever later transcripts contain
         forgotten = bool(data.get("forgotten")) or any(s.get("forgotten") for s in kept.values())
-        data.update(revision=revision, transcript_sha=tag, labels=kept, forgotten=forgotten, samples_tracked=True)
+        data.update(revision=revision, transcript_sha=tag, labels=kept, forgotten=forgotten)
         if voices is not _KEEP:
             data["voices"] = voices
         if request is not None:

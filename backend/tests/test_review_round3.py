@@ -937,26 +937,3 @@ def test_taking_back_one_confirmation_never_deletes_another_after_renumbering(en
     kept = [json.loads(p.read_text()) for p in worker.vault.person_dir(me).glob("samples/*.json")]
     assert [s["label"] for s in kept] == ["S1"], "only the mistaken sample (made at the original S2) went"
     assert labels(client, row["id"])["S2"]["person_id"] == me
-
-
-def test_confirmations_from_before_sample_tracking_are_found_before_labels_move(env):
-    _, client, worker = env
-    acknowledge(client)
-    row = talk(client, worker, dialogue(ALAN, PRIYA))
-    me = new_person(client, "Alan", me=True)
-    name_label(client, row["id"], "S2", me)  # a voice to compare with
-    bob = new_person(client, "Bob", attest_knows=True)
-    assert name_label(client, row["id"], "S1", bob).json()["sample"] == "created"  # a mistake: S1 is Alan
-    path = worker.vault.conversation_dir(row["id"]) / "speakers.json"
-    data = json.loads(path.read_text())  # as an older version wrote it: no sample ids
-    data.pop("samples_tracked", None)
-    for state in data["labels"].values():
-        state.pop("samples", None)
-    path.write_text(json.dumps(data))
-    worker.db.execute("UPDATE speaker_labels SET samples_json='[]' WHERE conversation_id=?", (row["id"],))
-    force_restt(worker, row, LaterStt())  # that voice is S2 now
-    worker.tick(T0 + 800)
-    worker.tick(T0 + 810)
-    assert labels(client, row["id"])["S2"]["person_id"] == bob
-    name_label(client, row["id"], "S2", None, not_person_id=bob)
-    assert not list(worker.vault.person_dir(bob).glob("samples/*.json")), "the repudiated sample was found and taken back"

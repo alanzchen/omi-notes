@@ -100,7 +100,7 @@ class SpeakerService:
                 states = {
                     label: (s | {"person_id": None, "source": None, "forgotten": True} if s.get("person_id") == person_id else s)
                     | {"not": [x for x in s.get("not") or [] if x != person_id]}
-                    for label, s in self.store.labels_for_update(conv_id).items()
+                    for label, s in self.store.labels(conv_id).items()
                 }
                 row = self.db.one("SELECT transcript_sha, note_path FROM conversations WHERE id=?", (conv_id,))
                 self.store.write_labels(conv_id, states)
@@ -198,7 +198,7 @@ class SpeakerService:
             for pid in (person_id, not_person):
                 if pid is not None and self.store.person(pid) is None:
                     raise ApiError(404, "not_found", f"unknown person {pid}")
-            states = self.store.labels_for_update(conv_id)
+            states = self.store.labels(conv_id)
             before = dict(states.get(label) or {})
             state = dict(before)
             blocked = set(state.get("not") or [])
