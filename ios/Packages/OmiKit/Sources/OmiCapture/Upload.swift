@@ -656,6 +656,10 @@ public struct APIClient: Sendable {
         return r.operation
     }
 
+    public func stats(days: Int = 7) async throws -> ServerStats {
+        try await get("/v1/stats", query: "days=\(days)")
+    }
+
     public func retryFailedChunks() async throws -> Int {
         let r: ChunkRetryResponse = try await send("POST", "/v1/chunks/retry", body: nil)
         return r.chunksQueued

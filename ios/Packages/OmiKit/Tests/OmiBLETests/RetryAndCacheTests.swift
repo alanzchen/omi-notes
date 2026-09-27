@@ -147,9 +147,37 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         #expect(again.details["c1"]?.summary?.overview == "The team agreed on the Q2 budget." && again.detailSavedAt["c1"] != nil)
         let offline = await again.search("budget", personId: nil, range: .any)
         #expect((try? offline.get())?.offline == true && (try? offline.get())?.conversations.map(\.id) == ["c1"])
+        let byPerson = await again.search("budget", personId: "p1", range: .any)
+        if case .failure(let e) = byPerson { #expect(e is AppModel.SearchError) } else { Issue.record("person filter offline") }
+        let lastWeek = await again.search("budget", personId: nil, range: .week)
+        let saved = try #require(ISO8601UTC.parse("2026-09-26T19:00:00.000Z"))
+        let weekStart = Calendar.current.startOfDay(for: Calendar.current.date(byAdding: .day, value: -6, to: Date())!)
+        #expect((try? lastWeek.get())?.conversations.count == (saved >= weekStart ? 1 : 0))
 
         again.clearSavedNotes()
         #expect(again.savedConversations().isEmpty)
+
+        // pairing with another server removes what the previous one's notes left on disk
+        AppServerStub.offline = false
+        _ = try await m.conversation("c1")
+        #expect(!m.noteCache.details(scope: try #require(m.noteCache.lastScope)).isEmpty)
+        try m.engine.settings.setServer(url: URL(string: "https://other.ts.net")!, token: "tok2")
+        await m.refreshServer()
+        #expect(m.noteCache.lastScope == nil || m.noteCache.lastScope?.serverURL == "https://other.ts.net")
+    }
+}
+
+@Suite struct RetryStoreTests {
+    @Test func anUnreadableStoreIsKeptAndBlocksNewRetries() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("app-retries.json")
+        try Data("{broken".utf8).write(to: url)
+        let store = RetryStore(url: url)
+        #expect(store.unreadable)
+        #expect(throws: RetryStore.StoreError.self) { try store.begin(conversationId: "c", server: "s") }
+        store.settle("anything")
+        #expect(try Data(contentsOf: url) == Data("{broken".utf8))
     }
 }
 

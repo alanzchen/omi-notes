@@ -159,7 +159,7 @@ No auth. `200 {"ok": true}`.
                "backing_off": 0, "oldest_waiting_ended_at": "…", "oldest_pending_chunk_received_at": null,
                "stt": {"last_ok_at": "…", "last_error_at": null, "last_error_kind": null}, "llm": null},
   "vault_id": "…",
-  "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "search"]
+  "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "search", "stats"]
 }
 ```
 
@@ -422,6 +422,18 @@ The operation above; observational (never queues or writes). `404` for unknown i
 
 Queues uploaded audio that failed to process again: `{"chunks_queued": 1}`. Operational only (the
 server replays surviving raw audio after a rebuild anyway); the phone doesn't repeat it on its own.
+
+### `GET /v1/stats?days=7`
+
+Per local day (the vault's time zone; today included; at most 90 days), from the index so it is
+rebuildable: kept conversations (with a note; discarded and voice-enrollment rows excluded),
+`conversation_s` (start to end, summed), `speech_s` (detected speech) and `people` (distinct named
+people assigned to a speaker), plus totals:
+
+```json
+{"days": [{"date": "2026-09-26", "conversations": 3, "conversation_s": 2710.5, "speech_s": 1980.2, "people": 2}],
+ "totals": {"conversations": 3, "conversation_s": 2710.5, "speech_s": 1980.2, "people": 2}, "timezone": "America/Chicago"}
+```
 
 ### `GET /v1/conversations/search?q=&person_id=&date_from=&date_to=&before=&limit=20`
 

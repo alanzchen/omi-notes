@@ -337,3 +337,39 @@ def test_the_sweep_rotates_past_stuck_operations(client, worker, settings, monke
     for t in range(4):
         worker.tick(T0 + 500 + t)
     assert op(client, rid)["state"] == "done"
+
+
+def test_a_note_frozen_before_the_retry_ran_stops_it_without_calling_the_provider(client, worker):
+    row = failed_summary(client, worker)
+    rid = retry(client, row["id"]).json()["operation"]["id"]
+    worker.db.execute("UPDATE conversations SET frozen=1 WHERE id=?", (row["id"],))
+    worker.providers._llm = llm = CountingLlm()
+    worker.tick(T0 + 500)
+    assert op(client, rid)["state"] == "stopped" and llm.calls == 0 and convs(worker)[0]["retry_op"] is None
+
+
+def test_a_repeat_of_a_finished_retry_whose_receipt_was_lost_is_not_run_again(client, worker, settings):
+    row = failed_summary(client, worker)
+    rid = retry(client, row["id"]).json()["operation"]["id"]
+    worker.tick(T0 + 500)  # fails again
+    (settings.vault_dir / "_omi" / "operations" / f"{rid}.json").unlink()
+    llm = worker.providers._llm
+    r = retry(client, row["id"], rid)
+    assert r.status_code == 200 and r.json()["operation"]["state"] == "failed"
+    worker.tick(T0 + 600)
+    assert llm.calls == 2 and convs(worker)[0]["retry_op"] is None
+
+
+@pytest.mark.parametrize("op_body", [
+    {"id": "X", "kind": "retry", "conversation_id": "c", "state": "accepted", "requested_at": 1},  # no format
+    {"format": 1, "id": "X", "kind": "retry", "conversation_id": "c", "state": "weird", "requested_at": 1},
+    {"format": 1, "id": "X", "kind": "retry", "conversation_id": "c", "state": "accepted"},  # no requested_at
+])  # fmt: skip
+def test_invalid_operation_files_are_rejected(settings, op_body):
+    from omi_notes.vault import Vault
+
+    vault = Vault.open(settings)
+    rid = str(uuid.uuid4())
+    write_op(settings, op_body | {"id": rid})
+    with pytest.raises(operations.OperationCorrupt):
+        operations.read(vault, rid)

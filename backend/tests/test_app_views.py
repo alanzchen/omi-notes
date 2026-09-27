@@ -296,3 +296,23 @@ def test_activity_reports_waiting_work_and_real_provider_calls(client, worker, s
                       (1e12, row["id"]))  # fmt: skip
     activity = get(client, "/v1/status")["activity"]
     assert activity["backing_off"] == 1 and activity["waiting"] == 0
+
+
+def test_stats_count_kept_conversations_per_local_day(client, worker, settings):
+    from datetime import timedelta
+
+    for i, start in enumerate([STARTED, STARTED + timedelta(days=1)]):
+        replay(client, SPEECH, start=start)
+    worker.tick(STARTED.timestamp() + 86400 + 400)
+    rows = convs(worker)
+    worker.db.execute("UPDATE conversations SET index_json=json_set(index_json, '$.kind', 'discarded') WHERE id=?",
+                      (rows[0]["id"],))  # fmt: skip
+    worker.db.execute("UPDATE conversations SET status='summarizing' WHERE id=?", (rows[1]["id"],))  # a retry keeps its note
+    import omi_notes.views as v
+
+    body = v.stats(worker.db, worker.pipeline.tz, 7, STARTED.timestamp() + 86400 * 2)
+    assert len(body["days"]) == 7 and body["totals"]["conversations"] == 1
+    (day,) = [d for d in body["days"] if d["conversations"]]
+    assert day["date"] == (STARTED + timedelta(days=1)).astimezone(worker.pipeline.tz).date().isoformat()
+    assert day["conversation_s"] > 0 and day["speech_s"] > 0 and day["people"] == 0
+    assert get(client, "/v1/stats?days=500")["days"].__len__() == 90

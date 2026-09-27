@@ -149,7 +149,9 @@ struct ConversationLink: View {
     let conversation: ConversationSummary
 
     var body: some View {
-        if model.serverStatus?.supportsConversationDetail == true {
+        // A saved copy can be read even before (or without) the server saying what it supports.
+        if model.serverStatus?.supportsConversationDetail == true || model.recentSavedAt != nil
+            || model.details[conversation.id] != nil {
             NavigationLink { ConversationDetailView(model: model, summary: conversation) } label: { ConversationRow(conversation: conversation) }
         } else if conversation.canReviewSpeakers {
             NavigationLink {
@@ -244,18 +246,24 @@ struct SearchResults: View {
                 Text("\(pending) conversation\(pending == 1 ? " isn't" : "s aren't") searchable yet; the server is still indexing.")
             }
         }
-        .task(id: "\(query)|\(personId ?? "")|\(range.rawValue)") {
+        .task(id: key) {
             try? await Task.sleep(for: .milliseconds(300))  // wait for typing to pause
             guard !Task.isCancelled else { return }
             await load(more: false)
         }
     }
 
+    private var key: String { "\(query)|\(personId ?? "")|\(range.rawValue)" }
+
     private func load(more: Bool) async {
+        let asked = key
         loading = true
         defer { loading = false }
         let answer = await model.search(query, personId: personId, range: range, before: more ? result?.nextCursor : nil)
+        guard asked == key else { return }  // the search changed meanwhile: this answer is for another one
         switch answer {
+        case .failure(is CancellationError):
+            return
         case .success(let r):
             if more, var current = result {
                 let ids = Set(current.conversations.map(\.id))

@@ -1,6 +1,7 @@
 import OmiBLE
 import OmiCapture
 import OmiProtocol
+import Charts
 import SwiftUI
 
 /// Is the server working, what needs attention and how to fix it, and how it is set up.
@@ -18,6 +19,7 @@ struct ServerView: View {
         List {
             statusSection
             issuesSection
+            WeekSection(model: model)
             activitySection
             processingSection
             if let status { configurationSection(status) }
@@ -290,6 +292,60 @@ struct RetryControl: View {
                 if let op, op.isFinished { Text(op.message ?? op.state).font(.caption).foregroundStyle(op.state == "done" ? .green : .orange) }
             }
             if let msg = model.retryMessages[conversationId] { Text(msg).font(.caption).foregroundStyle(.secondary) }
+        }
+    }
+}
+
+/// The last seven days on the server: conversation time per day, and totals.
+struct WeekSection: View {
+    let model: AppModel
+    @State private var stats: ServerStats?
+
+    var body: some View {
+        Group {
+            if let stats {
+                Section {
+                    Chart(stats.days) { day in
+                        BarMark(x: .value("Day", Self.weekday(day.date)), y: .value("Minutes", day.conversationS / 60))
+                            .foregroundStyle(.tint)
+                            .accessibilityLabel(Self.weekday(day.date))
+                            .accessibilityValue("\(Fmt.duration(day.conversationS) ?? "none"), \(day.conversations) conversations")
+                    }
+                    .chartYAxisLabel("minutes")
+                    .frame(height: 140)
+                    HStack {
+                        Tile(value: "\(stats.totals.conversations)", label: "conversations")
+                        Tile(value: Fmt.duration(stats.totals.conversationS) ?? "0 min", label: "talking")
+                        Tile(value: "\(stats.totals.people)", label: stats.totals.people == 1 ? "person" : "people")
+                    }
+                } header: {
+                    Text("Past 7 days")
+                } footer: {
+                    Text("Kept conversations only, start to end (\(Fmt.duration(stats.totals.speechS) ?? "no") of detected speech). People counts those you've named.")
+                }
+            }
+        }
+        .task(id: model.serverStatusAt) { if let s = await model.weekStats() { stats = s } }
+    }
+
+    static func weekday(_ iso: String) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        guard let d = f.date(from: iso) else { return iso }
+        return d.formatted(.dateTime.weekday(.abbreviated))
+    }
+
+    struct Tile: View {
+        let value: String
+        let label: String
+        var body: some View {
+            VStack(spacing: 2) {
+                Text(value).font(.title3.weight(.semibold)).monospacedDigit()
+                Text(label).font(.caption).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity)
+            .accessibilityElement(children: .combine)
         }
     }
 }

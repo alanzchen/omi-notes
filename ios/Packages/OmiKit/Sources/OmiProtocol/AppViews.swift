@@ -238,3 +238,36 @@ public struct SearchResponse: Decodable, Equatable, Sendable {
         case nextCursor = "next_cursor"
     }
 }
+
+/// `GET /v1/stats?days=7`: kept conversations per local day on the server.
+public struct ServerStats: Decodable, Equatable, Sendable {
+    public struct Day: Decodable, Equatable, Sendable, Identifiable {
+        public var date: String
+        public var conversations: Int
+        /// Start to end of each conversation, summed.
+        public var conversationS: Double
+        /// Detected speech only.
+        public var speechS: Double
+        public var people: Int
+        public var id: String { date }
+
+        enum CodingKeys: String, CodingKey {
+            case date, conversations, people
+            case conversationS = "conversation_s"
+            case speechS = "speech_s"
+        }
+    }
+    public struct Totals: Decodable, Equatable, Sendable {
+        public var conversations: Int
+        public var conversationS: Double
+        public var speechS: Double
+        public var people: Int
+        enum CodingKeys: String, CodingKey {
+            case conversations, people
+            case conversationS = "conversation_s"
+            case speechS = "speech_s"
+        }
+    }
+    public var days: [Day]
+    public var totals: Totals
+}

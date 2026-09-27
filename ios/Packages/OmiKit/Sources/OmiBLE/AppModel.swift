@@ -96,6 +96,13 @@ public final class AppModel {
     /// Forgets everything a previous server said (another server, or none), people included.
     private func adopt(_ config: UploadConfig) {
         guard config != answeredFor else { return }
+        // Notes saved for another server (or an earlier pairing) are removed, not just hidden.
+        if answeredFor != nil {
+            noteCache.clear()
+        } else if let last = noteCache.lastScope,
+                  last.serverURL != config.endpoint?.baseURL.absoluteString || last.generation != config.generation {
+            noteCache.clear()
+        }
         answeredFor = config
         speakers.serverChanged()
         serverStatus = nil
@@ -155,6 +162,7 @@ public final class AppModel {
         guard isCurrent(config) else { return }
         if let newIssues { issues = newIssues }
         await settleRetries(api: api, config: config)
+        guard isCurrent(config) else { return }
         switch page {
         case .success(let page):
             mergeFirstPage(page)
@@ -206,6 +214,7 @@ public final class AppModel {
     /// changed meanwhile; otherwise the whole detail is reloaded from the first page.
     public func loadMoreTranscript(_ id: String) async throws {
         guard let shown = details[id], let from = shown.transcript?.nextFrom else { return }
+        let epoch = cacheEpoch
         let page = try await conversation(id, segmentsFrom: from)
         guard var current = details[id], current.transcript?.segments.count == shown.transcript?.segments.count,
               current.transcriptSha == shown.transcriptSha, current.speakersRevision == shown.speakersRevision,
@@ -217,7 +226,7 @@ public final class AppModel {
         }
         current.append(next)
         details[id] = current
-        saveForOffline(current, engine.settings.serverConfig())
+        if epoch == cacheEpoch { saveForOffline(current, engine.settings.serverConfig()) }
     }
 
     /// Detail for one conversation (and later transcript pages with `segmentsFrom`).

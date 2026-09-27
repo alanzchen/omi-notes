@@ -75,25 +75,53 @@ extension AppModel {
         }
     }
 
-    /// Server search, or the saved copies when the server can't be reached.
+    public enum SearchError: Error, LocalizedError {
+        case personNeedsServer
+        public var errorDescription: String? {
+            "The server can't be reached, and filtering by person needs it. Choose Anyone to search the notes saved on this phone."
+        }
+    }
+
+    /// Server search, or the saved copies when the server can't be reached. Answers for a server
+    /// that is no longer configured, or for a cancelled search, come back as `CancellationError`.
     public func search(_ query: String, personId: String?, range: SearchRange, before: String? = nil) async -> Result<SearchResult, Error> {
         let config = engine.settings.serverConfig()
         guard let endpoint = config.endpoint else { return .failure(APIError.notConfigured) }
-        var from: String?
+        var fromDate: Date?
         if range != .any {
             let days = range == .week ? 6 : 29
-            let start = Calendar.current.date(byAdding: .day, value: -days, to: Date()) ?? Date()
-            from = Self.day(start)
+            fromDate = Calendar.current.startOfDay(for: Calendar.current.date(byAdding: .day, value: -days, to: Date()) ?? Date())
         }
-        do {
-            guard serverStatus?.supportsSearch == true else { throw APIError.http(404, "not supported") }
-            let r = try await APIClient(endpoint: endpoint, session: session).search(query: query, personId: personId, from: from, before: before)
+        let answer: Result<SearchResponse, Error>
+        if serverStatus?.supportsSearch == true || serverStatus == nil {
+            answer = await Result {
+                try await APIClient(endpoint: endpoint, session: session)
+                    .search(query: query, personId: personId, from: fromDate.map(Self.day), before: before)
+            }
+        } else {
+            answer = .failure(APIError.transport("this server doesn't support search"))
+        }
+        guard !Task.isCancelled, isCurrent(config) else { return .failure(CancellationError()) }
+        switch answer {
+        case .success(let r):
             return .success(SearchResult(conversations: r.conversations, nextCursor: r.nextCursor, pending: r.pending ?? 0, offline: false))
-        } catch {
-            guard let scope = cacheScope(config), !query.trimmingCharacters(in: .whitespaces).isEmpty else { return .failure(error) }
+        case .failure(let error):
+            // Only an unreachable server falls back to the saved copies; a refusal is an answer.
+            guard case APIError.transport = error, !query.trimmingCharacters(in: .whitespaces).isEmpty,
+                  let scope = cacheScope(config) else { return .failure(error) }
+            if personId != nil { return .failure(SearchError.personNeedsServer) }
             let rows = noteCache.search(query, scope: scope).map(\.entry)
+                .filter { c in fromDate.map { (c.startedDate ?? .distantPast) >= $0 } ?? true }
             return .success(SearchResult(conversations: rows, nextCursor: nil, pending: 0, offline: true))
         }
+    }
+
+    /// The server's last 7 days (nil when it doesn't report them).
+    public func weekStats() async -> ServerStats? {
+        let config = engine.settings.serverConfig()
+        guard let endpoint = config.endpoint, serverStatus?.supportsStats == true else { return nil }
+        let stats = try? await APIClient(endpoint: endpoint, session: session).stats(days: 7)
+        return isCurrent(config) ? stats : nil
     }
 
     static func day(_ date: Date) -> String {

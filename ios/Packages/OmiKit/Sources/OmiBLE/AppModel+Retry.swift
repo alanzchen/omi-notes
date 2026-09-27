@@ -22,7 +22,7 @@ extension AppModel {
         do {
             entry = try retryStore.begin(conversationId: conversationId, server: key)
         } catch {
-            retryMessages[conversationId] = "Couldn't save the request on this phone: \(Self.describe(error))"
+            retryMessages[conversationId] = (error as? LocalizedError)?.errorDescription ?? "Couldn't save the request on this phone: \(Self.describe(error))"
             return
         }
         retryMessages[conversationId] = nil
@@ -65,6 +65,7 @@ extension AppModel {
                 } catch APIError.http(404, _) {
                     await send(entry, api: api, config: config)  // accepted state was lost: the same id again
                 } catch {
+                    guard isCurrent(config) else { return }
                     retries[entry.conversationId] = op  // keep showing the last known state
                 }
             } else {

@@ -401,6 +401,61 @@ def activity(db, settings, now: float) -> dict:
     }
 
 
+# A kept note, by what was rendered (not the execution status: a retry in progress keeps its note).
+KEPT = "json_extract(index_json, '$.kind') IN ('completed', 'transcript_only')"
+
+
+def stats(db, tz, days: int, now: float) -> dict:
+    """Per local day for the last `days` days (today included, zero-filled): kept conversations
+    (discarded and voice-enrollment rows excluded), conversation time (start to end), speech time,
+    and how many named people spoke. A conversation counts on the local day it started (a
+    conversation over midnight counts on the first day; DST days are just shorter or longer); the
+    total people is the distinct set over the period. Derived from the index: rebuildable, and no
+    provider call."""
+    from datetime import datetime, timedelta
+
+    today = datetime.fromtimestamp(now, tz).date()
+    first = today - timedelta(days=days - 1)
+    start = datetime.combine(first, datetime.min.time(), tzinfo=tz).timestamp()
+    rows = db.query(
+        f"""SELECT id, start, "end", speech_seconds FROM conversations
+            WHERE {LISTED} AND start >= ? AND note_path IS NOT NULL AND {KEPT}""",
+        (start,),
+    )
+    people = db.query(
+        f"""SELECT c.start, l.person_id FROM speaker_labels l JOIN conversations c ON c.id = l.conversation_id
+            WHERE l.person_id IS NOT NULL AND c.start >= ? AND c.note_path IS NOT NULL
+            AND {KEPT.replace("index_json", "c.index_json")} AND c.enrollment_id IS NULL""",
+        (start,),
+    )
+    by_day = {first + timedelta(days=i): {"conversations": 0, "conversation_s": 0.0, "speech_s": 0.0, "people": set()}
+              for i in range(days)}  # fmt: skip
+    for r in rows:
+        day = by_day.get(datetime.fromtimestamp(r["start"], tz).date())
+        if day is not None:
+            day["conversations"] += 1
+            day["conversation_s"] += max(0.0, r["end"] - r["start"])
+            day["speech_s"] += r["speech_seconds"] or 0.0
+    everyone: set[str] = set()
+    for p in people:
+        day = by_day.get(datetime.fromtimestamp(p["start"], tz).date())
+        if day is not None:
+            day["people"].add(p["person_id"])
+            everyone.add(p["person_id"])
+    out = [{"date": d.isoformat(), "conversations": v["conversations"], "conversation_s": round(v["conversation_s"], 1),
+            "speech_s": round(v["speech_s"], 1), "people": len(v["people"])} for d, v in sorted(by_day.items())]  # fmt: skip
+    return {
+        "days": out,
+        "totals": {
+            "conversations": sum(d["conversations"] for d in out),
+            "conversation_s": round(sum(d["conversation_s"] for d in out), 1),
+            "speech_s": round(sum(d["speech_s"] for d in out), 1),
+            "people": len(everyone),
+        },
+        "timezone": str(tz),
+    }
+
+
 def last_note_at(db) -> str | None:
     """When the newest useful note was first written (discarded and enrollment rows excluded)."""
     r = db.one(f"SELECT MAX(done_at) AS t FROM conversations WHERE note_path IS NOT NULL "

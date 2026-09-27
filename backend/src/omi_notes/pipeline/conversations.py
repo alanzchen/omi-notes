@@ -311,6 +311,11 @@ class ConversationPipeline:
             if row["needs_render"]:
                 self._rerender(row, now)
             return
+        if row["retry_op"] and row["frozen"] and row["note_path"]:
+            # frozen while an app retry waited: stop it before any provider call
+            self._commit(conv_id, status="done", needs_render=0, next_attempt_at=None, **_outcome(row, "frozen", None))
+            operations.finished(self, row["retry_op"])
+            return
         stage = "transcribing" if row["status"] in ("closed", "transcribing") else "summarizing"
         try:
             if stage == "transcribing":

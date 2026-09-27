@@ -34,6 +34,7 @@ log = logging.getLogger(__name__)
 FORMAT = 1
 TERMINAL = ("done", "failed", "stopped", "superseded")
 REQUIRED = ("id", "kind", "conversation_id", "state")
+STATES = ("accepted", *TERMINAL)
 SWEEP_BATCH = 50
 BUSY = ("busy", "the server is working on this conversation right now; try again in a moment")
 
@@ -64,7 +65,9 @@ def read(vault: Vault, op_id: str) -> dict | None:
     except (OSError, ValueError) as exc:
         raise OperationCorrupt(500, "operation_unreadable", f"operation {op_id} is unreadable: {exc}") from exc
     if (not isinstance(op, dict) or any(not isinstance(op.get(k), str) for k in REQUIRED) or op["id"] != op_id
-            or not isinstance(op.get("format", 0), int) or op.get("format", 0) > FORMAT):  # fmt: skip
+            or not isinstance(op.get("format"), int) or not 1 <= op["format"] <= FORMAT or op["kind"] != "retry"
+            or op["state"] not in STATES
+            or (op["state"] == "accepted" and not isinstance(op.get("requested_at"), (int, float)))):  # fmt: skip
         raise OperationCorrupt(500, "operation_unreadable", f"operation {op_id} is not a valid operation file")
     return op
 
@@ -109,8 +112,14 @@ def accept(pipeline, conv_id: str, request_id: str, *, read_only: str | None) ->
                 # accepted, but its queueing isn't committed yet: not an answer to settle on
                 raise ApiError(409, *BUSY)
             return 200, view(pipeline, request_id)
-        if _row(db, conv_id) is None:
+        row = _row(db, conv_id)
+        if row is None:
             raise ApiError(404, "not_found", "unknown conversation")
+        outcome = _outcome(row)
+        if outcome and outcome.get("op") == request_id:
+            # this request already ran and its receipt was lost: answer with that outcome, never again
+            _close(vault, outcome, conv_id)
+            return 200, view(pipeline, request_id)
         token = pipeline.claim(conv_id)
         if token is None:
             raise ApiError(409, *BUSY)

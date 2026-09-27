@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 import numpy as np
 import soundfile as sf
 
+from .. import operations
 from ..ingest import ApiError
 from ..util import UUID_RE, iso_utc_epoch
 from . import enroll
@@ -287,11 +288,13 @@ class SpeakerService:
     def resummarize(self, conv_id: str) -> None:
         if self._conversation(conv_id)["enrollment_id"]:
             raise ApiError(409, "voice_enrollment", "a voice-enrollment reading has no transcript or summary")
-        # checked in the same statement: a queued app retry decides this conversation's next attempt
-        queued = self.db.execute(
-            "UPDATE conversations SET reprocess_request = reprocess_request + 1, force_llm = 1 WHERE id=? AND retry_op IS NULL",
-            (conv_id,),
-        ).rowcount
+        # a queued app retry decides this conversation's next attempt; its lock covers acceptance too
+        with operations.lock(self.vault):
+            queued = self.db.execute(
+                "UPDATE conversations SET reprocess_request = reprocess_request + 1, force_llm = 1 "
+                "WHERE id=? AND retry_op IS NULL",
+                (conv_id,),
+            ).rowcount
         if not queued:
             raise ApiError(409, "retry_in_progress", "a retry of this conversation is queued; try again when it finishes")
 

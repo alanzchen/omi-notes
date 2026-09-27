@@ -700,17 +700,10 @@ def reprocess(
         rows = w.db.query("SELECT * FROM conversations WHERE start >= ? AND status<>'open'", (start,))
     else:
         raise typer.BadParameter("give a conversation id or --since")
-    skipped = []
-    for row in rows:
-        # A request is recorded apart from the execution status, so a stage running right now
-        # cannot overwrite it; the pipeline consumes it atomically. A queued app retry owns the
-        # conversation's next attempt (docs/vault.md, "Operations"): checked in the same statement.
-        if not w.db.execute(
-            """UPDATE conversations SET reprocess_request = reprocess_request + 1,
-                   force_restt = MAX(force_restt, ?), force_llm = MAX(force_llm, ?) WHERE id=? AND retry_op IS NULL""",
-            (int(restt), int(force_llm), row["id"]),
-        ).rowcount:
-            skipped.append(row["id"])
+    from . import operations
+
+    with operations.lock(w.vault):  # the app retry's reservation lock: acceptance can't interleave
+        skipped = _queue_reprocess(w, rows, restt, force_llm)
     if skipped:
         typer.echo(f"Skipped {len(skipped)} conversation(s) with an app retry queued: {', '.join(skipped)}")
         rows = [r for r in rows if r["id"] not in skipped]
@@ -730,6 +723,23 @@ def reprocess(
     typer.echo(f"{len(rows)} conversation(s) reprocessed.")
 
 
+def _queue_reprocess(w, rows, restt: bool, force_llm: bool) -> list[str]:
+    """Queue reprocess requests; returns the ids skipped because an app retry owns them.
+
+    A request is recorded apart from the execution status, so a stage running right now cannot
+    overwrite it; the pipeline consumes it atomically. A queued app retry owns the conversation's
+    next attempt (docs/vault.md, "Operations"): checked in the same statement, under its lock."""
+    skipped = []
+    for row in rows:
+        if not w.db.execute(
+            """UPDATE conversations SET reprocess_request = reprocess_request + 1,
+                   force_restt = MAX(force_restt, ?), force_llm = MAX(force_llm, ?) WHERE id=? AND retry_op IS NULL""",
+            (int(restt), int(force_llm), row["id"]),
+        ).rowcount:
+            skipped.append(row["id"])
+    return skipped
+
+
 @app.command("retry-failed")
 def retry_failed() -> None:
     """Queue failed conversations and chunks again (after fixing keys/billing/etc.); processes
@@ -739,11 +749,14 @@ def retry_failed() -> None:
     settings = load_settings()
     _setup_logging()
     w = _worker(settings)
-    convs = w.db.execute(
-        """UPDATE conversations SET status=CASE failed_stage WHEN 'summarizing' THEN 'summarizing' ELSE 'closed' END,
-               attempts=0, next_attempt_at=NULL, error=NULL, error_kind=NULL, failed_stage=NULL
-           WHERE status='failed' AND retry_op IS NULL"""
-    ).rowcount
+    from . import operations
+
+    with operations.lock(w.vault):  # the app retry's reservation lock (docs/vault.md, "Operations")
+        convs = w.db.execute(
+            """UPDATE conversations SET status=CASE failed_stage WHEN 'summarizing' THEN 'summarizing' ELSE 'closed' END,
+                   attempts=0, next_attempt_at=NULL, error=NULL, error_kind=NULL, failed_stage=NULL
+               WHERE status='failed' AND retry_op IS NULL"""
+        ).rowcount
     chunks = w.db.execute(
         "UPDATE chunks SET status='pending', attempts=0, next_attempt_at=NULL, error=NULL WHERE status='failed'"
     ).rowcount

@@ -175,7 +175,7 @@ def create_app(
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes
-            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "search"],
+            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "search", "stats"],
             "vault_id": vault.vault_id,
         }
 
@@ -281,6 +281,11 @@ def create_app(
             "UPDATE chunks SET status='pending', attempts=0, next_attempt_at=NULL, error=NULL WHERE status='failed'"
         ).rowcount
         return {"chunks_queued": queued}
+
+    @app.get("/v1/stats")
+    def stats(days: int = 7) -> dict:
+        days = max(1, min(days, 90))
+        return views.stats(db, app.state.speakers.pipeline.tz, days, time.time())
 
     @app.get("/v1/issues")
     def issues(limit: int = views.ISSUE_LIMIT) -> dict:

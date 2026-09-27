@@ -18,13 +18,33 @@ public final class RetryStore: @unchecked Sendable {
         public var operation: RetryOperation?
     }
 
+    public enum StoreError: Error, LocalizedError {
+        case unreadable
+        public var errorDescription: String? {
+            "The list of retries on this phone can't be read, so no new retry is sent (the file is kept for diagnosis)."
+        }
+    }
+
     private let url: URL
     private let lock = NSLock()
     private var entries: [Entry]
+    /// The file exists but can't be read: it is kept (never overwritten) and nothing new is sent,
+    /// since a new request id could start a second retry of something already asked for.
+    public private(set) var unreadable = false
 
     public init(url: URL) {
         self.url = url
-        entries = JSONFile.load([Entry].self, from: url) ?? []
+        if FileManager.default.fileExists(atPath: url.path) {
+            if let loaded = JSONFile.load([Entry].self, from: url) {
+                entries = loaded
+            } else {
+                entries = []
+                unreadable = true
+                OmiLog.shared.log(.error, "retry", "app-retries.json is unreadable; keeping it and not sending new retries")
+            }
+        } else {
+            entries = []
+        }
     }
 
     public static func serverKey(baseURL: URL, vaultId: String) -> String { "\(baseURL.absoluteString)|\(vaultId)" }
@@ -42,6 +62,7 @@ public final class RetryStore: @unchecked Sendable {
     /// The entry to send for this conversation: the unsettled one if any, else a new one, saved first.
     public func begin(conversationId: String, server: String, now: Date = Date()) throws -> Entry {
         lock.lock(); defer { lock.unlock() }
+        if unreadable { throw StoreError.unreadable }
         if let existing = entries.first(where: { $0.conversationId == conversationId && $0.server == server }) {
             return existing
         }
@@ -69,6 +90,7 @@ public final class RetryStore: @unchecked Sendable {
     }
 
     private func persist(_ next: [Entry]) throws {
+        if unreadable { throw StoreError.unreadable }
         try FileIO.ensureDirectory(url.deletingLastPathComponent())
         try JSONFile.save(next, to: url)
         entries = next

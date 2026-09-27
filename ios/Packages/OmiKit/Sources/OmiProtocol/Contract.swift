@@ -350,6 +350,7 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
     public var supportsIssues: Bool { features?.contains("issues") == true }
     public var supportsRetry: Bool { features?.contains("retry") == true }
     public var supportsSearch: Bool { features?.contains("search") == true }
+    public var supportsStats: Bool { features?.contains("stats") == true }
 }
 
 public struct CaptureStatusResponse: Decodable, Equatable, Sendable {
