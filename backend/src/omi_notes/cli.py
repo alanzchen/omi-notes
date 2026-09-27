@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import secrets
 import shutil
@@ -27,11 +28,11 @@ SILERO_URL = "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/d
 SILERO_SHA256 = "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
 
 
-def _setup_logging(settings: Settings | None = None, to_file: bool = False) -> None:
-    handlers: list[logging.Handler] = [logging.StreamHandler()]
+def _setup_logging(settings: Settings | None = None, to_file: bool = False, *, console: bool = True) -> None:
+    handlers: list[logging.Handler] = [logging.StreamHandler()] if console else []
     if to_file and settings is not None:
         settings.logs_dir.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(settings.logs_dir / "omi-notes.log"))
+        handlers.append(RotatingFileHandler(settings.logs_dir / "omi-notes.log", maxBytes=10 * 1024 * 1024, backupCount=5))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", handlers=handlers)
 
 
@@ -64,6 +65,7 @@ def serve(
     host: str = typer.Option(None, help="Bind address (default HOST, 127.0.0.1)"),
     port: int = typer.Option(None, help="Port (default PORT, 8765)"),
     no_worker: bool = typer.Option(False, "--no-worker", help="Only accept uploads; run `omi-notes worker` separately"),
+    log_file_only: bool = typer.Option(False, "--log-file-only", help="Send server logs to the rotating log file (launchd)"),
     take_over: bool = typer.Option(False, "--take-over", help=TAKE_OVER_HELP),
 ) -> None:
     """Run the HTTP API (and the processing worker, unless --no-worker)."""
@@ -73,13 +75,18 @@ def serve(
     from .vault import VaultError
 
     settings = _settings()
-    _setup_logging(settings, to_file=True)
+    _setup_logging(settings, to_file=True, console=not log_file_only)
     try:
         application = create_app(settings, start_worker=not no_worker, take_over=take_over)
     except VaultError as exc:
+        logging.getLogger(__name__).error("Cannot start server: %s", exc)
         typer.secho(str(exc), fg=typer.colors.RED)
         raise typer.Exit(2) from exc
-    uvicorn.run(application, host=host or settings.host, port=port or settings.port, log_level="info")
+    except Exception:
+        logging.getLogger(__name__).exception("Cannot initialize server")
+        raise
+    options = {"log_config": None} if log_file_only else {}
+    uvicorn.run(application, host=host or settings.host, port=port or settings.port, log_level="info", **options)
 
 
 @app.command()

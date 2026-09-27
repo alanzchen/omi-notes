@@ -32,13 +32,23 @@ Linux works too: install `libopus0` and `libsndfile1` (or set `OMI_NOTES_LIBOPUS
 
 ```sh
 uv run omi-notes serve               # API + worker in one process
-./scripts/install-launchd.sh         # …or start it at login (logs in DATA_DIR/logs)
+./scripts/install-launchd.sh         # …or start it at login (rotating logs outside the vault)
 ```
 
 `omi-notes serve --no-worker` plus `omi-notes worker` splits upload handling and processing into
-two processes. Only one process runs the pipeline at a time (it holds `DATA_DIR/worker.lock`; a
+two processes. Only one process runs the pipeline at a time (it holds the vault's host lock; a
 second `serve`/`worker` just accepts uploads). The worker is restart-safe: every stage is idempotent
 and cached, so killing the server at any point loses nothing.
+
+The installer uses the existing `.venv` directly, so a restart cannot silently change dependencies.
+Run `uv sync --locked --extra diarization` first for local speaker labels and recognition.
+`OMI_NOTES_ENV_FILE=/absolute/path/server.env ./scripts/install-launchd.sh` selects a private
+configuration outside the checkout. Logs rotate at 10 MiB with five backups in `Settings.logs_dir`
+(next to the index directory); launchd's umask keeps new files private. Use `uninstall` to stop and
+remove the login service. For a system service, prepare a plist with
+`--write-plist /path/com.omi-notes.server.plist --user YOUR_USER`, then install it as root in
+`/Library/LaunchDaemons` and bootstrap it in the `system` domain. Stop/remove the login service first.
+Local inference services must also be available before processing can complete.
 
 `rebuild`, `reprocess` and `retry-failed` run inline when no worker is running; while one is, they
 only queue the work for it (so two processes never transcribe or write the same note).

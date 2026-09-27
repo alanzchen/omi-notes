@@ -16,7 +16,8 @@ Omi pendant → iPhone app (`ios/`) → your server (`backend/`) → Markdown no
 | iOS app shell (SwiftUI, iOS 17+) | `ios/OmiNotes/`, `ios/project.yml` | `make ios-build` |
 | Omi reference code (read-only) | `/Users/alan/Developer/_ref/omi` (BasedHardware/omi `d4e5a35`) | — |
 
-`make test` runs both suites. `make testflight` uploads a Release build (see `ios/README.md`).
+`make test` runs both suites. For this Mac's TestFlight releases, use the **local signing workflow
+below**; `make testflight` is the separate cloud-signing workflow described in `ios/README.md`.
 
 ## Rules
 
@@ -62,3 +63,178 @@ Omi pendant → iPhone app (`ios/`) → your server (`backend/`) → Markdown no
   delegate runs on a serial queue and UI state is published on the MainActor.
 - Keep the simulator build warning-free and both suites green before committing.
 - Commit messages: imperative subject, a body explaining why.
+
+## Development and release checks
+
+- Keep development servers on a separate port with a temporary `VAULT_DIR`, `INDEX_DIR` and
+  `LOCK_DIR`, fake providers and simulated Bluetooth. Never point a development worker at the
+  running deployment's vault, or load its provider credentials into tests.
+- For behavior fixes, reproduce the failure in a regression test first. Run the relevant tests,
+  then `make test` and `make ios-build` for a phone/server release. For contract changes, also run
+  `cd backend && uv run python scripts/make_contract_fixtures.py`; inspect fixture diffs.
+  Documentation-only changes need a diff/link check, not a new app build or deployment.
+- Capture release logs, source hashes, build-setting overrides and verification results under
+  `build/testflight-ready/<version-and-build>/` or `build/deployment/` (gitignored). Test counts and
+  build numbers in old reports are historical evidence; check the current results.
+- Verify the exported IPA's version, bundle ID, team, profile, signature, Release settings and
+  privacy manifest. Keep debug arguments and local HTTP exceptions out of Release. Record Xcode's
+  existing “Metadata extraction skipped, no AppIntents.framework dependency found” tooling warning
+  separately from compiler warnings or build failures.
+
+## TestFlight on this Mac
+
+The following setup was verified on **2026-09-27**; inspect current Apple state before each release.
+Reuse the existing app, signing assets, API key and tester group while they remain valid.
+
+| Item | Existing setup |
+|---|---|
+| App / bundle | Omi Notes / `dev.omi-notes.app` |
+| App Store Connect app ID | `6816608105` |
+| Developer team | `N9YEGD9WDP` |
+| Local signing identity / profile | `Apple Distribution` / `Omi Notes App Store` |
+| Upload configuration | `~/.appstoreconnect/omi-notes-upload.json` (`key_id`, `issuer_id`, `key_path`, `app_id`) |
+| Private API key | `~/.appstoreconnect/private_keys/AuthKey_<key_id>.p8`, file mode `0600`; role is **Developer** |
+| Internal Testing group | `b442156a-468f-491b-923c-489bd9548859` |
+| Last verified release | `0.1.0 (2)`, `VALID`, `IN_BETA_TESTING`; query Apple for the next build number |
+
+**Use manual local signing and upload the exported IPA.** `ios/Tools/testflight.sh` / `make testflight`
+uses automatic cloud signing and expects an Admin key; it is not the workflow for the current
+Developer key. Do not create a more privileged key just to use that script.
+
+1. Query App Store Connect for existing builds; choose an unused, increasing build number.
+   Generate the Xcode project with `cd ios && xcodegen generate`. From the repository root, set
+   `OMI_BUILD_NUMBER`, the intended `OMI_MARKETING_VERSION` (currently `0.1.0`), and an absolute
+   `OMI_RELEASE_DIR` under `build/testflight-ready/`, then archive:
+
+   ```sh
+   xcodebuild archive -project ios/OmiNotes.xcodeproj -scheme OmiNotes \
+     -configuration Release -destination 'generic/platform=iOS' \
+     -archivePath "$OMI_RELEASE_DIR/OmiNotes.xcarchive" \
+     -derivedDataPath build/testflight-ready/DerivedData \
+     DEVELOPMENT_TEAM=N9YEGD9WDP PRODUCT_BUNDLE_IDENTIFIER=dev.omi-notes.app \
+     MARKETING_VERSION="$OMI_MARKETING_VERSION" CURRENT_PROJECT_VERSION="$OMI_BUILD_NUMBER" \
+     CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY='Apple Distribution' \
+     PROVISIONING_PROFILE_SPECIFIER='Omi Notes App Store'
+   ```
+
+2. Prepare `ExportOptions.plist` with `destination=export`, `method=app-store-connect`,
+   `signingStyle=manual`, `teamID=N9YEGD9WDP`, `manageAppVersionAndBuildNumber=false`,
+   `uploadSymbols=true`, and `provisioningProfiles={dev.omi-notes.app: Omi Notes App Store}`.
+   Set `signingCertificate` to the verified installed distribution certificate's SHA-1.
+   The successful build-2 plist is a local example, not a permanent certificate reference.
+
+   ```sh
+   xcodebuild -exportArchive -archivePath "$OMI_RELEASE_DIR/OmiNotes.xcarchive" \
+     -exportPath "$OMI_RELEASE_DIR/export" \
+     -exportOptionsPlist "$OMI_RELEASE_DIR/ExportOptions.plist"
+   ```
+
+3. After package verification, read `ASC_KEY_ID` and `ASC_ISSUER_ID` from the private upload
+   configuration (these are identifiers, not the private key), then upload:
+
+   ```sh
+   xcrun altool --upload-package "$OMI_RELEASE_DIR/export/OmiNotes.ipa" \
+     --api-key "$ASC_KEY_ID" --api-issuer "$ASC_ISSUER_ID" --wait
+   ```
+
+4. Wait for Apple processing to report `VALID`. **An upload alone does not publish to testers.**
+   Automatic distribution is disabled for the existing group. Add the build to Internal Testing
+   through App Store Connect or `POST /v1/betaGroups/{group_id}/relationships/builds` with
+   `{"data":[{"type":"builds","id":"<Apple build UUID>"}]}`. Confirm group membership and
+   `buildBetaDetail.internalBuildState=IN_BETA_TESTING`; save the evidence and delivery UUID.
+   Tell the user the exact version/build to install from TestFlight.
+
+Use the existing authenticated Chrome session if a portal-only step is needed. Apple login,
+two-factor verification and macOS Keychain prompts are completed by the user in the native UI;
+never request passwords/codes in chat or print private keys/JWTs. If Chrome blocks a local upload,
+its ChatGPT extension needs “Allow access to file URLs”; this was enabled during initial setup.
+
+## Mac Studio backend deployment
+
+This is the existing user deployment, verified on **2026-09-27**. Inspect the service and selected
+settings before changing it; repository defaults are not the deployed configuration.
+
+| Item | Location / value |
+|---|---|
+| Private HTTPS | `https://alan-mac-studio.tailcd4f.ts.net:9443` via Tailscale Serve |
+| Loopback API | `http://127.0.0.1:18765` |
+| Private configuration | `/Users/alan/.config/omi-notes/server.env` (mode `0600`) |
+| Vault | `/Users/alan/OmiNotes` |
+| Index base | `/Users/alan/Library/Application Support/omi-notes/index/production` |
+| Locks | `/Users/alan/Library/Application Support/omi-notes/locks` |
+| Release root | `/Users/alan/.local/share/omi-notes/releases/` |
+| Current backend | `/Users/alan/.local/share/omi-notes/current/backend` |
+| System service | `/Library/LaunchDaemons/com.omi-notes.server.plist`, runs as `alan` |
+| Rotating log | `/Users/alan/Library/Application Support/omi-notes/index/logs/omi-notes.log` |
+
+- **Models:** local MLX Audio at `http://127.0.0.1:8000/v1`, Whisper
+  `mlx-community/whisper-large-v3-turbo-asr-fp16` (pinned snapshot in runtime `STT_MODEL`),
+  `STT_PROVIDER=openai`, `STT_REQUEST_STYLE=verbose`, `STT_DIARIZATION=local`,
+  `STT_MAX_REQUEST_SECONDS=30`. The request limit avoided repeated Whisper text in the verified
+  sample; local sherpa-onnx diarization still covers the full conversation. Speaker models are
+  pyannote segmentation + TitaNet, and WeSpeaker for recognition.
+- **Summaries:** `LLM_PROVIDER=openai`, `LLM_BASE_URL=https://cliproxyapi.cool.zenan.ch/v1`,
+  `LLM_MODEL=gpt-6-luna`, `LLM_JSON_MODE=auto`, as requested by the user. Audio transcription and
+  speaker processing stay local; transcripts go to this summary provider. Credentials stay in
+  `server.env`. Read only selected non-secret fields when diagnosing; never dump the whole file.
+- **Local speech service:** `com.local.mlx-audio` is an existing login LaunchAgent. Its PATH must
+  include `/opt/homebrew/bin` for ffmpeg. The backend starts as a system daemon, but speech inference
+  still needs login; FileVault also requires an unlock after a cold boot. Do not claim the entire
+  pipeline works before login just because the backend is running.
+- **Storage preference:** the user chose Obsidian Sync and no separate backup. Do not set up Time
+  Machine or another backup workflow. Do not assume Sync is configured: verify the remote vault
+  connection and inclusion of `_omi/`/other file types when that work is requested. Keep the SQLite
+  index outside sync and run only one backend writer against the vault.
+
+### Updating or restarting the backend
+
+1. Prepare a tested release under `releases/` with its own `.venv` (`uv sync --frozen --extra
+   diarization`), required models and a `release.json` source-hash manifest. Keep credentials and
+   the vault outside the release. Run its `omi-notes doctor` with
+   `OMI_NOTES_ENV_FILE=/Users/alan/.config/omi-notes/server.env`.
+2. Inspect `launchctl print system/com.omi-notes.server` and the installed plist. **The daemon uses
+   an absolute release path, not the `current` symlink. Changing that symlink alone does not deploy.**
+   Generate a staged system plist from the new release's `.venv/bin/python -m omi_notes.launchd
+   --write-plist /Users/alan/.config/omi-notes/com.omi-notes.server.plist --user alan` with the same
+   external environment file. Stop the old writer before starting the new one; switch `current`
+   and install/bootstrap the reviewed plist. Keep the old release for rollback.
+3. The prepared installer is `/Users/alan/.config/omi-notes/enable-boot-start.sh`; it installs a
+   root-owned plist but runs the service as `alan`. Inspect/regenerate its staged plist first.
+   System installation needs administrator authentication. Prepare all artifacts before requesting
+   that authentication, and show any command the user must run in a normal, copyable chat message.
+   Do not reinstall the disabled login service alongside the system daemon.
+4. For a restart without changing the plist, gracefully `SIGTERM` the verified `alan`-owned service
+   PID; launchd's KeepAlive restarts it. Confirm the new PID and readiness. Alternatively use
+   `sudo launchctl kickstart -k system/com.omi-notes.server` when administrator access is available.
+5. A small source hotfix to the active release must be explicit and reversible: verify the old
+   hash, retain prior source/manifest under `hotfixes/<timestamp>/`, replace files atomically,
+   update `release.json`, restart gracefully and verify. Apply the same change to the repository.
+   Never leave an unrecorded difference between deployed code and its source manifest.
+
+For runtime maintenance, use the release's `.venv/bin/omi-notes` with the external environment
+file, not an unconfigured checkout command. `retry-failed` and `reprocess` queue work when the
+worker is running. Use read-only SQLite access for inspection and derive the actual database path
+from `load_settings().db_path`; the index base is not itself the database file.
+
+### Pairing and end-to-end verification
+
+- Preserve the existing Tailscale Serve routes and private HTTPS endpoint; do not enable Funnel.
+  The phone must be connected to Tailscale. Pairing QR/deep links contain the bearer token, so do
+  not put them in git or logs. The local pairing page is `~/.config/omi-notes/pairing.html`.
+  The temporary tailnet pairing page used port `9444` → loopback `18766`, an unguessable route and
+  an expiry. Inspect `pairing-web.json` / `serve-pairing.py` in the private config directory before
+  reusing it; do not assume the old link still works or serve the whole configuration directory.
+- `/healthz` checks HTTP only; `/v1/status` provider readiness is not proof of inference. Verify
+  authenticated HTTPS, new uploads and seals, processed chunk counts, queue/errors and actual
+  transcript + Markdown output. Use an existing phone recording or a clearly labeled synthetic
+  replay; distinguish synthetic deployment captures from real phone traffic in reports.
+- Voice enrollment must be accepted without transcription and stay out of recent conversations.
+  Speaker review is offered only when `speakers_ready` is true; verify the completed conversation's
+  speakers endpoint too. Never fabricate an empty success response for an unfinished transcript.
+- `waiting_for` start/end coverage and a later `provisional` close can be normal. Respect the
+  documented 120-second gap and coverage fallback; do not force-close conversations, delete audio
+  or change segmentation just to empty the queue. Report provider failures separately from waiting.
+- After a deployment, verify restart, private HTTPS and queue progress; for ingestion changes,
+  also verify a duplicate upload is acknowledged without duplicate processing. Retain sanitized
+  evidence under `build/deployment/`, and distinguish server changes already live from phone
+  changes that require installing the new TestFlight build.
