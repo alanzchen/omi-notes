@@ -56,23 +56,58 @@ public final class SpeakersModel {
 
     // MARK: Loading
 
+    /// The server this model's people and settings came from.
+    private var loadedFor: UploadConfig?
+
+    /// Another server (or none) is configured: nothing the previous one said may be shown or sent
+    /// back, including a copy of its recognition settings.
+    public func serverChanged() {
+        loadedFor = nil
+        people = []
+        settings = nil
+        suggestions = []
+        error = nil
+        serverSupportsEnrollment = nil
+        switch enrollment {
+        case .idle: break
+        case .checking, .reading: cancelEnrollment()
+        case .waiting, .finished, .failed:
+            pollTask?.cancel()
+            enrollment = .idle
+        }
+    }
+
+    private var isCurrentServer: Bool { loadedFor != nil && loadedFor == engine.settings.serverConfig() }
+
     public func refresh() async {
         loading = true
         defer { loading = false }
+        let config = engine.settings.serverConfig()
+        if config != loadedFor { serverChanged() }
+        guard let endpoint = config.endpoint else {
+            error = Self.describe(APIError.notConfigured)
+            return
+        }
+        let api = APIClient(endpoint: endpoint, session: session)
         // First and on its own: an older server fails the calls below, and must not keep the
         // capability of the server that answered last time.
         serverSupportsEnrollment = nil
-        serverSupportsEnrollment = try? await api().status().supportsVoiceEnrollment
+        let supports = try? await api.status().supportsVoiceEnrollment
+        guard engine.settings.serverConfig() == config else { return }
+        serverSupportsEnrollment = supports
         do {
-            let api = try api()
             async let p = api.people()
             async let s = api.speakerSettings()
-            people = try await p
-            settings = try await s
-            suggestions = settings?.unknownVoicesEnabled == true ? (try await api.speakerSuggestions()) : []
+            let (newPeople, newSettings) = try await (p, s)
+            let newSuggestions = newSettings.unknownVoicesEnabled == true ? (try await api.speakerSuggestions()) : []
+            guard engine.settings.serverConfig() == config else { return }  // answered by a server no longer configured
+            people = newPeople
+            settings = newSettings
+            suggestions = newSuggestions
+            loadedFor = config
             error = nil
         } catch {
-            self.error = Self.describe(error)
+            if engine.settings.serverConfig() == config { self.error = Self.describe(error) }
         }
     }
 
@@ -86,7 +121,12 @@ public final class SpeakersModel {
     public func setAutoAssign(_ on: Bool) async { await updateSettings { $0.autoAssign = on } }
 
     private func updateSettings(_ change: (inout SpeakerSettings) -> Void) async {
-        var next = settings ?? SpeakerSettings()
+        // Only ever send back settings this server gave us.
+        guard isCurrentServer, var next = settings else {
+            error = "Recognition settings haven't loaded from this server yet; try again."
+            await refresh()
+            return
+        }
         change(&next)
         do {
             settings = try await api().putSpeakerSettings(next)

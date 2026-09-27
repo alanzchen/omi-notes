@@ -40,7 +40,7 @@ import Testing
 
     @Test func allGoodIsNormal() throws {
         let h = health(streaming(), reachable(), try status())
-        #expect(h.level == .normal && h.headline == "Everything is working")
+        #expect(h.level == .normal && h.headline == "Connected; no reported problems")
         #expect(step(h, .notes).title.hasPrefix("Last note"))
     }
 
@@ -92,6 +92,22 @@ import Testing
         let h = health(streaming(), reachable(), st)
         #expect(step(h, .server).level == .needsAction)
         #expect(step(h, .notes).level == .normal)  // an older server can't say when; not "no notes"
+    }
+
+    @Test func missingHealthFieldsAreUnknownNeverGreen() throws {
+        for json in [#"{"ok":true}"#, #"{"queue":{"failed":0}}"#] {
+            let st = try JSONDecoder().decode(ServerStatus.self, from: Data(json.utf8))
+            let h = health(streaming(), reachable(), st)
+            #expect(step(h, .server).level == .unknown && h.level != .normal, "\(json)")
+        }
+    }
+
+    @Test func unconfiguredSummariesNeedAction() throws {
+        let body: [String: Any] = ["llm": ["provider": "anthropic", "ready": false], "stt": ["provider": "fake", "ready": true],
+                "queue": ["failed": 0], "worker": ["present": true]]
+        let st = try JSONDecoder().decode(ServerStatus.self, from: JSONSerialization.data(withJSONObject: body))
+        let h = health(streaming(), reachable(), st)
+        #expect(h.level == .needsAction && h.headline == "Summaries aren't set up on the server")
     }
 
     @Test func missingWorkerAndReadOnlyNeedAction() throws {
@@ -152,6 +168,14 @@ import Testing
         m.mergeFirstPage(page([row("d", 40), row("c", 30), row("b", 20), row("a", 10)], cursor: nil))  // simulate a loaded second page
         #expect(m.recent.map(\.id) == ["d", "c", "b", "a"])
         m.mergeFirstPage(page([row("e", 50), row("d", 40)], cursor: "c2"))
+        #expect(m.recent.map(\.id) == ["e", "d", "c", "b", "a"])
+    }
+
+    @Test func rowsSharingTheBoundaryTimeFollowTheServersIdOrder() {
+        let m = model()
+        m.mergeFirstPage(page([row("d", 40), row("c", 30), row("b", 30), row("a", 10)], cursor: nil))
+        // page one now ends at (30, "c"); "b" shares its time but comes after it in (start, id) order
+        m.mergeFirstPage(page([row("e", 50), row("d", 40), row("c", 30)], cursor: "next"))
         #expect(m.recent.map(\.id) == ["e", "d", "c", "b", "a"])
     }
 

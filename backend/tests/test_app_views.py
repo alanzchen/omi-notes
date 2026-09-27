@@ -229,3 +229,45 @@ def test_transcript_pages(client, worker, monkeypatch):
 ])  # fmt: skip
 def test_failure_messages_are_chosen_by_kind(kind, stage, text):
     assert views.failure_message(kind, stage) == text
+
+
+def test_guidance_follows_whether_the_server_will_retry(client, worker):
+    row = finished(client, worker)
+    worker.db.execute("UPDATE conversations SET status='failed', failed_stage='transcribing', error_kind='transient', "
+                      "note_path=NULL, error='x' WHERE id=?", (row["id"],))  # fmt: skip
+    (issue,) = problems(client)
+    assert "stopped retrying" in issue["next_step"] and "retry-failed" in issue["next_step"]
+    assert "retries on its own" not in issue["next_step"]
+    worker.db.execute("UPDATE conversations SET status='transcribing', next_attempt_at=? WHERE id=?", (T0 + 999, row["id"]))
+    (issue,) = problems(client)
+    assert issue["code"] == "conversation_retrying" and issue["next_step"].startswith("The server retries on its own.")
+
+
+def test_commands_name_this_deployment_and_the_full_id(client, worker, monkeypatch):
+    monkeypatch.setenv("OMI_NOTES_ENV_FILE", "/Users/me/.config/omi-notes/server.env")
+    row = finished(client, worker)
+    worker.db.execute("UPDATE conversations SET edited=1 WHERE id=?", (row["id"],))
+    (issue,) = problems(client)
+    assert row["id"] in issue["next_step"] and "OMI_NOTES_ENV_FILE=/Users/me/.config/omi-notes/server.env" in issue["next_step"]
+
+
+@pytest.mark.parametrize("content", [b"{not json", b"[1, 2]", b"\xff\xfe"])
+def test_an_unreadable_speakers_file_costs_names_not_the_list(client, worker, content):
+    row = finished(client, worker)
+    (worker.pipeline.conv_dir(row["id"]) / "speakers.json").write_bytes(content)
+    (listed,) = get(client, "/v1/conversations/recent")["conversations"]
+    assert listed["id"] == row["id"] and listed["speaker_names"] == []
+    body = get(client, f"/v1/conversations/{row['id']}")
+    assert body["transcript_state"] == "ready" and all(s["name"] is None for s in body["speakers"])
+
+
+def test_action_owners_use_the_name_the_note_was_rendered_with(client, worker):
+    row = finished(client, worker)
+    worker.db.execute("UPDATE conversations SET settings_json=? WHERE id=?",
+                      (json.dumps({"timezone": "America/Chicago", "owner_name": "Alan"}), row["id"]))  # fmt: skip
+    cached = worker.pipeline.conv_dir(row["id"]) / row["llm_ref"]
+    data = json.loads(cached.read_text())
+    data["data"]["action_items"] = [{"description": "Send the budget", "owner": "me"}]
+    cached.write_text(json.dumps(data))
+    (item,) = get(client, f"/v1/conversations/{row['id']}")["summary"]["action_items"]
+    assert item == {"description": "Send the budget", "owner": "me", "owner_name": "Alan", "due_date": None}

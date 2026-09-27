@@ -122,7 +122,7 @@ struct ConversationDetailView: View {
             Section("Action items") {
                 ForEach(items, id: \.self) { item in
                     VStack(alignment: .leading, spacing: 2) {
-                        Label(item.description, systemImage: "circle").textSelection(.enabled)
+                        Label(item.description, systemImage: "arrow.forward.circle").textSelection(.enabled)
                         let owner = owner(item)
                         if owner != nil || item.dueDate != nil {
                             Text([owner, item.dueDate.map { "due \($0)" }].compactMap { $0 }.joined(separator: " · "))
@@ -253,18 +253,10 @@ struct ConversationDetailView: View {
     }
 
     private func loadMoreTranscript() async {
-        guard var current = detail, let from = current.transcript?.nextFrom else { return }
         loadingMore = true
         defer { loadingMore = false }
         do {
-            let page = try await model.conversation(summary.id, segmentsFrom: from)
-            // A different transcript generation can't be appended: reload from the start.
-            guard page.transcriptSha == current.transcriptSha, let next = page.transcript else {
-                await load()
-                return
-            }
-            current.append(next)
-            model.remember(current)
+            try await model.loadMoreTranscript(summary.id)
         } catch {
             self.error = AppModel.describe(error)
         }

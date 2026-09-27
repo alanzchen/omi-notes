@@ -108,7 +108,6 @@ struct DiagnosticsView: View {
             if s.outbox.quarantineCount > 0 {
                 LabeledContent("Couldn't upload (kept)") { Text("\(s.outbox.quarantineCount)").foregroundStyle(.red) }
                 ForEach(s.quarantined, id: \.self) { Text($0).font(.caption.monospaced()) }
-                Button("Try the kept files again") { model.engine.requeueQuarantined() }
             }
             if let r = s.upload.lastResult {
                 LabeledContent("Last result") {
@@ -122,7 +121,7 @@ struct DiagnosticsView: View {
         } header: {
             Text("Uploads")
         } footer: {
-            Text("Files are deleted from this phone only after the server confirms it saved them. Kept files are never deleted automatically.")
+            Text("Files are deleted from this phone only after the server confirms it saved them. Files that couldn't be uploaded are kept, never deleted automatically.")
         }
     }
 

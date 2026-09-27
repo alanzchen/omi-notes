@@ -36,6 +36,8 @@ public final class AppModel {
     public private(set) var issues: [ServerIssue] = []
     public private(set) var recent: [ConversationSummary] = []
     public private(set) var recentError: String?
+    /// When the list last came from the server (nil: never, for this server).
+    public private(set) var recentLoadedAt: Date?
     /// Cursor for the next older page; nil when everything is loaded.
     public private(set) var recentCursor: String?
     public private(set) var loadingMore = false
@@ -47,8 +49,9 @@ public final class AppModel {
     public let engine: OmiEngine
     public let speakers: SpeakersModel
 
-    /// Every server answer is kept only while this is still the configured server.
-    private var answeredFor: ServerEndpoint?
+    /// Every server answer is kept only while this is still the configured server. The
+    /// configuration generation changes on every save, so A → B → A is a new server too.
+    private var answeredFor: UploadConfig?
 
     public static let pageSize = 20
 
@@ -72,25 +75,27 @@ public final class AppModel {
 
     // MARK: Server
 
-    /// Forgets everything a previous server said (another server, or none).
-    private func adopt(_ endpoint: ServerEndpoint?) {
-        guard endpoint != answeredFor else { return }
-        answeredFor = endpoint
+    /// Forgets everything a previous server said (another server, or none), people included.
+    private func adopt(_ config: UploadConfig) {
+        guard config != answeredFor else { return }
+        answeredFor = config
+        speakers.serverChanged()
         serverStatus = nil
         serverStatusAt = nil
         issues = []
         recent = []
         recentCursor = nil
         recentError = nil
+        recentLoadedAt = nil
         details = [:]
     }
 
-    private func isCurrent(_ endpoint: ServerEndpoint) -> Bool { engine.settings.endpoint == endpoint }
+    private func isCurrent(_ config: UploadConfig) -> Bool { engine.settings.serverConfig() == config }
 
     public func refreshServer() async {
-        let endpoint = engine.settings.endpoint
-        adopt(endpoint)
-        guard let endpoint else {
+        let config = engine.settings.serverConfig()
+        adopt(config)
+        guard let endpoint = config.endpoint else {
             server = .notConfigured
             return
         }
@@ -110,22 +115,25 @@ public final class AppModel {
         } catch {
             reach = .unreachable(Self.describe(error))
         }
-        guard isCurrent(endpoint) else { return }  // the server changed while we were asking
+        guard isCurrent(config) else { return }  // the server changed while we were asking
         server = reach
-        if let status {
-            serverStatus = status
-            serverStatusAt = Date()
+        guard let status else {
+            // Shown conversations (if any) are now of unknown freshness; an empty list isn't "none yet".
+            recentError = Self.describeReach(reach)
+            return
         }
-        guard status != nil else { return }
-        async let issuesTask: [ServerIssue]? = status?.supportsIssues == true ? try? api.issues() : []
+        serverStatus = status
+        serverStatusAt = Date()
+        async let issuesTask: [ServerIssue]? = status.supportsIssues ? try? api.issues() : []
         async let pageTask = Result { try await api.recentConversations(limit: Self.pageSize) }
         let (newIssues, page) = await (issuesTask, pageTask)
-        guard isCurrent(endpoint) else { return }
+        guard isCurrent(config) else { return }
         if let newIssues { issues = newIssues }
         switch page {
         case .success(let page):
             mergeFirstPage(page)
             recentError = nil
+            recentLoadedAt = Date()
         case .failure(let error):
             recentError = Self.describe(error)  // the list already shown stays, marked stale
         }
@@ -134,46 +142,73 @@ public final class AppModel {
     /// Refreshing page one keeps older pages already loaded: rows newer than the page's last one
     /// come from the page; older rows stay (with their cursor) unless the page is the whole list.
     func mergeFirstPage(_ page: RecentConversationsResponse) {
-        guard page.nextCursor != nil, let oldest = page.conversations.last?.startedAt, recent.count > page.conversations.count else {
+        guard page.nextCursor != nil, let last = page.conversations.last, recent.count > page.conversations.count else {
             recent = page.conversations
             recentCursor = page.nextCursor
             return
         }
+        // The server's order is (start, id) descending: keep exactly the rows after the page's last one.
+        func key(_ c: ConversationSummary) -> (Date, String) { (c.startedDate ?? .distantPast, c.id) }
         let ids = Set(page.conversations.map(\.id))
-        let older = recent.filter { !ids.contains($0.id) && ($0.startedAt ?? "") < oldest }
+        let older = recent.filter { !ids.contains($0.id) && key($0) < key(last) }
         recent = page.conversations + older
         // recentCursor still points past the older pages
     }
 
     public func loadMoreConversations() async {
-        guard let endpoint = engine.settings.endpoint, let cursor = recentCursor, !loadingMore else { return }
+        let config = engine.settings.serverConfig()
+        guard let endpoint = config.endpoint, config == answeredFor, let cursor = recentCursor, !loadingMore else { return }
         loadingMore = true
         defer { loadingMore = false }
         do {
             let page = try await APIClient(endpoint: endpoint).recentConversations(limit: Self.pageSize, before: cursor)
-            guard isCurrent(endpoint), recentCursor == cursor else { return }
+            guard isCurrent(config), recentCursor == cursor else { return }
             let ids = Set(recent.map(\.id))
             recent += page.conversations.filter { !ids.contains($0.id) }
             recentCursor = page.nextCursor
             recentError = nil
         } catch {
-            if isCurrent(endpoint) { recentError = Self.describe(error) }
+            if isCurrent(config) { recentError = Self.describe(error) }
         }
     }
 
-    /// Keeps a transcript page the view appended, so a stale copy shows everything that was read.
-    public func remember(_ detail: ConversationDetail) { details[detail.id] = detail }
+    /// Appends the next transcript page to the cached detail. The page must belong to the same
+    /// transcript *and* speaker assignments as what is shown, and the cached copy must not have
+    /// changed meanwhile; otherwise the whole detail is reloaded from the first page.
+    public func loadMoreTranscript(_ id: String) async throws {
+        guard let shown = details[id], let from = shown.transcript?.nextFrom else { return }
+        let page = try await conversation(id, segmentsFrom: from)
+        guard var current = details[id], current.transcript?.segments.count == shown.transcript?.segments.count,
+              current.transcriptSha == shown.transcriptSha, current.speakersRevision == shown.speakersRevision,
+              page.transcriptSha == current.transcriptSha, page.speakersRevision == current.speakersRevision,
+              let next = page.transcript, next.from == from
+        else {
+            _ = try await conversation(id)
+            return
+        }
+        current.append(next)
+        details[id] = current
+    }
 
     /// Detail for one conversation (and later transcript pages with `segmentsFrom`).
     public func conversation(_ id: String, segmentsFrom: Int = 0) async throws -> ConversationDetail {
-        guard let endpoint = engine.settings.endpoint else { throw APIError.notConfigured }
+        let config = engine.settings.serverConfig()
+        guard let endpoint = config.endpoint else { throw APIError.notConfigured }
         let detail = try await APIClient(endpoint: endpoint).conversation(id, segmentsFrom: segmentsFrom)
-        guard isCurrent(endpoint) else { throw APIError.transport("The server changed; reload.") }
+        guard isCurrent(config), config == answeredFor else { throw APIError.transport("The server changed; reload.") }
         if segmentsFrom == 0 {
             if let i = recent.firstIndex(where: { $0.id == id }) { recent[i] = detail.entry }
             details[id] = detail
         }
         return detail
+    }
+
+    static func describeReach(_ reach: ServerReachability) -> String {
+        switch reach {
+        case .unauthorized: return "The server rejected this phone"
+        case .unreachable(let why): return "Can't reach the server (\(why))"
+        default: return "Couldn't check the server"
+        }
     }
 
     public static func describe(_ error: Error) -> String {

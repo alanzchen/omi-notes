@@ -59,7 +59,7 @@ public struct SystemHealth: Equatable, Sendable {
         let lead = steps.first { $0.level == worst }!
         switch worst {
         case .normal:
-            return SystemHealth(level: .normal, headline: "Everything is working", detail: steps[3].title, steps: steps)
+            return SystemHealth(level: .normal, headline: "Connected; no reported problems", detail: steps[3].title, steps: steps)
         case .working:
             return SystemHealth(level: .working, headline: s.connection == .streaming ? "Recording; notes are catching up" : lead.title,
                                 detail: lead.title, steps: steps)
@@ -137,7 +137,7 @@ public struct SystemHealth: Equatable, Sendable {
         if !s.attention.isEmpty {
             return step(.delayed, s.attention[0], s.attention.count > 1 ? "and \(s.attention.count - 1) more" : nil)
         }
-        return step(.normal, "Everything on this phone is uploaded")
+        return step(.normal, "No files waiting to upload")
     }
 
     static func server(_ reach: ServerReachability, status: ServerStatus?, statusAt: Date?, now: Date) -> Step {
@@ -168,6 +168,9 @@ public struct SystemHealth: Equatable, Sendable {
         if status.stt?.ready == false {
             return step(.needsAction, "Transcription isn't set up on the server", nil, .openServer)
         }
+        if status.llm?.ready == false {
+            return step(.needsAction, "Summaries aren't set up on the server", "Transcripts are still saved.", .openServer)
+        }
         let failed = (q?.conversationsFailed).map { $0 + (q?.chunksFailed ?? 0) } ?? q?.failed ?? 0
         let conflicts = q?.notesConflicted ?? 0
         if failed + conflicts > 0 {
@@ -178,16 +181,23 @@ public struct SystemHealth: Equatable, Sendable {
             return step(.delayed, "The server is retrying \(retrying) conversation\(retrying == 1 ? "" : "s")",
                         "A service it uses is having trouble; it keeps trying on its own.", .openServer)
         }
-        let processing = q?.conversationsPending ?? 0
-        let queued = q?.chunksPending ?? 0
+        guard let q else {
+            return step(.unknown, "Server reachable; processing status unavailable", "This server version doesn't report its queue.")
+        }
+        let processing = q.conversationsPending ?? 0
+        let queued = q.chunksPending ?? 0
         if processing > 0 {
             return step(.working, "Processing \(processing) conversation\(processing == 1 ? "" : "s")")
         }
         if queued > 0 {
             return step(.working, "Reading new audio")
         }
-        let open = q?.conversationsOpen ?? 0
-        return step(.normal, "Server is running", open > 0 ? "Listening to \(open) conversation\(open == 1 ? "" : "s") in progress" : nil)
+        guard status.worker?.present == true else {
+            return step(.unknown, "Server reachable; processing status unavailable",
+                        "This server version doesn't report whether processing is running.")
+        }
+        let open = q.conversationsOpen ?? 0
+        return step(.normal, "Server is running", open > 0 ? "\(open) conversation\(open == 1 ? "" : "s") in progress" : nil)
     }
 
     static func notes(_ status: ServerStatus?, statusAt: Date?, now: Date) -> Step {
