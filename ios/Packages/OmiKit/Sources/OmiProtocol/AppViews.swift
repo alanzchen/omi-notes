@@ -4,13 +4,13 @@ import Foundation
 // optional, and an unknown state string is kept as-is rather than failing the decode.
 
 /// `GET /v1/conversations/{id}`: the list entry plus the note's content.
-public struct ConversationDetail: Decodable, Equatable, Sendable, Identifiable {
-    public struct Summary: Decodable, Equatable, Sendable {
-        public struct Section: Decodable, Equatable, Sendable, Hashable {
+public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
+    public struct Summary: Codable, Equatable, Sendable {
+        public struct Section: Codable, Equatable, Sendable, Hashable {
             public var heading: String
             public var bullets: [String]
         }
-        public struct ActionItem: Decodable, Equatable, Sendable, Hashable {
+        public struct ActionItem: Codable, Equatable, Sendable, Hashable {
             public var description: String
             /// `me`, `other` or `unknown`.
             public var owner: String?
@@ -36,12 +36,12 @@ public struct ConversationDetail: Decodable, Equatable, Sendable, Identifiable {
         }
     }
 
-    public struct Speaker: Decodable, Equatable, Sendable, Hashable {
+    public struct Speaker: Codable, Equatable, Sendable, Hashable {
         public var label: String
         public var name: String?
     }
 
-    public struct Segment: Decodable, Equatable, Sendable, Hashable {
+    public struct Segment: Codable, Equatable, Sendable, Hashable {
         public var start: String
         public var end: String
         public var speaker: String
@@ -49,7 +49,7 @@ public struct ConversationDetail: Decodable, Equatable, Sendable, Identifiable {
         public var text: String
     }
 
-    public struct Transcript: Decodable, Equatable, Sendable {
+    public struct Transcript: Codable, Equatable, Sendable {
         public var total: Int
         public var from: Int
         /// `segments_from` of the next page; nil on the last one.
@@ -124,6 +124,31 @@ public struct ConversationDetail: Decodable, Equatable, Sendable, Identifiable {
         transcript = try c.decodeIfPresent(Transcript.self, forKey: .transcript)
     }
 
+    /// The same flat shape the server sends (so a saved copy decodes like a fresh one).
+    public func encode(to encoder: Encoder) throws {
+        try entry.encode(to: encoder)
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encodeIfPresent(speechS, forKey: .speechS)
+        try c.encodeIfPresent(lostS, forKey: .lostS)
+        try c.encodeIfPresent(noteState, forKey: .noteState)
+        try c.encodeIfPresent(noteFrozen, forKey: .noteFrozen)
+        try c.encodeIfPresent(myNotes, forKey: .myNotes)
+        try c.encodeIfPresent(myNotesUnreadable, forKey: .myNotesUnreadable)
+        try c.encodeIfPresent(discardReason, forKey: .discardReason)
+        try c.encodeIfPresent(transcriptSha, forKey: .transcriptSha)
+        try c.encodeIfPresent(speakersRevision, forKey: .speakersRevision)
+        try c.encodeIfPresent(revision, forKey: .revision)
+        try c.encode(summaryState, forKey: .summaryState)
+        try c.encodeIfPresent(summaryError, forKey: .summaryError)
+        try c.encodeIfPresent(summary, forKey: .summary)
+        try c.encode(transcriptState, forKey: .transcriptState)
+        try c.encode(speakers, forKey: .speakers)
+        try c.encodeIfPresent(transcript, forKey: .transcript)
+    }
+
+    /// Everything the server has is loaded (a saved copy may hold only the first transcript pages).
+    public var transcriptComplete: Bool { transcript.map { $0.nextFrom == nil } ?? true }
+
     /// The display name of a speaker label: the person, else "Speaker N".
     public func speakerName(_ label: String) -> String {
         speakers.first { $0.label == label }?.name ?? Self.anonymous(label)
@@ -169,4 +194,47 @@ public struct ServerIssue: Decodable, Equatable, Sendable, Identifiable, Hashabl
 
 public struct ServerIssuesResponse: Decodable, Equatable, Sendable {
     public var issues: [ServerIssue]
+}
+
+/// A durable app retry (`POST /v1/conversations/{id}/retry`, `GET /v1/operations/{id}`).
+public struct RetryOperation: Codable, Equatable, Sendable, Identifiable {
+    public var id: String
+    public var kind: String?
+    public var conversationId: String?
+    public var stage: String?
+    /// `accepted`, `queued`, `running`, `backing_off`, `blocked`, `done`, `failed`, `superseded`.
+    public var state: String
+    public var requestedAt: String?
+    public var finishedAt: String?
+    public var message: String?
+
+    public var isFinished: Bool { ["done", "failed", "superseded"].contains(state) }
+
+    enum CodingKeys: String, CodingKey {
+        case id, kind, stage, state, message
+        case conversationId = "conversation_id"
+        case requestedAt = "requested_at"
+        case finishedAt = "finished_at"
+    }
+}
+
+public struct RetryOperationResponse: Decodable, Equatable, Sendable {
+    public var operation: RetryOperation
+}
+
+public struct ChunkRetryResponse: Decodable, Equatable, Sendable {
+    public var chunksQueued: Int
+    enum CodingKeys: String, CodingKey { case chunksQueued = "chunks_queued" }
+}
+
+/// `GET /v1/conversations/search`: a page like `/recent`, plus how many aren't searchable yet.
+public struct SearchResponse: Decodable, Equatable, Sendable {
+    public var conversations: [ConversationSummary]
+    public var nextCursor: String?
+    public var pending: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case conversations, pending
+        case nextCursor = "next_cursor"
+    }
 }

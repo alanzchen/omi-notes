@@ -18,6 +18,7 @@ struct ServerView: View {
         List {
             statusSection
             issuesSection
+            activitySection
             processingSection
             if let status { configurationSection(status) }
             connectionSection
@@ -77,6 +78,34 @@ struct ServerView: View {
                 Text("Commands run in Terminal on the computer that runs your server.")
             }
         }
+    }
+
+    @ViewBuilder private var activitySection: some View {
+        if let a = status?.activity {
+            Section {
+                if let running = a.running?.first {
+                    Label("\(running.stage == "summarizing" ? "Writing the summary of" : "Transcribing") the \(when(running.startedAt)) conversation",
+                          systemImage: "gearshape.2")
+                }
+                if let waiting = a.waiting, waiting > 0 {
+                    LabeledContent("Waiting", value: "\(waiting)\(a.oldestWaitingEndedAt.flatMap(ISO8601UTC.parse).map { " · oldest ended \(Fmt.relative($0))" } ?? "")")
+                }
+                if let backing = a.backingOff, backing > 0 {
+                    LabeledContent("Waiting to try again") { Text("\(backing)").foregroundStyle(.orange) }
+                }
+                ServiceCallsRow(title: "Transcription service", calls: a.stt)
+                if status?.llm?.provider != "none" { ServiceCallsRow(title: "Summary service", calls: a.llm) }
+            } header: {
+                Text("Now")
+            } footer: {
+                Text("A successful request to a service means it answered; the note still has to be written. Times reset when the server rebuilds its index.")
+            }
+        }
+    }
+
+    private func when(_ iso: String?) -> String {
+        guard let d = iso.flatMap(ISO8601UTC.parse) else { return "" }
+        return Calendar.current.isDateInToday(d) ? Fmt.time(d) : "\(Fmt.day(d)) \(Fmt.time(d))"
     }
 
     private var processingSection: some View {
@@ -163,6 +192,14 @@ struct IssueRow: View {
             if let step = issue.nextStep {
                 Text(LocalizedStringKey(step)).font(.caption).textSelection(.enabled)
             }
+            if issue.code == "conversation_failed", let id = issue.conversationId, model.canRetry {
+                RetryControl(model: model, conversationId: id)
+            }
+            if issue.code == "chunks_failed", model.canRetry {
+                Button("Try these audio files again") { Task { await model.retryFailedAudio() } }
+                    .buttonStyle(.bordered).controlSize(.small)
+                if let msg = model.retryMessages["chunks"] { Text(msg).font(.caption).foregroundStyle(.secondary) }
+            }
             if let id = issue.conversationId {
                 NavigationLink {
                     ConversationDetailView(model: model, summary: placeholder(id))
@@ -199,5 +236,60 @@ struct ServerConnectionView: View {
         }
         .navigationTitle("Server connection")
         .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+/// When a service last answered, and whether the latest request failed.
+struct ServiceCallsRow: View {
+    let title: String
+    let calls: ServerStatus.Activity.ProviderCalls?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+            if let calls {
+                if let ok = calls.lastOkAt.flatMap(ISO8601UTC.parse) {
+                    Text("Last successful request \(Fmt.relative(ok))").font(.caption).foregroundStyle(.secondary)
+                }
+                if let failed = calls.lastErrorAt.flatMap(ISO8601UTC.parse) {
+                    Text("Last attempt failed \(Fmt.relative(failed))\(calls.lastErrorKind.map { " (\($0))" } ?? "")")
+                        .font(.caption).foregroundStyle(calls.lastFailed ? .orange : .secondary)
+                }
+            } else {
+                Text("No requests since the server started keeping track").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// Retry a failed conversation, and follow the retry until the server says how it ended.
+struct RetryControl: View {
+    let model: AppModel
+    let conversationId: String
+    @State private var sending = false
+
+    private var op: RetryOperation? { model.retries[conversationId] }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let op, !op.isFinished {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text(op.message ?? op.state).font(.caption).foregroundStyle(.secondary)
+                }
+            } else {
+                Button(sending ? "Retrying…" : "Retry") {
+                    sending = true
+                    Task {
+                        await model.retry(conversationId: conversationId)
+                        sending = false
+                    }
+                }
+                .buttonStyle(.bordered).controlSize(.small).disabled(sending)
+                if let op, op.isFinished { Text(op.message ?? op.state).font(.caption).foregroundStyle(op.state == "done" ? .green : .orange) }
+            }
+            if let msg = model.retryMessages[conversationId] { Text(msg).font(.caption).foregroundStyle(.secondary) }
+        }
     }
 }

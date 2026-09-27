@@ -34,30 +34,48 @@ public final class AppModel {
     public private(set) var serverStatusAt: Date?
     public private(set) var lastCheckAt: Date?
     public private(set) var issues: [ServerIssue] = []
-    public private(set) var recent: [ConversationSummary] = []
+    public internal(set) var recent: [ConversationSummary] = []
     public private(set) var recentError: String?
     /// When the list last came from the server (nil: never, for this server).
     public private(set) var recentLoadedAt: Date?
     /// Cursor for the next older page; nil when everything is loaded.
-    public private(set) var recentCursor: String?
+    public internal(set) var recentCursor: String?
     public private(set) var loadingMore = false
     /// Conversations opened this session, shown (marked stale) when the server can't be reached.
-    public private(set) var details: [String: ConversationDetail] = [:]
+    public internal(set) var details: [String: ConversationDetail] = [:]
     public var pendingConfigure: ConfigureLink?
     public private(set) var logs: [LogLine] = []
 
     public let engine: OmiEngine
     public let speakers: SpeakersModel
+    /// Retries by conversation id: the server's latest answer, for the current server only.
+    public internal(set) var retries: [String: RetryOperation] = [:]
+    /// A short outcome to show next to a retry button (by conversation id; "chunks" for audio files).
+    public internal(set) var retryMessages: [String: String] = [:]
+    let retryStore: RetryStore
+    public let noteCache: NoteCache
+    /// Bumped when the cache is cleared or the server changes: an answer that started before then
+    /// is not saved (it would bring cleared notes back).
+    var cacheEpoch = 0
+    /// Set while the list shown is the saved copy (the server couldn't be reached).
+    public internal(set) var recentSavedAt: Date?
+    /// Conversations shown from the saved copy, with when it was saved.
+    public internal(set) var detailSavedAt: [String: Date] = [:]
 
     /// Every server answer is kept only while this is still the configured server. The
     /// configuration generation changes on every save, so A → B → A is a new server too.
     private var answeredFor: UploadConfig?
+    var answeredForConfig: UploadConfig? { answeredFor }
 
     public static let pageSize = 20
+    /// Injectable for tests (no network).
+    public var session: URLSession = APIClient.defaultSession
 
-    public init(engine: OmiEngine) {
+    public init(engine: OmiEngine, noteCache: NoteCache = .appDefault()) {
         self.engine = engine
+        self.noteCache = noteCache
         speakers = SpeakersModel(engine: engine)
+        retryStore = RetryStore(url: engine.config.dirs.root.appendingPathComponent("app-retries.json"))
         engine.setSnapshotSink { [weak self] s in
             Task { @MainActor [weak self] in self?.snapshot = s }
         }
@@ -88,9 +106,14 @@ public final class AppModel {
         recentError = nil
         recentLoadedAt = nil
         details = [:]
+        retries = [:]
+        retryMessages = [:]
+        recentSavedAt = nil
+        detailSavedAt = [:]
+        cacheEpoch += 1
     }
 
-    private func isCurrent(_ config: UploadConfig) -> Bool { engine.settings.serverConfig() == config }
+    func isCurrent(_ config: UploadConfig) -> Bool { engine.settings.serverConfig() == config }
 
     public func refreshServer() async {
         let config = engine.settings.serverConfig()
@@ -101,7 +124,7 @@ public final class AppModel {
         }
         server = .checking
         lastCheckAt = Date()
-        let api = APIClient(endpoint: endpoint)
+        let api = APIClient(endpoint: endpoint, session: session)
         let reach: ServerReachability
         var status: ServerStatus?
         do {
@@ -120,22 +143,28 @@ public final class AppModel {
         guard let status else {
             // Shown conversations (if any) are now of unknown freshness; an empty list isn't "none yet".
             recentError = Self.describeReach(reach)
+            if recent.isEmpty { showSavedList(config) }
             return
         }
         serverStatus = status
         serverStatusAt = Date()
+        let epoch = cacheEpoch
         async let issuesTask: [ServerIssue]? = status.supportsIssues ? try? api.issues() : []
         async let pageTask = Result { try await api.recentConversations(limit: Self.pageSize) }
         let (newIssues, page) = await (issuesTask, pageTask)
         guard isCurrent(config) else { return }
         if let newIssues { issues = newIssues }
+        await settleRetries(api: api, config: config)
         switch page {
         case .success(let page):
             mergeFirstPage(page)
             recentError = nil
             recentLoadedAt = Date()
+            recentSavedAt = nil
+            if epoch == cacheEpoch, let scope = cacheScope(config) { noteCache.saveRecent(page.conversations, scope: scope) }
         case .failure(let error):
             recentError = Self.describe(error)  // the list already shown stays, marked stale
+            if recent.isEmpty { showSavedList(config) }
         }
     }
 
@@ -161,7 +190,7 @@ public final class AppModel {
         loadingMore = true
         defer { loadingMore = false }
         do {
-            let page = try await APIClient(endpoint: endpoint).recentConversations(limit: Self.pageSize, before: cursor)
+            let page = try await APIClient(endpoint: endpoint, session: session).recentConversations(limit: Self.pageSize, before: cursor)
             guard isCurrent(config), recentCursor == cursor else { return }
             let ids = Set(recent.map(\.id))
             recent += page.conversations.filter { !ids.contains($0.id) }
@@ -188,17 +217,27 @@ public final class AppModel {
         }
         current.append(next)
         details[id] = current
+        saveForOffline(current, engine.settings.serverConfig())
     }
 
     /// Detail for one conversation (and later transcript pages with `segmentsFrom`).
     public func conversation(_ id: String, segmentsFrom: Int = 0) async throws -> ConversationDetail {
         let config = engine.settings.serverConfig()
         guard let endpoint = config.endpoint else { throw APIError.notConfigured }
-        let detail = try await APIClient(endpoint: endpoint).conversation(id, segmentsFrom: segmentsFrom)
+        let epoch = cacheEpoch
+        let detail: ConversationDetail
+        do {
+            detail = try await APIClient(endpoint: endpoint, session: session).conversation(id, segmentsFrom: segmentsFrom)
+        } catch {
+            if segmentsFrom == 0, isCurrent(config), details[id] == nil { showSavedDetail(id, config) }
+            throw error
+        }
         guard isCurrent(config), config == answeredFor else { throw APIError.transport("The server changed; reload.") }
         if segmentsFrom == 0 {
             if let i = recent.firstIndex(where: { $0.id == id }) { recent[i] = detail.entry }
             details[id] = detail
+            detailSavedAt[id] = nil
+            if epoch == cacheEpoch { saveForOffline(detail, config) }
         }
         return detail
     }

@@ -20,7 +20,23 @@ struct ConversationDetailView: View {
     var body: some View {
         List {
             header
+            if let saved = model.detailSavedAt[summary.id] {
+                Section {
+                    Label("Saved copy from \(Fmt.relative(saved)). The server can't be reached right now.", systemImage: "tray.full")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    if detail?.transcriptComplete == false {
+                        Text("Only part of the transcript was saved on this phone.").font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+            }
             if let detail {
+                if detail.entry.status == "failed", model.canRetry, model.detailSavedAt[summary.id] == nil {
+                    Section {
+                        RetryControl(model: model, conversationId: detail.id)
+                    } footer: {
+                        Text("Redoes the step that failed. If a service's key or account is the problem, fix that on the server first.")
+                    }
+                }
                 caveats(detail)
                 summarySection(detail)
                 if let s = detail.summary { details(s) }
@@ -30,7 +46,7 @@ struct ConversationDetailView: View {
             } else if error == nil {
                 Section { HStack { ProgressView(); Text("Loading…").foregroundStyle(.secondary).padding(.leading, 6) } }
             }
-            if let error {
+            if let error, model.detailSavedAt[summary.id] == nil {
                 Section {
                     Label(detail == nil ? "Couldn't load this conversation: \(error)" : "Couldn't refresh (\(error)); showing what was loaded before.",
                           systemImage: "wifi.exclamationmark")

@@ -267,6 +267,47 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
             case notesConflicted = "notes_conflicted"
         }
     }
+    /// What the pipeline is doing (newer servers).
+    public struct Activity: Decodable, Equatable, Sendable {
+        public struct Running: Decodable, Equatable, Sendable {
+            public var conversationId: String
+            public var stage: String
+            public var startedAt: String?
+            enum CodingKeys: String, CodingKey {
+                case conversationId = "conversation_id"
+                case stage
+                case startedAt = "started_at"
+            }
+        }
+        /// Last requests to a provider: success doesn't mean a finished transcript or note yet.
+        public struct ProviderCalls: Decodable, Equatable, Sendable {
+            public var lastOkAt: String?
+            public var lastErrorAt: String?
+            public var lastErrorKind: String?
+            enum CodingKeys: String, CodingKey {
+                case lastOkAt = "last_ok_at"
+                case lastErrorAt = "last_error_at"
+                case lastErrorKind = "last_error_kind"
+            }
+
+            /// The most recent request failed.
+            public var lastFailed: Bool {
+                guard let e = lastErrorAt.flatMap(ISO8601UTC.parse) else { return false }
+                return lastOkAt.flatMap(ISO8601UTC.parse).map { e > $0 } ?? true
+            }
+        }
+        public var running: [Running]?
+        public var waiting: Int?
+        public var backingOff: Int?
+        public var oldestWaitingEndedAt: String?
+        public var stt: ProviderCalls?
+        public var llm: ProviderCalls?
+        enum CodingKeys: String, CodingKey {
+            case running, waiting, stt, llm
+            case backingOff = "backing_off"
+            case oldestWaitingEndedAt = "oldest_waiting_ended_at"
+        }
+    }
     public struct Worker: Decodable, Equatable, Sendable {
         /// A process holds the worker lock (pipeline or maintenance): present, not proof of progress.
         public var present: Bool?
@@ -280,6 +321,8 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
     public var llm: Provider?
     public var queue: Queue?
     public var worker: Worker?
+    public var activity: Activity?
+    public var vaultId: String?
     public var lastNoteAt: String?
     public var notesDir: String?
     /// Why the vault stopped accepting writes (nil: writable, or an older server).
@@ -293,7 +336,8 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
         case protocolVersion = "protocol_version"
         case serverTime = "server_time"
         case serverStartedAt = "server_started_at"
-        case stt, llm, queue, worker
+        case stt, llm, queue, worker, activity
+        case vaultId = "vault_id"
         case lastNoteAt = "last_note_at"
         case notesDir = "notes_dir"
         case readOnly = "read_only"
@@ -304,6 +348,8 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
     public var supportsVoiceEnrollment: Bool { features?.contains("voice_enrollment") == true }
     public var supportsConversationDetail: Bool { features?.contains("conversation_detail") == true }
     public var supportsIssues: Bool { features?.contains("issues") == true }
+    public var supportsRetry: Bool { features?.contains("retry") == true }
+    public var supportsSearch: Bool { features?.contains("search") == true }
 }
 
 public struct CaptureStatusResponse: Decodable, Equatable, Sendable {
@@ -322,12 +368,12 @@ public struct CaptureStatusResponse: Decodable, Equatable, Sendable {
 }
 
 /// A display state chosen by the server (`state`) or a problem next to readable content (`issues`).
-public struct ConversationFlag: Decodable, Equatable, Sendable, Hashable {
+public struct ConversationFlag: Codable, Equatable, Sendable, Hashable {
     public var code: String
     public var message: String
 }
 
-public struct ConversationSummary: Decodable, Equatable, Hashable, Sendable, Identifiable {
+public struct ConversationSummary: Codable, Equatable, Hashable, Sendable, Identifiable {
     public var id: String
     public var status: String
     public var state: ConversationFlag?

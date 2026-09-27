@@ -11,6 +11,7 @@ struct HomeView: View {
 
     private var s: EngineSnapshot { model.snapshot }
     @State private var debugOpened: ConversationSummary?
+    @State private var query = HomeView.debugSearch
 
     /// Simulator automation only (debug builds): `-OmiNotesDebugOpenConversation YES` opens the
     /// newest conversation once it has loaded (a headless simulator can't tap).
@@ -22,16 +23,30 @@ struct HomeView: View {
         #endif
     }
 
+    /// Simulator automation only (debug builds): `-OmiNotesDebugSearch <text>` starts with that search.
+    private static var debugSearch: String {
+        #if DEBUG
+        return UserDefaults.standard.string(forKey: "OmiNotesDebugSearch") ?? ""
+        #else
+        return ""
+        #endif
+    }
+
     var body: some View {
         List {
-            Section {
-                TimelineView(.periodic(from: .now, by: 30)) { context in
-                    HealthCard(health: model.health(now: context.date), onFix: onFix)
+            if query.trimmingCharacters(in: .whitespaces).isEmpty {
+                Section {
+                    TimelineView(.periodic(from: .now, by: 30)) { context in
+                        HealthCard(health: model.health(now: context.date), onFix: onFix)
+                    }
                 }
+                needsYouSection
+                conversationSections
+            } else {
+                SearchResults(model: model, query: query)
             }
-            needsYouSection
-            conversationSections
         }
+        .searchable(text: $query, prompt: "Search conversations")
         .navigationTitle("Omi Notes")
         .refreshable { await model.refreshServer() }
         .task { await model.speakers.refresh() }
@@ -88,6 +103,7 @@ struct HomeView: View {
                 if let error = model.recentError {
                     Label("Couldn't load conversations: \(error)", systemImage: "wifi.exclamationmark")
                         .font(.subheadline).foregroundStyle(.secondary)
+                    NavigationLink("Notes saved on this phone") { SavedConversationsView(model: model) }
                 } else if model.serverURL == nil {
                     Text("Connect your server to see your conversations here.").font(.subheadline).foregroundStyle(.secondary)
                 } else {
@@ -113,8 +129,13 @@ struct HomeView: View {
                     }
                     .disabled(model.loadingMore)
                 }
+                if model.recentSavedAt != nil || model.recentError != nil {
+                    NavigationLink("Notes saved on this phone") { SavedConversationsView(model: model) }
+                }
             } footer: {
-                if let error = model.recentError {
+                if let saved = model.recentSavedAt {
+                    Text("The server can't be reached. Showing the list saved \(Fmt.relative(saved)).")
+                } else if let error = model.recentError {
                     Text("Couldn't refresh (\(error)). Showing what was loaded before.")
                 }
             }
@@ -177,5 +198,99 @@ struct ConversationRow: View {
         if let names = c.speakerNames, !names.isEmpty { parts.append(names.joined(separator: ", ")) }
         if c.provisional == true { parts.append("may be incomplete") }
         return parts.joined(separator: " · ")
+    }
+}
+
+/// Search results under Home's search field: the server's, or the saved copies when offline.
+struct SearchResults: View {
+    let model: AppModel
+    let query: String
+    @State private var personId: String?
+    @State private var range: AppModel.SearchRange = .any
+    @State private var result: AppModel.SearchResult?
+    @State private var error: String?
+    @State private var loading = false
+
+    var body: some View {
+        Section {
+            Picker("When", selection: $range) {
+                ForEach(AppModel.SearchRange.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            if !model.speakers.people.isEmpty {
+                Picker("Person", selection: $personId) {
+                    Text("Anyone").tag(String?.none)
+                    ForEach(model.speakers.people) { p in Text(p.name).tag(Optional(p.id)) }
+                }
+            }
+        }
+        Section {
+            if let result {
+                if result.conversations.isEmpty {
+                    Text(loading ? "Searching…" : "No matching conversations.").foregroundStyle(.secondary)
+                }
+                ForEach(result.conversations) { c in ConversationLink(model: model, conversation: c) }
+                if result.nextCursor != nil {
+                    Button("Show more") { Task { await load(more: true) } }.disabled(loading)
+                }
+            } else if let error {
+                Text("Couldn't search: \(error)").foregroundStyle(.secondary)
+            } else {
+                HStack { ProgressView(); Text("Searching…").foregroundStyle(.secondary).padding(.leading, 6) }
+            }
+        } footer: {
+            if result?.offline == true {
+                Text("The server can't be reached, so only notes saved on this phone were searched (their transcripts may be partial).")
+            } else if let pending = result?.pending, pending > 0 {
+                Text("\(pending) conversation\(pending == 1 ? " isn't" : "s aren't") searchable yet; the server is still indexing.")
+            }
+        }
+        .task(id: "\(query)|\(personId ?? "")|\(range.rawValue)") {
+            try? await Task.sleep(for: .milliseconds(300))  // wait for typing to pause
+            guard !Task.isCancelled else { return }
+            await load(more: false)
+        }
+    }
+
+    private func load(more: Bool) async {
+        loading = true
+        defer { loading = false }
+        let answer = await model.search(query, personId: personId, range: range, before: more ? result?.nextCursor : nil)
+        switch answer {
+        case .success(let r):
+            if more, var current = result {
+                let ids = Set(current.conversations.map(\.id))
+                current.conversations += r.conversations.filter { !ids.contains($0.id) }
+                current.nextCursor = r.nextCursor
+                result = current
+            } else {
+                result = r
+            }
+            error = nil
+        case .failure(let e):
+            error = AppModel.describe(e)
+        }
+    }
+}
+
+/// Conversations kept on this phone for reading without a connection.
+struct SavedConversationsView: View {
+    let model: AppModel
+
+    var body: some View {
+        let saved = model.savedConversations()
+        List {
+            if saved.isEmpty {
+                Text("Nothing saved yet. Conversations you open are kept here for reading offline.").foregroundStyle(.secondary)
+            }
+            ForEach(saved) { d in
+                NavigationLink {
+                    ConversationDetailView(model: model, summary: d.entry)
+                        .onAppear { model.openSaved(d) }
+                } label: {
+                    ConversationRow(conversation: d.entry)
+                }
+            }
+        }
+        .navigationTitle("Saved on this phone")
     }
 }

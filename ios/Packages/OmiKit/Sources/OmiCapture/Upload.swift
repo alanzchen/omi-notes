@@ -644,6 +644,33 @@ public struct APIClient: Sendable {
         return r.issues
     }
 
+    /// `202` for a new retry, `200` for a repeated request id; both return the operation.
+    public func retry(conversationId: String, requestId: String) async throws -> RetryOperation {
+        let body = try JSONSerialization.data(withJSONObject: ["request_id": requestId])
+        let r: RetryOperationResponse = try await send("POST", "/v1/conversations/\(Self.queryValue(conversationId))/retry", body: body)
+        return r.operation
+    }
+
+    public func operation(_ id: String) async throws -> RetryOperation {
+        let r: RetryOperationResponse = try await get("/v1/operations/\(Self.queryValue(id))")
+        return r.operation
+    }
+
+    public func retryFailedChunks() async throws -> Int {
+        let r: ChunkRetryResponse = try await send("POST", "/v1/chunks/retry", body: nil)
+        return r.chunksQueued
+    }
+
+    public func search(query: String, personId: String? = nil, from: String? = nil, to: String? = nil,
+                       before: String? = nil, limit: Int = 20) async throws -> SearchResponse {
+        var q = ["q=\(Self.queryValue(query))", "limit=\(limit)"]
+        if let personId { q.append("person_id=\(Self.queryValue(personId))") }
+        if let from { q.append("date_from=\(from)") }
+        if let to { q.append("date_to=\(to)") }
+        if let before { q.append("before=\(Self.queryValue(before))") }
+        return try await get("/v1/conversations/search", query: q.joined(separator: "&"))
+    }
+
     static func queryValue(_ s: String) -> String {
         s.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~"))) ?? s
     }
@@ -664,8 +691,17 @@ public struct APIClient: Sendable {
     }
 
     private func get<T: Decodable>(_ path: String, query: String? = nil) async throws -> T {
+        try await send("GET", path, query: query, body: nil)
+    }
+
+    private func send<T: Decodable>(_ method: String, _ path: String, query: String? = nil, body: Data?) async throws -> T {
         guard let url = endpoint.url(path, query: query) else { throw APIError.notConfigured }
         var req = URLRequest(url: url)
+        req.httpMethod = method
+        if let body {
+            req.httpBody = body
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
         req.setValue("Bearer \(endpoint.token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         let data: Data

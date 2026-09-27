@@ -178,6 +178,12 @@ public struct SystemHealth: Equatable, Sendable {
             return step(.needsAction, "\(n) item\(n == 1 ? " needs" : "s need") your attention", "See Server for what happened and what to do.", .openServer)
         }
         if let retrying = q?.conversationsRetrying, retrying > 0 {
+            let a = status.activity
+            let failing = a?.stt?.lastFailed == true ? ("transcription", a?.stt) : a?.llm?.lastFailed == true ? ("summary", a?.llm) : nil
+            if let (service, calls) = failing, let at = calls?.lastErrorAt.flatMap(ISO8601UTC.parse) {
+                return step(.delayed, "The \(service) service is having trouble",
+                            "Last attempt failed \(relative(at, now)). The server keeps trying on its own.", .openServer)
+            }
             return step(.delayed, "The server is retrying \(retrying) conversation\(retrying == 1 ? "" : "s")",
                         "A service it uses is having trouble; it keeps trying on its own.", .openServer)
         }
@@ -187,7 +193,10 @@ public struct SystemHealth: Equatable, Sendable {
         let processing = q.conversationsPending ?? 0
         let queued = q.chunksPending ?? 0
         if processing > 0 {
-            return step(.working, "Processing \(processing) conversation\(processing == 1 ? "" : "s")")
+            let running = status.activity?.running?.first
+            let doing = running.map { $0.stage == "summarizing" ? "Writing a summary" : "Transcribing a conversation" }
+            return step(.working, doing ?? "Processing \(processing) conversation\(processing == 1 ? "" : "s")",
+                        processing > 1 ? "\(processing) conversations to go" : nil)
         }
         if queued > 0 {
             return step(.working, "Reading new audio")

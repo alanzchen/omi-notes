@@ -21,6 +21,7 @@ struct SettingsView: View {
                 Text("Audio goes from the pendant to this phone, then to your own server. This app sends it nowhere else. Your server decides which services receive your audio and transcripts; see Server → Configuration.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
+            SavedNotesSection(model: model)
             Section("About") {
                 LabeledContent("Version", value: Self.version)
             }
@@ -32,6 +33,26 @@ struct SettingsView: View {
     static var version: String {
         let info = Bundle.main.infoDictionary
         return "\(info?["CFBundleShortVersionString"] as? String ?? "?") (\(info?["CFBundleVersion"] as? String ?? "?"))"
+    }
+}
+
+/// Notes kept on this phone for reading offline.
+struct SavedNotesSection: View {
+    let model: AppModel
+    @State private var cleared = false
+
+    var body: some View {
+        Section {
+            Button("Clear saved notes", role: .destructive) {
+                model.clearSavedNotes()
+                cleared = true
+            }
+            if cleared { Text("Cleared. Notes are saved again as you read them.").font(.footnote).foregroundStyle(.secondary) }
+        } header: {
+            Text("Saved on this phone")
+        } footer: {
+            Text("Notes you open are kept on this phone (up to \(NoteCache.maxDetails)) so you can read them without a connection. iOS may remove them to free space; your server always has the originals.")
+        }
     }
 }
 
