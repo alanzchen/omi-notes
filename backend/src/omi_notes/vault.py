@@ -34,7 +34,10 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-FORMAT = 1
+# 2: conversation records may carry app-retry state (`retry`, `retry_outcome`) and `_omi/operations/`
+# exists. A vault is only raised to 2 when the first retry is accepted, so an older backend refuses
+# it rather than rewriting records without that state.
+FORMAT = 2
 OMI = "_omi"
 LEASE_RENEW_SECONDS = 5 * 60
 LEASE_STALE_SECONDS = 15 * 60
@@ -195,6 +198,19 @@ class Vault:
         log.info("initialized vault %s (%s)", vault.root, vault.vault_id)
         return vault
 
+    @property
+    def format(self) -> int:
+        return int(self.info.get("format", 1))
+
+    def raise_format(self, fmt: int) -> None:
+        """Mark the vault as using a newer format's data (durably, before that data is written), so
+        an older backend refuses it instead of silently dropping what it doesn't understand."""
+        if self.format >= fmt:
+            return
+        info = dict(self.info) | {"format": fmt}
+        self.write_json(self.vault_json, info)
+        self.info = info
+
     def sync_render_settings(self, settings: Settings) -> None:
         """Record explicitly configured render-affecting settings (TIMEZONE, OWNER_NAME) in
         VAULT.json, so another machine pointed at this vault renders the same notes."""
@@ -340,7 +356,7 @@ class Vault:
 def new_vault_info(settings: Settings, *, now: float | None = None) -> dict:
     return {
         "vault_id": str(uuid.uuid4()),
-        "format": FORMAT,
+        "format": 1,  # raised only when data needing a newer format is first written (`raise_format`)
         "created_at": time.time() if now is None else now,
         # Render-affecting, non-secret settings: another machine renders the same notes.
         "timezone": settings.timezone,

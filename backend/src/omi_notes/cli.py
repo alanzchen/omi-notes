@@ -700,6 +700,10 @@ def reprocess(
         rows = w.db.query("SELECT * FROM conversations WHERE start >= ? AND status<>'open'", (start,))
     else:
         raise typer.BadParameter("give a conversation id or --since")
+    queued = [r for r in rows if r["retry_op"]]
+    if queued:  # the app's durable retry owns their next attempt (docs/vault.md, "Operations")
+        typer.echo(f"Skipping {len(queued)} conversation(s) with an app retry queued: {', '.join(r['id'] for r in queued)}")
+        rows = [r for r in rows if not r["retry_op"]]
     for row in rows:
         # A request is recorded apart from the execution status, so a stage running right now
         # cannot overwrite it; the pipeline consumes it atomically.

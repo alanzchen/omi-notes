@@ -271,3 +271,28 @@ def test_action_owners_use_the_name_the_note_was_rendered_with(client, worker):
     cached.write_text(json.dumps(data))
     (item,) = get(client, f"/v1/conversations/{row['id']}")["summary"]["action_items"]
     assert item == {"description": "Send the budget", "owner": "me", "owner_name": "Alan", "due_date": None}
+
+
+def test_activity_reports_waiting_work_and_real_provider_calls(client, worker, settings):
+    replay(client, SPEECH)
+    worker.tick(T0 + 15)
+    activity = get(client, "/v1/status")["activity"]
+    assert activity["waiting"] == 0 and activity["stt"] is None and activity["running"] == []
+
+    from omi_notes.telemetry import RecordingProviders
+
+    worker.providers = worker.pipeline.providers = RecordingProviders(settings, db=worker.db)
+    worker.tick(T0 + 400)
+    activity = get(client, "/v1/status")["activity"]
+    assert activity["stt"]["last_ok_at"] and activity["stt"]["last_error_at"] is None
+    assert activity["llm"]["last_ok_at"]
+    before = activity["stt"]["last_ok_at"]
+    row = convs(worker)[0]
+    worker.db.execute("UPDATE conversations SET status='closed' WHERE id=?", (row["id"],))
+    worker.tick(T0 + 500)  # the cached transcription is reused: no provider request
+    assert get(client, "/v1/status")["activity"]["stt"]["last_ok_at"] == before
+
+    worker.db.execute("UPDATE conversations SET status='summarizing', error='x', next_attempt_at=? WHERE id=?",
+                      (1e12, row["id"]))  # fmt: skip
+    activity = get(client, "/v1/status")["activity"]
+    assert activity["backing_off"] == 1 and activity["waiting"] == 0

@@ -36,7 +36,11 @@ operational index. Copy the folder anywhere, point a backend at it, and it rebui
     people/<person_id>/enrollments/<id>.json       enrollment result
     speakers/settings.json                         recognition acknowledgment, unknown-voice opt-in, dismissed suggestions
     displaced/<sha>.md                             user-edited note versions set aside by an explicit "overwrite"
+    operations/<request_id>.json                   app retries: accepted → done | failed | superseded (see "Operations")
 ```
+
+`VAULT.json` `format` is 1 until the first app retry raises it to 2 (records may then carry retry
+state); an older backend refuses a format-2 vault instead of rewriting records without it.
 
 No lock files, temp files, logs, or caches that aren't referenced results live in the vault.
 
@@ -46,6 +50,9 @@ No lock files, temp files, logs, or caches that aren't referenced results live i
 (override `INDEX_DIR`). Holds the job queue, retries/backoff, claims, dirty days, and a cache of
 file facts. No index migrations: schema version, vault id, or path mismatch ⇒ rebuild.
 The host lock (`flock`) lives in the index directory, **not** in the synced vault.
+
+The `search_index` table and the provider telemetry in `meta` are operational: the worker refills
+search entries after a rebuild, and telemetry starts over.
 
 Every SQLite column has a declared mapping (vault file, or "operational — rebuilt from X");
 a schema-introspection test fails when a column lacks one.
@@ -94,6 +101,31 @@ Divergence — sync conflict-copy filenames or duplicate record ids under `_omi/
 is reported; never auto-merged. Supported setup: the writer's vault is on local disk and sync tools
 replicate outward. `doctor` warns for iCloud Drive (`~/Library/Mobile Documents`), and that
 Obsidian Sync needs "Sync all other types" and enough storage (30 days of raw ≈ 3–4 GB).
+
+## Operations
+
+A retry requested by the phone (`POST /v1/conversations/{id}/retry`) is durable before it is
+acknowledged:
+
+1. Under `operations.lock` and the conversation's work claim, and only for a `failed`, unfrozen,
+   unconflicted conversation with no other retry pending: write
+   `operations/<request_id>.json` `{id, kind: "retry", conversation_id, stage, failure_kind,
+   record_sha, requested_at, state: "accepted"}`.
+2. Commit `retry: {op, stage}` into `conversation.json` (then the index), then bump the reprocess
+   counter to wake the worker. `202`.
+3. The worker redoes the failed stage (transcribing even when an older transcript exists),
+   reusing cached results. The outcome is committed with `retry_outcome: {op, status,
+   failure_kind, finished_at}` in the same record write as the success or failure; the operation
+   file is then closed (`done` / `failed`) and never changes again.
+
+A record with `retry` but no `failure` (consumed, unfinished) rebuilds as queued at the retried
+stage, never as `done` from an older note. Reconciliation (every worker tick, bounded; and a
+repeated POST) closes operations whose outcome is recorded, wakes accepted ones a rebuild reset,
+and re-queues an operation whose record never got `retry` only while the record is still the exact
+failure it was accepted for (`record_sha`); otherwise it is `superseded`. A repeated request id
+returns the same operation; a request id reused for another conversation is `409`. Reprocess and
+resummarize requests leave a conversation with a pending retry alone. A provider call repeats
+only if the process dies between its response and the cache write.
 
 ## Retention
 

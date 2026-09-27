@@ -6,7 +6,8 @@
   `retry-failed`) try to take it: if they get it they run inline, otherwise they only queue work
   (DB flags) for the running worker. `rebuild-index` needs both.
 - `speakers.lock` (`SpeakerLock`): serializes speaker-label read-modify-writes between the API and
-  the worker, also when the worker is a separate process.
+  the worker, also when the worker is a separate process. `operations.lock` (the same class)
+  serializes app-retry operation files (`operations.py`).
 
 They live in one folder per vault *path* under LOCK_DIR (default: next to the index root), so every
 process using a vault on this host finds them whatever its INDEX_DIR — and never inside the synced
@@ -106,8 +107,8 @@ class SpeakerLock:
     _shared: dict[str, tuple[threading.RLock, threading.local]] = {}  # per lock file, for every instance
     _guard = threading.Lock()
 
-    def __init__(self, vault) -> None:
-        self.path = locks_dir(vault) / "speakers.lock"
+    def __init__(self, vault, name: str = "speakers.lock") -> None:
+        self.path = locks_dir(vault) / name
         key = os.path.realpath(self.path)
         with self._guard:
             self._rlock, self._local = self._shared.setdefault(key, (threading.RLock(), threading.local()))

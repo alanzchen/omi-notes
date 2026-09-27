@@ -366,6 +366,40 @@ def server_issues(db, *, read_only: str | None, worker: bool, limit: int = ISSUE
     return out[:limit]
 
 
+def activity(db, settings, now: float) -> dict:
+    """What the pipeline is doing now, for `/v1/status` (cheap: a few indexed queries)."""
+    from . import telemetry
+
+    queue = f"status IN ('closed','transcribing','summarizing') AND {LISTED}"
+    running = [{"conversation_id": r["id"], "stage": "summarizing" if r["status"] == "summarizing" else "transcribing",
+                "started_at": iso_utc_epoch(r["start"])}
+               for r in db.query(f"SELECT id, status, start FROM conversations WHERE {queue} AND claim_token IS NOT NULL "
+                                 "AND claim_expires > ? ORDER BY start LIMIT 5", (now,))]  # fmt: skip
+    waiting = db.one(f"SELECT COUNT(*) AS n, MIN(\"end\") AS oldest FROM conversations WHERE {queue} "
+                     "AND (next_attempt_at IS NULL OR next_attempt_at <= ?)", (now,))  # fmt: skip
+    backing_off = db.one(f"SELECT COUNT(*) AS n FROM conversations WHERE {queue} AND next_attempt_at > ?", (now,))["n"]
+    chunk = db.one("SELECT MIN(received_at) AS t FROM chunks WHERE status='pending'")
+
+    def provider(kind: str) -> dict | None:
+        stats = telemetry.read(db, settings, kind)
+        if not stats:
+            return None
+        return {"last_ok_at": iso_utc_epoch(stats["last_ok_at"]) if stats.get("last_ok_at") else None,
+                "last_error_at": iso_utc_epoch(stats["last_error_at"]) if stats.get("last_error_at") else None,
+                "last_error_kind": stats.get("last_error_kind")}  # fmt: skip
+
+    return {
+        "running": running,
+        "waiting": waiting["n"],
+        "backing_off": backing_off,
+        # when the oldest waiting conversation ended (not how long it has been queued)
+        "oldest_waiting_ended_at": iso_utc_epoch(waiting["oldest"]) if waiting["oldest"] else None,
+        "oldest_pending_chunk_received_at": iso_utc_epoch(chunk["t"]) if chunk and chunk["t"] else None,
+        "stt": provider("stt"),
+        "llm": None if settings.llm_provider == "none" else provider("llm"),
+    }
+
+
 def last_note_at(db) -> str | None:
     """When the newest useful note was first written (discarded and enrollment rows excluded)."""
     r = db.one(f"SELECT MAX(done_at) AS t FROM conversations WHERE note_path IS NOT NULL "

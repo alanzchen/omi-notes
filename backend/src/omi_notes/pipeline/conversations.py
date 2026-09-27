@@ -28,6 +28,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from .. import operations
 from ..audio.diarize import LocalDiarizer, Turn, local_diarization_status
 from ..audio.timeline import CaptureTimeline, Piece
 from ..db import Database
@@ -351,6 +352,8 @@ class ConversationPipeline:
             skip_llm = json.dumps(sorted(p.name for p in conv_dir.glob("llm-*.json"))) if row["force_llm"] else row["skip_llm"]
             transcript = (conv_dir / "transcript.json").exists()
             status = "summarizing" if transcript and not row["force_restt"] else "closed"
+            if row["retry_op"] and row["retry_stage"] != "summarizing":
+                status = "closed"  # an app retry redoes the stage that failed, even with an older transcript
             cur = self.db.execute(
                 """UPDATE conversations SET reprocess_handled=?, force_restt=0, force_llm=0, skip_stt=?, skip_llm=?,
                        status=?, attempts=0, error=NULL, error_kind=NULL, failed_stage=NULL, next_attempt_at=NULL, edited=0
@@ -386,7 +389,8 @@ class ConversationPipeline:
         if exc.terminal or attempts >= MAX_ATTEMPTS:
             log.error("conversation %s failed permanently in %s: %s", conv_id, stage, exc)
             self._commit(conv_id, status="failed", failed_stage=stage, attempts=attempts, error=str(exc)[:500],
-                         error_kind=exc.kind, next_attempt_at=None, updated_at=now)  # fmt: skip
+                         error_kind=exc.kind, next_attempt_at=None, updated_at=now, **_outcome(row, "failed", exc.kind, now))  # fmt: skip
+            operations.finished(self, row["retry_op"])
             if stage == "summarizing":
                 # The transcript is safe; publish it now rather than waiting for the LLM.
                 try:
@@ -841,7 +845,12 @@ class ConversationPipeline:
             llm_status=llm_status, **({"skip_llm": None} if llm_cached and not cache_only else {}),
             next_attempt_at=None, done_at=row["done_at"] or now, updated_at=now,
             **({} if failed else {"error": None, "error_kind": None, "failed_stage": None, "attempts": 0}),
+            # a cache-only re-render is not the retried attempt, and keeps whatever outcome is recorded
+            **({} if cache_only else _outcome(row, "failed" if failed and kind == "transcript_only" else
+                                              ("discarded" if kind == "discarded" else "done"), None, now)),
         )  # fmt: skip
+        if not cache_only:
+            operations.finished(self, row["retry_op"])
         if moved:
             self._remove_own(moved, conv_id)
             self._commit(conv_id, stale_note_path=None)
@@ -1281,6 +1290,14 @@ def bookmark_owner(db: Database, device_id: str, t: float) -> str | None:
         if best is None or key < best:
             best = key
     return best[2] if best else None
+
+
+def _outcome(row, status: str, failure_kind: str | None, now: float) -> dict:
+    """Index/record fields that close an app retry, committed with the outcome they describe."""
+    if not row["retry_op"]:
+        return {}
+    outcome = {"op": row["retry_op"], "status": status, "failure_kind": failure_kind, "finished_at": now}
+    return {"retry_outcome": json.dumps(outcome, sort_keys=True), "retry_op": None, "retry_stage": None}
 
 
 def _load_llm_cache(path: Path) -> dict:

@@ -155,7 +155,11 @@ No auth. `200 {"ok": true}`.
   "vault_dir": "/Users/alan/Notes/Omi",
   "notes_dir": "/Users/alan/Notes/Omi",
   "read_only": null,
-  "features": ["voice_enrollment", "conversation_detail", "issues"]
+  "activity": {"running": [{"conversation_id": "…", "stage": "transcribing", "started_at": "…"}], "waiting": 2,
+               "backing_off": 0, "oldest_waiting_ended_at": "…", "oldest_pending_chunk_received_at": null,
+               "stt": {"last_ok_at": "…", "last_error_at": null, "last_error_kind": null}, "llm": null},
+  "vault_id": "…",
+  "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "search"]
 }
 ```
 
@@ -168,7 +172,13 @@ The response is cheap and calls no provider: `ready` means *configured*, not tha
 `worker.present` means a process holds the vault's worker lock (the pipeline, or a maintenance
 command); it is not proof of progress. `last_note_at` is when the newest kept note was first
 written (discarded and enrollment rows excluded). `read_only` is the reason the vault stopped
-accepting writes, or null. `failed` is the sum of `conversations_failed` and `chunks_failed`, kept
+accepting writes, or null. `activity` says what the pipeline is doing: conversations being worked
+on now, how many wait or back off after a service error, and when the oldest waiting one *ended*
+(not how long it has been queued). `stt`/`llm` are the last successful and failed *requests* to the
+configured service (cached results don't count, so reuse never looks like a working service; a
+successful transcription request is not yet a finished transcript); null until one happens or
+after an index rebuild, and scoped to the current provider configuration. `vault_id` identifies the
+vault, so the phone can tell when a URL starts serving another one. `failed` is the sum of `conversations_failed` and `chunks_failed`, kept
 for older phones. Model labels are non-secret; base URLs and keys are never reported. Fields added
 after v1's first release may be absent on older servers; the phone treats absence as unknown.
 
@@ -382,4 +392,41 @@ What needs attention, most urgent first, bounded and sanitized:
 
 Codes: `read_only` (with `detail`), `worker_stopped`, `chunks_failed` (with `count`),
 `conversation_failed`, `note_conflict`, `conversation_retrying`. Severity is `action` (someone must
-do something) or `delayed` (the server retries on its own).
+do something) or `delayed` (the server retries on its own). `next_step` depends on whether the
+server will try again, and commands in it name this deployment's `omi-notes` and environment file.
+
+### `POST /v1/conversations/{id}/retry`
+
+Body `{"request_id": "<lowercase uuid>"}`, minted by the phone and kept until it gets an answer
+(the same id after a lost response returns the same operation). Only a `failed` conversation that
+is not frozen, has no note edited outside My Notes and has no other retry pending (`409`
+`not_failed` / `note_frozen` / `note_conflict` / `retry_in_progress`; `busy` while the worker holds
+it; `request_conflict` for an id used elsewhere; `503` read-only). `202` (`200` for a repeat) once
+the retry is durable in the vault (docs/vault.md, "Operations"):
+
+```json
+{"operation": {"id": "…", "kind": "retry", "conversation_id": "…", "stage": "summarizing", "state": "queued",
+               "requested_at": "…", "finished_at": null, "message": "Waiting for the server to start"}}
+```
+
+`state`: `accepted`, `queued`, `running`, `backing_off`, `blocked` (the note was edited meanwhile),
+`done`, `failed` (it failed again; see the conversation), `superseded` (other processing replaced
+it). The failed stage is redone with cached results reused.
+
+### `GET /v1/operations/{id}`
+
+The operation above; observational (never queues or writes). `404` for unknown ids.
+
+### `POST /v1/chunks/retry`
+
+Queues uploaded audio that failed to process again: `{"chunks_queued": 1}`. Operational only (the
+server replays surviving raw audio after a rebuild anyway); the phone doesn't repeat it on its own.
+
+### `GET /v1/conversations/search?q=&person_id=&date_from=&date_to=&before=&limit=20`
+
+Same entries and paging as `/recent`. `q`: every word must appear (literal, case-insensitive) in
+the title, summary, speaker names or transcript of the conversation's current generation; entries
+made from an older generation are never returned, and `pending` counts conversations not indexed
+yet. `person_id` keeps conversations where that person is assigned to a speaker. `date_from` /
+`date_to` are local calendar days (`YYYY-MM-DD`, inclusive, in the vault's time zone). Voice
+enrollment readings are never returned.

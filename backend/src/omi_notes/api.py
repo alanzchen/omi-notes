@@ -9,12 +9,14 @@ import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta
+from datetime import time as dt_time
 
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 
-from . import PROTOCOL_VERSION, __version__, views
+from . import PROTOCOL_VERSION, __version__, operations, search, views
 from .envelope import MAX_BODY_BYTES
 from .ingest import ApiError, Ingest, capture_status
 from .lock import api_lock
@@ -23,13 +25,26 @@ from .pipeline.worker import Worker, read_only_reason
 from .rebuild import open_index
 from .settings import Settings
 from .speakers.service import SpeakerService
-from .util import iso_utc_epoch
+from .util import UUID_RE, iso_utc_epoch
 from .vault import LeaseError, Vault, VaultBusy
 
 log = logging.getLogger(__name__)
 MAX_JSON_BYTES = 64 * 1024
 # Index fields that decide which artifacts a conversation view shows.
 _GENERATION = ("status", "revision", "written_sha", "transcript_sha", "llm_ref", "speakers_revision", "note_path", "edited")
+
+
+def _day(value: str | None, tz, *, next_day: bool = False) -> float | None:
+    """Midnight (local, the vault's time zone) starting a YYYY-MM-DD day, or the next one."""
+    if value is None:
+        return None
+    try:
+        day = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ApiError(422, "invalid_date", "dates are YYYY-MM-DD") from exc
+    if next_day:
+        day += timedelta(days=1)
+    return datetime.combine(day, dt_time.min, tzinfo=tz).timestamp()
 
 
 def create_app(
@@ -154,12 +169,14 @@ def create_app(
             },
             "queue": queue_counts(db),
             "worker": {"present": views.worker_present(vault)},
+            "activity": views.activity(db, settings, time.time()),
             "last_note_at": views.last_note_at(db),
             "vault_dir": str(settings.vault_dir),
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes
-            "features": ["voice_enrollment", "conversation_detail", "issues"],
+            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "search"],
+            "vault_id": vault.vault_id,
         }
 
     @app.put("/v1/captures/{capture_id}/chunks/{chunk_sequence}")
@@ -207,6 +224,20 @@ def create_app(
             "next_cursor": views.make_cursor(page[-1]) if len(rows) > limit else None,
         }
 
+    @app.get("/v1/conversations/search")
+    def search_conversations(q: str = "", person_id: str | None = None, date_from: str | None = None,
+                             date_to: str | None = None, before: str | None = None, limit: int = 20) -> dict:  # fmt: skip
+        """Newest first; `date_from`/`date_to` are local calendar days (YYYY-MM-DD, `date_to` inclusive)."""
+        limit = max(1, min(limit, 100))
+        cursor = views.parse_cursor(before) if before is not None else None
+        if before is not None and cursor is None:
+            raise ApiError(422, "invalid_cursor", "before must be a cursor returned by this endpoint")
+        if len(q) > 200:
+            raise ApiError(422, "invalid_query", "q is limited to 200 characters")
+        pipeline = app.state.speakers.pipeline
+        return search.search(pipeline, q=q, person_id=person_id, start=_day(date_from, pipeline.tz),
+                             end=_day(date_to, pipeline.tz, next_day=True), before=cursor, limit=limit)  # fmt: skip
+
     @app.get("/v1/conversations/{conv_id}")
     def conversation(conv_id: str, segments_from: int = 0) -> dict:
         """Read-only (capture-format-v1.md, "App views"). A row that changes while its files are read
@@ -223,6 +254,33 @@ def create_app(
         # still changing: show nothing that could belong to another generation
         return body | {"summary": None, "summary_state": "updating", "transcript": None, "transcript_state": "updating",
                        "speakers": [], "speaker_names": [], "preview": None}  # fmt: skip
+
+    @app.post("/v1/conversations/{conv_id}/retry")
+    async def retry(conv_id: str, request: Request) -> JSONResponse:
+        """Durable app retry of a failed conversation (docs/vault.md, "Operations")."""
+        body = await read_json(request)
+        if not isinstance(body, dict):
+            raise ApiError(422, "invalid_body", "expected a JSON object")
+        pipeline = app.state.speakers.pipeline
+        status_code, op = await run_in_threadpool(
+            operations.accept, pipeline, conv_id, body.get("request_id"), read_only=read_only_reason(db)
+        )
+        return JSONResponse({"operation": op}, status_code=status_code)
+
+    @app.get("/v1/operations/{op_id}")
+    def operation(op_id: str) -> dict:
+        if not UUID_RE.match(op_id):
+            raise ApiError(404, "not_found", "unknown operation")
+        return {"operation": operations.view(app.state.speakers.pipeline, op_id)}
+
+    @app.post("/v1/chunks/retry")
+    def retry_chunks() -> dict:
+        """Queue failed chunks again. Operational only (a rebuild replays surviving raw audio anyway)."""
+        writable()
+        queued = db.execute(
+            "UPDATE chunks SET status='pending', attempts=0, next_attempt_at=NULL, error=NULL WHERE status='failed'"
+        ).rowcount
+        return {"chunks_queued": queued}
 
     @app.get("/v1/issues")
     def issues(limit: int = views.ISSUE_LIMIT) -> dict:

@@ -22,7 +22,7 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
-from .. import __version__
+from .. import __version__, operations, search
 from ..audio.timeline import RING_RECORD_SECONDS, CaptureTimeline, ChunkDecode
 from ..audio.vad import MIN_SPEECH, VadChoice, VadStream, make_vad
 from ..db import Database
@@ -75,7 +75,11 @@ class Worker:
         self.clock = clock
         self.take_over = False
         self.vad = vad or make_vad(settings.vad_backend, settings.vad_model_path, settings.vad_threshold)
-        self.providers = providers or Providers(settings)
+        if providers is None:
+            from ..telemetry import RecordingProviders  # (imports this package's pipeline)
+
+            providers = RecordingProviders(settings, db=db)
+        self.providers = providers
         self.pipeline = ConversationPipeline(settings, db, self.providers, self.vad.vad.name, self.vad.warning)
         self.enrollments = enroll.EnrollmentProcessor(self)
         self.params = seg.Params(
@@ -89,6 +93,7 @@ class Worker:
         self._decoders: OrderedDict[str, tuple[int, CaptureTimeline, VadStream]] = OrderedDict()
         self._last_retention = 0.0
         self._reconciled = False
+        self.operations = operations.Sweeper()
 
     # -- loop ------------------------------------------------------------------------------------
 
@@ -124,7 +129,15 @@ class Worker:
                 self.enrollments.run(now)
             except Exception:
                 log.exception("could not process voice enrollments")
+            try:
+                self.operations.run(self.pipeline)
+            except Exception:
+                log.exception("could not reconcile app retries")
             advanced = self.pipeline.run(now)
+            try:
+                search.index_batch(self.pipeline)
+            except Exception:
+                log.exception("could not update the search index")
             self.pipeline.render_stubs(now)
             self.pipeline.render_dailies()
         self._status(now)

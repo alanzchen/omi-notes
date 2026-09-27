@@ -22,7 +22,7 @@ from pathlib import Path
 
 from .spool import make_dirs_durable
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -230,6 +230,9 @@ CREATE TABLE IF NOT EXISTS conversations (
     record_sha TEXT,
     speakers_revision INTEGER NOT NULL DEFAULT 0,
     rendered_speakers_revision INTEGER,
+    retry_op TEXT,
+    retry_stage TEXT,
+    retry_outcome TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     finalized_at REAL,
@@ -240,6 +243,13 @@ CREATE INDEX IF NOT EXISTS conversations_device ON conversations(device_id, star
 
 -- decision.known_through: speech from (capture, seq) is known to a finalized conversation iff
 -- seq <= known_through[capture] (the seal flush is virtual chunk last + 1).
+-- Search over what the app shows: title, summary and transcript of the current generation.
+CREATE TABLE IF NOT EXISTS search_index (
+    conversation_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    body TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS known_through (
     conversation_id TEXT NOT NULL,
     capture_id TEXT NOT NULL,
@@ -442,9 +452,17 @@ COLUMN_SOURCES: dict[str, dict[str, str]] = {
         "claim_token": "operational — work claim",
         "claim_expires": "operational — work claim",
         "record_sha": "operational — sha256 of conversation.json as last written/applied",
+        "retry_op": "conversation.json retry.op (an accepted app retry not yet finished)",
+        "retry_stage": "conversation.json retry.stage",
+        "retry_outcome": "conversation.json retry_outcome {op, status, failure_kind, finished_at}: the last finished app retry",
         "speakers_revision": "<conversation dir>/speakers.json revision",
         "created_at": "operational",
         "updated_at": "operational",
+    },
+    "search_index": {
+        "conversation_id": "operational — rebuilt by the worker from transcript.json + the referenced LLM result",
+        "source": "operational — the generation (transcript_sha, llm_ref, speakers revision) the text was made from",
+        "body": "operational — lowercased title, summary and transcript text",
     },
     "people": {
         "id": "People/*.md frontmatter omi_person_id (or an _omi/people/<id>/ folder without a note)",

@@ -7,7 +7,10 @@ Blocks (docs/vault.md):
   `seq <= known_through[capture]`;
 - `settings`: render-affecting settings at completion (config changes don't rewrite history);
 - `render`: what the note was rendered from and where it is;
-- `failure`: why it failed permanently.
+- `failure`: why it failed permanently;
+- `retry`: an app retry accepted and not yet finished (`{op, stage}`), and `retry_outcome`: how the
+  last finished one ended (`{op, status, failure_kind, finished_at}`), written in the same commit as
+  that outcome — so a rebuild tells a finished retry from a pending one (docs/vault.md, "Operations").
 
 Open conversations have no record: they are recomputed. The index row is derived from the record
 (`row_from_record`) and the record from the row (`record_from_row`), so the rebuild and the running
@@ -115,6 +118,10 @@ def record_from_row(row, known_through: dict[str, int]) -> dict:
         "render": None,
         "failure": None,
     }
+    if _get(row, "retry_op"):
+        record["retry"] = {"op": row["retry_op"], "stage": _get(row, "retry_stage")}
+    if _get(row, "retry_outcome"):
+        record["retry_outcome"] = json.loads(row["retry_outcome"])
     if row["note_path"]:
         render = {key: _out(_get(row, col), kind) for key, spec in RENDER_COLUMNS.items() if spec for col, kind in [spec]}
         render["kind"] = (json.loads(row["index_json"]) if row["index_json"] else {}).get("kind")
@@ -142,7 +149,16 @@ def row_from_record(record: dict) -> tuple[dict, dict[str, int]]:
             col, kind = spec
             values[col] = _in(render.get(key), kind) if render else _in(None, kind)
     values["revision"] = values["revision"] or 0
-    if failure:
+    retry = record.get("retry") if isinstance(record.get("retry"), dict) else None
+    values["retry_op"] = retry.get("op") if retry else None
+    values["retry_stage"] = retry.get("stage") if retry else None
+    outcome = record.get("retry_outcome")
+    values["retry_outcome"] = json.dumps(outcome, sort_keys=True) if isinstance(outcome, dict) else None
+    if retry and not failure:
+        # consumed but unfinished: run the retried stage again (its cached results are reused)
+        status = "summarizing" if retry.get("stage") == "summarizing" else "closed"
+        values.update(error=None, error_kind=None, failed_stage=None)
+    elif failure:
         status = "failed"
         values.update(error=failure.get("error"), error_kind=failure.get("kind"), failed_stage=failure.get("stage"))
     else:
