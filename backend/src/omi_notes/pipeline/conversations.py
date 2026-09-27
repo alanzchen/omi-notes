@@ -528,6 +528,7 @@ class ConversationPipeline:
             elif fresh:
                 name, fresh = None, False  # no audio in hand (a recovery path): nothing to compute
         with self.speakers.lock:
+            self.speakers.sync_labels_index(conv_id)  # start from the file's states, not a stale index
             stored = self.speakers.labels(conv_id)
             previous = self.speakers.labels_transcript(conv_id)
             moved = previous not in (None, transcript_sha)
@@ -590,9 +591,14 @@ class ConversationPipeline:
                 out.setdefault(label, {"forgotten": True})
         return out
 
+    def sync_labels_everywhere(self) -> None:
+        with self.speakers.lock:
+            for r in self.db.query("SELECT id FROM conversations WHERE status <> 'open'"):
+                self.speakers.sync_labels_index(r["id"])
+
     def finish_migrations(self) -> None:
         """Move every conversation's label states to its current transcript (a crash may have left
-        some behind): forget needs labels and voices to agree before it marks anything."""
+        some behind), so labels and voices agree."""
         with self.speakers.lock:
             for r in self.db.query("SELECT id FROM conversations WHERE status <> 'open' AND transcript_sha IS NOT NULL"):
                 conv_dir = self.conv_dir(r["id"])
@@ -628,6 +634,7 @@ class ConversationPipeline:
             row = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
             if row is None:
                 continue
+            self.speakers.sync_labels_index(conv_id)  # never overwrite the file with a stale index
             voices = self.speakers.voices(conv_id)
             current = self.speakers.labels(conv_id)
             key = next(((v.model, v.model_sha) for v in voices.values()), None)

@@ -89,12 +89,12 @@ class SpeakerService:
         with self.store.lock:
             if self.store.person(person_id) is None and not self.store.person_dir(person_id).exists():
                 raise ApiError(404, "not_found", "unknown person")
-            # Labels and voices must agree first (finish any interrupted move to a new transcript,
-            # drop voices generations nothing depends on); then the labels (marked forgotten: their
-            # voice is never stored again), their vectors, and the voice data itself. A retry after
-            # a crash finishes whatever is left.
-            self.pipeline.finish_migrations()
-            self.store.remove_obsolete_voices_everywhere()
+            # 1. the index agrees with every speakers.json; 2. the person's labels are marked
+            # forgotten, before anything can move them (a pending or in-flight move to a new
+            # transcript carries the marker instead of dropping the association); 3. pending moves
+            # finish and voices generations nothing depends on go; 4. vectors, then the voice data.
+            # A retry after a crash finishes whatever is left.
+            self.pipeline.sync_labels_everywhere()
             affected = self.store.labeled_with(person_id)
             for conv_id in affected:
                 states = {
@@ -106,6 +106,8 @@ class SpeakerService:
                 self.store.write_labels(conv_id, states)
                 if row and row["note_path"]:
                     self.pipeline._set(conv_id, needs_render=1, next_attempt_at=None)
+            self.pipeline.finish_migrations()
+            self.store.remove_obsolete_voices_everywhere()
             self.store.reconcile_vectors()
             self.store.forget_voice(person_id, delete_note=delete_note)
             self.db.set_meta("relabel_pending", "1")
@@ -197,9 +199,10 @@ class SpeakerService:
                 if pid is not None and self.store.person(pid) is None:
                     raise ApiError(404, "not_found", f"unknown person {pid}")
             states = self.store.labels(conv_id)
-            state = dict(states.get(label) or {})
+            before = dict(states.get(label) or {})
+            state = dict(before)
             blocked = set(state.get("not") or [])
-            sample = "none"
+            sample, sample_id = "none", None
             if not_person:
                 blocked.add(not_person)
                 if state.get("person_id") == not_person:
@@ -207,15 +210,21 @@ class SpeakerService:
             if person_id:
                 blocked.discard(person_id)
                 state |= {"person_id": person_id, "source": "user", "forgotten": False}
-                sample = self._sample_for(row, transcript, label, person_id, request_id)
+                sample, sample_id = self._sample_for(row, transcript, label, person_id, request_id)
             elif not not_person:
                 state |= {"person_id": None, "source": None}
             state["not"] = sorted(blocked)
-            previous = (states.get(label) or {}).get("person_id")
+            previous = before.get("person_id")
             removed = 0
             if previous and previous != state.get("person_id"):
-                # the user took this label back from `previous`: so is the voiceprint it gave them
-                removed = self.store.remove_samples(conv_id, label, previous)
+                # the user took this label back from `previous`: so are the voiceprints it gave them —
+                # the ones the state lists (they moved with it across re-transcriptions), and any
+                # tagged with this label from before states listed them
+                removed = self.store.remove_sample_ids(previous, before.get("samples") or [])
+                removed += self.store.remove_samples(conv_id, label, previous)
+                state["samples"] = []
+            if sample_id:
+                state["samples"] = sorted(set(state.get("samples") or []) | {sample_id})
             states[label] = state
             revision = self.store.write_labels(conv_id, states,
                                                request=(request_id, {"label": label, "person_id": person_id, "sample": sample}))  # fmt: skip
@@ -232,28 +241,30 @@ class SpeakerService:
         self.db.set_meta("relabel_pending", "1")
         return sorted(set(self.pipeline.relabel(time.time())) - set(exclude))
 
-    def _sample_for(self, row, transcript: dict, label: str, person_id: str, request_id: str) -> str:
-        """A confirmed voiceprint from this label (deduplicated by request_id), if consented."""
-        if self.store.sample_for_request(request_id) is not None:
-            return "exists"
+    def _sample_for(self, row, transcript: dict, label: str, person_id: str, request_id: str) -> tuple[str, str | None]:
+        """A confirmed voiceprint from this label (deduplicated by request_id), if consented:
+        (outcome, sample id)."""
+        done = self.store.sample_for_request(request_id)
+        if done is not None:
+            return "exists", done["id"]
         person = self.store.person(person_id)
         prefs = self.store.settings()
         if not person["me"]:
             if not prefs["acknowledged_at"]:
-                return "not_acknowledged"
+                return "not_acknowledged", None
             if not self.store.attested(person_id):
-                return "not_attested"
+                return "not_attested", None
         embedder = self.pipeline.providers.embedder
         if embedder is None:
-            return "no_model"
+            return "no_model", None
         voice = self._label_voice(row, transcript, label, embedder)
         if voice is None or voice.vector is None:
-            return "no_audio"
+            return "no_audio", None
         day = datetime.fromtimestamp(row["start"], self.pipeline.tz).date().isoformat()
-        self.store.add_sample(person_id, voice.vector, model=embedder.model, model_sha=embedder.model_sha, source="user",
-                              seconds=voice.seconds, day=day, session=row["id"], conversation_id=row["id"], label=label,
-                              request_id=request_id)  # fmt: skip
-        return "created"
+        sample_id = self.store.add_sample(person_id, voice.vector, model=embedder.model, model_sha=embedder.model_sha,
+                                          source="user", seconds=voice.seconds, day=day, session=row["id"],
+                                          conversation_id=row["id"], label=label, request_id=request_id)  # fmt: skip
+        return "created", sample_id
 
     def _label_voice(self, row, transcript: dict, label: str, embedder):
         """The label's voice: stored, else recomputed from raw audio (kept in the voices file)."""

@@ -841,3 +841,81 @@ def test_forgetting_during_an_interrupted_label_move_removes_the_right_voice(env
     assert "vector_b64" not in stored["S1"], "Priya's voice (now S1) is gone"
     assert "vector_b64" in stored["S2"], "Alan's voice (now S2) is kept"
     assert labels(client, row["id"])["S2"]["person_id"] == me
+
+
+# == fifth pass (review of 32c1bb0) ===================================================================
+
+
+def named_pair(client, worker, *, unknown: bool = True) -> tuple[dict, str, str]:
+    acknowledge(client, unknown=unknown)
+    row = talk(client, worker, dialogue(ALAN, PRIYA))
+    me = new_person(client, "Alan", me=True)
+    name_label(client, row["id"], "S1", me)
+    priya = new_person(client, "Priya", attest_knows=True)
+    name_label(client, row["id"], "S2", priya)
+    return row, me, priya
+
+
+def force_restt(worker, row, stt) -> None:
+    worker.providers._stt = stt
+    worker.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1, force_restt = 1 WHERE id=?", (row["id"],))
+
+
+def test_forgetting_while_the_worker_embeds_a_new_transcript_never_keeps_that_voice(env, monkeypatch):
+    _, client, worker = env
+    row, _, priya = named_pair(client, worker)
+    real = conversations_mod.embed_voices
+    forgot = {}
+
+    def forgetting(*args, **kwargs):
+        if not forgot:  # the worker is embedding, outside the speaker lock
+            forgot["status"] = client.delete(f"/v1/people/{priya}", headers=AUTH).status_code
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(conversations_mod, "embed_voices", forgetting)
+    force_restt(worker, row, ShorterStt())  # new words; Priya is still S2
+    worker.tick(T0 + 800)
+    worker.tick(T0 + 810)
+    assert forgot["status"] == 200
+    stored = voices_file(worker, row["id"])["labels"]
+    assert "vector_b64" not in stored["S2"], "the forgotten voice was stored as an unknown voice"
+
+
+def test_forgetting_with_the_index_behind_the_labels_file_prunes_the_right_voice(env, monkeypatch):
+    _, client, worker = env
+    row, me, priya = named_pair(client, worker)
+    store = worker.pipeline.speakers
+    real = store.index_labels
+    calls = {"n": 0}
+
+    def failing(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("disk I/O error")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(store, "index_labels", failing)
+    force_restt(worker, row, LaterStt())  # Priya's voice becomes S1, Alan's S2
+    worker.tick(T0 + 800)  # speakers.json committed the move; the index write failed
+    assert calls["n"] == 1
+    assert client.delete(f"/v1/people/{priya}", headers=AUTH).status_code == 200
+    stored = voices_file(worker, row["id"])["labels"]
+    assert "vector_b64" not in stored["S1"] and "vector_b64" in stored["S2"]
+    assert labels(client, row["id"])["S2"]["person_id"] == me
+
+
+def test_a_confirmation_can_be_taken_back_after_its_voice_moved_to_another_label(env):
+    _, client, worker = env
+    acknowledge(client)
+    row = talk(client, worker, dialogue(ALAN, PRIYA))
+    me = new_person(client, "Alan", me=True)
+    name_label(client, row["id"], "S2", me)  # Alan has a voice, so voices are compared on re-transcription
+    bob = new_person(client, "Bob", attest_knows=True)
+    assert name_label(client, row["id"], "S1", bob).json()["sample"] == "created"  # a mistake: S1 is Alan
+    force_restt(worker, row, LaterStt())  # that voice is S2 now
+    worker.tick(T0 + 800)
+    worker.tick(T0 + 810)
+    assert labels(client, row["id"])["S2"]["person_id"] == bob
+    assert name_label(client, row["id"], "S2", None, not_person_id=bob).status_code == 200  # "not Bob"
+    people = {p["name"]: p for p in client.get("/v1/people", headers=AUTH).json()["people"]}
+    assert people["Bob"]["samples"] == 0, "the repudiated sample was taken back"

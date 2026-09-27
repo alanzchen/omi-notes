@@ -62,8 +62,15 @@ relative to `/Users/alan/Developer/_ref/omi`.
   again, even as an unknown voice), prunes those labels' vectors, keeps only the *decision* of a
   global enrollment result (so the reading is not learned again), then deletes that folder and
   re-renders affected notes back to "Speaker N". A retry after a crash finishes what is left.
-- Taking a label back from someone (renaming it, "Unknown speaker", "Not X") deletes the sample
-  that assignment created: a repudiated confirmation must not train anyone's voice.
+- Taking a label back from someone (renaming it, "Unknown speaker", "Not X") deletes the samples
+  that assignment created — a label state lists them (`samples`), so they follow it when a
+  re-transcription moves it to another label number: a repudiated confirmation must not train
+  anyone's voice.
+- Forget runs in this order, under the speaker lock: the index catches up with every
+  `speakers.json`; the person's labels are marked forgotten *before* anything may move them (a
+  pending or in-flight move to a new transcript then carries the marker instead of dropping the
+  association); pending moves finish; unreferenced voices files go; vectors are pruned; the
+  person's voice data is deleted.
 
 ## Enrollment (wearer, through the pendant)
 

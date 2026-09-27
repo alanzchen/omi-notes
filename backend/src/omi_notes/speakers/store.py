@@ -320,6 +320,15 @@ class SpeakerStore:
             self.db.execute("DELETE FROM samples WHERE id=?", (r["id"],))
         return len(rows)
 
+    def remove_sample_ids(self, person_id: str, sample_ids: list[str]) -> int:
+        """Delete these samples of a person (file first, then index)."""
+        n = 0
+        for sid in sample_ids:
+            if remove(self.person_dir(person_id) / "samples" / f"{sid}.json") or self.db.one("SELECT 1 FROM samples WHERE id=?", (sid,)):
+                n += 1
+            self.db.execute("DELETE FROM samples WHERE id=?", (sid,))
+        return n
+
     def sample_for_request(self, request_id: str):
         return self.db.one("SELECT * FROM samples WHERE request_id=?", (request_id,))
 
@@ -443,7 +452,8 @@ class SpeakerStore:
     def labels(self, conv_id: str) -> dict[str, dict]:
         return {
             r["label"]: {"person_id": r["person_id"], "source": r["source"], "distance": r["distance"], "margin": r["margin"],
-                         "evidence_s": r["evidence_s"], "not": json.loads(r["not_json"]), "forgotten": bool(r["forgotten"])}
+                         "evidence_s": r["evidence_s"], "not": json.loads(r["not_json"]), "forgotten": bool(r["forgotten"]),
+                         "samples": json.loads(r["samples_json"])}
             for r in self.db.query("SELECT * FROM speaker_labels WHERE conversation_id=?", (conv_id,))
         }  # fmt: skip
 
@@ -485,6 +495,8 @@ class SpeakerStore:
             out[label] = {k: (sorted(state.get(k) or []) if k == "not" else state.get(k)) for k in keys}
             if state.get("forgotten"):
                 out[label]["forgotten"] = True
+            if state.get("samples"):  # the confirmations this assignment created: they move with it
+                out[label]["samples"] = sorted(state["samples"])
         return out
 
     def request_result(self, conv_id: str, request_id: str) -> dict | None:
@@ -496,23 +508,27 @@ class SpeakerStore:
             conn.execute("DELETE FROM speaker_labels WHERE conversation_id=?", (conv_id,))
             conn.executemany(
                 """INSERT INTO speaker_labels (conversation_id, label, person_id, source, distance, margin, evidence_s, not_json,
-                       forgotten) VALUES (?,?,?,?,?,?,?,?,?)""",
+                       forgotten, samples_json) VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 [(conv_id, label, s.get("person_id"), s.get("source"), s.get("distance"), s.get("margin"),
-                  s.get("evidence_s"), json.dumps(sorted(s.get("not") or [])), int(bool(s.get("forgotten"))))
-                 for label, s in states.items()],
+                  s.get("evidence_s"), json.dumps(sorted(s.get("not") or [])), int(bool(s.get("forgotten"))),
+                  json.dumps(sorted(s.get("samples") or []))) for label, s in states.items()],
             )  # fmt: skip
             conn.execute("UPDATE conversations SET speakers_revision=? WHERE id=?", (revision, conv_id))
+
+    def sync_labels_index(self, conv_id: str) -> bool:
+        """Re-index the label states if the index is behind speakers.json (a failed index write
+        after the file was published): every read-modify-write starts from the file's states."""
+        data = Vault.read_json(self.conv_dir(conv_id) / "speakers.json")
+        row = self.db.one("SELECT speakers_revision FROM conversations WHERE id=?", (conv_id,))
+        if data and row is not None and int(data.get("revision") or 0) != row["speakers_revision"]:
+            self.index_labels(conv_id, data.get("labels") or {}, int(data.get("revision") or 0))
+            return True
+        return False
 
     def sync_conversation(self, conv_id: str) -> bool:
         """Re-index this conversation's speakers/voices files where the index is behind them (a
         crash or failed index write after the file was published). True if anything changed."""
-        conv_dir = self.conv_dir(conv_id)
-        changed = False
-        data = Vault.read_json(conv_dir / "speakers.json")
-        row = self.db.one("SELECT speakers_revision FROM conversations WHERE id=?", (conv_id,))
-        if data and row is not None and int(data.get("revision") or 0) != row["speakers_revision"]:
-            self.index_labels(conv_id, data.get("labels") or {}, int(data.get("revision") or 0))
-            changed = True
+        changed = self.sync_labels_index(conv_id)
         if self.remove_obsolete_voices(conv_id):
             changed = True
         name = self.voices_file(conv_id)

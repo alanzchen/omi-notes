@@ -154,7 +154,7 @@ def assign(voices: dict[str, object], current: dict[str, dict], models: dict[str
         found = match(voices.get(label), models, blocked, op)
         fresh = {"person_id": None, "source": None, "distance": found.distance, "margin": found.margin,
                  "evidence_s": getattr(voices.get(label), "seconds", None), "not": sorted(blocked),
-                 "forgotten": bool(state.get("forgotten"))}  # fmt: skip
+                 "forgotten": bool(state.get("forgotten")), "samples": list(state.get("samples") or [])}  # fmt: skip
         model = models.get(found.person_id) if found.person_id else None
         if auto_assign and found.accepted and model is not None and model.active:
             fresh |= {"person_id": found.person_id, "source": "auto"}
