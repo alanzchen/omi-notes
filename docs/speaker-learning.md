@@ -71,6 +71,8 @@ relative to `/Users/alan/Developer/_ref/omi`.
    `voice_enrollment` feature — asked again right before starting, never a remembered answer, and
    only used if the attempt wasn't cancelled and the configured server is still the one asked (an
    older server would transcribe the reading) — shows consent text, then ~6 sentences (~50 s).
+   Closing the screen while checking or reading ends the attempt (`cancelled`): a window must
+   never stay open unseen, or it would swallow ordinary speech.
 2. At start the phone journals an outbox event `voice_enrollment_start` (`capture_id`, `offset_us`,
    `enrollment_id`) and **holds that capture's chunks from the start offset until the start event
    is acknowledged**, so enrollment speech can never reach STT unmarked. A start event that went
@@ -114,14 +116,19 @@ exists → "Is this you?". Dismissals persist with a 7-day cooldown (cf. Omi
   any other label's vector — unknown, or named without consent — only while unknown-voice storage
   is on and the raw audio exists; a forgotten label's never. The rule is re-applied idempotently on
   every retention pass and after every settings change, so a cleanup a crash interrupted finishes.
-- A voices file is keyed by model, model hash, audio and transcript: a new transcript gets new
-  voices, and an earlier assignment survives only where its label still has the same voice. A
-  forgotten voice has no vector to follow, so once a voice in a conversation was forgotten
-  (`speakers.json` `forgotten`, durable whatever later transcripts contain) every label that
-  doesn't carry over is forgotten too. Label states stay tagged with the transcript they were made
-  for; only that move re-tags them, and it happens before anything renders, summarizes, relabels
-  or assigns against a new transcript, also after a crash between the two. Voices files of other
-  transcripts are removed by the startup sweep and by every forget.
+- A voices file is keyed by model, model hash, audio and transcript, and `speakers.json` names the
+  one its label states were made against (`voices`): committed together with the states, so it is
+  the only generation that counts. Every other file is removed by the startup sweep and by forget
+  — except, while the states wait to be moved to a newer transcript, that transcript's file (the
+  move compares the two).
+- A state belongs to a voice, not a label number: on a new transcript it follows its voice to
+  whichever label has it (one-to-one, closest first, within `SAME_VOICE` = 0.25 — the same
+  speaker in the same audio), and is dropped when no same voice is found. A forgotten voice has
+  no vector to follow, so once a voice in a conversation was forgotten (`speakers.json`
+  `forgotten`, durable whatever later transcripts contain) every label nothing carried over to is
+  forgotten too. States stay tagged with the transcript they were made for; only that move
+  re-tags them, and it happens before anything renders, summarizes, relabels, assigns or forgets
+  against a new transcript, also after a crash between the two.
 - A note records the `speakers.json` revision it was rendered from (`render.speakers_revision`);
   any other revision re-renders it, however the labels changed (a correction during a render, a
   recovered file, a rebuild).

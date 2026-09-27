@@ -312,7 +312,7 @@ class LaterStt(FakeStt):
         return response
 
 
-def test_retranscription_recomputes_voices_and_drops_assignments_of_the_old_labels(env):
+def test_retranscription_moves_assignments_with_their_voice_not_their_label_number(env):
     _, client, worker = env
     row = talk(client, worker, dialogue(ALAN, PRIYA))
     me = new_person(client, "Alan", me=True)
@@ -323,7 +323,8 @@ def test_retranscription_recomputes_voices_and_drops_assignments_of_the_old_labe
     worker.tick(T0 + 810)
     after = labels(client, row["id"])
     assert after["S1"]["person_id"] is None, "S1 is Priya's voice now"
-    assert after["S2"]["distance"] < after["S1"]["distance"], "the voices were recomputed for the new labels"
+    assert after["S2"]["person_id"] == me and after["S2"]["source"] == "user", "Alan's correction followed his voice"
+    assert len(list(worker.vault.conversation_dir(row["id"]).glob("voices-*.json"))) == 1
 
 
 # -- 12. renames re-render notes --------------------------------------------------------------------
@@ -759,4 +760,84 @@ def test_relabeling_never_moves_labels_to_a_transcript_they_were_not_made_for(en
     fresh.tick(T0 + 910)
     s1 = db.one("SELECT person_id FROM speaker_labels WHERE conversation_id=? AND label='S1'", (row["id"],))
     assert s1 is None or s1["person_id"] is None, "Priya's voice is S1 now"
-    assert "[[Alan]]" not in (settings.vault_dir / row["note_path"]).read_text()
+    note = (settings.vault_dir / row["note_path"]).read_text()
+    assert "'S1: [[Alan]]'" not in note and "'S2: [[Alan]]'" in note, "the correction followed Alan's voice"
+
+
+# == fourth pass (review of 5749f76) ==================================================================
+
+
+def test_a_second_voices_file_for_the_same_transcript_is_removed(env):
+    """E.g. a new speaker model, crashed before its labels committed: only the referenced file counts."""
+    settings, client, worker = env
+    acknowledge(client)
+    row = talk(client, worker, dialogue(ALAN, PRIYA))
+    priya = new_person(client, "Priya", attest_knows=True)
+    name_label(client, row["id"], "S2", priya)
+    conv_dir = worker.vault.conversation_dir(row["id"])
+    (current,) = conv_dir.glob("voices-*.json")
+    orphan = conv_dir / current.name.replace("voices-fake-voice-", "voices-newer-model-")
+    orphan.write_bytes(current.read_bytes())
+    open_index(settings, Vault.open(settings))
+    assert not orphan.exists() and current.exists()
+    orphan.write_bytes(current.read_bytes())
+    assert client.delete(f"/v1/people/{priya}", headers=AUTH).status_code == 200
+    assert not orphan.exists()
+    assert "vector_b64" not in json.loads(current.read_text())["labels"]["S2"]
+
+
+def crash_first_label_write(monkeypatch, store) -> dict:
+    real = store.write_labels
+    calls = {"n": 0}
+
+    def failing(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("crashed after the voices file")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(store, "write_labels", failing)
+    return calls
+
+
+def test_a_pending_label_move_keeps_its_evidence_through_a_restart(env, monkeypatch):
+    settings, client, worker = env
+    acknowledge(client, unknown=True)
+    me = new_person(client, "Alan", me=True)
+    earlier = talk(client, worker, dialogue(ALAN, RAVI), day=3)
+    name_label(client, earlier["id"], "S1", me)  # Alan has a voice, so voices are computed from now on
+    row = talk(client, worker, dialogue(PRIYA, RAVI))
+    assert voices_file(worker, row["id"])["labels"]["S1"].get("vector_b64")
+    assert name_label(client, row["id"], "S1", None, not_person_id=me).status_code == 200  # "not Alan"
+    calls = crash_first_label_write(monkeypatch, worker.pipeline.speakers)
+    worker.providers._stt = ShorterStt()  # new words, same voices
+    worker.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1, force_restt = 1 WHERE id=?", (row["id"],))
+    worker.tick(T0 + 800)
+    assert calls["n"] == 1
+    open_index(settings, Vault.open(settings))  # a restart sweeps before the move is retried
+    worker.tick(T0 + 5000)
+    worker.tick(T0 + 5010)
+    s1 = worker.db.one("SELECT not_json FROM speaker_labels WHERE conversation_id=? AND label='S1'", (row["id"],))
+    assert s1 is not None and me in json.loads(s1["not_json"]), "the block followed the unchanged voice"
+
+
+def test_forgetting_during_an_interrupted_label_move_removes_the_right_voice(env, monkeypatch):
+    _, client, worker = env
+    acknowledge(client, unknown=True)
+    row = talk(client, worker, dialogue(ALAN, PRIYA))
+    me = new_person(client, "Alan", me=True)
+    name_label(client, row["id"], "S1", me)
+    priya = new_person(client, "Priya", attest_knows=True)
+    name_label(client, row["id"], "S2", priya)
+    calls = crash_first_label_write(monkeypatch, worker.pipeline.speakers)
+    worker.providers._stt = LaterStt()  # Priya's voice becomes S1, Alan's S2
+    worker.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1, force_restt = 1 WHERE id=?", (row["id"],))
+    worker.tick(T0 + 800)
+    assert calls["n"] == 1
+    assert client.delete(f"/v1/people/{priya}", headers=AUTH).status_code == 200  # before the worker retries
+    files = list(worker.vault.conversation_dir(row["id"]).glob("voices-*.json"))
+    assert len(files) == 1
+    stored = json.loads(files[0].read_text())["labels"]
+    assert "vector_b64" not in stored["S1"], "Priya's voice (now S1) is gone"
+    assert "vector_b64" in stored["S2"], "Alan's voice (now S2) is kept"
+    assert labels(client, row["id"])["S2"]["person_id"] == me

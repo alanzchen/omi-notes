@@ -89,8 +89,12 @@ class SpeakerService:
         with self.store.lock:
             if self.store.person(person_id) is None and not self.store.person_dir(person_id).exists():
                 raise ApiError(404, "not_found", "unknown person")
-            # Labels first (marked forgotten: their voice is never stored again), then their vectors,
-            # then the voice data itself; a retry after a crash finishes whatever is left.
+            # Labels and voices must agree first (finish any interrupted move to a new transcript,
+            # drop voices generations nothing depends on); then the labels (marked forgotten: their
+            # voice is never stored again), their vectors, and the voice data itself. A retry after
+            # a crash finishes whatever is left.
+            self.pipeline.finish_migrations()
+            self.store.remove_obsolete_voices_everywhere()
             affected = self.store.labeled_with(person_id)
             for conv_id in affected:
                 states = {
@@ -103,7 +107,6 @@ class SpeakerService:
                 if row and row["note_path"]:
                     self.pipeline._set(conv_id, needs_render=1, next_attempt_at=None)
             self.store.reconcile_vectors()
-            self.store.remove_obsolete_voices_everywhere()  # older voices generations may hold their vector too
             self.store.forget_voice(person_id, delete_note=delete_note)
             self.db.set_meta("relabel_pending", "1")
         return affected
@@ -267,6 +270,7 @@ class SpeakerService:
         keep = {label} | self.store.vector_labels(self.store.labels(row["id"]), set(voices), raw=True)
         name = voices_name(embedder, row["audio_sha"], row["transcript_sha"])
         self.store.write_voices(row["id"], name, embedder.model, embedder.model_sha, voices, keep)
+        self.store.reference_voices(row["id"], name)
         self.store.remove_other_voices(row["id"], name)
         return voices.get(label)
 

@@ -102,6 +102,24 @@ import OmiProtocol
         #expect(startEvents(root).isEmpty)
     }
 
+    @MainActor @Test func closingTheScreenWhileCheckingOrReadingEndsTheAttempt() async throws {
+        let (engine, model, root) = try await streamingModel()
+        defer { ServerStub.delay = 0 }
+        let attempt = Task { await model.startEnrollment() }
+        #expect(await waitOnMain(2) { model.enrollment == .checking })
+        model.enrollmentScreenClosed()  // swiped away while checking
+        await attempt.value
+        #expect(model.enrollment == .idle && engine.snapshotNow().activeEnrollmentId == nil && startEvents(root).isEmpty)
+
+        ServerStub.delay = 0
+        await model.startEnrollment()
+        guard case .reading = model.enrollment else { Issue.record("\(model.enrollment)"); return }
+        model.enrollmentScreenClosed()  // gone while reading: the window is closed, not left open
+        #expect(model.enrollment == .idle)
+        #expect(await waitOnMain(2) { engine.snapshotNow().activeEnrollmentId == nil })
+        #expect(await waitOnMain(2) { self.events(root).contains { ($0["data"] as? [String: Any])?["outcome"] as? String == "cancelled" } })
+    }
+
     @MainActor @Test func aServerChangedWhileItWasCheckedStartsNothing() async throws {
         let (engine, model, root) = try await streamingModel()
         defer { ServerStub.delay = 0 }

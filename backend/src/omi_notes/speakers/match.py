@@ -23,6 +23,9 @@ from .voices import centroid, cosine_distance
 
 THRESHOLD = 0.50
 MARGIN = 0.10
+# The same speaker in the same audio embeds this close: label states follow their voice across a
+# re-transcription only within it (stricter than THRESHOLD, which compares different recordings).
+SAME_VOICE = 0.25
 MIN_EVIDENCE = 5.0
 MIN_TURNS = 2
 SAMPLE_CAP = 20

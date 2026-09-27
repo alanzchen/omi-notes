@@ -531,10 +531,10 @@ class ConversationPipeline:
             stored = self.speakers.labels(conv_id)
             previous = self.speakers.labels_transcript(conv_id)
             moved = previous not in (None, transcript_sha)
-            old_voices = self.speakers.voices_for_transcript(conv_id, previous, not_file=name) if moved else {}
+            # what the stored states were made against (speakers.json names it), never the new file
+            old_voices = self.speakers.voices_of_labels(conv_id, previous, not_file=name) if moved else {}
             if name is not None and not fresh:  # a retried stage: finish it with the stored voices
-                self.speakers.index_voices(conv_id, name)
-                voices = self.speakers.voices(conv_id)
+                voices = self.speakers.read_voices(conv_id, name)
             current = self._carry_over(stored, old_voices, voices, labels, self.speakers.had_forgotten(conv_id)) if moved else stored
             states = current
             if voices is not None:
@@ -542,13 +542,18 @@ class ConversationPipeline:
                 if samples:
                     states = speaker_match.assign(voices, current, speaker_match.build_models(samples, self.operating),
                                                   auto_assign=self.speakers.settings()["auto_assign"], op=self.operating)  # fmt: skip
-                if fresh:
-                    keep = self.speakers.vector_labels(states, set(voices), raw=True)
-                    self.speakers.write_voices(conv_id, name, embedder.model, embedder.model_sha, voices, keep)
-            if moved or self.speakers.persisted(states) != self.speakers.persisted(stored):
-                self.speakers.write_labels(conv_id, states, transcript_sha=transcript_sha)
+            if fresh:
+                keep = self.speakers.vector_labels(states, set(voices), raw=True)
+                self.speakers.write_voices(conv_id, name, embedder.model, embedder.model_sha, voices, keep)
+            elif name is not None:  # written for states that never committed: apply the rule to these
+                self.speakers.index_voices(conv_id, name)
+                raw = self.speakers.raw_available(self._row(conv_id))
+                self.speakers.prune_vectors(conv_id, self.speakers.vector_labels(states, set(voices), raw=raw))
+            if moved or name is not None or self.speakers.persisted(states) != self.speakers.persisted(stored):
+                # one commit: the states, their transcript, and the voices file they were made against
+                self.speakers.write_labels(conv_id, states, transcript_sha=transcript_sha, voices=name)
             if moved or name is not None:
-                self.speakers.remove_other_voices(conv_id, name)  # voices of an earlier transcript
+                self.speakers.remove_other_voices(conv_id, name)  # nothing depends on the others now
 
     def move_labels(self, conv_id: str, transcript: dict) -> None:
         """Label states made for another transcript (recovery after a crash between writing the
@@ -561,20 +566,38 @@ class ConversationPipeline:
 
     def _carry_over(self, current: dict, old_voices: dict, new_voices: dict | None, labels: set[str],
                     had_forgotten: bool = False) -> dict:  # fmt: skip
-        """Label states of the previous transcript that still apply: only where the label has the
-        same voice (a user's assignment or block survives a re-transcription that kept it). A
-        forgotten voice has no vector to follow, so in a conversation where one was ever forgotten
-        every label that didn't carry over may be it and is marked forgotten too."""
-        out = {}
-        for label, state in current.items():
-            old, new = old_voices.get(label), (new_voices or {}).get(label)
-            if (not state.get("forgotten") and old is not None and new is not None and old.vector is not None
-                    and new.vector is not None and cosine_distance(old.vector, new.vector) < self.operating.threshold):  # fmt: skip
-                out[label] = state
+        """Label states of the previous transcript that still apply. A state belongs to a voice,
+        not a label number: it moves to the new label with the same voice (one-to-one, closest
+        first, within SAME_VOICE); without a same voice to follow it is dropped. A forgotten voice
+        has no vector to follow, so in a conversation where one was ever forgotten every new label
+        that nothing carried over to may be it and is marked forgotten too."""
+        pairs = sorted(
+            (cosine_distance(old.vector, new.vector), old_label, new_label)
+            for old_label, old in old_voices.items()
+            if old.vector is not None and old_label in current and not current[old_label].get("forgotten")
+            for new_label, new in (new_voices or {}).items() if new.vector is not None
+        )  # fmt: skip
+        out: dict[str, dict] = {}
+        moved: set[str] = set()
+        for distance, old_label, new_label in pairs:
+            if distance >= speaker_match.SAME_VOICE:
+                break
+            if old_label not in moved and new_label not in out:
+                moved.add(old_label)
+                out[new_label] = current[old_label]
         if had_forgotten or any(state.get("forgotten") for state in current.values()):
             for label in labels | set(new_voices or {}):
                 out.setdefault(label, {"forgotten": True})
         return out
+
+    def finish_migrations(self) -> None:
+        """Move every conversation's label states to its current transcript (a crash may have left
+        some behind): forget needs labels and voices to agree before it marks anything."""
+        with self.speakers.lock:
+            for r in self.db.query("SELECT id FROM conversations WHERE status <> 'open' AND transcript_sha IS NOT NULL"):
+                conv_dir = self.conv_dir(r["id"])
+                if (conv_dir / "speakers.json").exists() and (conv_dir / "transcript.json").exists():
+                    self.move_labels(r["id"], json.loads((conv_dir / "transcript.json").read_text()))
 
     def relabel(self, now: float) -> list[str]:
         """Re-run the pure assignment over stored voices after people/samples changed; notes whose

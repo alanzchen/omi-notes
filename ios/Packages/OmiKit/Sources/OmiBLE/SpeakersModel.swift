@@ -225,6 +225,15 @@ public final class SpeakersModel {
         poll(id)
     }
 
+    /// The enrollment screen went away: an attempt it was showing (checking the server, or the
+    /// reading) must not continue unseen — the window would swallow ordinary speech.
+    public func enrollmentScreenClosed() {
+        switch enrollment {
+        case .checking, .reading: cancelEnrollment()
+        case .idle, .waiting, .finished, .failed: break
+        }
+    }
+
     public func cancelEnrollment() {
         startAttempt = nil
         pollTask?.cancel()

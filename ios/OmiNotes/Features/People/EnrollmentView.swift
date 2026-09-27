@@ -29,10 +29,12 @@ struct EnrollmentView: View {
                     }
                 }
         }
-        .interactiveDismissDisabled(isReading)
+        .interactiveDismissDisabled(isReading || isChecking)
+        .onDisappear { speakers.enrollmentScreenClosed() }
     }
 
     private var isReading: Bool { if case .reading = speakers.enrollment { return true } else { return false } }
+    private var isChecking: Bool { speakers.enrollment == .checking }
     private var isDone: Bool { if case .finished = speakers.enrollment { return true } else { return false } }
 
     @ViewBuilder private var content: some View {

@@ -79,6 +79,9 @@ def voices_name(embedder, audio_sha: str, transcript_sha: str) -> str:
     return f"voices-{model}-{embedder.model_sha[:8]}-{(audio_sha or '')[:16]}-{(transcript_sha or '')[:8]}.json"
 
 
+_KEEP = object()
+
+
 class SpeakerStore:
     def __init__(self, vault: Vault, db: Database, *, auto_assign_default: bool = True) -> None:
         self.vault = vault
@@ -445,11 +448,11 @@ class SpeakerStore:
         }  # fmt: skip
 
     def write_labels(self, conv_id: str, states: dict[str, dict], *, transcript_sha: str | None = None,
-                     request: tuple[str, dict] | None = None) -> int:  # fmt: skip
+                     voices: str | None | object = _KEEP, request: tuple[str, dict] | None = None) -> int:  # fmt: skip
         """Persist label assignments (speakers.json, then the index); returns the new revision.
-        `transcript_sha`: only when the states were moved to that transcript (`identify`);
-        otherwise they stay tagged with the transcript they were made for. `request`: an app
-        request id and its result, remembered so a retry is answered, not redone."""
+        `transcript_sha` and `voices`: only when the states were made (`identify`) for that
+        transcript and against that voices file (None: none); otherwise the stored ones stay.
+        `request`: an app request id and its result, remembered so a retry is answered, not redone."""
         row = self.db.one("SELECT speakers_revision, transcript_sha FROM conversations WHERE id=?", (conv_id,))
         kept = self.persisted(states)
         path = self.conv_dir(conv_id) / "speakers.json"
@@ -460,6 +463,8 @@ class SpeakerStore:
         # once a voice here was forgotten, that stays true whatever later transcripts contain
         forgotten = bool(data.get("forgotten")) or any(s.get("forgotten") for s in kept.values())
         data.update(revision=revision, transcript_sha=tag, labels=kept, forgotten=forgotten)
+        if voices is not _KEEP:
+            data["voices"] = voices
         if request is not None:
             requests = dict(data.get("requests") or {})
             requests[request[0]] = request[1] | {"revision": revision}
@@ -526,8 +531,43 @@ class SpeakerStore:
         self.load_samples()
         return True
 
+    def reference_voices(self, conv_id: str, name: str) -> None:
+        """Record which voices file the (unchanged) label states now go with."""
+        path = self.conv_dir(conv_id) / "speakers.json"
+        data = Vault.read_json(path) or {}
+        if data.get("voices") == name:
+            return
+        if "transcript_sha" not in data:
+            row = self.db.one("SELECT transcript_sha FROM conversations WHERE id=?", (conv_id,))
+            data["transcript_sha"] = row["transcript_sha"] if row else None
+        Vault.write_json(path, data | {"voices": name})
+
+    def referenced_voices(self, conv_id: str) -> tuple[bool, str | None]:
+        """(speakers.json names its voices file, that file): the generation its labels were made against."""
+        data = Vault.read_json(self.conv_dir(conv_id) / "speakers.json") or {}
+        return "voices" in data, data.get("voices")
+
+    def read_voices(self, conv_id: str, name: str) -> dict[str, VoiceRow]:
+        data = Vault.read_json(self.conv_dir(conv_id) / name) or {}
+        return {
+            label: VoiceRow(label, decode_vector(e["vector_b64"]) if e.get("vector_b64") else None, e.get("seconds") or 0.0,
+                            e.get("turns") or 0, e.get("spread") or 0.0, e.get("rms_db"), e.get("clips") or [],
+                            data.get("model"), data.get("model_sha"))
+            for label, e in (data.get("labels") or {}).items()
+        }  # fmt: skip
+
+    def voices_of_labels(self, conv_id: str, transcript_sha: str | None, *, not_file: str | None = None) -> dict[str, VoiceRow]:
+        """The voices the stored label states were made against."""
+        named, ref = self.referenced_voices(conv_id)
+        if named:
+            return self.read_voices(conv_id, ref) if ref and ref != not_file and (self.conv_dir(conv_id) / ref).exists() else {}
+        return self.voices_for_transcript(conv_id, transcript_sha, not_file=not_file)  # speakers.json from before references
+
     def voices_file(self, conv_id: str) -> str | None:
-        """The voices file of the conversation's current transcript (else the newest one)."""
+        """The voices file speakers.json names; else (older files) the current transcript's, else the newest."""
+        named, ref = self.referenced_voices(conv_id)
+        if named:
+            return ref if ref and (self.conv_dir(conv_id) / ref).exists() else None
         voices = sorted(self.conv_dir(conv_id).glob("voices-*.json"), key=lambda p: (p.stat().st_mtime, p.name))
         row = self.db.one("SELECT transcript_sha FROM conversations WHERE id=?", (conv_id,))
         if row is not None and row["transcript_sha"]:
@@ -549,13 +589,8 @@ class SpeakerStore:
         if not transcript_sha:
             return {}
         for path in self.conv_dir(conv_id).glob(f"voices-*-{transcript_sha[:8]}.json"):
-            data = Vault.read_json(path) or {}
-            return {
-                label: VoiceRow(label, decode_vector(e["vector_b64"]) if e.get("vector_b64") else None, e.get("seconds") or 0.0,
-                                e.get("turns") or 0, e.get("spread") or 0.0, e.get("rms_db"), e.get("clips") or [],
-                                data.get("model"), data.get("model_sha"))
-                for label, e in (data.get("labels") or {}).items()
-            }  # fmt: skip
+            if path.name != not_file:
+                return self.read_voices(conv_id, path.name)
         indexed = self.db.one("SELECT file FROM voices WHERE conversation_id=? LIMIT 1", (conv_id,))
         if indexed is None or indexed["file"] == not_file or re.search(r"-[0-9a-f]{8}\.json$", indexed["file"] or ""):
             return {}
@@ -571,18 +606,28 @@ class SpeakerStore:
         return sha256_hex(canonical_json(data.get("segments") or []).encode()) if data else None
 
     def remove_obsolete_voices(self, conv_id: str) -> bool:
-        """Voices files of another transcript than transcript.json (an interrupted
-        re-transcription's leftovers). An untagged (older-format) file goes once a current one exists."""
+        """Voices files no label state depends on (an interrupted voices stage's leftovers): all but
+        the one speakers.json names — and, while its labels still wait to be moved to a newer
+        transcript, that transcript's (the move compares the two)."""
         files = list(self.conv_dir(conv_id).glob("voices-*.json"))
-        sha = self.current_transcript_sha(conv_id) if files else None
-        if sha is None:
+        if not files:
             return False
+        data = Vault.read_json(self.conv_dir(conv_id) / "speakers.json") or {}
+        sha = self.current_transcript_sha(conv_id)
         tag = re.compile(r"-([0-9a-f]{8})\.json$")
-        current = any((m := tag.search(p.name)) and m.group(1) == sha[:8] for p in files)
+        if "voices" in data:
+            keep = {data["voices"]} if data["voices"] else set()
+            if sha and data.get("transcript_sha") not in (None, sha):
+                keep |= {p.name for p in files if (m := tag.search(p.name)) and m.group(1) == sha[:8]}
+        elif sha is None:
+            return False
+        else:  # speakers.json from before references: by transcript tag (its labels' own, while a move is pending)
+            tags = {sha[:8]} | ({data["transcript_sha"][:8]} if data.get("transcript_sha") else set())
+            current = any((m := tag.search(p.name)) and m.group(1) == sha[:8] for p in files)
+            keep = {p.name for p in files if ((m := tag.search(p.name)) and m.group(1) in tags) or (not m and not current)}
         removed = False
         for path in files:
-            m = tag.search(path.name)
-            if (m and m.group(1) != sha[:8]) or (not m and current):
+            if path.name not in keep:
                 remove(path)
                 removed = True
         if removed:
