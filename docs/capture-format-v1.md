@@ -149,9 +149,14 @@ No auth. `200 {"ok": true}`.
   "llm": {"provider": "anthropic", "ready": true},
   "queue": {"chunks_pending": 0, "conversations_open": 1, "conversations_pending": 0, "failed": 0},
   "vault_dir": "/Users/alan/Notes/Omi",
-  "notes_dir": "/Users/alan/Notes/Omi"
+  "notes_dir": "/Users/alan/Notes/Omi",
+  "features": ["voice_enrollment"]
 }
 ```
+
+`features` lists optional capabilities (absent on older servers). The phone starts a voice
+enrollment only when it contains `voice_enrollment`: a server that doesn't know the enrollment
+events would transcribe the reading as a conversation.
 
 ### `PUT /v1/captures/{capture_id}/chunks/{chunk_sequence}`
 

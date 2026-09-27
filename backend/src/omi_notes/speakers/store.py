@@ -13,6 +13,7 @@ Vault files (the index tables `people`, `samples`, `voices`, `speaker_labels` ar
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -26,8 +27,9 @@ import numpy as np
 import yaml
 
 from ..db import Database
+from ..lock import SpeakerLock
 from ..notes.writer import remove, sanitize_title, write_if_changed
-from ..spool import atomic_write_bytes
+from ..spool import atomic_write_bytes, fsync_dir
 from ..vault import Vault
 from .match import Sample
 from .voices import LabelVoice, decode_vector, encode_vector
@@ -69,11 +71,20 @@ def read_frontmatter(text: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def voices_name(embedder, audio_sha: str, transcript_sha: str) -> str:
+    """A conversation's voices file, keyed by everything the voices depend on (a new transcript
+    may number the voices differently)."""
+    model = re.sub(r"[^A-Za-z0-9._-]+", "-", embedder.model).strip("-")[:40]
+    return f"voices-{model}-{embedder.model_sha[:8]}-{(audio_sha or '')[:16]}-{(transcript_sha or '')[:8]}.json"
+
+
 class SpeakerStore:
     def __init__(self, vault: Vault, db: Database, *, auto_assign_default: bool = True) -> None:
         self.vault = vault
         self.db = db
         self.auto_assign_default = auto_assign_default
+        # every read-modify-write of label states, in the API and in the worker (any process)
+        self.lock = SpeakerLock(vault)
 
     # -- settings --------------------------------------------------------------------------------
 
@@ -148,6 +159,11 @@ class SpeakerStore:
                 names.append((data.get("created_at") or 0, data["person_name"]))
         return max(names)[1] if names else None
 
+    def names_digest(self) -> str:
+        """What rendering depends on about people (ids, names, me), as one hash."""
+        rows = [(r["id"], r["name"], r["me"]) for r in self.db.query("SELECT id, name, me FROM people ORDER BY id")]
+        return hashlib.sha256(json.dumps(rows).encode()).hexdigest()
+
     def people(self) -> list:
         return self.db.query("SELECT * FROM people ORDER BY me DESC, name")
 
@@ -213,21 +229,31 @@ class SpeakerStore:
         block = line.sub(f"{key}: {value}", block, count=1) if line.search(block) else block + f"\n{key}: {value}"
         write_if_changed(path, f"---\n{block}\n---\n" + text[match.end():])
 
-    def forget_voice(self, person_id: str, *, delete_note: bool = False) -> list[str]:
-        """Delete the person's voice data (samples, enrollment audio, consent); clear their label
-        assignments. Returns the conversations whose labels changed."""
+    def labeled_with(self, person_id: str) -> list[str]:
+        """Conversations with a label assigned to (or blocked for) this person."""
+        return [r["conversation_id"] for r in self.db.query(
+            "SELECT DISTINCT conversation_id FROM speaker_labels WHERE person_id=? OR not_json LIKE ?",
+            (person_id, f'%"{person_id}"%'))]  # fmt: skip
+
+    def forget_voice(self, person_id: str, *, delete_note: bool = False) -> None:
+        """Delete the person's voice data (samples, enrollment audio, consent). A global enrollment
+        result keeps only its decision, so the reading is not learned again."""
+        results = self.vault.speakers / "enrollments"
+        for path in sorted(results.glob("*.json")) if results.exists() else []:
+            data = Vault.read_json(path) or {}
+            if data.get("person_id") == person_id:
+                for key in ("person_id", "sample_id", "model", "model_sha"):
+                    data.pop(key, None)
+                Vault.write_json(path, data | {"forgotten": True})
         folder = self.person_dir(person_id)
         if folder.exists():
             shutil.rmtree(folder)
+            fsync_dir(folder.parent)
         person = self.person(person_id)
         if delete_note and person is not None and person["note_path"]:
             remove(self.vault.root / person["note_path"])
-        affected = [r["conversation_id"] for r in self.db.query(
-            "SELECT DISTINCT conversation_id FROM speaker_labels WHERE person_id=? OR not_json LIKE ?",
-            (person_id, f'%"{person_id}"%'))]  # fmt: skip
         self.db.execute("DELETE FROM samples WHERE person_id=?", (person_id,))
         self.scan_people()
-        return affected
 
     def attested(self, person_id: str) -> bool:
         row = self.person(person_id)
@@ -280,6 +306,15 @@ class SpeakerStore:
                    r["day"], r["session"], r["created_at"])
             for r in self.db.query("SELECT * FROM samples WHERE model=? AND model_sha=? ORDER BY created_at, id", (model, model_sha))
         ]  # fmt: skip
+
+    def remove_samples(self, conversation_id: str, label: str, person_id: str) -> int:
+        """Delete the samples a label of a conversation gave a person (file first, then index)."""
+        rows = self.db.query("SELECT id FROM samples WHERE conversation_id=? AND label=? AND person_id=?",
+                             (conversation_id, label, person_id))  # fmt: skip
+        for r in rows:
+            remove(self.person_dir(person_id) / "samples" / f"{r['id']}.json")
+            self.db.execute("DELETE FROM samples WHERE id=?", (r["id"],))
+        return len(rows)
 
     def sample_for_request(self, request_id: str):
         return self.db.one("SELECT * FROM samples WHERE request_id=?", (request_id,))
@@ -339,8 +374,58 @@ class SpeakerStore:
                 changed = True
         if changed:
             Vault.write_json(path, data)
+        stale = self.db.one(
+            f"SELECT 1 FROM voices WHERE conversation_id=? AND vector IS NOT NULL AND label NOT IN ({','.join('?' * len(keep))})",
+            (conv_id, *sorted(keep)),
+        )  # fmt: skip
+        if changed or stale:  # also heals an index a crash left behind the file
             self.index_voices(conv_id, row["file"])
         return changed
+
+    def vector_labels(self, states: dict[str, dict], labels: set[str], *, raw: bool) -> set[str]:
+        """Labels whose voice vector may be stored (docs/speaker-learning.md, "Privacy"): named for
+        me, or for someone with consent (acknowledged and attested); any other label only while
+        unknown voices are on and its raw audio exists. A forgotten label never."""
+        prefs = self.settings()
+        people = {r["id"]: r for r in self.people()}
+        keep = set()
+        for label in labels:
+            state = states.get(label) or {}
+            if state.get("forgotten"):
+                continue
+            person = people.get(state.get("person_id"))
+            if person is not None and (person["me"] or (prefs["acknowledged_at"] and person["attested_at"])):
+                keep.add(label)
+            elif raw and prefs["unknown_voices_enabled"]:
+                keep.add(label)
+        return keep
+
+    def raw_available(self, row) -> bool:
+        """All raw audio under the conversation's speech still exists."""
+        blocks = json.loads(row["blocks_json"])
+        if not blocks:
+            return False
+        lo, hi = min(b[0] for b in blocks), max(b[1] for b in blocks)
+        return self.db.one(
+            """SELECT 1 FROM chunks WHERE device_id=? AND raw_deleted=1 AND audio_start IS NOT NULL
+               AND audio_start <= ? AND audio_end >= ?""",
+            (row["device_id"], hi + 1, lo - 1),
+        ) is None
+
+    def reconcile_vectors(self) -> int:
+        """Drop every stored vector the rule no longer allows. Idempotent and independent of how
+        we got here (a setting change, raw deletion, forgetting, or a crash in the middle of one)."""
+        pruned = 0
+        for r in self.db.query("SELECT DISTINCT conversation_id FROM voices WHERE vector IS NOT NULL"):
+            conv_id = r["conversation_id"]
+            row = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
+            stored = {v["label"] for v in self.db.query(
+                "SELECT label FROM voices WHERE conversation_id=? AND vector IS NOT NULL", (conv_id,))}  # fmt: skip
+            keep = self.vector_labels(self.labels(conv_id), stored, raw=row is not None and self.raw_available(row))
+            if stored - keep:
+                self.prune_vectors(conv_id, keep)
+                pruned += 1
+        return pruned
 
     def voices(self, conv_id: str) -> dict[str, VoiceRow]:
         return {
@@ -353,7 +438,7 @@ class SpeakerStore:
     def labels(self, conv_id: str) -> dict[str, dict]:
         return {
             r["label"]: {"person_id": r["person_id"], "source": r["source"], "distance": r["distance"], "margin": r["margin"],
-                         "evidence_s": r["evidence_s"], "not": json.loads(r["not_json"])}
+                         "evidence_s": r["evidence_s"], "not": json.loads(r["not_json"]), "forgotten": bool(r["forgotten"])}
             for r in self.db.query("SELECT * FROM speaker_labels WHERE conversation_id=?", (conv_id,))
         }  # fmt: skip
 
@@ -362,10 +447,11 @@ class SpeakerStore:
         """Persist label assignments (speakers.json, then the index); returns the new revision.
         `request`: an app request id and its result, remembered so a retry is answered, not redone."""
         row = self.db.one("SELECT speakers_revision FROM conversations WHERE id=?", (conv_id,))
-        revision = (row["speakers_revision"] if row else 0) + 1
         kept = self.persisted(states)
         path = self.conv_dir(conv_id) / "speakers.json"
         data = Vault.read_json(path) or {}
+        # the file is the truth: its revision may be ahead of an index write that failed
+        revision = max(row["speakers_revision"] if row else 0, int(data.get("revision") or 0)) + 1
         data.update(revision=revision, transcript_sha=transcript_sha, labels=kept)
         if request is not None:
             requests = dict(data.get("requests") or {})
@@ -377,11 +463,17 @@ class SpeakerStore:
 
     @staticmethod
     def persisted(states: dict[str, dict]) -> dict[str, dict]:
-        """What speakers.json keeps of label states: assignments, blocks, match evidence."""
+        """What speakers.json keeps of label states: assignments, blocks, match evidence, and
+        `forgotten` (the label's person was forgotten: its voice is never stored again)."""
         keys = ("person_id", "source", "distance", "margin", "evidence_s", "not")
-        return {label: {k: (sorted(state.get(k) or []) if k == "not" else state.get(k)) for k in keys}
-                for label, state in sorted(states.items())
-                if state.get("person_id") or state.get("not") or state.get("distance") is not None}  # fmt: skip
+        out = {}
+        for label, state in sorted(states.items()):
+            if not (state.get("person_id") or state.get("not") or state.get("distance") is not None or state.get("forgotten")):
+                continue
+            out[label] = {k: (sorted(state.get(k) or []) if k == "not" else state.get(k)) for k in keys}
+            if state.get("forgotten"):
+                out[label]["forgotten"] = True
+        return out
 
     def request_result(self, conv_id: str, request_id: str) -> dict | None:
         data = Vault.read_json(self.conv_dir(conv_id) / "speakers.json") or {}
@@ -391,19 +483,66 @@ class SpeakerStore:
         with self.db.tx() as conn:
             conn.execute("DELETE FROM speaker_labels WHERE conversation_id=?", (conv_id,))
             conn.executemany(
-                """INSERT INTO speaker_labels (conversation_id, label, person_id, source, distance, margin, evidence_s, not_json)
-                   VALUES (?,?,?,?,?,?,?,?)""",
+                """INSERT INTO speaker_labels (conversation_id, label, person_id, source, distance, margin, evidence_s, not_json,
+                       forgotten) VALUES (?,?,?,?,?,?,?,?,?)""",
                 [(conv_id, label, s.get("person_id"), s.get("source"), s.get("distance"), s.get("margin"),
-                  s.get("evidence_s"), json.dumps(sorted(s.get("not") or []))) for label, s in states.items()],
+                  s.get("evidence_s"), json.dumps(sorted(s.get("not") or [])), int(bool(s.get("forgotten"))))
+                 for label, s in states.items()],
             )  # fmt: skip
             conn.execute("UPDATE conversations SET speakers_revision=? WHERE id=?", (revision, conv_id))
+
+    def sync_conversation(self, conv_id: str) -> bool:
+        """Re-index this conversation's speakers/voices files where the index is behind them (a
+        crash or failed index write after the file was published). True if anything changed."""
+        conv_dir = self.conv_dir(conv_id)
+        changed = False
+        data = Vault.read_json(conv_dir / "speakers.json")
+        row = self.db.one("SELECT speakers_revision FROM conversations WHERE id=?", (conv_id,))
+        if data and row is not None and int(data.get("revision") or 0) != row["speakers_revision"]:
+            self.index_labels(conv_id, data.get("labels") or {}, int(data.get("revision") or 0))
+            changed = True
+        name = self.voices_file(conv_id)
+        indexed = self.db.one("SELECT file FROM voices WHERE conversation_id=? LIMIT 1", (conv_id,))
+        if name and (indexed is None or indexed["file"] != name):
+            self.index_voices(conv_id, name)
+            changed = True
+        return changed
+
+    def sync_samples(self) -> bool:
+        """Re-index voice samples if the index lost any (or kept a deleted one)."""
+        files = {p.stem for p in self.vault.people.glob("*/samples/*.json")} if self.vault.people.exists() else set()
+        indexed = {r["id"] for r in self.db.query("SELECT id FROM samples")}
+        if files == indexed:
+            return False
+        self.load_samples()
+        return True
+
+    def voices_file(self, conv_id: str) -> str | None:
+        """The voices file of the conversation's current transcript (else the newest one)."""
+        voices = sorted(self.conv_dir(conv_id).glob("voices-*.json"), key=lambda p: (p.stat().st_mtime, p.name))
+        row = self.db.one("SELECT transcript_sha FROM conversations WHERE id=?", (conv_id,))
+        if row is not None and row["transcript_sha"]:
+            current = [p for p in voices if p.name.endswith(f"-{row['transcript_sha'][:8]}.json")]
+            voices = current or voices
+        return voices[-1].name if voices else None
+
+    def remove_other_voices(self, conv_id: str, keep: str) -> None:
+        """Voices of an earlier transcript (their labels no longer apply) are deleted."""
+        for path in self.conv_dir(conv_id).glob("voices-*.json"):
+            if path.name != keep:
+                remove(path)
+
+    def labels_transcript(self, conv_id: str) -> str | None:
+        """The transcript the stored label states were made for (None: no states yet)."""
+        data = Vault.read_json(self.conv_dir(conv_id) / "speakers.json")
+        return data.get("transcript_sha") if data else None
 
     def load_conversation(self, conv_id: str) -> None:
         """Index a conversation's voices and speakers files (rebuild)."""
         conv_dir = self.conv_dir(conv_id)
-        voices = sorted(conv_dir.glob("voices-*.json"))
-        if voices:
-            self.index_voices(conv_id, voices[-1].name)
+        name = self.voices_file(conv_id)
+        if name:
+            self.index_voices(conv_id, name)
         data = Vault.read_json(conv_dir / "speakers.json")
         if data:
             self.index_labels(conv_id, data.get("labels") or {}, int(data.get("revision") or 0))

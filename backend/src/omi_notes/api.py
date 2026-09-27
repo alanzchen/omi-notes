@@ -17,13 +17,14 @@ from fastapi.responses import JSONResponse, Response
 from . import PROTOCOL_VERSION, __version__
 from .envelope import MAX_BODY_BYTES
 from .ingest import ApiError, Ingest, capture_status
+from .lock import api_lock
 from .pipeline.conversations import ConversationPipeline, Providers, queue_counts
 from .pipeline.worker import Worker, read_only_reason
 from .rebuild import open_index
 from .settings import Settings
 from .speakers.service import SpeakerService
 from .util import iso_utc_epoch
-from .vault import LeaseError, Vault
+from .vault import LeaseError, Vault, VaultBusy
 
 log = logging.getLogger(__name__)
 MAX_JSON_BYTES = 64 * 1024
@@ -45,19 +46,31 @@ def create_app(
     ingest = Ingest(db, vault, settings, read_only=lambda: read_only_reason(db))
     token = settings.omi_notes_token.encode()
 
+    serving = api_lock(vault)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # One server per vault on this host (docs/vault.md, "Writer ownership"): it writes chunks,
+        # events and speaker changes, so a second one must not start, whatever its INDEX_DIR.
+        if not serving.acquire():
+            raise VaultBusy(f"another backend (pid {serving.owner()}) is already serving this vault ({vault.root})")
         stop = threading.Event()
         thread = None
-        if start_worker:
-            w = worker or Worker(settings, db)
-            w.take_over = take_over
-            thread = threading.Thread(target=w.run_forever, args=(stop,), name="omi-notes-worker", daemon=True)
-            thread.start()
-        yield
-        stop.set()
-        if thread is not None:
-            thread.join(timeout=30)
+        try:
+            if start_worker:
+                w = worker or Worker(settings, db)
+                w.take_over = take_over
+                if not w.lock.acquire():
+                    raise VaultBusy(f"a separate `omi-notes worker` (pid {w.lock.owner()}) is processing this vault; "
+                                    "run `omi-notes serve --no-worker` next to it")  # fmt: skip
+                thread = threading.Thread(target=w.run_forever, args=(stop,), name="omi-notes-worker", daemon=True)
+                thread.start()
+            yield
+        finally:
+            stop.set()
+            if thread is not None:
+                thread.join(timeout=30)
+            serving.release()
 
     app = FastAPI(title="omi-notes", version=__version__, lifespan=lifespan)
     app.state.db = db
@@ -130,6 +143,8 @@ def create_app(
             "vault_dir": str(settings.vault_dir),
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
+            # the phone only starts a voice enrollment when the server keeps the reading out of notes
+            "features": ["voice_enrollment"],
         }
 
     @app.put("/v1/captures/{capture_id}/chunks/{chunk_sequence}")

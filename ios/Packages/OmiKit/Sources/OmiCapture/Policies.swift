@@ -205,9 +205,11 @@ public struct EventWriter: Sendable {
     }
 
     @discardableResult
-    public func voiceEnrollmentStart(enrollmentId: String, deviceId: String, captureId: String, offsetUs: Int64) throws -> OutboxItem {
+    /// `at`: only when writing a lost start event again (the original wall time).
+    public func voiceEnrollmentStart(enrollmentId: String, deviceId: String, captureId: String, offsetUs: Int64,
+                                     at: String? = nil) throws -> OutboxItem {
         try write(EventBody(
-            deviceId: deviceId, at: ISO8601UTC.format(clock.wallNow()),
+            deviceId: deviceId, at: at ?? ISO8601UTC.format(clock.wallNow()),
             payload: .voiceEnrollmentStart(VoiceEnrollmentStartData(enrollmentId: enrollmentId)),
             captureId: captureId, offsetUs: offsetUs))
     }

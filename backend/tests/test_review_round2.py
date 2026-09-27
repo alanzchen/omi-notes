@@ -21,9 +21,10 @@ from omi_notes.cli import app as cli
 from omi_notes.db import Database
 from omi_notes.devtools import live_envelopes, pcm_envelopes, ring_envelopes, synth_speech_like
 from omi_notes.envelope import build_envelope, parse_envelope
-from omi_notes.lock import WorkerLock
+from omi_notes.lock import worker_lock
 from omi_notes.pipeline.worker import Worker
 from omi_notes.providers.fake import FakeLlm
+from omi_notes.vault import Vault
 
 from .conftest import AUTH, DEVICE, cli_env, make_settings, put_chunk, upload_all
 from .helpers import STARTED, T0, convs, event, iso, live, live_seal, replay, ring_seal, ring_sync, silence, timedelta
@@ -167,7 +168,7 @@ def test_r5_reprocess_request_during_a_running_stage_is_kept(client, worker, set
     (row,) = convs(worker)
     llm = BlockingLlm()
     worker.providers._llm = llm
-    lock = WorkerLock(settings.db_path.parent)
+    lock = worker_lock(Vault.open(settings))
     assert lock.acquire()  # a worker is "running": the CLI only queues
     try:
         runner = CliRunner()

@@ -81,7 +81,11 @@ another path) are reported and never deleted. `_status.md` and stubs rewrite at 
 
 ## Writer ownership
 
-One writer per vault. The local `flock` (index dir) prevents two backends on one host. The
+One writer per vault. Host `flock`s in `_omi/locks/` (in the vault, so every process finds them
+whatever its `INDEX_DIR`; the files only hold a pid and lock state is never synced) prevent two
+backends on one host: `api.lock` (one HTTP server — a second `serve` refuses to start),
+`worker.lock` (one pipeline; maintenance commands queue work when they can't take it), and
+`speakers.lock` (label read-modify-writes, between the API and a separate worker). The
 `_omi/writer.json` lease is **advisory** across hosts: startup refuses a live foreign lease
 (renewed < 15 min ago) unless `--take-over`, which is only for after the other writer was stopped.
 Divergence — sync conflict-copy filenames or duplicate record ids under `_omi/` — stops writes and

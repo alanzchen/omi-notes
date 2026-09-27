@@ -32,6 +32,8 @@ public final class SpeakersModel {
     public private(set) var suggestions: [SpeakerSuggestion] = []
     public private(set) var error: String?
     public private(set) var loading = false
+    /// nil until the server's status was read.
+    public private(set) var serverSupportsEnrollment: Bool?
     public var enrollment: Enrollment = .idle
 
     private let engine: OmiEngine
@@ -56,8 +58,10 @@ public final class SpeakersModel {
             let api = try api()
             async let p = api.people()
             async let s = api.speakerSettings()
+            async let st = api.status()
             people = try await p
             settings = try await s
+            serverSupportsEnrollment = try await st.supportsVoiceEnrollment
             suggestions = settings?.unknownVoicesEnabled == true ? (try await api.speakerSuggestions()) : []
             error = nil
         } catch {
@@ -152,10 +156,17 @@ public final class SpeakersModel {
     // MARK: Enrollment
 
     public var canStartEnrollment: Bool {
-        engine.settings.endpoint != nil && engine.snapshotNow().connection == .streaming
+        engine.settings.endpoint != nil && engine.snapshotNow().connection == .streaming && serverSupportsEnrollment == true
     }
 
+    public static let serverTooOld = "Update the Omi Notes server first: this one doesn't support voice enrollment, so your reading would be transcribed as a conversation."
+
     public func startEnrollment() {
+        // Only a server that knows the enrollment events keeps the reading out of transcripts.
+        guard serverSupportsEnrollment == true else {
+            enrollment = .failed(serverSupportsEnrollment == false ? Self.serverTooOld : "Couldn't reach the server to check it supports voice enrollment.")
+            return
+        }
         do {
             let id = try engine.startVoiceEnrollment()
             enrollment = .reading(id: id, prompt: 0)

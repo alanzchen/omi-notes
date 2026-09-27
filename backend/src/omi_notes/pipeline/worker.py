@@ -28,7 +28,7 @@ from ..audio.vad import MIN_SPEECH, VadChoice, VadStream, make_vad
 from ..db import Database
 from ..envelope import OPUS_CODECS, parse_envelope
 from ..ingest import seal_end_epoch
-from ..lock import WorkerLock
+from ..lock import worker_lock
 from ..notes.writer import remove
 from ..rebuild import advance_processed
 from ..records import record_from_row, write_record
@@ -85,7 +85,7 @@ class Worker:
             soft_max=settings.soft_max_conversation_seconds,
             hard_max=settings.hard_max_conversation_seconds,
         )
-        self.lock = WorkerLock(db.path.parent)
+        self.lock = worker_lock(self.vault)
         self._decoders: OrderedDict[str, tuple[int, CaptureTimeline, VadStream]] = OrderedDict()
         self._last_retention = 0.0
         self._reconciled = False
@@ -162,7 +162,7 @@ class Worker:
 
     def run_forever(self, stop: threading.Event) -> None:
         if not self.lock.acquire():
-            log.error("another worker holds %s; this process only accepts uploads", self.lock.path)
+            log.error("another worker (pid %s) holds %s; not processing", self.lock.owner(), self.lock.path)
             return
         try:
             try:
@@ -503,7 +503,7 @@ class Worker:
         ]
         return seg.DeviceTimeline(
             speech=[seg.Speech(r["id"], r["start"], r["end"], r["capture_id"], r["chunk_sequence"]) for r in rows],
-            splits=self.effective_splits(device, lo - gap, hi + gap),
+            splits=self.effective_splits(device, lo - gap, hi + gap, now),
             finalized=finalized,
             **self._evidence(device, lo, hi, now),
         )
@@ -640,14 +640,21 @@ class Worker:
         complete = cap is not None and cap["last_chunk_sequence"] is not None and cap["processed_through"] >= cap["last_chunk_sequence"]
         return complete or (reached is not None and reached >= t)
 
-    def effective_splits(self, device: str, lo: float, hi: float) -> list[float]:
+    def capture_end(self, capture_id: str) -> float | None:
+        """Wall-clock end of the capture's audio received so far."""
+        return self.db.one("SELECT MAX(end_epoch) AS m FROM chunks WHERE capture_id=?", (capture_id,))["m"]
+
+    def enrollment_windows(self, device: str, now: float) -> list:
+        return enroll.settle(enroll.windows(self.db, device), now, self.enrollments.capture_finished, self.capture_end)
+
+    def effective_splits(self, device: str, lo: float, hi: float, now: float) -> list[float]:
         """Double-tap times and voice-enrollment window boundaries in [lo, hi] whose capture audio
         up to that moment has been processed."""
         points = [(ev["t"], ev["capture_id"]) for ev in self.db.query(
             "SELECT * FROM event_times WHERE device_id=? AND type='button' AND code=2 AND t BETWEEN ? AND ?",
             (device, lo, hi),
         )]  # fmt: skip
-        points += [(t, cap) for t, cap in enroll.boundaries(enroll.windows(self.db, device)) if lo <= t <= hi]
+        points += [(t, cap) for t, cap in enroll.boundaries(self.enrollment_windows(device, now)) if lo <= t <= hi]
         return sorted(t for t, cap in points if not cap or self.capture_reached(cap, t))
 
     def segment_device(self, device: str, now: float) -> int:
@@ -662,7 +669,7 @@ class Worker:
                 self.db.execute("UPDATE speech SET claimed_by='*' WHERE id=?", (speech_id,))
         keep: set[str] = set()
         changes = 0
-        windows = enroll.windows(self.db, device)
+        windows = self.enrollment_windows(device, now)
         for c in candidates:
             conv_id = self._conversation_id(device, c.start)
             keep.add(conv_id)
@@ -814,6 +821,10 @@ class Worker:
                 log.exception("retention: could not expire raw audio of capture %s", capture_id)
         if deleted:
             log.info("retention: deleted %d raw chunks", deleted)
+        try:  # every pass, so a cleanup a crash interrupted is finished
+            self.pipeline.speakers.reconcile_vectors()
+        except Exception:
+            log.exception("retention: could not reconcile stored voice vectors")
         return deleted
 
     def _expire(self, capture_id: str, chunks: list, now: float) -> int:
@@ -841,18 +852,7 @@ class Worker:
 
     def _prune_voices(self, device: str, chunks: list) -> None:
         """Unknown-voice vectors live only as long as the conversation's raw audio."""
-        starts = [c["audio_start"] for c in chunks if c["audio_start"] is not None]
-        ends = [c["audio_end"] for c in chunks if c["audio_end"] is not None]
-        if not starts:
-            return
-        for conv in self.db.query(
-            """SELECT DISTINCT v.conversation_id FROM voices v JOIN conversations c ON c.id = v.conversation_id
-               WHERE c.device_id=? AND c.end >= ? AND c.start <= ? AND v.vector IS NOT NULL""",
-            (device, min(starts) - 2, max(ends) + 2),
-        ):
-            conv_id = conv["conversation_id"]
-            keep = {label for label, state in self.pipeline.speakers.labels(conv_id).items() if state.get("person_id")}
-            self.pipeline.speakers.prune_vectors(conv_id, keep)
+        self.pipeline.speakers.reconcile_vectors()
 
     def _evidence_for(self, capture, seqs: set[int]) -> dict:
         capture_id = capture["capture_id"]

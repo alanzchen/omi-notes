@@ -7,8 +7,13 @@ import OmiProtocol
 /// ordinary conversation. The matching `voice_enrollment_end` event is held too, so the server never
 /// sees an end before its start. Holds are persisted, so a relaunch keeps holding.
 ///
-/// If the start event is permanently rejected (quarantined), the hold is released: holding audio
-/// forever would be worse than the enrollment speech being transcribed.
+/// A start event that disappeared without being acknowledged is unexplained state: the audio stays
+/// held and the start event is written again (`reemitStart`) from what the hold remembers.
+///
+/// If the start event is permanently rejected (quarantined), the hold is released: the hold covers
+/// every later chunk of the capture, and holding all of it forever would be worse than the reading
+/// being transcribed. The app only starts an enrollment against a server that advertises
+/// `voice_enrollment` in `/v1/status`, so a rejection means a server bug, not an old server.
 public final class EnrollmentGate: UploadGate, @unchecked Sendable {
     public struct Hold: Codable, Equatable, Sendable {
         public var enrollmentId: String
@@ -17,13 +22,21 @@ public final class EnrollmentGate: UploadGate, @unchecked Sendable {
         public var fromSequence: Int
         public var startEventId: String
         public var endEventId: String?
+        /// What the start event said, so a lost one can be written again.
+        public var deviceId: String?
+        public var startAt: String?
+        public var startOffsetUs: Int64?
 
-        public init(enrollmentId: String, captureId: String, fromSequence: Int, startEventId: String, endEventId: String? = nil) {
+        public init(enrollmentId: String, captureId: String, fromSequence: Int, startEventId: String, endEventId: String? = nil,
+                    deviceId: String? = nil, startAt: String? = nil, startOffsetUs: Int64? = nil) {
             self.enrollmentId = enrollmentId
             self.captureId = captureId
             self.fromSequence = fromSequence
             self.startEventId = startEventId
             self.endEventId = endEventId
+            self.deviceId = deviceId
+            self.startAt = startAt
+            self.startOffsetUs = startOffsetUs
         }
     }
 
@@ -31,6 +44,12 @@ public final class EnrollmentGate: UploadGate, @unchecked Sendable {
     private let outbox: Outbox
     private let lock = NSLock()
     private var holds: [Hold]
+    /// Writes a hold's start event again and returns the new event id (set by the engine).
+    public var reemitStart: (@Sendable (Hold) throws -> String)? {
+        get { lock.lock(); defer { lock.unlock() }; return _reemitStart }
+        set { lock.lock(); _reemitStart = newValue; lock.unlock() }
+    }
+    private var _reemitStart: (@Sendable (Hold) throws -> String)?
 
     public init(stateDir: URL, outbox: Outbox) {
         url = stateDir.appendingPathComponent("enrollment-holds.json")
@@ -81,26 +100,50 @@ public final class EnrollmentGate: UploadGate, @unchecked Sendable {
         releaseSettled()
     }
 
-    /// Drops holds whose start event is acknowledged (or gone after retention) or quarantined.
+    /// Drops holds whose start event is acknowledged or quarantined; writes a lost one again.
     private func releaseSettled() {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
         let before = holds.count
+        var missing: [Hold] = []
         holds.removeAll { h in
             let kind = OutboxKind.event(eventId: h.startEventId)
-            if outbox.isAcknowledged(kind) || outbox.locate(kind) == nil { return true }
+            if outbox.isAcknowledged(kind) { return true }
             if outbox.quarantined().contains(where: { $0.kind == kind }) {
                 log(.warning, "enrollment", "start event of \(h.enrollmentId) was rejected; releasing its audio")
                 return true
             }
+            if outbox.locate(kind) == nil { missing.append(h) }
             return false
         }
         if holds.count != before { try? persistLocked() }
+        let reemit = _reemitStart
+        lock.unlock()
+        guard !missing.isEmpty else { return }
+        // Outside the lock: writing to the outbox may call back into the gate.
+        var rewritten: [String: String] = [:]
+        for h in missing {
+            do {
+                guard let reemit else { throw EnrollmentGateError.cannotRewrite }
+                rewritten[h.enrollmentId] = try reemit(h)
+                log(.warning, "enrollment", "start event of \(h.enrollmentId) was lost; wrote it again, audio stays held")
+            } catch {
+                log(.error, "enrollment", "start event of \(h.enrollmentId) is lost and could not be written again (\(error)); audio stays held")
+            }
+        }
+        guard !rewritten.isEmpty else { return }
+        lock.lock(); defer { lock.unlock() }
+        for i in holds.indices {
+            if let id = rewritten[holds[i].enrollmentId] { holds[i].startEventId = id }
+        }
+        try? persistLocked()
     }
 
     private func persistLocked() throws {
         try JSONFile.save(holds, to: url)
     }
 }
+
+enum EnrollmentGateError: Error { case cannotRewrite }
 
 /// Every gate must allow an item; acknowledgements go to all of them.
 public final class CompositeUploadGate: UploadGate, @unchecked Sendable {

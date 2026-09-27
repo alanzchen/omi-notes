@@ -256,9 +256,11 @@ def advance_processed(conn, capture: str) -> None:
 # -- records -----------------------------------------------------------------------------------------
 
 
-def apply_record(conn, record: dict, sha: str, now: float) -> None:
+def apply_record(conn, record: dict, sha: str, now: float, vault: Vault | None = None) -> None:
     """Make the index row of a conversation match its permanent record."""
     values, known = row_from_record(record)
+    if vault is not None:
+        _resume_newer_transcript(vault, values)
     current = conn.execute("SELECT * FROM conversations WHERE id=?", (values["id"],)).fetchone()
     values["record_sha"] = sha
     if current is None:
@@ -278,6 +280,22 @@ def apply_record(conn, record: dict, sha: str, now: float) -> None:
         [(values["id"], cap, seq) for cap, seq in known.items()],
     )
     # Speech this conversation knows about is claimed (segmentation re-derives the exact claims).
+
+
+def _resume_newer_transcript(vault: Vault, values: dict) -> None:
+    """A transcript.json newer than the record's last render (a forced re-transcription that a
+    crash interrupted before its render was committed) is finished — summarized and rendered —
+    rather than paired with the old summary."""
+    if values.get("status") not in ("done", "failed", "discarded") or values.get("enrollment_id") or not values.get("transcript_sha"):
+        return
+    data = Vault.read_json(vault.conversation_dir(values["id"]) / "transcript.json")
+    if not data:
+        return
+    current = sha256_hex(canonical_json(data.get("segments") or []).encode())
+    if current != values["transcript_sha"]:
+        log.info("conversation %s: its transcript is newer than its note; summarizing it again", values["id"])
+        values.update(status="summarizing", transcript_sha=current, stt_ref=data.get("stt_file") or values.get("stt_ref"),
+                      audio_sha=data.get("audio_sha") or values.get("audio_sha"))  # fmt: skip
 
 
 def _validate(conn, vault: Vault, record: dict, report: Report) -> None:
@@ -333,7 +351,7 @@ def build(settings: Settings, vault: Vault, path: Path, *, now: float | None = N
             if record is None:
                 report.problems.append(f"unreadable conversation record {vault.relpath(record_path)}")
                 continue
-            apply_record(conn, record, sha, now)
+            apply_record(conn, record, sha, now, vault)
             _validate(conn, vault, record, report)
             report.conversations += 1
         days = {r["start"] for r in conn.execute("SELECT start FROM conversations")}
@@ -506,9 +524,21 @@ def sweep(db: Database, vault: Vault) -> dict:
         if record is None or shas.get(record["id"]) == sha:
             continue
         with db.tx() as conn:
-            apply_record(conn, record, sha, now)
+            apply_record(conn, record, sha, now, vault)
         counts["records"] += 1
+    counts["speakers"] = _sweep_speakers(db, vault)
     if any(counts.values()):
         log.info("startup sweep indexed %s", counts)
     return counts
+
+
+def _sweep_speakers(db: Database, vault: Vault) -> int:
+    """People, samples, and per-conversation speakers/voices files newer than the index."""
+    from .speakers.store import SpeakerStore
+
+    store = SpeakerStore(vault, db)
+    changed = int(store.scan_people()) + int(store.sync_samples())
+    for r in db.query("SELECT id FROM conversations WHERE status <> 'open'"):
+        changed += int(store.sync_conversation(r["id"]))
+    return changed
 

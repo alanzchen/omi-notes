@@ -261,6 +261,8 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
     public var llm: Provider?
     public var queue: Queue?
     public var notesDir: String?
+    /// Optional capabilities, e.g. `voice_enrollment` (older servers send none).
+    public var features: [String]?
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -269,7 +271,11 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
         case serverTime = "server_time"
         case stt, llm, queue
         case notesDir = "notes_dir"
+        case features
     }
+
+    /// The server understands `voice_enrollment_start`/`_end` (so a reading is never transcribed).
+    public var supportsVoiceEnrollment: Bool { features?.contains("voice_enrollment") == true }
 }
 
 public struct CaptureStatusResponse: Decodable, Equatable, Sendable {

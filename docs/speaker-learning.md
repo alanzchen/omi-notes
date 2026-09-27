@@ -57,18 +57,32 @@ relative to `/Users/alan/Developer/_ref/omi`.
 - `People/<Name>.md`: frontmatter `omi_person_id`, `name`, `aliases`, `omi_me: true|false`; created
   once by the server, then user-owned (rename freely; identity is the id). Obsidian backlinks show
   their conversations.
-- Voice data: `_omi/people/<id>/samples|enrollment|enrollments`. **Forget voice** deletes that
-  folder, clears assignments, and re-renders affected notes back to "Speaker N".
+- Voice data: `_omi/people/<id>/samples|enrollment|enrollments`. **Forget voice** first clears
+  the person's label assignments (marking those labels `forgotten`, so their voice is never stored
+  again, even as an unknown voice), prunes those labels' vectors, keeps only the *decision* of a
+  global enrollment result (so the reading is not learned again), then deletes that folder and
+  re-renders affected notes back to "Speaker N". A retry after a crash finishes what is left.
+- Taking a label back from someone (renaming it, "Unknown speaker", "Not X") deletes the sample
+  that assignment created: a repudiated confirmation must not train anyone's voice.
 
 ## Enrollment (wearer, through the pendant)
 
-1. The app requires a live, flowing capture, shows consent text, then ~6 sentences (~50 s).
+1. The app requires a live, flowing capture and a server whose `/v1/status` lists the
+   `voice_enrollment` feature (an older server would transcribe the reading), shows consent text,
+   then ~6 sentences (~50 s).
 2. At start the phone journals an outbox event `voice_enrollment_start` (`capture_id`, `offset_us`,
    `enrollment_id`) and **holds that capture's chunks from the start offset until the start event
-   is acknowledged**, so enrollment speech can never reach STT unmarked. At finish (or interruption)
-   it sends `voice_enrollment_end` (`end_offset_us`, `outcome`), forcing a chunk rotation.
+   is acknowledged**, so enrollment speech can never reach STT unmarked. A start event that went
+   missing unacknowledged is written again (the hold remembers it) while the audio stays held. A
+   start event the server *rejects* releases the hold — it covers every later chunk of the capture,
+   and holding all of that forever is worse than the reading being transcribed; with the feature
+   check this is a server bug. At finish (or interruption) it sends `voice_enrollment_end`
+   (`end_offset_us`, `outcome`), forcing a chunk rotation.
 3. The server treats the window as explicit splits: a conversation inside it is discarded as
-   "voice enrollment" **without STT**, and its raw audio is protected until the result is decided.
+   "voice enrollment" **without STT** (reprocessing and resummarize never transcribe it either),
+   and its raw audio is protected until the result is decided. A window whose end never arrives
+   (the phone crashed; the end landed in another capture) is, once stale, closed at the end of its
+   capture's audio and decided `interrupted` — the reading stays excluded.
 4. After `processed_through` covers the end: decode the window; require ≥ 20 s of VAD speech,
    ≥ 80 % of 3 s windows within 0.5 of the window centroid (else "another voice"), level/clipping
    checks; verify with a **disjoint** held-out clip. States: `waiting_audio` → `processing` →
@@ -94,6 +108,13 @@ exists → "Is this you?". Dismissals persist with a 7-day cooldown (cf. Omi
   attestation that the person knows. Unknown-voice storage is a separate opt-in.
 - Embeddings never go to providers; the LLM only sees names. No third-party audio is kept beyond
   raw retention (clips are rendered on demand while raw exists).
+- **What a conversation's voices file may keep** (one rule, `SpeakerStore.vector_labels`): the
+  vector of a label named for the wearer or for someone with consent (acknowledged + attested);
+  any other label's vector — unknown, or named without consent — only while unknown-voice storage
+  is on and the raw audio exists; a forgotten label's never. The rule is re-applied idempotently on
+  every retention pass and after every settings change, so a cleanup a crash interrupted finishes.
+- A voices file is keyed by model, model hash, audio and transcript: a new transcript gets new
+  voices, and an earlier assignment survives only where its label still has the same voice.
 
 ## API (bearer auth; errors in the existing shape)
 

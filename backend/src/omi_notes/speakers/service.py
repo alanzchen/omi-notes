@@ -11,7 +11,6 @@ from __future__ import annotations
 import io
 import json
 import logging
-import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -24,11 +23,11 @@ from ..util import UUID_RE, iso_utc_epoch
 from . import enroll
 from . import match as speaker_match
 from . import suggest as speaker_suggest
+from .store import voices_name
 from .voices import Clip, embed_voices
 
 log = logging.getLogger(__name__)
 
-_lock = threading.RLock()
 MAX_CLIP_SECONDS = 10.0
 EXCERPT_CHARS = 140
 
@@ -80,20 +79,22 @@ class SpeakerService:
         attest = body.get("attest_knows", False)
         if not isinstance(attest, bool):
             raise ApiError(422, "invalid_body", "attest_knows must be a boolean")
-        with _lock:
+        with self.store.lock:
             created = self.store.put_person(person_id, name.strip(), me=me, attest=attest)
             self.db.set_meta("relabel_pending", "1")  # names/me shape rendering and prompts
         person = next(p for p in self.people() if p["id"] == person_id)
         return (201 if created else 200), person
 
     def forget(self, person_id: str, *, delete_note: bool) -> list[str]:
-        with _lock:
+        with self.store.lock:
             if self.store.person(person_id) is None and not self.store.person_dir(person_id).exists():
                 raise ApiError(404, "not_found", "unknown person")
-            affected = self.store.forget_voice(person_id, delete_note=delete_note)
+            # Labels first (marked forgotten: their voice is never stored again), then their vectors,
+            # then the voice data itself; a retry after a crash finishes whatever is left.
+            affected = self.store.labeled_with(person_id)
             for conv_id in affected:
                 states = {
-                    label: (s | {"person_id": None, "source": None} if s.get("person_id") == person_id else s)
+                    label: (s | {"person_id": None, "source": None, "forgotten": True} if s.get("person_id") == person_id else s)
                     | {"not": [x for x in s.get("not") or [] if x != person_id]}
                     for label, s in self.store.labels(conv_id).items()
                 }
@@ -101,6 +102,8 @@ class SpeakerService:
                 self.store.write_labels(conv_id, states, transcript_sha=row["transcript_sha"] if row else None)
                 if row and row["note_path"]:
                     self.pipeline._set(conv_id, needs_render=1, next_attempt_at=None)
+            self.store.reconcile_vectors()
+            self.store.forget_voice(person_id, delete_note=delete_note)
             self.db.set_meta("relabel_pending", "1")
         return affected
 
@@ -123,15 +126,7 @@ class SpeakerService:
         return stored | {k: v for k, v in (transcript.get("speaker_clips") or {}).items() if k not in stored}
 
     def audio_available(self, row) -> bool:
-        blocks = json.loads(row["blocks_json"])
-        if not blocks:
-            return False
-        lo, hi = min(b[0] for b in blocks), max(b[1] for b in blocks)
-        return self.db.one(
-            """SELECT 1 FROM chunks WHERE device_id=? AND raw_deleted=1 AND audio_start IS NOT NULL
-               AND audio_start <= ? AND audio_end >= ?""",
-            (row["device_id"], hi + 1, lo - 1),
-        ) is None
+        return self.store.raw_available(row)
 
     def conversation_speakers(self, conv_id: str) -> dict:
         row = self._conversation(conv_id)
@@ -179,7 +174,9 @@ class SpeakerService:
         for value, what in ((person_id, "person_id"), (not_person, "not_person_id")):
             if value is not None and (not isinstance(value, str) or not UUID_RE.match(value)):
                 raise ApiError(422, "invalid_body", f"{what} must be a lowercase UUID or null")
-        with _lock:
+        with self.store.lock:
+            self.store.sync_conversation(conv_id)  # an earlier attempt may have failed after its file write
+            self.store.sync_samples()
             row = self._conversation(conv_id)
             transcript = self._transcript(conv_id)
             if label not in {s["speaker"] for s in transcript.get("segments") or []}:
@@ -202,11 +199,15 @@ class SpeakerService:
                     state |= {"person_id": None, "source": None}
             if person_id:
                 blocked.discard(person_id)
-                state |= {"person_id": person_id, "source": "user"}
+                state |= {"person_id": person_id, "source": "user", "forgotten": False}
                 sample = self._sample_for(row, transcript, label, person_id, request_id)
             elif not not_person:
                 state |= {"person_id": None, "source": None}
             state["not"] = sorted(blocked)
+            previous = (states.get(label) or {}).get("person_id")
+            if previous and previous != state.get("person_id"):
+                # the user took this label back from `previous`: so is the voiceprint it gave them
+                self.store.remove_samples(conv_id, label, previous)
             states[label] = state
             revision = self.store.write_labels(conv_id, states, transcript_sha=row["transcript_sha"],
                                                request=(request_id, {"label": label, "person_id": person_id, "sample": sample}))  # fmt: skip
@@ -256,15 +257,16 @@ class SpeakerService:
         audio = self.pipeline.conversation_audio(row)
         all_clips = {lab: [Clip(a, b, i) for i, (a, b) in enumerate(spans)] for lab, spans in clips.items()}
         voices = embed_voices(all_clips, audio.pcm, embedder)
-        prefs = self.store.settings()
-        states = self.store.labels(row["id"])
-        keep = set(voices) if prefs["unknown_voices_enabled"] else {label} | {k for k, s in states.items() if s.get("person_id")}
-        name = f"voices-{_slug(embedder.model)}-{(row['audio_sha'] or '')[:16]}.json"
+        # `label` is about to be confirmed for someone who passed the consent checks (`_sample_for`)
+        keep = {label} | self.store.vector_labels(self.store.labels(row["id"]), set(voices), raw=True)
+        name = voices_name(embedder, row["audio_sha"], row["transcript_sha"])
         self.store.write_voices(row["id"], name, embedder.model, embedder.model_sha, voices, keep)
+        self.store.remove_other_voices(row["id"], name)
         return voices.get(label)
 
     def resummarize(self, conv_id: str) -> None:
-        self._conversation(conv_id)
+        if self._conversation(conv_id)["enrollment_id"]:
+            raise ApiError(409, "voice_enrollment", "a voice-enrollment reading has no transcript or summary")
         self.db.execute(
             "UPDATE conversations SET reprocess_request = reprocess_request + 1, force_llm = 1 WHERE id=?", (conv_id,)
         )
@@ -326,7 +328,7 @@ class SpeakerService:
             raise ApiError(422, "invalid_body", "person_id must be a lowercase UUID")
         if not isinstance(request_id, str) or not request_id:
             raise ApiError(422, "invalid_body", "request_id is required")
-        with _lock:
+        with self.store.lock:
             found, _ = self._suggestions(now)
             suggestion = next((s for s in found if s.id == suggestion_id), None)
             if suggestion is None:
@@ -372,13 +374,10 @@ class SpeakerService:
                 if not isinstance(body[key], bool):
                     raise ApiError(422, "invalid_body", f"{key} must be a boolean")
                 changes[key] = body[key]
-        with _lock:
+        with self.store.lock:
             before = self.store.settings()
             self.store.update_settings(**changes)
-            if changes.get("unknown_voices_enabled") is False and before["unknown_voices_enabled"]:
-                for r in self.db.query("SELECT DISTINCT conversation_id FROM voices WHERE vector IS NOT NULL"):
-                    keep = {k for k, s in self.store.labels(r["conversation_id"]).items() if s.get("person_id")}
-                    self.store.prune_vectors(r["conversation_id"], keep)
+            self.store.reconcile_vectors()  # e.g. unknown voices off or the acknowledgment withdrawn
             if "auto_assign" in changes and changes["auto_assign"] != before["auto_assign"]:
                 self.db.set_meta("relabel_pending", "1")
         return self.get_settings()
@@ -407,8 +406,3 @@ class SpeakerService:
         sf.write(buf, pcm, 16000, format="WAV", subtype="PCM_16")
         return buf.getvalue()
 
-
-def _slug(value: str) -> str:
-    import re
-
-    return re.sub(r"[^A-Za-z0-9.]+", "-", value).strip("-") or "x"

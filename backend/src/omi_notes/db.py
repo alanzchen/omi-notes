@@ -22,7 +22,7 @@ from pathlib import Path
 
 from .spool import make_dirs_durable
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -297,6 +297,7 @@ CREATE TABLE IF NOT EXISTS speaker_labels (
     margin REAL,
     evidence_s REAL,
     not_json TEXT NOT NULL DEFAULT '[]',
+    forgotten INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (conversation_id, label)
 );
 CREATE INDEX IF NOT EXISTS speaker_labels_person ON speaker_labels(person_id);
@@ -462,7 +463,8 @@ COLUMN_SOURCES: dict[str, dict[str, str]] = {
     },  # fmt: skip
     "speaker_labels": {
         c: "<conversation dir>/speakers.json labels"
-        for c in ("conversation_id", "label", "person_id", "source", "distance", "margin", "evidence_s", "not_json")
+        for c in ("conversation_id", "label", "person_id", "source", "distance", "margin", "evidence_s", "not_json",
+                  "forgotten")
     },
     "known_through": {
         "conversation_id": "conversation.json id",

@@ -73,6 +73,36 @@ import OmiProtocol
         #expect(gate.mayUpload(try chunk(t, "cap-1", 3)), "holding audio forever would be worse")
     }
 
+    @Test func aMissingStartEventIsWrittenAgainAndTheAudioStaysHeld() throws {
+        let t = TestEnv()
+        let writer = EventWriter(outbox: t.outbox, clock: t.clock)
+        let start = try writer.voiceEnrollmentStart(enrollmentId: "e1", deviceId: "dev-1", captureId: "cap-1", offsetUs: 7,
+                                                    at: "2026-09-26T19:32:05.200Z")
+        guard case .event(let eventId) = start.kind else { throw InjectedFault(what: "kind") }
+        let gate = EnrollmentGate(stateDir: t.dirs.state, outbox: t.outbox)
+        try gate.hold(.init(enrollmentId: "e1", captureId: "cap-1", fromSequence: 3, startEventId: eventId,
+                            deviceId: "dev-1", startAt: "2026-09-26T19:32:05.200Z", startOffsetUs: 7))
+        try FileManager.default.removeItem(at: try #require(t.outbox.locate(start.kind)))  // unexplained: never acknowledged
+
+        #expect(!gate.mayUpload(try chunk(t, "cap-1", 3)), "without a way to rewrite it, the audio stays held")
+        gate.reemitStart = { h in
+            let item = try writer.voiceEnrollmentStart(enrollmentId: h.enrollmentId, deviceId: h.deviceId ?? "", captureId: h.captureId,
+                                                       offsetUs: h.startOffsetUs ?? 0, at: h.startAt)
+            guard case .event(let id) = item.kind else { throw InjectedFault(what: "kind") }
+            return id
+        }
+        #expect(!gate.mayUpload(try chunk(t, "cap-1", 4)))
+        let hold = try #require(gate.snapshot.first)
+        #expect(hold.startEventId != eventId)
+        let rewritten = try #require(t.outbox.pending().first { $0.kind == .event(eventId: hold.startEventId) })
+        let body = try JSONSerialization.jsonObject(with: Data(contentsOf: rewritten.url)) as? [String: Any]
+        #expect(body?["at"] as? String == "2026-09-26T19:32:05.200Z" && body?["offset_us"] as? Int == 7)
+        #expect((body?["data"] as? [String: Any])?["enrollment_id"] as? String == "e1")
+        try t.outbox.markSent(rewritten.name)
+        gate.didAcknowledge(rewritten)
+        #expect(gate.mayUpload(try chunk(t, "cap-1", 4)), "released once the rewritten start is acknowledged")
+    }
+
     @Test func compositeGateRequiresEveryGate() throws {
         let (t, gate, _) = try setUp()
         let ledger = RingCaptureLedger(dirs: t.dirs, outbox: t.outbox)
@@ -98,6 +128,13 @@ import OmiProtocol
         let r = try APIClient.snakeDecoder.decode(ConversationSpeakers.self, from: Data(json.utf8))
         #expect(r.revision == 3 && r.audioAvailable == true)
         #expect(r.labels.first?.personId == "p1" && r.labels.first?.evidenceS == 12.5 && r.labels.first?.isAuto == true)
+    }
+
+    @Test func serverFeaturesTellWhetherEnrollmentIsSupported() throws {
+        let json = #"{"ok":true,"server_version":"0.1.0","protocol_version":1,"features":["voice_enrollment"]}"#
+        let new = try JSONDecoder().decode(ServerStatus.self, from: Data(json.utf8))  // as `APIClient.status()` decodes
+        let old = try JSONDecoder().decode(ServerStatus.self, from: Data(#"{"ok":true,"server_version":"0.0.9"}"#.utf8))
+        #expect(new.supportsVoiceEnrollment && new.serverVersion == "0.1.0" && !old.supportsVoiceEnrollment)
     }
 
     @Test func enrollmentPollingStopsOnEveryServerDecision() {

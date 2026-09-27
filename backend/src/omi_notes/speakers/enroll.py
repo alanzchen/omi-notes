@@ -25,7 +25,7 @@ import io
 import json
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -88,6 +88,20 @@ def windows(db, device_id: str | None = None) -> list[Window]:
             end_t = e["t"] if e["capture_id"] == ev["capture_id"] else None
         out.append(Window(eid, ev["device_id"], ev["capture_id"], float(ev["t"]),
                           None if end_t is None else float(end_t), outcome, float(ev["received_at"])))  # fmt: skip
+    return out
+
+
+def settle(ws: list[Window], now: float, capture_finished, capture_end) -> list[Window]:
+    """Windows whose end will never come (the phone crashed, the end landed in another capture):
+    once stale they end with their capture's audio — the reading stays excluded whatever the
+    enrollment result. Without a capture, the window is bounded by OPEN_MAX_SECONDS."""
+    out = []
+    for w in ws:
+        if w.end is None and stale(w, now, capture_finished):
+            end = capture_end(w.capture_id) if w.capture_id else None
+            w = replace(w, end=max(w.start, end if end is not None else w.start + OPEN_MAX_SECONDS),
+                        outcome=w.outcome or "interrupted")  # fmt: skip
+        out.append(w)
     return out
 
 
@@ -234,21 +248,28 @@ class EnrollmentProcessor:
         verdict = evaluate(self.speech_pcm(w), embedder)
         vector, enroll_pcm = verdict.pop("vector", None), verdict.pop("enroll_pcm", None)
         extra: dict = {}
-        if verdict["state"] == "accepted":
-            store = self.pipeline.speakers
-            me = store.me()
-            if me is None:
-                person_id = str(uuid.uuid4())
-                store.put_person(person_id, "Me", me=True, now=now)
-            else:
-                person_id = me["id"]
-            day = datetime.fromtimestamp(w.start, self.pipeline.tz).date().isoformat()
-            sample_id = store.add_sample(person_id, vector, model=embedder.model, model_sha=embedder.model_sha,
-                                         source="enrollment", seconds=verdict["speech_s"], day=day,
-                                         session=w.enrollment_id, enrollment_id=w.enrollment_id, now=now)  # fmt: skip
-            extra = {"person_id": person_id, "sample_id": sample_id, "model": embedder.model, "model_sha": embedder.model_sha}
-            store.save_enrollment(person_id, w.enrollment_id, flac_bytes(enroll_pcm), verdict | extra | {"decided_at": now})
-        self._write(w, verdict | extra, now)
+        store = self.pipeline.speakers
+        with store.lock:
+            if verdict["state"] == "accepted":
+                request = f"enrollment:{w.enrollment_id}"  # a crash before the result: reuse the sample
+                done = store.sample_for_request(request)
+                me = store.me()
+                if done is not None:
+                    person_id, sample_id = done["person_id"], done["id"]
+                else:
+                    if me is None:
+                        person_id = str(uuid.uuid4())
+                        store.put_person(person_id, "Me", me=True, now=now)
+                    else:
+                        person_id = me["id"]
+                    day = datetime.fromtimestamp(w.start, self.pipeline.tz).date().isoformat()
+                    sample_id = store.add_sample(person_id, vector, model=embedder.model, model_sha=embedder.model_sha,
+                                                 source="enrollment", seconds=verdict["speech_s"], day=day,
+                                                 session=w.enrollment_id, enrollment_id=w.enrollment_id,
+                                                 request_id=request, now=now)  # fmt: skip
+                extra = {"person_id": person_id, "sample_id": sample_id, "model": embedder.model, "model_sha": embedder.model_sha}
+                store.save_enrollment(person_id, w.enrollment_id, flac_bytes(enroll_pcm), verdict | extra | {"decided_at": now})
+            self._write(w, verdict | extra, now)
         if verdict["state"] == "accepted":
             self.db.set_meta("relabel_pending", "1")
         log.info("voice enrollment %s: %s (%.0f s)", w.enrollment_id, verdict["state"], verdict.get("speech_s", 0))

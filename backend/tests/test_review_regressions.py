@@ -326,12 +326,13 @@ def test_f09_new_directories_are_fsynced_before_the_ack(tmp_path, monkeypatch):
 
 
 def test_f10_maintenance_only_queues_work_while_a_worker_runs(client, worker, settings):
-    from omi_notes.lock import WorkerLock
+    from omi_notes.lock import worker_lock
+    from omi_notes.vault import Vault
 
     replay(client, SPEECH)
     worker.tick(T0 + 200)
     (row,) = convs(worker)
-    lock = WorkerLock(settings.db_path.parent)
+    lock = worker_lock(Vault.open(settings))
     assert lock.acquire()
     try:
         result = CliRunner().invoke(cli, ["reprocess", row["id"], "--force-llm"], env=cli_env(settings))

@@ -52,6 +52,10 @@ class VaultError(RuntimeError):
     """The vault cannot be opened for writing (message says why and what to do)."""
 
 
+class VaultBusy(VaultError):
+    """Another process on this host already serves (or processes) this vault."""
+
+
 class LeaseError(VaultError):
     """Another backend holds a live writer lease on this vault."""
 

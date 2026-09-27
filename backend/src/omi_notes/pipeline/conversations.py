@@ -56,8 +56,8 @@ from ..settings import Settings
 from ..spool import atomic_write_bytes
 from ..util import canonical_json, sha256_hex
 from ..speakers import match as speaker_match
-from ..speakers.store import SpeakerStore
-from ..speakers.voices import embed_voices, label_turns, select_clips, usable_spans
+from ..speakers.store import SpeakerStore, voices_name
+from ..speakers.voices import cosine_distance, embed_voices, label_turns, select_clips, usable_spans
 from ..vault import Vault
 from . import prompt
 from .relevance import deterministic_relevance
@@ -327,6 +327,15 @@ class ConversationPipeline:
         record references them. The compare-and-swap on the counter means a request arriving
         meanwhile is never lost: it is applied too, or left pending for the next pass."""
         while True:
+            if row["enrollment_id"]:  # a voice-enrollment reading is never transcribed: nothing to redo
+                cur = self.db.execute(
+                    "UPDATE conversations SET reprocess_handled=?, force_restt=0, force_llm=0 WHERE id=? AND reprocess_request=?",
+                    (row["reprocess_request"], row["id"], row["reprocess_request"]),
+                )
+                row = self._row(row["id"])
+                if cur.rowcount == 1:
+                    return row
+                continue
             conv_dir = self.conv_dir(row["id"])
             skip_stt = json.dumps(sorted(p.name for p in conv_dir.glob("stt-*.json"))) if row["force_restt"] else row["skip_stt"]
             skip_llm = json.dumps(sorted(p.name for p in conv_dir.glob("llm-*.json"))) if row["force_llm"] else row["skip_llm"]
@@ -431,6 +440,8 @@ class ConversationPipeline:
 
     def transcribe(self, conv_id: str, now: float) -> None:
         row = self._row(conv_id)
+        if row["enrollment_id"]:
+            raise ProviderError("voice-enrollment audio is never transcribed", terminal=True, kind="enrollment")
         audio = self.conversation_audio(row)
         if len(audio.pcm) == 0:
             raise ProviderError("no decodable audio under this conversation's speech", terminal=True, kind="audio")
@@ -500,26 +511,51 @@ class ConversationPipeline:
         samples = self.speakers.samples(embedder.model, embedder.model_sha)
         if not samples:
             return
-        name = f"voices-{_slug(embedder.model)}-{audio_sha[:16]}.json"
+        # keyed by everything the voices depend on: a new transcript may number the voices differently
+        name = voices_name(embedder, audio_sha, transcript_sha)
         if (self.conv_dir(conv_id) / name).exists():
             self.speakers.index_voices(conv_id, name)  # decided before (a retried stage)
             return
         voices = embed_voices(clips, audio.pcm, embedder)
-        prefs = self.speakers.settings()
-        current = self.speakers.labels(conv_id)
-        states = speaker_match.assign(voices, current, speaker_match.build_models(samples, self.operating),
-                                      auto_assign=prefs["auto_assign"], op=self.operating)  # fmt: skip
-        assigned = {label for label, state in states.items() if state.get("person_id")}
-        keep = set(voices) if prefs["unknown_voices_enabled"] else assigned
-        self.speakers.write_voices(conv_id, name, embedder.model, embedder.model_sha, voices, keep)
-        if self.speakers.persisted(states) != self.speakers.persisted(current):
-            self.speakers.write_labels(conv_id, states, transcript_sha=transcript_sha)
+        with self.speakers.lock:
+            prefs = self.speakers.settings()
+            current = self.speakers.labels(conv_id)
+            if self.speakers.labels_transcript(conv_id) not in (None, transcript_sha):
+                current = self._carry_over(current, self.speakers.voices(conv_id), voices)
+            states = speaker_match.assign(voices, current, speaker_match.build_models(samples, self.operating),
+                                          auto_assign=prefs["auto_assign"], op=self.operating)  # fmt: skip
+            keep = self.speakers.vector_labels(states, set(voices), raw=True)
+            self.speakers.write_voices(conv_id, name, embedder.model, embedder.model_sha, voices, keep)
+            if self.speakers.persisted(states) != self.speakers.persisted(current) or \
+                    self.speakers.labels_transcript(conv_id) not in (None, transcript_sha):
+                self.speakers.write_labels(conv_id, states, transcript_sha=transcript_sha)
+            self.speakers.remove_other_voices(conv_id, name)
+
+    def _carry_over(self, current: dict, old_voices: dict, new_voices: dict) -> dict:
+        """Label states of the previous transcript that still apply: only where the label has the
+        same voice (a user's assignment or block survives a re-transcription that kept it)."""
+        out = {}
+        for label, state in current.items():
+            old, new = old_voices.get(label), new_voices.get(label)
+            if (old is not None and new is not None and old.vector is not None and new.vector is not None
+                    and cosine_distance(old.vector, new.vector) < self.operating.threshold):  # fmt: skip
+                out[label] = state
+        return out
 
     def relabel(self, now: float) -> list[str]:
         """Re-run the pure assignment over stored voices after people/samples changed; notes whose
         names changed are re-rendered from cache (no provider call). Returns the conversations
-        whose label assignments changed."""
-        names_changed = self.speakers.scan_people()
+        whose label assignments changed. Holds the speaker lock, so an API correction made
+        meanwhile is never overwritten by states computed before it."""
+        with self.speakers.lock:
+            return self._relabel(now)
+
+    def _relabel(self, now: float) -> list[str]:
+        self.speakers.scan_people()
+        # compared with what notes were last rendered with, not with the previous scan: another
+        # caller (PUT /v1/people, GET /v1/people) may have scanned the change first
+        names = self.speakers.names_digest()
+        names_changed = names != self.db.meta("rendered_names")
         operating = f"{self.operating.threshold}/{self.operating.margin}"
         if operating != self.db.meta("speaker_operating"):  # new operating points: reassign everything
             self.db.set_meta("speaker_operating", operating)
@@ -556,6 +592,7 @@ class ConversationPipeline:
             if (differs or names_changed) and row["note_path"] and named:
                 self._set(conv_id, needs_render=1, next_attempt_at=None)
         self.db.set_meta("relabel_pending", None)
+        self.db.set_meta("rendered_names", names)
         return changed
 
     def voice_names(self, conv_id: str) -> dict[str, tuple[str, bool]]:
@@ -708,9 +745,9 @@ class ConversationPipeline:
 
         old = row["note_path"]
         relpath = self._target_path(row, kind, data, tz)
-        self._guard_edits(row, old)
         user_notes = self._user_notes(conv_id, relpath, old)
         text = render_note(data, user_notes)
+        self._guard_edits(row, old, text)
         write_if_changed(root / relpath, text)
         moved = old if old and old != relpath else None
 
@@ -779,8 +816,10 @@ class ConversationPipeline:
             return self.settings.owner_name
         return self.vault.info.get("owner_name") or self.settings.owner_name
 
-    def _guard_edits(self, row, old: str | None) -> None:
-        """Best-effort (not race-free) protection of edits outside My Notes."""
+    def _guard_edits(self, row, old: str | None, text: str) -> None:
+        """Best-effort (not race-free) protection of edits outside My Notes. `text` is what is
+        about to be written: a note that already says exactly that is our own earlier write that
+        a crash kept from being recorded, not a user's edit."""
         if not old or not row["written_sha"]:
             return
         path = self.settings.vault_dir / old
@@ -792,7 +831,7 @@ class ConversationPipeline:
             current = generated_sha(data.decode("utf-8"))
         except UnicodeDecodeError:
             current = None
-        if current == row["written_sha"]:
+        if current in (row["written_sha"], generated_sha(text)):
             return
         if row["edited"] == 2:  # "overwrite" chosen: set the user's version aside first
             atomic_write_bytes(self.vault.displaced / f"{sha256_hex(data)}.md", data)

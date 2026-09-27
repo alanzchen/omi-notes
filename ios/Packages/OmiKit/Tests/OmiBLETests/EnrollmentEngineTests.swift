@@ -36,6 +36,16 @@ import OmiProtocol
             .compactMap { try? JSONSerialization.jsonObject(with: Data(contentsOf: $0.url)) as? [String: Any] }
     }
 
+    @MainActor @Test func theAppOnlyEnrollsAgainstAServerThatSupportsIt() throws {
+        let (engine, _, root) = try makeEngine()
+        let speakers = SpeakersModel(engine: engine)
+        #expect(speakers.serverSupportsEnrollment == nil && !speakers.canStartEnrollment)
+        speakers.startEnrollment()
+        guard case .failed(let reason) = speakers.enrollment else { Issue.record("started without a server check"); return }
+        #expect(reason.contains("server"))
+        #expect(events(root).isEmpty, "no start event was written")
+    }
+
     @Test func enrollmentWindowIsMarkedAndItsAudioHeldUntilTheStartIsAcknowledged() async throws {
         let (engine, uploads, root) = try makeEngine()
         #expect(throws: OmiEngine.EnrollmentError.notRecording) { try engine.startVoiceEnrollment() }

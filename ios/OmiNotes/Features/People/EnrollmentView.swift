@@ -86,7 +86,10 @@ struct EnrollmentView: View {
             Text("Wear your pendant and read six short sentences aloud, in a quiet place, in your normal voice. It takes about a minute.")
             Text("Your voice is turned into a voiceprint stored only on your own server, so notes can label you. You can forget it any time from People.")
                 .font(.footnote).foregroundStyle(.secondary)
-            if !streaming {
+            if speakers.serverSupportsEnrollment == false {
+                Label(SpeakersModel.serverTooOld, systemImage: "server.rack")
+                    .font(.footnote).foregroundStyle(.orange)
+            } else if !streaming {
                 Label("Waiting for the pendant to stream audio (Home should say Recording).", systemImage: "waveform.slash")
                     .font(.footnote).foregroundStyle(.orange)
             }
@@ -96,7 +99,7 @@ struct EnrollmentView: View {
                 Text("Start reading").frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(!streaming)
+            .disabled(!streaming || speakers.serverSupportsEnrollment != true)
         }
     }
 

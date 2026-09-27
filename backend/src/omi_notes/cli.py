@@ -70,6 +70,7 @@ def serve(
     import uvicorn
 
     from .api import create_app
+    from .lock import api_lock
     from .vault import VaultError
 
     settings = _settings()
@@ -79,6 +80,11 @@ def serve(
     except VaultError as exc:
         typer.secho(str(exc), fg=typer.colors.RED)
         raise typer.Exit(2) from exc
+    probe = api_lock(application.state.vault)  # the app takes it at startup; this only gives a clean message
+    if not probe.acquire():
+        typer.secho(f"Another backend (pid {probe.owner()}) is already serving this vault.", fg=typer.colors.RED)
+        raise typer.Exit(2)
+    probe.release()
     uvicorn.run(application, host=host or settings.host, port=port or settings.port, log_level="info")
 
 
@@ -513,13 +519,13 @@ def rebuild() -> None:
 
     Runs inline when no worker is running; otherwise queues the work for the worker."""
     from . import __version__
-    from .lock import WorkerLock
+    from .lock import worker_lock
     from .pipeline.conversations import CacheMiss
 
     settings = load_settings()
     _setup_logging()
     w = _worker(settings)
-    lock = WorkerLock(w.db.path.parent)
+    lock = worker_lock(w.vault)
     if not lock.acquire():
         n = w.db.execute(
             "UPDATE conversations SET needs_render=1, next_attempt_at=NULL WHERE status IN ('done','discarded','failed') AND note_path IS NOT NULL"
@@ -552,17 +558,19 @@ def rebuild() -> None:
 def rebuild_index() -> None:
     """Rebuild the operational index from the vault (the server must be stopped). Zero provider
     calls; the next start replays surviving raw audio and re-renders every note from cache."""
-    from .lock import WorkerLock
+    from .lock import api_lock, worker_lock
     from .rebuild import open_index
-    from .vault import Vault, index_dir
+    from .vault import Vault
 
     settings = _settings()
     _setup_logging()
     vault = Vault.open(settings, create=False)
-    lock = WorkerLock(index_dir(settings, vault))
-    if not lock.acquire():
-        typer.secho("A worker is running on this vault: stop the server first.", fg=typer.colors.RED)
+    lock, serving = worker_lock(vault), api_lock(vault)
+    if not lock.acquire() or not serving.acquire():
+        lock.release()
+        typer.secho("A server or worker is running on this vault: stop it first.", fg=typer.colors.RED)
         raise typer.Exit(1)
+    serving.release()
     try:
         db = open_index(settings, vault, sweep_orphans=False, force_rebuild=True)
         counts = {t: db.one(f"SELECT COUNT(*) AS n FROM {t}")["n"] for t in ("captures", "chunks", "events", "conversations")}
@@ -631,13 +639,13 @@ def _with_claim(w, conv_id: str, action) -> None:
 @note_app.command("overwrite")
 def note_overwrite(conversation: str = typer.Argument(..., help="Conversation id (or unique prefix)")) -> None:
     """Re-render the note; the edited version is kept in _omi/displaced/<sha>.md."""
-    from .lock import WorkerLock
+    from .lock import worker_lock
 
     settings = _settings()
     w = _worker(settings)
     row = _note_row(w, conversation)
     w.db.execute("UPDATE conversations SET edited=2, needs_render=1, next_attempt_at=NULL WHERE id=?", (row["id"],))
-    lock = WorkerLock(w.db.path.parent)
+    lock = worker_lock(w.vault)
     if not lock.acquire():
         typer.echo("Queued for the running worker.")
         return
@@ -679,7 +687,7 @@ def reprocess(
     """Re-run STT/summary for conversations, reusing caches unless told otherwise.
 
     Runs inline when no worker is running; otherwise queues the work for the worker."""
-    from .lock import WorkerLock
+    from .lock import worker_lock
 
     settings = load_settings()
     _setup_logging()
@@ -699,7 +707,7 @@ def reprocess(
                    force_restt = MAX(force_restt, ?), force_llm = MAX(force_llm, ?) WHERE id=?""",
             (int(restt), int(force_llm), row["id"]),
         )
-    lock = WorkerLock(w.db.path.parent)
+    lock = worker_lock(w.vault)
     if not lock.acquire():
         typer.echo(f"A worker is running: {len(rows)} conversation(s) queued for it.")
         return
@@ -719,7 +727,7 @@ def reprocess(
 def retry_failed() -> None:
     """Queue failed conversations and chunks again (after fixing keys/billing/etc.); processes
     them right away when no worker is running."""
-    from .lock import WorkerLock
+    from .lock import worker_lock
 
     settings = load_settings()
     _setup_logging()
@@ -733,7 +741,7 @@ def retry_failed() -> None:
         "UPDATE chunks SET status='pending', attempts=0, next_attempt_at=NULL, error=NULL WHERE status='failed'"
     ).rowcount
     typer.echo(f"Queued {convs} conversation(s) and {chunks} chunk(s).")
-    lock = WorkerLock(w.db.path.parent)
+    lock = worker_lock(w.vault)
     if not lock.acquire():
         typer.echo("A worker is running; it picks them up on its next tick.")
         return

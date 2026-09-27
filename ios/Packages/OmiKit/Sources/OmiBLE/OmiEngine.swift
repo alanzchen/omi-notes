@@ -169,6 +169,14 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         cursors = RingCursorStore(stateDir: dirs.state)
         ledger = RingCaptureLedger(dirs: dirs, outbox: outbox)
         enrollmentGate = EnrollmentGate(stateDir: dirs.state, outbox: outbox)
+        let writer = EventWriter(outbox: outbox, clock: config.clock)
+        enrollmentGate.reemitStart = { h in
+            guard let deviceId = h.deviceId, let offset = h.startOffsetUs else { throw EnrollmentError.writeFailed("hold predates rewriting") }
+            let item = try writer.voiceEnrollmentStart(enrollmentId: h.enrollmentId, deviceId: deviceId, captureId: h.captureId,
+                                                       offsetUs: offset, at: h.startAt)
+            guard case .event(let id) = item.kind else { throw EnrollmentError.writeFailed("unexpected outbox item") }
+            return id
+        }
         processedThrough = JSONFile.load([String: Int].self, from: processedURL) ?? [:]
 
         // Capture pipeline (objects only; no scanning here).
@@ -461,12 +469,13 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
                 throw EnrollmentError.notRecording
             }
             let id = UUID().uuidString.lowercased()
+            let at = ISO8601UTC.format(config.clock.wallNow())
             do {
-                let item = try events.voiceEnrollmentStart(enrollmentId: id, deviceId: s.deviceId, captureId: captureId, offsetUs: offset)
+                let item = try events.voiceEnrollmentStart(enrollmentId: id, deviceId: s.deviceId, captureId: captureId, offsetUs: offset, at: at)
                 guard case .event(let eventId) = item.kind else { throw EnrollmentError.writeFailed("unexpected outbox item") }
                 try enrollmentGate.hold(.init(
                     enrollmentId: id, captureId: captureId, fromSequence: recorder.stats.chunkSequence,
-                    startEventId: eventId, endEventId: nil))
+                    startEventId: eventId, endEventId: nil, deviceId: s.deviceId, startAt: at, startOffsetUs: offset))
             } catch let e as EnrollmentError {
                 throw e
             } catch {
