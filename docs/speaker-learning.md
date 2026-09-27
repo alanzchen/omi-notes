@@ -64,8 +64,10 @@ relative to `/Users/alan/Developer/_ref/omi`.
   re-renders affected notes back to "Speaker N". A retry after a crash finishes what is left.
 - Taking a label back from someone (renaming it, "Unknown speaker", "Not X") deletes the samples
   that assignment created — a label state lists them (`samples`), so they follow it when a
-  re-transcription moves it to another label number: a repudiated confirmation must not train
-  anyone's voice.
+  re-transcription moves it to another label number (retraction is only ever by those ids, never
+  by a label number that may have been another assignment's): a repudiated confirmation must not
+  train anyone's voice. States written before they listed samples (no `samples_tracked`) get them
+  from the samples' conversation/label tags before anything may move them.
 - Forget runs in this order, under the speaker lock: the index catches up with every
   `speakers.json`; the person's labels are marked forgotten *before* anything may move them (a
   pending or in-flight move to a new transcript then carries the marker instead of dropping the

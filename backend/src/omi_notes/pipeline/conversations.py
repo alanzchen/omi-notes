@@ -529,7 +529,7 @@ class ConversationPipeline:
                 name, fresh = None, False  # no audio in hand (a recovery path): nothing to compute
         with self.speakers.lock:
             self.speakers.sync_labels_index(conv_id)  # start from the file's states, not a stale index
-            stored = self.speakers.labels(conv_id)
+            stored = self.speakers.labels_for_update(conv_id)
             previous = self.speakers.labels_transcript(conv_id)
             moved = previous not in (None, transcript_sha)
             # what the stored states were made against (speakers.json names it), never the new file
@@ -636,7 +636,7 @@ class ConversationPipeline:
                 continue
             self.speakers.sync_labels_index(conv_id)  # never overwrite the file with a stale index
             voices = self.speakers.voices(conv_id)
-            current = self.speakers.labels(conv_id)
+            current = self.speakers.labels_for_update(conv_id)
             key = next(((v.model, v.model_sha) for v in voices.values()), None)
             if key is not None:
                 if key not in models_by_voice:
