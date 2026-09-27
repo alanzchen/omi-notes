@@ -45,16 +45,34 @@ class Settings(BaseSettings):
     timezone: str = Field(default_factory=system_timezone)
     owner_name: str = ""
 
-    stt_provider: Literal["deepgram", "fake"] = "deepgram"
+    stt_provider: Literal["deepgram", "openai", "fake"] = "deepgram"
     deepgram_api_key: str = ""
     stt_model: str = "nova-3"
     stt_language: str = "en"
     stt_keyterms: str = ""
+    # OpenAI-compatible transcriptions (STT_PROVIDER=openai): Mistral, OpenAI, Together, vLLM, LocalAI, ...
+    stt_base_url: str = "https://api.openai.com/v1"
+    stt_api_key: str = ""
+    stt_request_style: Literal["auto", "openai_diarized", "mistral", "together", "verbose"] = "auto"
+    # Longest audio per request; unset = the style's known limit, 0 = unlimited.
+    stt_max_request_seconds: float | None = None
+    # Where speaker labels come from; transcripts without them fail unless this is "off".
+    stt_diarization: Literal["auto", "provider", "local", "off"] = "auto"
+    diarization_num_speakers: int = 0  # 0 = decide from DIARIZATION_THRESHOLD
+    diarization_threshold: float = 0.5
+    diarization_segmentation_model: Path = MODELS_DIR / "pyannote-segmentation-3-0.onnx"
+    diarization_embedding_model: Path = MODELS_DIR / "nemo_en_titanet_small.onnx"
 
-    llm_provider: Literal["anthropic", "fake", "none"] = "anthropic"
+    llm_provider: Literal["anthropic", "openai", "fake", "none"] = "anthropic"
     anthropic_api_key: str = ""
     llm_model: str = "claude-opus-5"
-    llm_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+    # Anthropic effort; "none" omits it (Haiku models never get it: they reject the parameter).
+    llm_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "medium"
+    # OpenAI-compatible chat completions (LLM_PROVIDER=openai): OpenAI, Ollama, llama.cpp, vLLM, ...
+    llm_base_url: str = "https://api.openai.com/v1"
+    llm_api_key: str = ""
+    llm_json_mode: Literal["auto", "json_schema", "json_object", "prompt"] = "auto"
+    llm_reasoning_effort: str = ""
 
     conversation_gap_seconds: float = 120.0
     provisional_wait_open_seconds: float = 300.0
@@ -68,7 +86,10 @@ class Settings(BaseSettings):
     vad_model_path: Path = MODELS_DIR / "silero_vad.onnx"
     worker_tick_seconds: float = 5.0
 
-    @field_validator("notes_dir", "data_dir", "vad_model_path", mode="after")
+    @field_validator(
+        "notes_dir", "data_dir", "vad_model_path", "diarization_segmentation_model", "diarization_embedding_model",
+        mode="after",
+    )
     @classmethod
     def _expand(cls, value: Path) -> Path:
         return value.expanduser()

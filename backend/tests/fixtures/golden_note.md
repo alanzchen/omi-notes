@@ -22,6 +22,7 @@ audio_gaps:
 - 14:03:32–14:03:37
 audio_lost_s: 0.0
 clock_suspect: false
+speaker_labels_consistent: true
 action_items_open: 2
 tags:
 - launch

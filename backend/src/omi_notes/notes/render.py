@@ -55,6 +55,7 @@ class NoteData:
     late_double_taps: list[float] = field(default_factory=list)
     lost_seconds: float = 0.0
     clock_suspect: bool = False
+    speaker_labels_consistent: bool = True
 
 
 def neutralize(text: str) -> str:
@@ -158,6 +159,7 @@ def frontmatter(d: NoteData) -> dict:
         "audio_gaps": [f"{_clock(a, d.tz)}–{_clock(b, d.tz)}" for a, b in d.audio_gaps],
         "audio_lost_s": round(d.lost_seconds, 1),
         "clock_suspect": d.clock_suspect,
+        "speaker_labels_consistent": d.speaker_labels_consistent,
         "action_items_open": len(items),
         "tags": (notes.tags if notes else []),
         "discard_reason": d.discard_reason if d.status == "discarded" else None,
@@ -208,6 +210,12 @@ def render_note(d: NoteData, my_notes: str | None = None) -> str:
         out += [
             f"> [!warning] About {d.lost_seconds:.1f} s of audio was lost in transmission around this conversation "
             "(short dropouts are concealed).",
+            "",
+        ]
+    if not d.speaker_labels_consistent:
+        out += [
+            "> [!warning] Speaker labels restart in each part this audio was transcribed in, so the same person "
+            "may appear under different labels. Install local diarization for consistent speakers.",
             "",
         ]
     if d.clock_suspect:

@@ -13,7 +13,7 @@ Omi pendant ──BLE──▶ iPhone app ──HTTPS (Tailscale)──▶ backe
 | Directory | What it is |
 |---|---|
 | [`ios/`](ios/README.md) | SwiftUI app (iOS 17+). Pairs with the pendant, journals raw BLE audio durably, syncs the pendant's offline storage, uploads chunks in the background. |
-| [`backend/`](backend/README.md) | Python/FastAPI server. Reassembles and decodes Opus, detects speech, splits conversations, transcribes with Deepgram nova-3, summarizes with Claude, writes the notes. |
+| [`backend/`](backend/README.md) | Python/FastAPI server. Reassembles and decodes Opus, detects speech, splits conversations, transcribes with speaker labels (Deepgram or any OpenAI-compatible service, plus optional local diarization), summarizes (Claude or any OpenAI-compatible LLM), writes the notes. |
 | [`docs/`](docs/) | [Architecture decisions](docs/architecture.md), [phone ↔ server contract](docs/capture-format-v1.md), [Omi BLE protocol notes](docs/device-protocol.md). |
 | `contracts/fixtures/` | Envelopes produced by each side and checked by the other side's tests. |
 
@@ -70,9 +70,13 @@ The iOS app also has a simulated pendant (Debug tab) that replays real CV1-forma
 - The server segments per device across live and offline audio. A conversation ends after 120 s
   without speech, Omi's own rule, but only once the phone has proven that stretch was silence
   rather than missing audio (otherwise the note is written after a short wait and marked provisional).
-- Only detected speech is sent to Deepgram (batch pricing, speaker labels included), and noise is
-  filtered by deterministic rules before any LLM call. Each conversation is one structured Claude
-  call (`claude-opus-5` by default; set `LLM_MODEL`/`LLM_EFFORT` to trade quality for cost).
+- Only detected speech is transcribed: Deepgram by default (batch pricing, speaker labels
+  included), or any OpenAI-compatible transcription service (Mistral Voxtral, OpenAI, Together,
+  or a self-hosted server). Every transcript gets speaker labels, from the service or from local
+  diarization (sherpa-onnx, `uv sync --extra diarization && uv run omi-notes fetch-models
+  --diarization`). Noise is filtered by deterministic rules before any LLM call. Each
+  conversation is one structured call to Claude (`claude-opus-5` by default) or to any
+  OpenAI-compatible chat API (OpenAI, Ollama, llama.cpp, LM Studio, vLLM).
 
 The design was worked out by a two-model committee (Claude Opus 5.5 and GPT-6-Astra) after
 studying [BasedHardware/omi](https://github.com/BasedHardware/omi). The code was reviewed by
@@ -88,6 +92,7 @@ make ios-build   # simulator build of the app
 
 ## Privacy
 
-Audio stays on your phone and your Mac, except that detected speech goes to Deepgram and
-transcripts go to Anthropic. The server listens on localhost only and is reachable over your
-tailnet through `tailscale serve`, behind a bearer token.
+Audio stays on your phone and your Mac, except that detected speech goes to your transcription
+service and transcripts go to your LLM service (Deepgram and Anthropic by default). Point both at
+self-hosted servers and nothing leaves your machines. The server listens on localhost only and is
+reachable over your tailnet through `tailscale serve`, behind a bearer token.

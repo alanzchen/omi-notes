@@ -29,6 +29,9 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
         vad_backend="energy",
         timezone="America/Chicago",
         owner_name="",
+        # Local diarization stays off in tests unless a test injects a diarizer.
+        diarization_segmentation_model=tmp_path / "no-segmentation.onnx",
+        diarization_embedding_model=tmp_path / "no-embedding.onnx",
     )
     values.update(overrides)
     return Settings(**values)

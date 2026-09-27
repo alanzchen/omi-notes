@@ -43,9 +43,13 @@ Omi pendant → iPhone app (`ios/`) → your server (`backend/`) → Markdown no
   (`omi-notes fetch-models`), `data/`, `build/`.
 - **Debug-only hooks stay debug-only.** Simulator automation arguments (`-OmiNotesDebug…`) and plain
   `http` for local hosts live behind `#if DEBUG`; Release builds are HTTPS-only.
-- **Claude API code:** default model `claude-opus-5` (configurable via `LLM_MODEL`); structured output
-  plus server-side refusal fallbacks. Check current SDK docs before changing
-  `backend/src/omi_notes/providers/anthropic_llm.py`.
+- **Providers:** STT is Deepgram or any OpenAI-compatible transcription API (`providers/openai_stt.py`);
+  LLM is Anthropic or any OpenAI-compatible chat API (`providers/openai_llm.py`). Transcripts must
+  have speaker labels (provider or local sherpa-onnx diarization, `pipeline/speakers.py`); never
+  silently degrade to one speaker. Provider API shapes change: verify against current docs and keep
+  mocked-transport tests for each request/response shape. Claude defaults: `claude-opus-5`,
+  structured output, server-side refusal fallbacks (check current SDK docs before changing
+  `anthropic_llm.py`).
 
 ## Conventions
 

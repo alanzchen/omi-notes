@@ -21,6 +21,12 @@ dependencies = [
 [project.scripts]
 omi-notes = "omi_notes.cli:app"
 
+[project.optional-dependencies]
+diarization = [
+    "sherpa-onnx==1.13.8",
+    "sherpa-onnx-core==1.13.8",
+]
+
 [dependency-groups]
 dev = [
     "httpx2>=2.0",

@@ -98,10 +98,17 @@ def create_app(settings: Settings, *, start_worker: bool = True, worker: Worker 
             "server_version": __version__,
             "protocol_version": PROTOCOL_VERSION,
             "server_time": iso_utc_epoch(time.time()),
-            "stt": {"provider": settings.stt_provider, "ready": settings.stt_provider == "fake" or bool(settings.deepgram_api_key)},
+            "stt": {
+                "provider": settings.stt_provider,
+                "ready": settings.stt_provider == "fake"
+                or (settings.stt_provider == "deepgram" and bool(settings.deepgram_api_key))
+                or (settings.stt_provider == "openai" and bool(settings.stt_base_url)),
+            },
             "llm": {
                 "provider": settings.llm_provider,
-                "ready": settings.llm_provider in ("fake", "none") or bool(settings.anthropic_api_key),
+                "ready": settings.llm_provider in ("fake", "none")
+                or (settings.llm_provider == "anthropic" and bool(settings.anthropic_api_key))
+                or (settings.llm_provider == "openai" and bool(settings.llm_base_url)),
             },
             "queue": queue_counts(db),
             "notes_dir": str(settings.notes_dir),

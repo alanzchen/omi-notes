@@ -45,8 +45,11 @@ class AnthropicLlm:
             "max_tokens": self.max_tokens,
             "system": [{"type": "text", "text": request.system, "cache_control": {"type": "ephemeral"}}],
             "messages": [{"role": "user", "content": request.user}],
-            "output_config": {"effort": self.effort, "format": {"type": "json_schema", "schema": request.schema}},
+            "output_config": {"format": {"type": "json_schema", "schema": request.schema}},
         }
+        if self.effort and self.effort != "none" and "haiku" not in self.model:
+            # Haiku models reject `effort`; LLM_EFFORT=none omits it for any model.
+            params["output_config"]["effort"] = self.effort
         try:
             response = self._create(params)
         except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:

@@ -102,3 +102,18 @@ def test_invalid_json_and_truncation_are_retryable():
     with pytest.raises(ProviderError) as info:
         llm.summarize(REQUEST)
     assert not info.value.terminal
+
+
+def test_haiku_and_effort_none_omit_effort():
+    for model, effort in (("claude-haiku-4-5", "medium"), ("claude-opus-5", "none")):
+        seen: list[httpx2.Request] = []
+
+        def record(request: httpx2.Request, seen: list[httpx2.Request] = seen) -> httpx2.Response:
+            seen.append(request)
+            return httpx2.Response(200, json=message(json.dumps({"title": "x"})))
+
+        client = anthropic.Anthropic(
+            api_key="k", max_retries=0, http_client=anthropic.DefaultHttpxClient(transport=httpx2.MockTransport(record))
+        )
+        AnthropicLlm("k", model, effort, client=client).summarize(REQUEST)
+        assert "effort" not in json.loads(seen[0].content)["output_config"], model

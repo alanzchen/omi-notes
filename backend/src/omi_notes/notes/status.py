@@ -35,6 +35,9 @@ def render_status(s: StatusSnapshot, tz: ZoneInfo) -> str:
     out = ["# Omi Notes status", ""]
     if s.vad_warning:
         out += [f"> [!danger] {s.vad_warning}", ""]
+    diarization = [c for c in s.failed_conversations if c.get("error_kind") == "diarization"]
+    if diarization:
+        out += [f"> [!danger] {diarization[0].get('error') or 'Transcripts have no speaker labels.'}", ""]
     auth = [c for c in s.failed_conversations if c.get("error_kind") in ("auth", "billing", "config")]
     if auth:
         out += [

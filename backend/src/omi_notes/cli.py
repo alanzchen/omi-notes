@@ -155,7 +155,7 @@ def _writable(path: Path) -> bool:
 
 @app.command()
 def doctor() -> None:
-    """Check libopus, the VAD model, folders, keys and tailscale serve."""
+    """Check libopus, the VAD model, folders, keys, transcription/diarization and tailscale serve."""
     settings = load_settings()
     problems = 0
 
@@ -190,14 +190,50 @@ def doctor() -> None:
     check(_writable(settings.data_dir), f"Data folder writable: {settings.data_dir}", "check DATA_DIR")
     check(bool(settings.omi_notes_token), "OMI_NOTES_TOKEN set", "run `omi-notes pair`")
     check(True, f"Timezone {settings.timezone}")
+    style = None
     if settings.stt_provider == "deepgram":
         check(bool(settings.deepgram_api_key), "DEEPGRAM_API_KEY set", "needed for transcription")
+    elif settings.stt_provider == "openai":
+        from .providers.openai_stt import default_max_seconds, resolve_style
+
+        base, model = settings.stt_base_url, settings.stt_model
+        style = resolve_style(base, model, settings.stt_request_style)
+        check(base.startswith(("http://", "https://")), f"STT server {base}", "set STT_BASE_URL, e.g. https://api.mistral.ai/v1")
+        check(not model.startswith("nova-"), f"STT model {model} (request style {style})",
+              "set STT_MODEL to a model your server serves (nova-* is Deepgram's)")  # fmt: skip
+        if any(host in base for host in ("api.openai.com", "api.mistral.ai", "api.together.xyz")):
+            check(bool(settings.stt_api_key), "STT_API_KEY set", f"needed for {base}")
+        limit = settings.stt_max_request_seconds
+        limit = default_max_seconds(style, base) if limit is None else limit
+        check(True, f"STT request limit: {f'{limit:.0f} s (longer audio is split)' if limit else 'none'}")
     else:
         check(True, "STT provider: fake (no transcription)")
+    from .audio.diarize import EMBEDDING, SEGMENTATION, local_diarization_status
+
+    segmentation, embedding = settings.diarization_segmentation_model, settings.diarization_embedding_model
+    problem = local_diarization_status(segmentation, embedding)
+    mode = settings.stt_diarization
+    if mode == "off":
+        check(True, "Diarization off: single-speaker transcripts are accepted (STT_DIARIZATION=off)")
+    elif mode == "local":
+        check(problem is None, "Local diarization (sherpa-onnx + models)", problem or "")
+    elif mode == "auto" and style == "verbose":
+        check(problem is None, "Local diarization (this server may not label speakers)", problem or "", required=False)
+    else:
+        check(problem is None, "Local diarization (optional: consistent speakers when long audio is split)",
+              problem or "", required=False)  # fmt: skip
+    if problem is None:
+        pinned = _sha256_file(segmentation) == SEGMENTATION.member_sha256 and _sha256_file(embedding) == EMBEDDING.sha256
+        check(pinned, "Diarization model checksums", "run `omi-notes fetch-models --diarization`", required=False)
     if settings.llm_provider == "anthropic":
         check(bool(settings.anthropic_api_key) or bool(os.environ.get("ANTHROPIC_AUTH_TOKEN")),
               f"ANTHROPIC_API_KEY set (model {settings.llm_model}, effort {settings.llm_effort})",
               "needed for summaries (or an `ant auth login` profile)", required=False)  # fmt: skip
+    elif settings.llm_provider == "openai":
+        check(not settings.llm_model.startswith("claude-"), f"LLM model {settings.llm_model} at {settings.llm_base_url}",
+              "set LLM_MODEL to a model your OpenAI-compatible server serves")  # fmt: skip
+        if "api.openai.com" in settings.llm_base_url:
+            check(bool(settings.llm_api_key), "LLM_API_KEY set", "needed for api.openai.com")
     else:
         check(True, f"LLM provider: {settings.llm_provider}")
     url = _tailscale_url()
@@ -214,27 +250,59 @@ def doctor() -> None:
     raise typer.Exit(1 if problems else 0)
 
 
-@app.command("fetch-models")
-def fetch_models() -> None:
-    """Download the Silero VAD model and verify its checksum."""
+def _fetch_verified(url: str, sha256: str, target: Path, member: str | None = None, member_sha256: str | None = None) -> None:
+    """Download `url` (checksum-pinned), optionally extract one archive member, and write `target`."""
+    import io
+    import tarfile
+
     import httpx
 
-    target = MODELS_DIR / "silero_vad.onnx"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists() and _sha256_file(target) == SILERO_SHA256:
+    expected = member_sha256 if member else sha256
+    if target.exists() and _sha256_file(target) == expected:
         typer.echo(f"{target} is already present and verified.")
         return
-    typer.echo(f"Downloading {SILERO_URL}")
-    response = httpx.get(SILERO_URL, follow_redirects=True, timeout=120)
+    typer.echo(f"Downloading {url}")
+    response = httpx.get(url, follow_redirects=True, timeout=300)
     response.raise_for_status()
-    digest = hashlib.sha256(response.content).hexdigest()
-    if digest != SILERO_SHA256:
-        typer.secho(f"Checksum mismatch: got {digest}, expected {SILERO_SHA256}", fg=typer.colors.RED)
+    data = response.content
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != sha256:
+        typer.secho(f"Checksum mismatch for {url}: got {digest}, expected {sha256}", fg=typer.colors.RED)
         raise typer.Exit(1)
-    tmp = target.with_suffix(".onnx.tmp")
-    tmp.write_bytes(response.content)
+    if member:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                typer.secho(f"{member} not found in {url}", fg=typer.colors.RED)
+                raise typer.Exit(1)
+            data = extracted.read()
+        if hashlib.sha256(data).hexdigest() != member_sha256:
+            typer.secho(f"Checksum mismatch for {member}", fg=typer.colors.RED)
+            raise typer.Exit(1)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_bytes(data)
     tmp.replace(target)
-    typer.echo(f"Saved {target} ({len(response.content)} bytes, sha256 verified).")
+    typer.echo(f"Saved {target} ({len(data)} bytes, sha256 verified).")
+
+
+@app.command("fetch-models")
+def fetch_models(
+    diarization: bool = typer.Option(False, "--diarization", help="Also fetch the local speaker diarization models"),
+) -> None:
+    """Download the Silero VAD model (and, with --diarization, the sherpa-onnx diarization models)."""
+    _fetch_verified(SILERO_URL, SILERO_SHA256, MODELS_DIR / "silero_vad.onnx")
+    if diarization:
+        from .audio.diarize import EMBEDDING, SEGMENTATION
+
+        settings = load_settings()
+        for spec, target in ((SEGMENTATION, settings.diarization_segmentation_model),
+                             (EMBEDDING, settings.diarization_embedding_model)):  # fmt: skip
+            _fetch_verified(spec.url, spec.sha256, target, spec.member, spec.member_sha256)
+        try:
+            import sherpa_onnx  # noqa: F401
+        except ImportError:
+            typer.secho("sherpa-onnx is not installed yet: run `uv sync --extra diarization`.", fg=typer.colors.YELLOW)
 
 
 # -- dev tooling -----------------------------------------------------------------------------------

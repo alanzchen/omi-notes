@@ -49,7 +49,7 @@ only queue the work for it (so two processes never transcribe or write the same 
 | `worker` | processing worker only |
 | `pair [--url URL]` | print the pairing QR (generates a token into `.env` if needed) |
 | `doctor` | environment checks |
-| `fetch-models` | download + verify the Silero VAD model |
+| `fetch-models [--diarization]` | download + verify the Silero VAD model (and the local diarization models) |
 | `rebuild` | re-render every note, daily index and `_status.md` from caches (no API calls) |
 | `reprocess <id> \| --since YYYY-MM-DD [--restt] [--force-llm]` | redo STT/summary (caches reused unless forced; queued if a worker runs) |
 | `retry-failed` | re-queue failed conversations/chunks after fixing a key or billing problem |
@@ -83,10 +83,15 @@ All settings come from the environment or `backend/.env`; see [`.env.example`](.
 | `HOST` / `PORT` | `127.0.0.1` / `8765` | bind address |
 | `TIMEZONE` | this Mac's zone | times and filenames in notes |
 | `OWNER_NAME` | — | shown for action items you own |
-| `STT_PROVIDER` | `deepgram` | `deepgram` or `fake` |
+| `STT_PROVIDER` | `deepgram` | `deepgram`, `openai` (any OpenAI-compatible transcription server) or `fake` |
 | `DEEPGRAM_API_KEY` | — | Deepgram key |
-| `STT_MODEL` / `STT_LANGUAGE` | `nova-3` / `en` | Deepgram model and language (`multi` = detect) |
+| `STT_MODEL` / `STT_LANGUAGE` | `nova-3` / `en` | transcription model and language (`multi` = detect) |
 | `STT_KEYTERMS` | — | comma-separated terms to boost |
+| `STT_BASE_URL` / `STT_API_KEY` | `https://api.openai.com/v1` / — | OpenAI-compatible server and bearer token (empty = none) |
+| `STT_REQUEST_STYLE` | `auto` | `openai_diarized`, `mistral`, `together` or `verbose` (auto-detected from host/model) |
+| `STT_MAX_REQUEST_SECONDS` | per service | longest audio per request; longer audio is split (0 = unlimited) |
+| `STT_DIARIZATION` | `auto` | speaker labels from `provider`, `local` diarization, `auto`, or `off` |
+| `DIARIZATION_NUM_SPEAKERS` / `DIARIZATION_THRESHOLD` | `0` / `0.5` | local diarization: fixed count, or clustering threshold |
 | `LLM_PROVIDER` | `anthropic` | `anthropic`, `fake`, or `none` (transcript-only notes) |
 | `ANTHROPIC_API_KEY` | — | Anthropic key |
 | `LLM_MODEL` / `LLM_EFFORT` | `claude-opus-5` / `medium` | summary model and effort |
@@ -98,6 +103,28 @@ All settings come from the environment or `backend/.env`; see [`.env.example`](.
 | `RAW_RETENTION_DAYS` | `30` | keep raw uploads this long after their conversations finish |
 | `VAD_BACKEND` / `VAD_THRESHOLD` | `silero` / `0.5` | speech detector |
 | `WORKER_TICK_SECONDS` | `5` | worker polling interval |
+
+### Transcription and speaker labels
+
+Notes attribute what was said to speakers, so every transcript needs speaker labels (diarization).
+Two ways to get them:
+
+- **A diarizing transcription service.** Deepgram (default), or `STT_PROVIDER=openai` with any
+  OpenAI-compatible server: Mistral `voxtral-mini-latest` (`https://api.mistral.ai/v1`), OpenAI
+  `gpt-4o-transcribe-diarize`, Together `openai/whisper-large-v3`, or self-hosted
+  `OpenMOSS-Team/MOSS-Transcribe-Diarize` on vLLM (or mlx-audio with `STT_REQUEST_STYLE=verbose`).
+  See `.env.example` for the exact settings.
+- **Local diarization** with sherpa-onnx (pyannote segmentation + TitaNet embeddings, ONNX, no torch;
+  about 5 s per 3 minutes of audio on Apple Silicon):
+  `uv sync --extra diarization && uv run omi-notes fetch-models --diarization`. It works with any
+  transcription server, including ones that don't diarize (whisper.cpp server, LocalAI without
+  WhisperX). The models are MIT (segmentation) and CC-BY-4.0 (embeddings).
+
+Services with a per-request limit (OpenAI's diarize model: 20 min here; Together) get long
+conversations in pieces cut between speech blocks. Their speaker labels restart in every piece, so
+with `STT_DIARIZATION=auto` local diarization (when installed) labels the whole conversation instead;
+without it the note warns that labels are not consistent across pieces. A transcript without any
+speaker labels fails with instructions in `_status.md`, unless `STT_DIARIZATION=off`.
 
 ## The notes folder
 
@@ -133,7 +160,7 @@ timestamped transcript.
 ## Privacy
 
 Audio stays on your Mac except for what the providers need: **speech segments are sent to
-Deepgram** for transcription and **transcripts are sent to Anthropic** for summaries (both only
+the transcription service** (Deepgram, or your `STT_BASE_URL`; local diarization never leaves the Mac) and **transcripts are sent to Anthropic** for summaries (both only
 when those providers are configured). Raw uploads are kept in `DATA_DIR/raw` for
 `RAW_RETENTION_DAYS` after their conversations are finished; transcripts and provider responses
 are cached in `DATA_DIR/derived`. The server is reachable only on your tailnet, with a bearer token.

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from ..audio.diarize import LocalDiarizer, Turn, local_diarization_status
 from ..audio.timeline import CaptureTimeline, Piece
 from ..db import Database
 from ..envelope import OPUS_CODECS, parse_envelope
@@ -50,6 +51,7 @@ from ..util import canonical_json, sha256_hex
 from . import prompt
 from .relevance import deterministic_relevance
 from .segmenter import RingCapture, ring_resolved_until
+from .speakers import SpeakerResult, resolve_speakers
 from .transcript import ConversationAudio, assemble, detected_language, merge_same_speaker, segments_from_deepgram
 
 log = logging.getLogger(__name__)
@@ -84,6 +86,7 @@ class Providers:
     settings: Settings
     _stt: SttProvider | None = None
     _llm: LlmProvider | None = None
+    _diarizer: object = None  # LocalDiarizer, or False once known to be unavailable
 
     @property
     def stt(self) -> SttProvider:
@@ -92,11 +95,44 @@ class Providers:
                 from ..providers.fake import FakeStt
 
                 self._stt = FakeStt()
+            elif self.settings.stt_provider == "openai":
+                from ..providers.openai_stt import OpenAICompatStt
+
+                self._stt = OpenAICompatStt(
+                    self.settings.stt_base_url,
+                    self.settings.stt_api_key,
+                    self.settings.stt_model,
+                    style=self.settings.stt_request_style,
+                    max_request_seconds=self.settings.stt_max_request_seconds,
+                )
             else:
                 from ..providers.deepgram import DeepgramStt
 
                 self._stt = DeepgramStt(self.settings.deepgram_api_key, self.settings.stt_model)
         return self._stt
+
+    @property
+    def local_diarization_problem(self) -> str | None:
+        """None when local diarization can run, else why not."""
+        return local_diarization_status(
+            self.settings.diarization_segmentation_model, self.settings.diarization_embedding_model
+        )
+
+    @property
+    def diarizer(self):
+        """The local diarizer, or None when it is not installed (loaded once, on first use)."""
+        if self._diarizer is None:
+            problem = self.local_diarization_problem
+            if problem:
+                self._diarizer = False
+            else:
+                self._diarizer = LocalDiarizer(
+                    self.settings.diarization_segmentation_model,
+                    self.settings.diarization_embedding_model,
+                    num_speakers=self.settings.diarization_num_speakers,
+                    threshold=self.settings.diarization_threshold,
+                )
+        return self._diarizer or None
 
     @property
     def llm(self) -> LlmProvider:
@@ -105,6 +141,16 @@ class Providers:
                 from ..providers.fake import FakeLlm
 
                 self._llm = FakeLlm()
+            elif self.settings.llm_provider == "openai":
+                from ..providers.openai_llm import OpenAICompatLlm
+
+                self._llm = OpenAICompatLlm(
+                    self.settings.llm_base_url,
+                    self.settings.llm_api_key,
+                    self.settings.llm_model,
+                    json_mode=self.settings.llm_json_mode,
+                    reasoning_effort=self.settings.llm_reasoning_effort,
+                )
             else:
                 from ..providers.anthropic_llm import AnthropicLlm
 
@@ -115,9 +161,17 @@ class Providers:
 
     @property
     def stt_label(self) -> str:
+        """What transcribes and where speaker labels come from, e.g.
+        `openai/voxtral-mini-latest+local-diarization` (status page)."""
         if self.settings.stt_provider == "fake":
             return "fake/fake-stt"
-        return f"deepgram/{self.settings.stt_model}"
+        label = f"{self.settings.stt_provider}/{self.settings.stt_model}"
+        mode = self.settings.stt_diarization
+        if mode == "off":
+            return label + "+no-diarization"
+        if mode == "local" or (mode == "auto" and self.local_diarization_problem is None):
+            return label + ("+local-diarization" if mode == "local" else "+local-diarization-fallback")
+        return label
 
     @property
     def llm_model(self) -> str:
@@ -339,7 +393,8 @@ class ConversationPipeline:
             raise ProviderError("no decodable audio under this conversation's speech", terminal=True, kind="audio")
         audio_sha = sha256_hex(audio.pcm.tobytes() + canonical_json([list(b) for b in audio.blocks_out]).encode())
         stt = self.providers.stt
-        name = f"stt-{stt.name}-{_slug(stt.model)}-{_slug(self.settings.stt_language)}-{audio_sha[:16]}.json"
+        tag = f"-{_slug(stt.cache_tag)}" if getattr(stt, "cache_tag", "") else ""
+        name = f"stt-{stt.name}{tag}-{_slug(stt.model)}-{_slug(self.settings.stt_language)}-{audio_sha[:16]}.json"
         path = self.conv_dir(conv_id) / name
         if path.exists():
             cached = json.loads(path.read_text())
@@ -350,7 +405,8 @@ class ConversationPipeline:
             )  # fmt: skip
             cached = {"created_at": now, "provider": stt.name, "model": stt.model, "response": response}
             atomic_write_bytes(path, json.dumps(cached).encode())
-        segments = merge_same_speaker(segments_from_deepgram(cached["response"], audio.timemap))
+        speakers = self._speakers(conv_id, cached["response"], audio, audio_sha)
+        segments = merge_same_speaker(segments_from_deepgram(speakers.response, audio.timemap))
         language = self.settings.stt_language
         if language == "multi":
             language = detected_language(cached["response"]) or language
@@ -358,7 +414,9 @@ class ConversationPipeline:
             "segments": segments,
             "language": language,
             "audio_sha": audio_sha,
-            "stt": f"{cached['provider']}/{cached['model']}",
+            "stt": f"{cached['provider']}/{cached['model']}" + ("+local-diarization" if speakers.source == "local" else ""),
+            "speaker_source": speakers.source,
+            "speaker_labels_consistent": speakers.consistent,
             "stt_file": name,
             "transcribed_at": cached["created_at"],
             "submitted_seconds": round(audio.duration, 3),
@@ -368,6 +426,23 @@ class ConversationPipeline:
         self._set(conv_id, status="summarizing", audio_sha=audio_sha, stt_ref=name, language=language,
                   transcript_sha=sha256_hex(canonical_json(segments).encode()), attempts=0, error=None,
                   error_kind=None, next_attempt_at=None, updated_at=now)  # fmt: skip
+
+    def _speakers(self, conv_id: str, response: dict, audio: ConversationAudio, audio_sha: str) -> SpeakerResult:
+        """Speaker labels per STT_DIARIZATION (see `pipeline.speakers`). Local diarization runs on
+        the submitted PCM (same clock as the provider's timestamps) and is cached."""
+
+        def local_turns() -> list[Turn] | None:
+            diarizer = self.providers.diarizer
+            if diarizer is None:
+                return None
+            path = self.conv_dir(conv_id) / f"diarization-{_slug(diarizer.tag)}-{audio_sha[:16]}.json"
+            if path.exists():
+                return [Turn(*t) for t in json.loads(path.read_text())["turns"]]
+            turns = diarizer.diarize(audio.pcm)
+            atomic_write_bytes(path, json.dumps({"turns": [[t.start, t.end, t.speaker] for t in turns]}).encode())
+            return turns
+
+        return resolve_speakers(response, self.settings.stt_diarization, local_turns)
 
     # -- LLM + render ----------------------------------------------------------------------------
 
@@ -475,6 +550,7 @@ class ConversationPipeline:
             bookmarks=self.bookmarks(row), late_double_taps=self.late_double_taps(row),
             discard_reason=discard_reason, summary_error=summary_error, owner_name=self.settings.owner_name,
             lost_seconds=row["lost_seconds"], clock_suspect=bool(row["clock_suspect"]),
+            speaker_labels_consistent=transcript.get("speaker_labels_consistent", True),
         )  # fmt: skip
         content_sha = sha256_hex(render_note(data, "").encode())
         revision = row["revision"] if row["content_sha"] == content_sha and row["revision"] else row["revision"] + 1
