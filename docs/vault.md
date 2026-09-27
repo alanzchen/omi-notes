@@ -110,21 +110,27 @@ acknowledged:
 1. Under `operations.lock` and the conversation's work claim, and only for a `failed`, unfrozen,
    unconflicted conversation with no other retry pending: write
    `operations/<request_id>.json` `{id, kind: "retry", conversation_id, stage, failure_kind,
-   record_sha, requested_at, state: "accepted"}`.
+   failure_id, record_sha, requested_at, state: "accepted"}` (`failure_id` names the failed
+   attempt; every permanent failure records one in `failure.id`).
 2. Commit `retry: {op, stage}` into `conversation.json` (then the index), then bump the reprocess
    counter to wake the worker. `202`.
 3. The worker redoes the failed stage (transcribing even when an older transcript exists),
    reusing cached results. The outcome is committed with `retry_outcome: {op, status,
    failure_kind, finished_at}` in the same record write as the success or failure; the operation
-   file is then closed (`done` / `failed`) and never changes again.
+   file is then closed (`done` / `failed`, or `stopped` when the note was frozen meanwhile) and
+   never changes again.
 
 A record with `retry` but no `failure` (consumed, unfinished) rebuilds as queued at the retried
 stage, never as `done` from an older note. Reconciliation (every worker tick, bounded; and a
 repeated POST) closes operations whose outcome is recorded, wakes accepted ones a rebuild reset,
-and re-queues an operation whose record never got `retry` only while the record is still the exact
-failure it was accepted for (`record_sha`); otherwise it is `superseded`. A repeated request id
-returns the same operation; a request id reused for another conversation is `409`. Reprocess and
-resummarize requests leave a conversation with a pending retry alone. A provider call repeats
+and re-queues an operation whose record never got `retry` only while the record is still the failed
+attempt it was accepted for (`failure_id`); otherwise it is `superseded`. The sweep resumes where it
+stopped, so stuck operations can't starve later ones. A malformed operation file is reported and
+never overwritten; a missing one whose outcome is recorded is written again from the outcome. A repeated request id
+returns the same operation once its queueing is committed (`409 busy` until then); a request id
+reused for another conversation is `409`. Reprocess, resummarize and `retry-failed` leave a
+conversation with a pending retry alone (checked in the same statement that queues them), and a
+retry isn't accepted while other processing of the conversation is queued. A provider call repeats
 only if the process dies between its response and the cache write.
 
 ## Retention

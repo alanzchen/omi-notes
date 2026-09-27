@@ -376,7 +376,8 @@ def activity(db, settings, now: float) -> dict:
                for r in db.query(f"SELECT id, status, start FROM conversations WHERE {queue} AND claim_token IS NOT NULL "
                                  "AND claim_expires > ? ORDER BY start LIMIT 5", (now,))]  # fmt: skip
     waiting = db.one(f"SELECT COUNT(*) AS n, MIN(\"end\") AS oldest FROM conversations WHERE {queue} "
-                     "AND (next_attempt_at IS NULL OR next_attempt_at <= ?)", (now,))  # fmt: skip
+                     "AND (next_attempt_at IS NULL OR next_attempt_at <= ?) "
+                     "AND NOT (claim_token IS NOT NULL AND claim_expires > ?)", (now, now))  # fmt: skip
     backing_off = db.one(f"SELECT COUNT(*) AS n FROM conversations WHERE {queue} AND next_attempt_at > ?", (now,))["n"]
     chunk = db.one("SELECT MIN(received_at) AS t FROM chunks WHERE status='pending'")
 

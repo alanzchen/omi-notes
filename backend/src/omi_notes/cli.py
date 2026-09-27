@@ -700,18 +700,20 @@ def reprocess(
         rows = w.db.query("SELECT * FROM conversations WHERE start >= ? AND status<>'open'", (start,))
     else:
         raise typer.BadParameter("give a conversation id or --since")
-    queued = [r for r in rows if r["retry_op"]]
-    if queued:  # the app's durable retry owns their next attempt (docs/vault.md, "Operations")
-        typer.echo(f"Skipping {len(queued)} conversation(s) with an app retry queued: {', '.join(r['id'] for r in queued)}")
-        rows = [r for r in rows if not r["retry_op"]]
+    skipped = []
     for row in rows:
         # A request is recorded apart from the execution status, so a stage running right now
-        # cannot overwrite it; the pipeline consumes it atomically.
-        w.db.execute(
+        # cannot overwrite it; the pipeline consumes it atomically. A queued app retry owns the
+        # conversation's next attempt (docs/vault.md, "Operations"): checked in the same statement.
+        if not w.db.execute(
             """UPDATE conversations SET reprocess_request = reprocess_request + 1,
-                   force_restt = MAX(force_restt, ?), force_llm = MAX(force_llm, ?) WHERE id=?""",
+                   force_restt = MAX(force_restt, ?), force_llm = MAX(force_llm, ?) WHERE id=? AND retry_op IS NULL""",
             (int(restt), int(force_llm), row["id"]),
-        )
+        ).rowcount:
+            skipped.append(row["id"])
+    if skipped:
+        typer.echo(f"Skipped {len(skipped)} conversation(s) with an app retry queued: {', '.join(skipped)}")
+        rows = [r for r in rows if r["id"] not in skipped]
     lock = worker_lock(w.vault)
     if not lock.acquire():
         typer.echo(f"A worker is running: {len(rows)} conversation(s) queued for it.")
@@ -740,7 +742,7 @@ def retry_failed() -> None:
     convs = w.db.execute(
         """UPDATE conversations SET status=CASE failed_stage WHEN 'summarizing' THEN 'summarizing' ELSE 'closed' END,
                attempts=0, next_attempt_at=NULL, error=NULL, error_kind=NULL, failed_stage=NULL
-           WHERE status='failed'"""
+           WHERE status='failed' AND retry_op IS NULL"""
     ).rowcount
     chunks = w.db.execute(
         "UPDATE chunks SET status='pending', attempts=0, next_attempt_at=NULL, error=NULL WHERE status='failed'"

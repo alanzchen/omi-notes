@@ -389,7 +389,10 @@ class ConversationPipeline:
         if exc.terminal or attempts >= MAX_ATTEMPTS:
             log.error("conversation %s failed permanently in %s: %s", conv_id, stage, exc)
             self._commit(conv_id, status="failed", failed_stage=stage, attempts=attempts, error=str(exc)[:500],
-                         error_kind=exc.kind, next_attempt_at=None, updated_at=now, **_outcome(row, "failed", exc.kind, now))  # fmt: skip
+                         error_kind=exc.kind, next_attempt_at=None, updated_at=now,
+                         # which failed attempt this is (deterministic, so a rebuild reproduces the record)
+                         failure_id=sha256_hex(f"{conv_id}:{now!r}:{attempts}".encode())[:16],
+                         **_outcome(row, "failed", exc.kind))  # fmt: skip
             operations.finished(self, row["retry_op"])
             if stage == "summarizing":
                 # The transcript is safe; publish it now rather than waiting for the LLM.
@@ -782,6 +785,11 @@ class ConversationPipeline:
         conv_id = row["id"]
         root = self.settings.vault_dir
         if row["frozen"] and row["note_path"]:
+            if row["retry_op"] and not cache_only:
+                # frozen while an app retry ran: the retry stops here, and the row leaves the queue
+                self._commit(conv_id, status="done", needs_render=0, next_attempt_at=None, **_outcome(row, "frozen", None))
+                operations.finished(self, row["retry_op"])
+                return
             self._set(conv_id, needs_render=0, next_attempt_at=None)
             return
         snap = self._render_settings(row, cache_only)
@@ -847,7 +855,7 @@ class ConversationPipeline:
             **({} if failed else {"error": None, "error_kind": None, "failed_stage": None, "attempts": 0}),
             # a cache-only re-render is not the retried attempt, and keeps whatever outcome is recorded
             **({} if cache_only else _outcome(row, "failed" if failed and kind == "transcript_only" else
-                                              ("discarded" if kind == "discarded" else "done"), None, now)),
+                                              ("discarded" if kind == "discarded" else "done"), None)),
         )  # fmt: skip
         if not cache_only:
             operations.finished(self, row["retry_op"])
@@ -1292,11 +1300,12 @@ def bookmark_owner(db: Database, device_id: str, t: float) -> str | None:
     return best[2] if best else None
 
 
-def _outcome(row, status: str, failure_kind: str | None, now: float) -> dict:
-    """Index/record fields that close an app retry, committed with the outcome they describe."""
+def _outcome(row, status: str, failure_kind: str | None) -> dict:
+    """Index/record fields that close an app retry, committed with the outcome they describe
+    (completion time is the wall clock: a tick's `now` can predate the retry's acceptance)."""
     if not row["retry_op"]:
         return {}
-    outcome = {"op": row["retry_op"], "status": status, "failure_kind": failure_kind, "finished_at": now}
+    outcome = {"op": row["retry_op"], "status": status, "failure_kind": failure_kind, "finished_at": time.time()}
     return {"retry_outcome": json.dumps(outcome, sort_keys=True), "retry_op": None, "retry_stage": None}
 
 

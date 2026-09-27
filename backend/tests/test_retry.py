@@ -58,6 +58,16 @@ def op(client, op_id: str) -> dict:
     return r.json()["operation"]
 
 
+def op_file(settings, op_id: str) -> dict:
+    return json.loads((settings.vault_dir / "_omi" / "operations" / f"{op_id}.json").read_text())
+
+
+def write_op(settings, op: dict) -> None:
+    folder = settings.vault_dir / "_omi" / "operations"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{op['id']}.json").write_text(json.dumps(op))
+
+
 def record(worker, conv_id: str) -> dict:
     return json.loads((worker.pipeline.conv_dir(conv_id) / "conversation.json").read_text())
 
@@ -119,7 +129,7 @@ def test_only_failed_unfrozen_unconflicted_conversations_can_be_retried(client, 
     assert retry(client, row["id"]).status_code == 503
 
 
-def test_a_retry_that_fails_again_is_failed_once_without_looping(client, worker):
+def test_a_retry_that_fails_again_is_failed_once_without_looping(client, worker, settings):
     row = failed_summary(client, worker)
     rid = retry(client, row["id"]).json()["operation"]["id"]
     worker.tick(T0 + 500)
@@ -128,18 +138,16 @@ def test_a_retry_that_fails_again_is_failed_once_without_looping(client, worker)
     for t in range(3):
         worker.tick(T0 + 600 + t)
     assert llm.calls == 2 and convs(worker)[0]["status"] == "failed"
-    assert record(worker, row["id"])["retry_outcome"] == {"op": rid, "status": "failed", "failure_kind": "auth",
-                                                          "finished_at": T0 + 500}  # fmt: skip
+    outcome = record(worker, row["id"])["retry_outcome"]
+    assert outcome["op"] == rid and outcome["status"] == "failed" and outcome["failure_kind"] == "auth"
+    assert outcome["finished_at"] >= op_file(settings, rid)["requested_at"]
 
 
 def test_a_crash_between_the_operation_and_the_record_is_repaired(client, worker, settings):
     row = failed_summary(client, worker)
     rid = str(uuid.uuid4())
     # the operation file was written, then the process died before conversation.json/index changed
-    settings.vault_dir.joinpath("_omi", "operations").mkdir(parents=True, exist_ok=True)
-    (settings.vault_dir / "_omi" / "operations" / f"{rid}.json").write_text(json.dumps({
-        "format": 1, "id": rid, "kind": "retry", "conversation_id": row["id"], "stage": "summarizing",
-        "failure_kind": "auth", "record_sha": row["record_sha"], "requested_at": T0, "state": "accepted"}))  # fmt: skip
+    write_op(settings, orphan(row, rid))
     assert op(client, rid)["state"] == "accepted"  # observing never repairs
     assert record(worker, row["id"]).get("retry") is None
     worker.providers._llm = CountingLlm()
@@ -230,3 +238,102 @@ def test_failed_chunks_can_be_queued_again(client, worker):
 @pytest.mark.parametrize("path", ["/v1/operations/not-a-uuid", f"/v1/operations/{uuid.uuid4()}"])
 def test_unknown_operations_are_404(client, path):
     assert client.get(path, headers=AUTH).status_code == 404
+
+
+def orphan(row, rid: str, **extra) -> dict:
+    return {"format": 1, "id": rid, "kind": "retry", "conversation_id": row["id"], "stage": "summarizing",
+            "failure_kind": "auth", "failure_id": row["failure_id"], "record_sha": row["record_sha"],
+            "requested_at": T0, "state": "accepted"} | extra  # fmt: skip
+
+
+def test_an_orphan_for_another_attempt_with_identical_bytes_is_superseded(client, worker, settings):
+    row = failed_summary(client, worker)
+    rid = str(uuid.uuid4())
+    write_op(settings, orphan(row, rid, failure_id="an-earlier-attempt"))
+    worker.tick(T0 + 500)
+    assert op(client, rid)["state"] == "superseded" and worker.providers._llm.calls == 1
+
+
+@pytest.mark.parametrize("content", ["[]", "{not json", json.dumps({"id": "other", "kind": "retry"})])
+def test_a_malformed_operation_is_reported_and_never_overwritten(client, worker, settings, content):
+    row = failed_summary(client, worker)
+    rid = str(uuid.uuid4())
+    path = settings.vault_dir / "_omi" / "operations" / f"{rid}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    r = retry(client, row["id"], rid)
+    assert r.status_code == 500 and r.json()["error"] == "operation_unreadable"
+    assert path.read_text() == content and convs(worker)[0]["retry_op"] is None
+    worker.tick(T0 + 500)  # the sweep skips it and carries on
+    assert path.read_text() == content
+
+
+def test_a_missing_receipt_is_written_again_from_the_recorded_outcome(client, worker, settings):
+    row = failed_summary(client, worker)
+    rid = retry(client, row["id"]).json()["operation"]["id"]
+    worker.tick(T0 + 500)  # fails again: outcome recorded, receipt closed
+    (settings.vault_dir / "_omi" / "operations" / f"{rid}.json").unlink()
+    second = retry(client, row["id"])  # closing the previous receipt comes first
+    assert second.status_code == 202
+    assert op_file(settings, rid)["state"] == "failed" and op_file(settings, rid)["reconstructed"] is True
+
+
+def test_a_repeated_request_is_not_confirmed_until_it_is_queued(client, worker, settings):
+    row = failed_summary(client, worker)
+    rid = str(uuid.uuid4())
+    write_op(settings, orphan(row, rid))
+    token = worker.pipeline.claim(row["id"])  # the worker holds the conversation
+    r = retry(client, row["id"], rid)
+    assert r.status_code == 409 and r.json()["error"] == "busy"
+    worker.pipeline.release(row["id"], token)
+    r = retry(client, row["id"], rid)
+    assert r.status_code == 200 and r.json()["operation"]["state"] == "queued"
+
+
+def test_freezing_the_note_during_a_retry_stops_it_without_looping(client, worker, settings):
+    row = failed_summary(client, worker)
+    rid = retry(client, row["id"]).json()["operation"]["id"]
+    worker.providers._llm = CountingLlm(ProviderError("overloaded", kind="transient"))
+    worker.tick(T0 + 500)
+    assert op(client, rid)["state"] == "backing_off"
+    worker.db.execute("UPDATE conversations SET frozen=1 WHERE id=?", (row["id"],))
+    assert op(client, rid)["state"] == "blocked"
+    worker.providers._llm = CountingLlm()
+    worker.tick(T0 + 5000)
+    (after,) = convs(worker)
+    assert op(client, rid)["state"] == "stopped" and after["retry_op"] is None and after["status"] == "done"
+    assert worker.pipeline.run(T0 + 5001) == 0  # nothing left in the queue
+
+
+def test_other_enqueues_leave_a_pending_retry_alone(client, worker, settings):
+    row = failed_summary(client, worker)
+    worker.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1 WHERE id=?", (row["id"],))
+    assert retry(client, row["id"]).json()["error"] == "busy"  # a reprocess is already queued
+    worker.tick(T0 + 450)
+    worker.db.execute("UPDATE conversations SET status='failed', failed_stage='summarizing' WHERE id=?", (row["id"],))
+    rid = retry(client, row["id"]).json()["operation"]["id"]
+    from typer.testing import CliRunner
+
+    from omi_notes.cli import app as cli
+
+    from .conftest import cli_env
+
+    out = CliRunner().invoke(cli, ["reprocess", row["id"], "--force-llm"], env=cli_env(settings)).output
+    assert "Skipped 1" in out and convs(worker)[0]["force_llm"] == 0
+    # retry-failed leaves it to the retry (which it then runs inline, as the worker would)
+    assert "Queued 0 conversation" in CliRunner().invoke(cli, ["retry-failed"], env=cli_env(settings)).output
+    assert op(client, rid)["state"] == "done" and convs(worker)[0]["force_llm"] == 0
+
+
+def test_the_sweep_rotates_past_stuck_operations(client, worker, settings, monkeypatch):
+    row = failed_summary(client, worker)
+    monkeypatch.setattr(operations, "SWEEP_BATCH", 3)
+    for _ in range(5):  # operations for a conversation that isn't there: never settled
+        write_op(settings, {"format": 1, "id": "0" + str(uuid.uuid4())[1:], "kind": "retry",
+                            "conversation_id": str(uuid.uuid4()), "state": "accepted"})  # fmt: skip
+    rid = "f" + str(uuid.uuid4())[1:]  # sorts last
+    write_op(settings, orphan(row, rid))
+    worker.providers._llm = CountingLlm()
+    for t in range(4):
+        worker.tick(T0 + 500 + t)
+    assert op(client, rid)["state"] == "done"

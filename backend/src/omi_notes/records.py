@@ -128,6 +128,8 @@ def record_from_row(row, known_through: dict[str, int]) -> dict:
         record["render"] = render
     if row["status"] == "failed":
         record["failure"] = {"stage": row["failed_stage"], "error": row["error"], "kind": row["error_kind"]}
+        if _get(row, "failure_id"):
+            record["failure"]["id"] = row["failure_id"]
     return record
 
 
@@ -157,12 +159,13 @@ def row_from_record(record: dict) -> tuple[dict, dict[str, int]]:
     if retry and not failure:
         # consumed but unfinished: run the retried stage again (its cached results are reused)
         status = "summarizing" if retry.get("stage") == "summarizing" else "closed"
-        values.update(error=None, error_kind=None, failed_stage=None)
+        values.update(error=None, error_kind=None, failed_stage=None, failure_id=None)
     elif failure:
         status = "failed"
-        values.update(error=failure.get("error"), error_kind=failure.get("kind"), failed_stage=failure.get("stage"))
+        values.update(error=failure.get("error"), error_kind=failure.get("kind"), failed_stage=failure.get("stage"),
+                      failure_id=failure.get("id"))  # fmt: skip
     else:
-        values.update(error=None, error_kind=None, failed_stage=None)
+        values.update(error=None, error_kind=None, failed_stage=None, failure_id=None)
         if decision.get("enrollment_id"):
             status = "discarded"
         else:

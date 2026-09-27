@@ -94,6 +94,7 @@ class Worker:
         self._last_retention = 0.0
         self._reconciled = False
         self.operations = operations.Sweeper()
+        self.search = search.Indexer()
 
     # -- loop ------------------------------------------------------------------------------------
 
@@ -135,7 +136,7 @@ class Worker:
                 log.exception("could not reconcile app retries")
             advanced = self.pipeline.run(now)
             try:
-                search.index_batch(self.pipeline)
+                self.search.run(self.pipeline)
             except Exception:
                 log.exception("could not update the search index")
             self.pipeline.render_stubs(now)

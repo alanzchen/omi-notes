@@ -285,14 +285,15 @@ class SpeakerService:
         return voices.get(label)
 
     def resummarize(self, conv_id: str) -> None:
-        row = self._conversation(conv_id)
-        if row["enrollment_id"]:
+        if self._conversation(conv_id)["enrollment_id"]:
             raise ApiError(409, "voice_enrollment", "a voice-enrollment reading has no transcript or summary")
-        if row["retry_op"]:  # the queued app retry decides this conversation's next attempt
+        # checked in the same statement: a queued app retry decides this conversation's next attempt
+        queued = self.db.execute(
+            "UPDATE conversations SET reprocess_request = reprocess_request + 1, force_llm = 1 WHERE id=? AND retry_op IS NULL",
+            (conv_id,),
+        ).rowcount
+        if not queued:
             raise ApiError(409, "retry_in_progress", "a retry of this conversation is queued; try again when it finishes")
-        self.db.execute(
-            "UPDATE conversations SET reprocess_request = reprocess_request + 1, force_llm = 1 WHERE id=?", (conv_id,)
-        )
 
     # -- suggestions -----------------------------------------------------------------------------
 

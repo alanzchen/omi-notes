@@ -409,9 +409,10 @@ the retry is durable in the vault (docs/vault.md, "Operations"):
                "requested_at": "…", "finished_at": null, "message": "Waiting for the server to start"}}
 ```
 
-`state`: `accepted`, `queued`, `running`, `backing_off`, `blocked` (the note was edited meanwhile),
-`done`, `failed` (it failed again; see the conversation), `superseded` (other processing replaced
-it). The failed stage is redone with cached results reused.
+`state`: `accepted`, `queued`, `running`, `backing_off`, `blocked` (the note was edited or frozen
+meanwhile), `done`, `failed` (it failed again; see the conversation), `stopped` (the note was frozen),
+`superseded` (other processing replaced it). `409 busy` is not an answer: keep the request id and
+send it again later. The failed stage is redone with cached results reused.
 
 ### `GET /v1/operations/{id}`
 
@@ -427,6 +428,7 @@ server replays surviving raw audio after a rebuild anyway); the phone doesn't re
 Same entries and paging as `/recent`. `q`: every word must appear (literal, case-insensitive) in
 the title, summary, speaker names or transcript of the conversation's current generation; entries
 made from an older generation are never returned, and `pending` counts conversations not indexed
-yet. `person_id` keeps conversations where that person is assigned to a speaker. `date_from` /
+yet (renaming a person makes affected entries pending until the worker reindexes them). `person_id`
+keeps conversations where that person is assigned to a speaker. `date_from` /
 `date_to` are local calendar days (`YYYY-MM-DD`, inclusive, in the vault's time zone). Voice
 enrollment readings are never returned.
