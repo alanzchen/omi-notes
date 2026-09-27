@@ -1,7 +1,8 @@
 import OmiBLE
+import OmiProtocol
 import SwiftUI
 
-/// First run: what the app does → server → device → background notes.
+/// First run: what the app does → connect the server → pair the pendant → what to expect.
 struct OnboardingView: View {
     let model: AppModel
     let onFinish: () -> Void
@@ -14,7 +15,7 @@ struct OnboardingView: View {
                 case 0: welcome
                 case 1: server
                 case 2: device
-                default: background
+                default: expect
                 }
             }
             .toolbar {
@@ -31,10 +32,11 @@ struct OnboardingView: View {
     private var welcome: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                Image(systemName: "waveform.badge.mic").font(.system(size: 56)).foregroundStyle(.tint)
+                Image(systemName: "waveform.badge.mic").font(.system(size: 56)).foregroundStyle(.tint).accessibilityHidden(true)
                 Text("Omi Notes").font(.largeTitle.bold())
-                Text("This app carries audio from your Omi pendant to **your own server**, which transcribes it and writes Markdown notes.")
-                Text("The phone doesn't transcribe anything: it saves what the pendant sends, then uploads it. If the phone or network is away, the pendant and the phone both keep audio until it can be delivered.")
+                Text("Wear your Omi pendant and talk as usual. A few minutes after each conversation, a note with a summary, action items and a transcript appears here and in your notes folder.")
+                Label("Audio goes from the pendant to this phone, then to **your own server**. This app sends it nowhere else.", systemImage: "lock.shield")
+                Label("If the phone or the network is away, audio waits safely on the pendant or the phone until it can be delivered.", systemImage: "tray.and.arrow.up")
                     .foregroundStyle(.secondary)
             }
             .padding()
@@ -45,14 +47,14 @@ struct OnboardingView: View {
     private var server: some View {
         Form {
             Section {
-                Text("On your Mac, run `omi-notes pair` and scan the QR code with the iPhone **Camera** app. The link opens this app and asks you to confirm the server.")
+                Text("On the computer that runs your server, run `omi-notes pair`, then scan the QR code with the iPhone **Camera** app. The link opens this app and asks you to confirm.")
                 if let host = model.serverURL?.host() {
-                    Label("Configured: \(host)", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                    Label("Connected to \(host)", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
                 }
             }
             ServerSettingsSection(model: model)
         }
-        .navigationTitle("Server")
+        .navigationTitle("Your server")
     }
 
     private var device: some View {
@@ -62,20 +64,57 @@ struct OnboardingView: View {
             }
             PairingView(model: model, onPaired: { step = 3 })
         }
-        .navigationTitle("Device")
+        .navigationTitle("Your pendant")
     }
 
-    private var background: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                Text("Keep it running").font(.title.bold())
-                Label("Leave the app in the background. iOS wakes it for the pendant and finishes uploads on its own.", systemImage: "moon.zzz")
-                Label("Don't force-quit it from the app switcher: that stops Bluetooth reconnection until you open it again (the pendant buffers meanwhile).", systemImage: "xmark.app")
-                Label("Only one phone can connect to the pendant. Disconnect the official Omi app.", systemImage: "iphone.slash")
-                Label("Single tap on the pendant = bookmark. Double tap = end the current conversation now.", systemImage: "hand.tap")
+    private var expect: some View {
+        List {
+            Section {
+                check
+            } header: {
+                Text("Connection")
+            } footer: {
+                Text("This checks that the phone can reach your server and that the server is set up. It doesn't prove transcription works; that is confirmed when your first note appears.")
             }
-            .padding()
+            Section("What to expect") {
+                Label("Your first note appears a few minutes after a conversation ends.", systemImage: "clock")
+                Label("Leave the app in the background. Don't force-quit it: that stops the pendant from reconnecting until you open it again.", systemImage: "moon.zzz")
+                Label("Only one phone can connect to the pendant. Disconnect the official Omi app.", systemImage: "iphone.slash")
+                Label("Tap the pendant once to bookmark a moment; double-tap to end the conversation now.", systemImage: "hand.tap")
+                Label("If your server is a Mac, it must be awake and logged in to transcribe. If you use Tailscale, keep it connected on this phone.",
+                      systemImage: "desktopcomputer")
+            }
+            .font(.subheadline)
+            Section {
+                Text("Your server decides which services receive your audio and transcripts. You can see its setup in the Server tab.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
         }
-        .navigationTitle("Background")
+        .navigationTitle("You're set")
+        .task { await model.refreshServer() }
+    }
+
+    @ViewBuilder private var check: some View {
+        switch model.server {
+        case .reachable:
+            let st = model.serverStatus
+            Label("Your server answered", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+            if st?.stt?.ready == false {
+                Label("Transcription isn't set up on the server yet", systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
+            }
+            if model.snapshot.rememberedDeviceId == nil {
+                Label("No pendant paired yet", systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
+            }
+        case .checking, .unknown:
+            HStack { ProgressView(); Text("Checking your server…").padding(.leading, 6) }
+        case .notConfigured:
+            Label("No server connected yet. Recordings wait on this phone until you connect one.", systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+        case .unauthorized:
+            Label("The server rejected this phone. Pair again with a new code.", systemImage: "xmark.octagon").foregroundStyle(.red)
+        case .unreachable(let why):
+            Label("Couldn't reach your server (\(why)). Recordings wait on this phone until it's reachable.", systemImage: "wifi.exclamationmark")
+                .foregroundStyle(.orange)
+        }
     }
 }

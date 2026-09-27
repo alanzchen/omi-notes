@@ -37,8 +37,15 @@ def test_auth_required(client, new_id):
 
 def test_status(client):
     body = client.get("/v1/status", headers=AUTH).json()
-    assert body["ok"] and body["protocol_version"] == 1 and body["stt"] == {"provider": "fake", "ready": True}
-    assert body["queue"] == {"chunks_pending": 0, "conversations_open": 0, "conversations_pending": 0, "failed": 0}
+    assert body["ok"] and body["protocol_version"] == 1
+    assert body["stt"] == {"provider": "fake", "model": "fake-stt", "diarization": "auto", "ready": True}
+    assert body["llm"] == {"provider": "fake", "model": "fake-llm", "ready": True}
+    assert body["queue"] == {"chunks_pending": 0, "conversations_open": 0, "conversations_pending": 0, "failed": 0,
+                             "conversations_failed": 0, "chunks_failed": 0, "conversations_retrying": 0,
+                             "notes_conflicted": 0}  # fmt: skip
+    # the test client runs no worker: the phone must not be told processing is running
+    assert body["worker"] == {"present": False} and body["last_note_at"] is None and body["read_only"] is None
+    assert {"conversation_detail", "issues"} <= set(body["features"])
 
 
 def test_chunk_idempotency_201_200_409(client, new_id):
@@ -165,7 +172,7 @@ def test_events_idempotent(client, new_id, settings):
 
 
 def test_recent_conversations_empty(client):
-    assert client.get("/v1/conversations/recent?limit=5", headers=AUTH).json() == {"conversations": []}
+    assert client.get("/v1/conversations/recent?limit=5", headers=AUTH).json() == {"conversations": [], "next_cursor": None}
 
 
 def test_recent_conversations_only_offer_speakers_after_transcription(client, worker):

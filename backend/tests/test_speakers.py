@@ -177,4 +177,5 @@ def test_split_audio_without_local_diarization_warns_about_labels(tmp_path):
 
 def test_status_reports_openai_stt_readiness(tmp_path):
     settings, client, _ = pipeline(tmp_path)
-    assert client.get("/v1/status", headers=AUTH).json()["stt"] == {"provider": "openai", "ready": True}
+    stt = client.get("/v1/status", headers=AUTH).json()["stt"]
+    assert stt["provider"] == "openai" and stt["ready"] is True and stt["model"] == settings.stt_model

@@ -1225,14 +1225,22 @@ def queue_counts(db: Database) -> dict:
     def count(sql: str) -> int:
         return db.one(sql)["n"]
 
+    conversations_failed = count("SELECT COUNT(*) AS n FROM conversations WHERE status='failed'")
+    chunks_failed = count("SELECT COUNT(*) AS n FROM chunks WHERE status='failed'")
     return {
         "chunks_pending": count("SELECT COUNT(*) AS n FROM chunks WHERE status='pending'"),
         "conversations_open": count("SELECT COUNT(*) AS n FROM conversations WHERE status='open'"),
         "conversations_pending": count(
             "SELECT COUNT(*) AS n FROM conversations WHERE status IN ('closed','transcribing','summarizing')"
         ),
-        "failed": count("SELECT COUNT(*) AS n FROM conversations WHERE status='failed'")
-        + count("SELECT COUNT(*) AS n FROM chunks WHERE status='failed'"),
+        "failed": conversations_failed + chunks_failed,  # older phones read only this sum
+        "conversations_failed": conversations_failed,
+        "chunks_failed": chunks_failed,
+        "conversations_retrying": count(
+            "SELECT COUNT(*) AS n FROM conversations WHERE status IN ('closed','transcribing','summarizing') "
+            "AND error IS NOT NULL AND next_attempt_at IS NOT NULL"
+        ),
+        "notes_conflicted": count("SELECT COUNT(*) AS n FROM conversations WHERE edited=1 AND frozen=0 AND note_path IS NOT NULL"),
     }
 
 

@@ -1,0 +1,164 @@
+import Foundation
+import Testing
+@testable import OmiBLE
+@testable import OmiCapture
+@testable import OmiProtocol
+
+@Suite struct SystemHealthTests {
+    let now = Date(timeIntervalSince1970: 1_790_000_000)
+
+    func streaming() -> EngineSnapshot {
+        var s = EngineSnapshot()
+        s.connection = .streaming
+        s.serverConfigured = true
+        s.rememberedDeviceName = "Omi"
+        var d = DeviceSession.Info()
+        d.battery = 80
+        s.device = d
+        return s
+    }
+
+    func status(_ queue: [String: Int] = [:], worker: Bool = true, readOnly: String? = nil) throws -> ServerStatus {
+        var q = ["chunks_pending": 0, "conversations_open": 0, "conversations_pending": 0, "failed": 0, "conversations_failed": 0,
+                 "chunks_failed": 0, "conversations_retrying": 0, "notes_conflicted": 0]
+        q.merge(queue) { $1 }
+        let body: [String: Any] = [
+            "ok": true, "stt": ["provider": "fake", "ready": true], "llm": ["provider": "fake", "ready": true], "queue": q,
+            "worker": ["present": worker], "last_note_at": "2026-09-21T12:00:00.000Z", "read_only": readOnly ?? NSNull(),
+            "features": ["issues"],
+        ]
+        return try JSONDecoder().decode(ServerStatus.self, from: JSONSerialization.data(withJSONObject: body))
+    }
+
+    func reachable() -> ServerReachability { .reachable(version: "0.1.0", detail: "") }
+
+    func health(_ s: EngineSnapshot, _ reach: ServerReachability, _ st: ServerStatus?, age: TimeInterval = 10) -> SystemHealth {
+        SystemHealth.evaluate(snapshot: s, server: reach, status: st, statusAt: st == nil ? nil : now.addingTimeInterval(-age), now: now)
+    }
+
+    func step(_ h: SystemHealth, _ area: SystemHealth.Area) -> SystemHealth.Step { h.steps.first { $0.area == area }! }
+
+    @Test func allGoodIsNormal() throws {
+        let h = health(streaming(), reachable(), try status())
+        #expect(h.level == .normal && h.headline == "Everything is working")
+        #expect(step(h, .notes).title.hasPrefix("Last note"))
+    }
+
+    @Test func unreachableServerWithQueuedAudioIsDelayedNotBroken() {
+        var s = streaming()
+        s.outbox.pendingCount = 3
+        let h = health(s, .unreachable("offline"), nil)
+        #expect(h.level == .delayed)
+        #expect(step(h, .phone).level == .delayed && step(h, .phone).title == "Audio is waiting to upload" && step(h, .phone).detail?.hasPrefix("3 files") == true)
+        #expect(step(h, .server).level == .delayed && step(h, .server).fix == .openServer)
+    }
+
+    @Test func rejectedTokenNeedsAction() {
+        let h = health(streaming(), .unauthorized, nil)
+        #expect(h.level == .needsAction && h.headline == "The server rejected this phone")
+    }
+
+    @Test func staleStatusIsUnknownButPhoneProblemsStillWin() throws {
+        let stale = health(streaming(), reachable(), try status(), age: 3600)
+        #expect(stale.level == .unknown && step(stale, .server).title.hasPrefix("Server last checked"))
+
+        var full = streaming()
+        full.storageTripped = true
+        full.connection = .paused("phone storage low")
+        let h = health(full, reachable(), try status(), age: 3600)
+        #expect(h.level == .needsAction && h.headline == "Recording is paused")
+        #expect(step(h, .phone).title == "Phone storage is full; recording stopped")
+    }
+
+    @Test func disconnectedPendantIsUnknownNotAClaim() throws {
+        var s = streaming()
+        s.connection = .waitingForDevice
+        s.device = nil
+        let h = health(s, reachable(), try status())
+        #expect(h.level == .unknown && h.headline == "Omi isn't connected")
+        #expect(step(h, .pendant).detail?.contains("If its firmware supports offline recording") == true)
+    }
+
+    @Test func failedChunksAndConflictsNeedAction() throws {
+        let chunks = health(streaming(), reachable(), try status(["chunks_failed": 2]))
+        #expect(chunks.level == .needsAction && chunks.headline == "2 items need your attention")
+        let conflict = health(streaming(), reachable(), try status(["notes_conflicted": 1]))
+        #expect(conflict.headline == "1 item needs your attention")
+    }
+
+    @Test func olderServersFallBackToTheLegacyFailedSum() throws {
+        let json = #"{"queue":{"chunks_pending":0,"conversations_open":0,"conversations_pending":0,"failed":1}}"#
+        let st = try JSONDecoder().decode(ServerStatus.self, from: Data(json.utf8))
+        let h = health(streaming(), reachable(), st)
+        #expect(step(h, .server).level == .needsAction)
+        #expect(step(h, .notes).level == .normal)  // an older server can't say when; not "no notes"
+    }
+
+    @Test func missingWorkerAndReadOnlyNeedAction() throws {
+        let stopped = health(streaming(), reachable(), try status(worker: false))
+        #expect(stopped.headline == "Processing is stopped on the server")
+        let ro = health(streaming(), reachable(), try status(readOnly: "vault divergence"))
+        #expect(ro.level == .needsAction && ro.headline == "The server stopped saving notes")
+    }
+
+    @Test func retryingIsDelayedAndProcessingIsWorking() throws {
+        let retry = health(streaming(), reachable(), try status(["conversations_retrying": 1]))
+        #expect(retry.level == .delayed)
+        let busy = health(streaming(), reachable(), try status(["conversations_pending": 2]))
+        #expect(busy.level == .working && busy.headline == "Recording; notes are catching up")
+    }
+
+    @Test func noNotesYetOnANewServer() throws {
+        let json = #"{"queue":{"failed":0,"conversations_failed":0,"chunks_failed":0},"worker":{"present":true},"last_note_at":null,"features":["issues"]}"#
+        let st = try JSONDecoder().decode(ServerStatus.self, from: Data(json.utf8))
+        let h = health(streaming(), reachable(), st)
+        #expect(h.level == .unknown && h.headline == "No notes yet")
+    }
+
+    @Test func nothingPairedNeedsAction() {
+        var s = EngineSnapshot()
+        s.serverConfigured = false
+        let h = health(s, .notConfigured, nil)
+        #expect(h.level == .needsAction && h.headline == "No pendant paired")
+        #expect(step(h, .server).fix == .openServer)
+    }
+}
+
+@MainActor
+@Suite struct RecentMergeTests {
+    func row(_ id: String, _ minute: Int) -> ConversationSummary {
+        let json = #"{"id":"\#(id)","status":"done","started_at":"2026-09-26T19:\#(String(format: "%02d", minute)):00.000Z"}"#
+        return try! JSONDecoder().decode(ConversationSummary.self, from: Data(json.utf8))
+    }
+
+    func page(_ rows: [ConversationSummary], cursor: String?) -> RecentConversationsResponse {
+        var p = try! JSONDecoder().decode(RecentConversationsResponse.self, from: Data(#"{"conversations":[]}"#.utf8))
+        p.conversations = rows
+        p.nextCursor = cursor
+        return p
+    }
+
+    func model() -> AppModel {
+        let dirs = CaptureDirectories(root: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        let settings = SettingsStore(defaults: UserDefaults(suiteName: "omi-merge-\(UUID().uuidString)")!, tokens: InMemoryTokenStore())
+        let engine = OmiEngine(config: EngineConfiguration(dirs: dirs, appVersion: "test", useCoreBluetooth: false),
+                               settings: settings, uploadTransport: CountingUploadTransport())
+        return AppModel(engine: engine)
+    }
+
+    @Test func refreshingPageOneKeepsOlderLoadedPages() {
+        let m = model()
+        m.mergeFirstPage(page([row("d", 40), row("c", 30)], cursor: "c1"))
+        m.mergeFirstPage(page([row("d", 40), row("c", 30), row("b", 20), row("a", 10)], cursor: nil))  // simulate a loaded second page
+        #expect(m.recent.map(\.id) == ["d", "c", "b", "a"])
+        m.mergeFirstPage(page([row("e", 50), row("d", 40)], cursor: "c2"))
+        #expect(m.recent.map(\.id) == ["e", "d", "c", "b", "a"])
+    }
+
+    @Test func aCompleteFirstPageReplacesTheList() {
+        let m = model()
+        m.mergeFirstPage(page([row("b", 20), row("a", 10)], cursor: nil))
+        m.mergeFirstPage(page([row("c", 30)], cursor: nil))
+        #expect(m.recent.map(\.id) == ["c"] && m.recentCursor == nil)
+    }
+}

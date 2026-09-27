@@ -239,28 +239,51 @@ public enum ContractJSON {
 public struct ServerStatus: Decodable, Equatable, Sendable {
     public struct Provider: Decodable, Equatable, Sendable {
         public var provider: String?
+        /// Non-secret model label (newer servers).
+        public var model: String?
+        /// STT only: `auto`, `provider`, `local` or `off`.
+        public var diarization: String?
+        /// Configured, not proven to work: the status call never runs inference.
         public var ready: Bool?
     }
     public struct Queue: Decodable, Equatable, Sendable {
         public var chunksPending: Int?
         public var conversationsOpen: Int?
         public var conversationsPending: Int?
+        /// Conversations + chunks (older servers send only this).
         public var failed: Int?
+        public var conversationsFailed: Int?
+        public var chunksFailed: Int?
+        public var conversationsRetrying: Int?
+        public var notesConflicted: Int?
         enum CodingKeys: String, CodingKey {
             case chunksPending = "chunks_pending"
             case conversationsOpen = "conversations_open"
             case conversationsPending = "conversations_pending"
             case failed
+            case conversationsFailed = "conversations_failed"
+            case chunksFailed = "chunks_failed"
+            case conversationsRetrying = "conversations_retrying"
+            case notesConflicted = "notes_conflicted"
         }
+    }
+    public struct Worker: Decodable, Equatable, Sendable {
+        /// A process holds the worker lock (pipeline or maintenance): present, not proof of progress.
+        public var present: Bool?
     }
     public var ok: Bool?
     public var serverVersion: String?
     public var protocolVersion: Int?
     public var serverTime: String?
+    public var serverStartedAt: String?
     public var stt: Provider?
     public var llm: Provider?
     public var queue: Queue?
+    public var worker: Worker?
+    public var lastNoteAt: String?
     public var notesDir: String?
+    /// Why the vault stopped accepting writes (nil: writable, or an older server).
+    public var readOnly: String?
     /// Optional capabilities, e.g. `voice_enrollment` (older servers send none).
     public var features: [String]?
 
@@ -269,13 +292,18 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
         case serverVersion = "server_version"
         case protocolVersion = "protocol_version"
         case serverTime = "server_time"
-        case stt, llm, queue
+        case serverStartedAt = "server_started_at"
+        case stt, llm, queue, worker
+        case lastNoteAt = "last_note_at"
         case notesDir = "notes_dir"
+        case readOnly = "read_only"
         case features
     }
 
     /// The server understands `voice_enrollment_start`/`_end` (so a reading is never transcribed).
     public var supportsVoiceEnrollment: Bool { features?.contains("voice_enrollment") == true }
+    public var supportsConversationDetail: Bool { features?.contains("conversation_detail") == true }
+    public var supportsIssues: Bool { features?.contains("issues") == true }
 }
 
 public struct CaptureStatusResponse: Decodable, Equatable, Sendable {
@@ -293,27 +321,72 @@ public struct CaptureStatusResponse: Decodable, Equatable, Sendable {
     }
 }
 
-public struct ConversationSummary: Decodable, Equatable, Sendable, Identifiable {
+/// A display state chosen by the server (`state`) or a problem next to readable content (`issues`).
+public struct ConversationFlag: Decodable, Equatable, Sendable, Hashable {
+    public var code: String
+    public var message: String
+}
+
+public struct ConversationSummary: Decodable, Equatable, Hashable, Sendable, Identifiable {
     public var id: String
     public var status: String
+    public var state: ConversationFlag?
+    public var issues: [ConversationFlag]?
     public var startedAt: String?
     public var endedAt: String?
+    public var durationS: Double?
     public var title: String?
+    public var emoji: String?
+    public var preview: String?
+    public var speakerNames: [String]?
     public var notePath: String?
     public var lateAudio: Bool?
     public var provisional: Bool?
     public var speakersReady: Bool?
+
+    /// A placeholder until the server's answer arrives (e.g. opened from an issue).
+    public init(id: String, status: String, startedAt: String? = nil, title: String? = nil) {
+        self.id = id
+        self.status = status
+        self.startedAt = startedAt
+        self.title = title
+    }
 
     /// Older servers do not report readiness; only completed notes are safe to open there.
     public var canReviewSpeakers: Bool {
         speakersReady ?? (notePath != nil && (status == "done" || status == "discarded"))
     }
 
+    /// The chip: the server's state, or one derived from `status` for older servers.
+    public var displayState: ConversationFlag {
+        if let state { return state }
+        switch status {
+        case "open": return ConversationFlag(code: "listening", message: "Still listening")
+        case "closed", "transcribing", "summarizing": return ConversationFlag(code: "processing", message: "Processing")
+        case "done": return ConversationFlag(code: "ready", message: "Note ready")
+        case "discarded": return ConversationFlag(code: "discarded", message: "Skipped")
+        case "failed": return ConversationFlag(code: notePath == nil ? "failed" : "transcript_only",
+                                               message: notePath == nil ? "Processing failed" : "Transcript ready; summary unavailable")
+        default: return ConversationFlag(code: status, message: status)
+        }
+    }
+
+    public var startedDate: Date? { startedAt.flatMap(ISO8601UTC.parse) }
+
+    /// From the server, else from the start and end times.
+    public var duration: TimeInterval? {
+        if let durationS { return durationS }
+        guard let s = startedDate, let e = endedAt.flatMap(ISO8601UTC.parse) else { return nil }
+        return max(0, e.timeIntervalSince(s))
+    }
+
     enum CodingKeys: String, CodingKey {
-        case id, status
+        case id, status, state, issues
         case startedAt = "started_at"
         case endedAt = "ended_at"
-        case title
+        case durationS = "duration_s"
+        case title, emoji, preview
+        case speakerNames = "speaker_names"
         case notePath = "note_path"
         case lateAudio = "late_audio"
         case provisional
@@ -323,6 +396,13 @@ public struct ConversationSummary: Decodable, Equatable, Sendable, Identifiable 
 
 public struct RecentConversationsResponse: Decodable, Equatable, Sendable {
     public var conversations: [ConversationSummary]
+    /// nil on the last page (and from older servers, which don't paginate).
+    public var nextCursor: String?
+
+    enum CodingKeys: String, CodingKey {
+        case conversations
+        case nextCursor = "next_cursor"
+    }
 }
 
 public struct APIErrorBody: Decodable, Equatable, Sendable {

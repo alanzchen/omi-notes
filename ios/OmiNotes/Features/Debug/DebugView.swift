@@ -1,7 +1,9 @@
+#if DEBUG
 import OmiBLE
 import OmiCapture
 import SwiftUI
 
+/// Developer tools (debug builds only): simulated pendant and maintenance actions.
 struct DebugView: View {
     let model: AppModel
     @State private var logFilter = ""
@@ -58,7 +60,7 @@ struct DebugView: View {
                 }
             }
         }
-        .navigationTitle("Debug")
+        .navigationTitle("Developer tools")
         .onAppear { model.refreshLogs() }
     }
 
@@ -71,3 +73,4 @@ struct DebugView: View {
         }
     }
 }
+#endif

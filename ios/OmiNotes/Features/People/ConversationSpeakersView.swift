@@ -42,7 +42,7 @@ struct ConversationSpeakersView: View {
                         }
                     }
                 } footer: {
-                    Text("Names update in the note right away. Re-summarizing also rewrites the summary with them (one LLM call).")
+                    Text("Names update in the note right away. Re-summarizing also rewrites the summary using them; it takes a minute or two.")
                 }
             } else if error == nil {
                 ProgressView()
@@ -95,6 +95,9 @@ struct ConversationSpeakersView: View {
     }
 
     private func load() async {
+        // Opened straight from a conversation: the picker needs people and recognition settings
+        // even if the People tab was never visited.
+        if speakers.settings == nil || speakers.people.isEmpty { await speakers.refresh() }
         do {
             data = try await speakers.speakers(conversationId: conversationId)
             error = nil

@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 
-from . import PROTOCOL_VERSION, __version__
+from . import PROTOCOL_VERSION, __version__, views
 from .envelope import MAX_BODY_BYTES
 from .ingest import ApiError, Ingest, capture_status
 from .lock import api_lock
@@ -28,6 +28,8 @@ from .vault import LeaseError, Vault, VaultBusy
 
 log = logging.getLogger(__name__)
 MAX_JSON_BYTES = 64 * 1024
+# Index fields that decide which artifacts a conversation view shows.
+_GENERATION = ("status", "revision", "written_sha", "transcript_sha", "llm_ref", "speakers_revision", "note_path", "edited")
 
 
 def create_app(
@@ -48,6 +50,7 @@ def create_app(
             "--take-over once it is stopped."
         )
     db = open_index(settings, vault)
+    started_at = time.time()
     ingest = Ingest(db, vault, settings, read_only=lambda: read_only_reason(db))
     token = settings.omi_notes_token.encode()
 
@@ -132,24 +135,31 @@ def create_app(
             "server_version": __version__,
             "protocol_version": PROTOCOL_VERSION,
             "server_time": iso_utc_epoch(time.time()),
+            "server_started_at": iso_utc_epoch(started_at),
+            # `ready` means configured, not proven: nothing here calls a provider
             "stt": {
                 "provider": settings.stt_provider,
+                "model": "fake-stt" if settings.stt_provider == "fake" else settings.stt_model,
+                "diarization": settings.stt_diarization,
                 "ready": settings.stt_provider == "fake"
                 or (settings.stt_provider == "deepgram" and bool(settings.deepgram_api_key))
                 or (settings.stt_provider == "openai" and bool(settings.stt_base_url)),
             },
             "llm": {
                 "provider": settings.llm_provider,
+                "model": None if settings.llm_provider == "none" else app.state.speakers.pipeline.providers.llm_model,
                 "ready": settings.llm_provider in ("fake", "none")
                 or (settings.llm_provider == "anthropic" and bool(settings.anthropic_api_key))
                 or (settings.llm_provider == "openai" and bool(settings.llm_base_url)),
             },
             "queue": queue_counts(db),
+            "worker": {"present": views.worker_present(vault)},
+            "last_note_at": views.last_note_at(db),
             "vault_dir": str(settings.vault_dir),
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes
-            "features": ["voice_enrollment"],
+            "features": ["voice_enrollment", "conversation_detail", "issues"],
         }
 
     @app.put("/v1/captures/{capture_id}/chunks/{chunk_sequence}")
@@ -180,29 +190,44 @@ def create_app(
         return JSONResponse(payload, status_code=status_code)
 
     @app.get("/v1/conversations/recent")
-    def recent(limit: int = 20) -> dict:
+    def recent(limit: int = 20, before: str | None = None) -> dict:
         limit = max(1, min(limit, 200))
-        rows = db.query(
-            "SELECT * FROM conversations WHERE enrollment_id IS NULL "
-            "AND COALESCE(waiting_for, '') <> 'voice enrollment' ORDER BY start DESC LIMIT ?",
-            (limit,),
-        )
+        where, params = views.LISTED, []
+        if before is not None:
+            cursor = views.parse_cursor(before)
+            if cursor is None:
+                raise ApiError(422, "invalid_cursor", "before must be a cursor returned by this endpoint")
+            where += " AND (start < ? OR (start = ? AND id < ?))"
+            params += [cursor[0], cursor[0], cursor[1]]
+        rows = db.query(f"SELECT * FROM conversations WHERE {where} ORDER BY start DESC, id DESC LIMIT ?", (*params, limit + 1))
+        page = rows[:limit]
+        speakers_pipeline = app.state.speakers.pipeline
         return {
-            "conversations": [
-                {
-                    "id": r["id"],
-                    "status": r["status"],
-                    "started_at": iso_utc_epoch(r["start"]),
-                    "ended_at": iso_utc_epoch(r["end"]),
-                    "title": r["title"] if r["note_path"] else None,
-                    "note_path": r["note_path"],
-                    "late_audio": bool(r["late_audio"]),
-                    "provisional": bool(r["provisional"]),
-                    "speakers_ready": r["status"] != "open" and r["transcript_sha"] is not None,
-                }
-                for r in rows
-            ]
+            "conversations": [views.summary_row(speakers_pipeline, r) for r in page],
+            "next_cursor": views.make_cursor(page[-1]) if len(rows) > limit else None,
         }
+
+    @app.get("/v1/conversations/{conv_id}")
+    def conversation(conv_id: str, segments_from: int = 0) -> dict:
+        """Read-only (capture-format-v1.md, "App views"). A row that changes while its files are read
+        (a render or reprocess committing) is read again once, so one answer never mixes generations."""
+        body = None
+        for _ in range(2):
+            row = db.one(f"SELECT * FROM conversations WHERE id=? AND {views.LISTED}", (conv_id,))
+            if row is None:
+                raise ApiError(404, "not_found", "unknown conversation")
+            body = views.detail(app.state.speakers.pipeline, row, segments_from=segments_from)
+            again = db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
+            if again is not None and all(again[k] == row[k] for k in _GENERATION):
+                return body
+        # still changing: show nothing that could belong to another generation
+        return body | {"summary": None, "summary_state": "updating", "transcript": None, "transcript_state": "updating",
+                       "speakers": [], "speaker_names": [], "preview": None}  # fmt: skip
+
+    @app.get("/v1/issues")
+    def issues(limit: int = views.ISSUE_LIMIT) -> dict:
+        limit = max(1, min(limit, 100))
+        return {"issues": views.server_issues(db, read_only=read_only_reason(db), worker=views.worker_present(vault), limit=limit)}
 
     # -- people & voices (docs/speaker-learning.md, "API") --------------------------------------
 

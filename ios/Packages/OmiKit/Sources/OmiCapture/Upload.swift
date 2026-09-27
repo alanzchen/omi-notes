@@ -628,9 +628,24 @@ public struct APIClient: Sendable {
 
     public func status() async throws -> ServerStatus { try await get("/v1/status") }
 
-    public func recentConversations(limit: Int = 20) async throws -> [ConversationSummary] {
-        let r: RecentConversationsResponse = try await get("/v1/conversations/recent", query: "limit=\(limit)")
-        return r.conversations
+    /// One page, newest first; pass the returned cursor as `before` for the next one.
+    public func recentConversations(limit: Int = 20, before: String? = nil) async throws -> RecentConversationsResponse {
+        var query = "limit=\(limit)"
+        if let before { query += "&before=\(Self.queryValue(before))" }
+        return try await get("/v1/conversations/recent", query: query)
+    }
+
+    public func conversation(_ id: String, segmentsFrom: Int = 0) async throws -> ConversationDetail {
+        try await get("/v1/conversations/\(Self.queryValue(id))", query: segmentsFrom > 0 ? "segments_from=\(segmentsFrom)" : nil)
+    }
+
+    public func issues(limit: Int = 20) async throws -> [ServerIssue] {
+        let r: ServerIssuesResponse = try await get("/v1/issues", query: "limit=\(limit)")
+        return r.issues
+    }
+
+    static func queryValue(_ s: String) -> String {
+        s.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~"))) ?? s
     }
 
     /// nil for 404 (unknown capture).

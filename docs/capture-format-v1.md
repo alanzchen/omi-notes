@@ -145,18 +145,32 @@ No auth. `200 {"ok": true}`.
   "server_version": "0.1.0",
   "protocol_version": 1,
   "server_time": "2026-09-26T19:32:05.123Z",
-  "stt": {"provider": "deepgram", "ready": true},
-  "llm": {"provider": "anthropic", "ready": true},
-  "queue": {"chunks_pending": 0, "conversations_open": 1, "conversations_pending": 0, "failed": 0},
+  "server_started_at": "2026-09-26T08:00:00.000Z",
+  "stt": {"provider": "openai", "model": "whisper-large-v3-turbo", "diarization": "local", "ready": true},
+  "llm": {"provider": "anthropic", "model": "claude-opus-5", "ready": true},
+  "queue": {"chunks_pending": 0, "conversations_open": 1, "conversations_pending": 0, "failed": 0,
+            "conversations_failed": 0, "chunks_failed": 0, "conversations_retrying": 0, "notes_conflicted": 0},
+  "worker": {"present": true},
+  "last_note_at": "2026-09-26T19:20:41.002Z",
   "vault_dir": "/Users/alan/Notes/Omi",
   "notes_dir": "/Users/alan/Notes/Omi",
-  "features": ["voice_enrollment"]
+  "read_only": null,
+  "features": ["voice_enrollment", "conversation_detail", "issues"]
 }
 ```
 
 `features` lists optional capabilities (absent on older servers). The phone starts a voice
 enrollment only when it contains `voice_enrollment`: a server that doesn't know the enrollment
-events would transcribe the reading as a conversation.
+events would transcribe the reading as a conversation. `conversation_detail` and `issues` announce
+the app views below.
+
+The response is cheap and calls no provider: `ready` means *configured*, not that inference works.
+`worker.present` means a process holds the vault's worker lock (the pipeline, or a maintenance
+command); it is not proof of progress. `last_note_at` is when the newest kept note was first
+written (discarded and enrollment rows excluded). `read_only` is the reason the vault stopped
+accepting writes, or null. `failed` is the sum of `conversations_failed` and `chunks_failed`, kept
+for older phones. Model labels are non-secret; base URLs and keys are never reported. Fields added
+after v1's first release may be absent on older servers; the phone treats absence as unknown.
 
 ### `PUT /v1/captures/{capture_id}/chunks/{chunk_sequence}`
 
@@ -281,20 +295,91 @@ own raw originals until every conversation using them is finished (and then for
 7 days, or `sent/` above 1 GB, oldest first) wins over this rule: acknowledged chunks are already
 durable on the server. Unacknowledged files are never deleted. `404` for unknown capture.
 
-### `GET /v1/conversations/recent?limit=20`
+### `GET /v1/conversations/recent?limit=20&before=<cursor>`
 
-Newest first, for the app's home screen. Voice enrollment recordings (including those still
-waiting for the enrollment to end) are excluded before applying the limit:
+Newest first (`start` descending, then id), for the app's home screen. Voice enrollment recordings
+(including those still waiting for the enrollment to end) are excluded before applying the limit.
+`next_cursor` is null on the last page; pass it back as `before` for the next one. Cursors are
+opaque; a malformed one is `422 invalid_cursor`.
 
 ```json
-{"conversations": [{"id": "…", "status": "summarizing", "started_at": "…", "ended_at": "…", "title": null, "note_path": "Conversations/2026/2026-09/2026-09-26 1403 Team Finalizes Q2 Budget.md", "late_audio": false, "provisional": false, "speakers_ready": true}]}
+{"conversations": [{"id": "…", "status": "done", "state": {"code": "ready", "message": "Note ready"}, "issues": [],
+  "started_at": "…", "ended_at": "…", "duration_s": 312.4, "title": "Team Finalizes Q2 Budget", "emoji": "💰",
+  "preview": "The team agreed on…", "speaker_names": ["Priya"],
+  "note_path": "Conversations/2026/2026-09/2026-09-26 1403 Team Finalizes Q2 Budget.md",
+  "late_audio": false, "provisional": false, "speakers_ready": true}],
+ "next_cursor": "1790449380.25:01923f…"}
 ```
 
 Conversation `status`: `open` → `closed` → `transcribing` → `summarizing` → `done` | `discarded`
 (no meaningful content), or `failed` (retryable; see `_status.md`). `note_path` is relative to the
 notes directory.
 
+`state` is the display chip, chosen by precedence from the row; the raw `status` stays alongside.
+Codes: `listening` (open; the message says what it is waiting for), `processing`, `retrying` (an
+automatic retry is scheduled), `ready`, `transcript_only` (summary failed or summaries are turned
+off: the message says which), `failed` (no note), `discarded`. Messages are chosen by the server from
+the failure kind, never copied from a provider error. `issues` lists problems that coexist with
+readable content: `reprocess_failed` (an earlier note is still shown), `note_conflict` (edited
+outside My Notes; the server stopped updating it), `render_retrying`. `provisional`, `late_audio`
+and lost audio are caveats, not issues. `preview` is the start of the summary's overview (null when
+no current summary is readable); `speaker_names` are the people assigned to this transcript's
+speakers.
+
 `speakers_ready` is true once a closed conversation has a persisted transcript, even while
 summarization is pending or has failed. The phone offers speaker details only when it is true;
 the speakers endpoint remains unavailable before transcription. This additive field may be absent
 on older servers; the phone then offers details only for `done` or `discarded` rows with a note path.
+Every field after `title` except `note_path`, `late_audio` and `provisional` is additive: older
+servers omit them and the phone falls back to `status`.
+
+## App views
+
+Read-only endpoints for the phone. They never call a provider, move speaker labels or repair the
+index. The index row names the current transcript (`transcript_sha`) and summary (`llm_ref`); a
+file that describes another generation (a reprocess in flight) is reported as `updating` rather
+than mixed into the answer, and a row that changes while the files are read is read again once.
+
+### `GET /v1/conversations/{id}?segments_from=0`
+
+`404` for unknown ids and voice enrollment readings; `200` for every other conversation, open ones
+included (with nothing to show yet). The body is the list entry plus:
+
+```json
+{"speech_s": 280.1, "lost_s": 0, "note_state": "matches", "note_frozen": false,
+ "my_notes": "Call Priya back.", "my_notes_unreadable": false, "discard_reason": null,
+ "transcript_sha": "…", "speakers_revision": 3, "revision": 2,
+ "summary_state": "ready",
+ "summary": {"overview": "…", "sections": [{"heading": "…", "bullets": ["…"]}],
+             "action_items": [{"description": "Send the budget", "owner": "me", "owner_name": "Alan", "due_date": "2026-09-30"}],
+             "decisions": ["…"], "open_questions": ["…"]},
+ "transcript_state": "ready",
+ "speakers": [{"label": "S1", "name": "Priya"}, {"label": "S2", "name": null}],
+ "transcript": {"total": 812, "from": 0, "next_from": 500,
+                "segments": [{"start": "…", "end": "…", "speaker": "S1", "name": "Priya", "text": "…"}]}}
+```
+
+- `summary_state`: `ready`, `pending`, `disabled` (summaries turned off), `failed` (then
+  `summary_error` is a sanitized sentence), `not_applicable` (discarded before summarizing),
+  `updating`, `unavailable` (the referenced file is missing or unreadable).
+- `transcript_state`: `ready`, `pending`, `updating`, `unavailable`. Segments come 500 at a time;
+  `next_from` is the `segments_from` of the next page (null on the last).
+- Speaker names are shown only when the stored assignments were made for this transcript.
+- `note_state`: `none` (no note yet), `matches` (the saved Markdown is what the server wrote, apart
+  from My Notes), `differs` (edited elsewhere: the phone shows this generated view with a banner),
+  `missing`. `my_notes` is the text of the note's My Notes block; `my_notes_unreadable` is true when
+  its markers are ambiguous. Action items are read-only.
+
+### `GET /v1/issues?limit=20`
+
+What needs attention, most urgent first, bounded and sanitized:
+
+```json
+{"issues": [{"code": "conversation_failed", "severity": "action", "message": "The summary service rejected the server's credentials.",
+             "next_step": "Fix the provider settings on the server, then run `omi-notes retry-failed` on the Mac.",
+             "conversation_id": "…", "started_at": "…", "title": null}]}
+```
+
+Codes: `read_only` (with `detail`), `worker_stopped`, `chunks_failed` (with `count`),
+`conversation_failed`, `note_conflict`, `conversation_retrying`. Severity is `action` (someone must
+do something) or `delayed` (the server retries on its own).

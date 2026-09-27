@@ -2,19 +2,36 @@ import OmiBLE
 import OmiCapture
 import SwiftUI
 
+/// App and pendant settings (the server connection lives in the Server tab).
 struct SettingsView: View {
     let model: AppModel
     var body: some View {
         Form {
-            ServerSettingsSection(model: model)
             DeviceSettingsSection(model: model)
-            Section("About") {
-                LabeledContent("Version", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")
-                Text("Audio is journaled on this phone and uploaded to your server, which transcribes it and writes Markdown notes. Nothing is sent anywhere else by this app.")
+            Section {
+                Label("Leave Omi Notes running in the background. Force-quitting it stops the pendant from reconnecting until you open the app again.",
+                      systemImage: "moon.zzz")
+                Label("Only one phone can connect to the pendant. Disconnect the official Omi app.", systemImage: "iphone.slash")
+                Label("Tap the pendant once to bookmark a moment; double-tap to end the conversation now.", systemImage: "hand.tap")
+            } header: {
+                Text("Tips")
+            }
+            .font(.subheadline)
+            Section("Privacy") {
+                Text("Audio goes from the pendant to this phone, then to your own server. This app sends it nowhere else. Your server decides which services receive your audio and transcripts; see Server → Configuration.")
                     .font(.footnote).foregroundStyle(.secondary)
+            }
+            Section("About") {
+                LabeledContent("Version", value: Self.version)
             }
         }
         .navigationTitle("Settings")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    static var version: String {
+        let info = Bundle.main.infoDictionary
+        return "\(info?["CFBundleShortVersionString"] as? String ?? "?") (\(info?["CFBundleVersion"] as? String ?? "?"))"
     }
 }
 
@@ -68,7 +85,7 @@ struct ServerSettingsSection: View {
         } header: {
             Text("Server")
         } footer: {
-            Text("Easiest: run `omi-notes pair` on your Mac and scan the QR code with the Camera app. The token is stored in the Keychain.")
+            Text("Easiest: run `omi-notes pair` on your server and scan the QR code with the Camera app. The token is stored in the Keychain.")
         }
         .onAppear { urlText = model.serverURL?.absoluteString ?? "" }
     }
@@ -85,26 +102,28 @@ struct DeviceSettingsSection: View {
 
     var body: some View {
         let s = model.snapshot
-        Section("Device") {
+        Section("Pendant") {
             if let id = s.rememberedDeviceId {
                 LabeledContent("Paired", value: s.rememberedDeviceName ?? "Omi")
-                LabeledContent("Identifier", value: String(id.prefix(8))).font(.footnote)
+                LabeledContent("ID", value: String(id.prefix(8))).font(.footnote)
                 switch s.connection {
                 case .paused, .refused:
                     Button("Reconnect") { model.engine.reconnect() }
                 default:
                     Button("Disconnect") { model.engine.disconnect() }
+                    Text("Disconnecting stops this phone from receiving audio. The pendant may keep recording to its own storage.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
-                NavigationLink("Pair a different device") { PairingView(model: model) }
-                Button("Forget device", role: .destructive) { confirmForget = true }
+                NavigationLink("Pair a different pendant") { PairingView(model: model) }
+                Button("Forget pendant", role: .destructive) { confirmForget = true }
             } else {
-                NavigationLink("Pair a device") { PairingView(model: model) }
+                NavigationLink("Pair a pendant") { PairingView(model: model) }
             }
         }
-        .confirmationDialog("Forget this device?", isPresented: $confirmForget, titleVisibility: .visible) {
+        .confirmationDialog("Forget this pendant?", isPresented: $confirmForget, titleVisibility: .visible) {
             Button("Forget", role: .destructive) { model.engine.forgetDevice() }
         } message: {
-            Text("The current capture is sealed and uploaded; the app stops reconnecting. Audio already on the phone is kept until the server has it.")
+            Text("The current recording is finished and uploaded, and the app stops reconnecting. Audio already on this phone is kept until your server has it.")
         }
     }
 }
