@@ -13,13 +13,37 @@ Contract: [`docs/capture-format-v1.md`](../docs/capture-format-v1.md). Device fa
 
 Simulator with the simulated pendant, uploading to a local backend (fake STT/LLM providers):
 
-| Welcome | Pairing link | Pair device | Recording |
+| Home | Conversation | Search | Server |
 |---|---|---|---|
-| ![](../docs/screenshots/01-onboarding.png) | ![](../docs/screenshots/02-pairing-confirm.png) | ![](../docs/screenshots/03-pair-device.png) | ![](../docs/screenshots/04-home-recording.png) |
+| ![](../docs/screenshots/01-home.png) | ![](../docs/screenshots/02-conversation.png) | ![](../docs/screenshots/03-search.png) | ![](../docs/screenshots/04-server.png) |
 
-| Uploads and notes | Settings | Debug |
+| Diagnostics | Settings | Welcome |
 |---|---|---|
-| ![](../docs/screenshots/05-home-uploads-and-notes.png) | ![](../docs/screenshots/06-settings.png) | ![](../docs/screenshots/07-debug.png) |
+| ![](../docs/screenshots/05-diagnostics.png) | ![](../docs/screenshots/06-settings.png) | ![](../docs/screenshots/07-welcome.png) |
+
+## Using the app
+
+- **Home** answers "is it working?" in one sentence (tap it for pendant → phone → server → notes,
+  each with a fix), lists what needs you, and shows conversations by day. Tap one for its summary,
+  action items, speakers, transcript and My Notes; fix speaker names from there, open the note in
+  Obsidian (set the vault name in Settings), or retry it if it failed. Search covers titles,
+  summaries, speaker names and transcripts, with time and person filters.
+- **People**: teach the server your voice, name people and recurring voices.
+- **Server**: what the server is doing now, what needs attention with plain reasons and next
+  steps (and Retry where the phone can do it), the past seven days, its configuration (view only;
+  it is changed on the server) and the connection. **Diagnostics** has the pendant, Bluetooth and
+  upload details that used to be on Home.
+- **Settings** (gear on Home): the pendant, opt-in alerts for problems the phone sees (recording
+  stopped, audio that couldn't upload, uploads paused), the Obsidian vault name, and notes saved
+  for reading offline.
+
+Health states: *normal*, *working* (uploading, processing), *unknown* (not checked yet, or the last
+answer is over 5 minutes old; a disconnected pendant is unknown because it may be recording to its
+own storage), *delayed* (held up but safe, e.g. the server is unreachable and audio waits on the
+phone), *needs action*. "Ready" in the server configuration means configured, not proven to work.
+
+Notes you open are kept on the phone (up to 50, in Caches, protected while locked) so they can be
+read without a connection; they are removed when you pair with another server, and from Settings.
 
 ## Layout
 
@@ -144,7 +168,7 @@ Clips are rendered by the server as WAV and played from memory; the phone never 
   knows the gap is covered.
 - Uploads go through a background `URLSession` (`PUT`, with a SHA-256 header), so they keep
   going while the app is suspended and resume after relaunch. Files the server rejects for good
-  (409/413/422, or 400 five times) are **kept**, not deleted. They show under "Needs attention".
+  (409/413/422, or 400 five times) are **kept**, not deleted. Home and Server say so; Diagnostics lists them.
 - Acknowledged files stay in `sent/` until the server has processed them plus 24 h (hard cap:
   7 days / 1 GB). Unacknowledged audio is never deleted.
 - **Storage guard:** below 200 MB free, the app stops recording and deliberately disconnects so
@@ -171,9 +195,10 @@ Clips are rendered by the server as WAV and played from memory; the phone never 
 
 ## Simulator
 
-BLE doesn't work in the Simulator. Turn on **Debug › Simulated device**. It replays a real
+BLE doesn't work in the Simulator. Turn on **Server › Developer tools › Simulated device** (debug
+builds only). It replays a real
 Opus trace (CELT 20 ms, the CV1's format) in real time, with a silence gap each loop so idle
-rotation happens. It also serves a fake offline backlog through the ring protocol. The Debug tab
+rotation happens. It also serves a fake offline backlog through the ring protocol. Developer tools
 can simulate taps, walking out of range for 15 s, forced rotation, heartbeats, retries, and
 shows the (token-redacted) log.
 
@@ -183,8 +208,9 @@ shows the (token-redacted) log.
 - Debug builds accept automation launch arguments:
   `-OmiNotesDebugServerURL http://localhost:8765 -OmiNotesDebugToken <token>` to configure the
   server, `-OmiNotesDebugOpenURL 'omi-notes://configure?…'` to open the pairing sheet,
-  `-OmiNotesDebugTab home|people|settings|debug|pairing` to open a screen, and
-  `-OmiNotesDebugHomeBottom YES` to scroll Home to the upload/notes sections.
+  `-OmiNotesDebugTab home|people|server|settings|pairing|diagnostics|debug` to open a screen,
+  `-OmiNotesDebugOpenConversation YES` to open the newest conversation and
+  `-OmiNotesDebugSearch <text>` to start with a search. `-omi.onboarded YES` skips onboarding.
   `xcrun simctl spawn booted defaults write <bundle-id> omi.simulatedDevice -bool YES` turns on
   the simulated device before launch.
 
@@ -195,9 +221,10 @@ shows the (token-redacted) log.
 | Pendant not in the scan list | Disconnect or quit the official Omi app (one connection at a time); check the pendant is on and charged; check Bluetooth is allowed (Settings › Omi Notes). |
 | "Unsupported device" | The pendant reported an audio codec other than Opus 20/21. The app refuses to record rather than produce garbage. Update the firmware. |
 | "Pairing information removed" | iOS kept a stale bond. Settings › Bluetooth › (i) next to the Omi › Forget This Device, then tap **Reconnect** in the app. |
-| "Token rejected (401)" | Uploads are paused. Re-scan the `omi-notes pair` QR code or fix the token in Settings. |
-| Server unreachable | Is Tailscale connected on the iPhone? Is `tailscale serve` running on the Mac? Try **Test connection**. |
-| Files under "Kept, not uploaded" | The server refused them permanently (409/413/422). They are kept on the phone. Check the server logs, then **Debug › Re-queue kept files**. |
+| "The server rejected this phone" | Uploads are paused. Re-scan the `omi-notes pair` QR code, or fix the token in Server › Change server. |
+| "Can't reach your server" | Is Tailscale connected on the iPhone? Is `tailscale serve` running on the Mac? Try **Test connection** in Server › Change server. Audio waits on the phone meanwhile. |
+| "Audio files couldn't be uploaded" | The server refused them permanently (409/413/422). They are kept on the phone (Server › Diagnostics lists them). Check the server logs; in a debug build, Developer tools › Re-queue kept files. |
+| A conversation failed | Server lists it with the reason and what to do. **Retry** redoes the failed step once the cause (a provider key, a stopped service) is fixed. |
 | "Offline sync unsupported" | Firmware older than 3.0.20 (or no offline storage). Live capture still works, but audio while disconnected can't be recovered. |
 | "Device clock invalid" | The pendant drops offline recording while its clock is invalid. The app sets it on every connect; reconnect once. |
 | "MTU payload low" | CV1 frames need an ATT MTU ≥ 166. Frames may be fragmented or dropped; move closer or restart Bluetooth. |

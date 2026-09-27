@@ -65,7 +65,7 @@ uv run omi-notes synth-wav /tmp/talk.wav           # two voices, a long pause
 uv run omi-notes replay-wav /tmp/talk.wav --as ble # encodes like the firmware, uploads like the phone
 ```
 
-The iOS app also has a simulated pendant (Debug tab) that replays real CV1-format Opus in the Simulator.
+The iOS app also has a simulated pendant (Server › Developer tools, debug builds) that replays real CV1-format Opus in the Simulator.
 
 ## How it works (short version)
 
