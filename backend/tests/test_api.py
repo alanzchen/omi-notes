@@ -166,3 +166,18 @@ def test_events_idempotent(client, new_id, settings):
 
 def test_recent_conversations_empty(client):
     assert client.get("/v1/conversations/recent?limit=5", headers=AUTH).json() == {"conversations": []}
+
+
+def test_recent_conversations_only_offer_speakers_after_transcription(client, worker):
+    from .helpers import T0, replay, tone
+
+    replay(client, tone(10))
+    worker.tick(T0 + 15)
+    (recording,) = client.get("/v1/conversations/recent", headers=AUTH).json()["conversations"]
+    assert recording["status"] == "open"
+    assert recording["speakers_ready"] is False
+
+    worker.tick(T0 + 400)
+    (finished,) = client.get("/v1/conversations/recent", headers=AUTH).json()["conversations"]
+    assert finished["id"] == recording["id"] and finished["speakers_ready"] is True
+    assert client.get(f"/v1/conversations/{finished['id']}/speakers", headers=AUTH).status_code == 200

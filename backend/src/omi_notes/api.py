@@ -182,7 +182,11 @@ def create_app(
     @app.get("/v1/conversations/recent")
     def recent(limit: int = 20) -> dict:
         limit = max(1, min(limit, 200))
-        rows = db.query("SELECT * FROM conversations ORDER BY start DESC LIMIT ?", (limit,))
+        rows = db.query(
+            "SELECT * FROM conversations WHERE enrollment_id IS NULL "
+            "AND COALESCE(waiting_for, '') <> 'voice enrollment' ORDER BY start DESC LIMIT ?",
+            (limit,),
+        )
         return {
             "conversations": [
                 {
@@ -194,6 +198,7 @@ def create_app(
                     "note_path": r["note_path"],
                     "late_audio": bool(r["late_audio"]),
                     "provisional": bool(r["provisional"]),
+                    "speakers_ready": r["status"] != "open" and r["transcript_sha"] is not None,
                 }
                 for r in rows
             ]

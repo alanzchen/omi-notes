@@ -175,9 +175,13 @@ struct HomeView: View {
                 Text(model.recentError ?? "None yet").foregroundStyle(.secondary).font(.subheadline)
             }
             ForEach(model.recent) { c in
-                NavigationLink {
-                    ConversationSpeakersView(model: model, conversationId: c.id, title: c.title ?? "Speakers")
-                } label: {
+                if c.canReviewSpeakers {
+                    NavigationLink {
+                        ConversationSpeakersView(model: model, conversationId: c.id, title: c.title ?? "Speakers")
+                    } label: {
+                        conversationRow(c)
+                    }
+                } else {
                     conversationRow(c)
                 }
             }
@@ -195,6 +199,10 @@ struct HomeView: View {
             Text("\(Fmt.iso(c.startedAt))\(c.provisional == true ? " · provisional" : "")\(c.lateAudio == true ? " · late audio" : "")")
                 .font(.caption).foregroundStyle(.secondary)
             if let path = c.notePath { Text(path).font(.caption2).foregroundStyle(.tertiary).lineLimit(1) }
+            if !c.canReviewSpeakers {
+                Text("Speaker details will be available after transcription.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 

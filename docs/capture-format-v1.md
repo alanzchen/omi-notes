@@ -283,12 +283,18 @@ durable on the server. Unacknowledged files are never deleted. `404` for unknown
 
 ### `GET /v1/conversations/recent?limit=20`
 
-Newest first, for the app's home screen:
+Newest first, for the app's home screen. Voice enrollment recordings (including those still
+waiting for the enrollment to end) are excluded before applying the limit:
 
 ```json
-{"conversations": [{"id": "…", "status": "summarizing", "started_at": "…", "ended_at": "…", "title": null, "note_path": "Conversations/2026/2026-09/2026-09-26 1403 Team Finalizes Q2 Budget.md", "late_audio": false, "provisional": false}]}
+{"conversations": [{"id": "…", "status": "summarizing", "started_at": "…", "ended_at": "…", "title": null, "note_path": "Conversations/2026/2026-09/2026-09-26 1403 Team Finalizes Q2 Budget.md", "late_audio": false, "provisional": false, "speakers_ready": true}]}
 ```
 
 Conversation `status`: `open` → `closed` → `transcribing` → `summarizing` → `done` | `discarded`
 (no meaningful content), or `failed` (retryable; see `_status.md`). `note_path` is relative to the
 notes directory.
+
+`speakers_ready` is true once a closed conversation has a persisted transcript, even while
+summarization is pending or has failed. The phone offers speaker details only when it is true;
+the speakers endpoint remains unavailable before transcription. This additive field may be absent
+on older servers; the phone then offers details only for `done` or `discarded` rows with a note path.

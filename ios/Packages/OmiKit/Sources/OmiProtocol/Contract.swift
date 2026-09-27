@@ -302,6 +302,12 @@ public struct ConversationSummary: Decodable, Equatable, Sendable, Identifiable 
     public var notePath: String?
     public var lateAudio: Bool?
     public var provisional: Bool?
+    public var speakersReady: Bool?
+
+    /// Older servers do not report readiness; only completed notes are safe to open there.
+    public var canReviewSpeakers: Bool {
+        speakersReady ?? (notePath != nil && (status == "done" || status == "discarded"))
+    }
 
     enum CodingKeys: String, CodingKey {
         case id, status
@@ -311,6 +317,7 @@ public struct ConversationSummary: Decodable, Equatable, Sendable, Identifiable 
         case notePath = "note_path"
         case lateAudio = "late_audio"
         case provisional
+        case speakersReady = "speakers_ready"
     }
 }
 

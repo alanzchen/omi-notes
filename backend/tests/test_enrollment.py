@@ -103,6 +103,7 @@ def test_enrollment_window_becomes_a_voiceprint_and_is_never_transcribed(env):
     (row,) = convs(worker)
     assert row["status"] == "discarded" and row["enrollment_id"] == eid
     assert CountingStt.calls == 0 and row["note_path"] is None
+    assert client.get("/v1/conversations/recent", headers=AUTH).json() == {"conversations": []}
     status = client.get(f"/v1/speakers/enrollments/{eid}", headers=AUTH).json()
     assert status["state"] == "accepted" and status["speech_s"] >= 20
     people = client.get("/v1/people", headers=AUTH).json()["people"]
@@ -139,6 +140,7 @@ def test_a_conversation_waits_while_the_window_end_is_unknown(env):
     worker.tick(T0 + 400)
     (row,) = convs(worker)
     assert row["status"] == "open" and row["waiting_for"] == "voice enrollment"
+    assert client.get("/v1/conversations/recent", headers=AUTH).json() == {"conversations": []}
     assert client.get(f"/v1/speakers/enrollments/{eid}", headers=AUTH).json() == {"state": "waiting_audio"}
     end_event(client, eid, capture, 43.5)
     worker.tick(T0 + 410)
@@ -172,6 +174,8 @@ def test_speech_after_the_window_is_its_own_conversation(env):
     rows = sorted(convs(worker), key=lambda r: r["start"])
     assert [r["status"] for r in rows] == ["discarded", "done"]
     assert rows[1]["start"] >= T0 + 43.0 and CountingStt.calls == 1
+    (recent,) = client.get("/v1/conversations/recent?limit=1", headers=AUTH).json()["conversations"]
+    assert recent["id"] == rows[1]["id"] and recent["speakers_ready"] is True
 
 
 def test_unknown_enrollment_is_404(env):
