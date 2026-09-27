@@ -21,6 +21,7 @@ struct SettingsView: View {
                 Text("Audio goes from the pendant to this phone, then to your own server. This app sends it nowhere else. Your server decides which services receive your audio and transcripts; see Server → Configuration.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
+            ObsidianSection(model: model)
             SavedNotesSection(model: model)
             Section("About") {
                 LabeledContent("Version", value: Self.version)
@@ -33,6 +34,32 @@ struct SettingsView: View {
     static var version: String {
         let info = Bundle.main.infoDictionary
         return "\(info?["CFBundleShortVersionString"] as? String ?? "?") (\(info?["CFBundleVersion"] as? String ?? "?"))"
+    }
+}
+
+/// The name of this server's vault in the Obsidian app on this phone (for "Open in Obsidian").
+struct ObsidianSection: View {
+    let model: AppModel
+    @State private var name = ""
+
+    var body: some View {
+        if let vaultId = model.serverStatus?.vaultId {
+            let suggestion = ObsidianLink.suggestedVault(notesDir: model.serverStatus?.notesDir)
+            Section {
+                TextField(suggestion ?? "Vault name", text: $name)
+                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    .onSubmit { ObsidianLink.setVaultName(name, for: vaultId) }
+                    .onChange(of: name) { _, value in ObsidianLink.setVaultName(value, for: vaultId) }
+                if name.isEmpty, let suggestion {
+                    Button("Use “\(suggestion)”") { name = suggestion }
+                }
+            } header: {
+                Text("Obsidian vault")
+            } footer: {
+                Text("The vault's name as it appears in Obsidian on this phone. The server's folder is only a guess; the names can differ.")
+            }
+            .onAppear { name = ObsidianLink.vaultName(for: vaultId) ?? "" }
+        }
     }
 }
 

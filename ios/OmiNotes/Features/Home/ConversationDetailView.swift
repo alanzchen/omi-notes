@@ -13,6 +13,7 @@ struct ConversationDetailView: View {
     @State private var error: String?
     @State private var loadingMore = false
     @State private var showTranscript = false
+    @State private var obsidianMessage: String?
     @Environment(\.dynamicTypeSize) private var typeSize
 
     private var detail: ConversationDetail? { model.details[summary.id] }
@@ -42,6 +43,7 @@ struct ConversationDetailView: View {
                 summarySection(detail)
                 if let s = detail.summary { details(s) }
                 myNotes(detail)
+                obsidianSection(detail)
                 speakersSection(detail)
                 transcriptSection(detail)
             } else if error == nil {
@@ -188,6 +190,30 @@ struct ConversationDetailView: View {
             Section("My Notes") {
                 Label("Your My Notes section couldn't be read because its markers are ambiguous. Fix it in the note file.",
                       systemImage: "exclamationmark.triangle").font(.footnote).foregroundStyle(.orange)
+            }
+        }
+    }
+
+    @ViewBuilder private func obsidianSection(_ d: ConversationDetail) -> some View {
+        if let path = d.entry.notePath, let vaultId = model.serverStatus?.vaultId {
+            Section {
+                if let name = ObsidianLink.vaultName(for: vaultId), let url = ObsidianLink.url(vault: name, notePath: path) {
+                    Button {
+                        if UIApplication.shared.canOpenURL(url) {
+                            UIApplication.shared.open(url)
+                            obsidianMessage = nil
+                        } else {
+                            obsidianMessage = "Obsidian isn't installed on this phone."
+                        }
+                    } label: {
+                        Label("Open in Obsidian", systemImage: "arrow.up.forward.app")
+                    }
+                } else {
+                    Text("To open notes in Obsidian, enter your vault's name in Settings.").font(.footnote).foregroundStyle(.secondary)
+                }
+                if let obsidianMessage { Text(obsidianMessage).font(.footnote).foregroundStyle(.orange) }
+            } footer: {
+                Text("Obsidian Sync may take a moment to bring a new note to this phone.")
             }
         }
     }
