@@ -264,7 +264,17 @@ class ConversationPipeline:
 
     # -- scheduling ------------------------------------------------------------------------------
 
+    def mark_stale_renders(self) -> int:
+        """Notes rendered from other speaker labels than the current ones are re-rendered, however
+        the labels changed (a correction during a render, a recovered file, a rebuild)."""
+        return self.db.execute(
+            """UPDATE conversations SET needs_render=1, next_attempt_at=NULL
+               WHERE note_path IS NOT NULL AND needs_render=0 AND frozen=0 AND status IN ('done','discarded','failed')
+                 AND COALESCE(rendered_speakers_revision, 0) <> speakers_revision"""
+        ).rowcount
+
     def run(self, now: float, *, limit: int = 20) -> int:
+        self.mark_stale_renders()
         rows = self.db.query(
             """SELECT id FROM conversations
                WHERE ((status IN ('closed','transcribing','summarizing') OR (needs_render=1 AND status IN ('done','discarded','failed')))
@@ -360,7 +370,7 @@ class ConversationPipeline:
             self.summarize_and_render(row["id"], now, cache_only=True, summary_error=error)
         except CacheMiss as exc:
             log.warning("conversation %s: nothing cached to re-render (%s)", row["id"], exc)
-            self._set(row["id"], needs_render=0)
+            self._set(row["id"], needs_render=0, rendered_speakers_revision=row["speakers_revision"])
         except NoteEdited:
             self._set(row["id"], next_attempt_at=now + EDITED_RETRY)
         except (OSError, UserRegionError) as exc:
@@ -483,8 +493,8 @@ class ConversationPipeline:
             "timemap": [[m.out_start, m.wall_start, m.duration] for m in audio.timemap],
         }
         atomic_write_bytes(self.conv_dir(conv_id) / "transcript.json", json.dumps(transcript, indent=1).encode())
-        if speakers.consistent:
-            self.identify(conv_id, audio, audio_sha, clips, sha256_hex(canonical_json(segments).encode()))
+        self.identify(conv_id, audio, audio_sha, clips, sha256_hex(canonical_json(segments).encode()),
+                      {seg["speaker"] for seg in segments}, consistent=speakers.consistent)  # fmt: skip
         self._set(conv_id, status="summarizing", audio_sha=audio_sha, stt_ref=name, language=language,
                   transcript_sha=sha256_hex(canonical_json(segments).encode()), attempts=0, error=None,
                   error_kind=None, next_attempt_at=None, updated_at=now, skip_stt=None)  # fmt: skip
@@ -502,44 +512,64 @@ class ConversationPipeline:
                     out.append((m.out_start + lo - m.wall_start, m.out_start + hi - m.wall_start))
         return out
 
-    def identify(self, conv_id: str, audio: ConversationAudio, audio_sha: str, clips: dict, transcript_sha: str) -> None:
+    def identify(self, conv_id: str, audio: ConversationAudio | None, audio_sha: str | None, clips: dict,
+                 transcript_sha: str, labels: set[str], *, consistent: bool = True) -> None:  # fmt: skip
         """Voices stage: label voiceprints while the PCM is in memory, then the pure assignment.
-        Inert until someone is enrolled or named; skipped without a speaker model."""
+        Voices are inert until someone is enrolled or named and skipped without a speaker model;
+        label states always move to a new transcript (`_carry_over`), voices or not."""
         embedder = self.providers.embedder
-        if embedder is None or not clips:
-            return
-        samples = self.speakers.samples(embedder.model, embedder.model_sha)
-        if not samples:
-            return
-        # keyed by everything the voices depend on: a new transcript may number the voices differently
-        name = voices_name(embedder, audio_sha, transcript_sha)
-        if (self.conv_dir(conv_id) / name).exists():
-            self.speakers.index_voices(conv_id, name)  # decided before (a retried stage)
-            return
-        voices = embed_voices(clips, audio.pcm, embedder)
+        voices, name, fresh = None, None, False
+        if embedder is not None and clips and consistent and audio is not None and self.speakers.any_samples():
+            # keyed by everything the voices depend on: a new transcript may number the voices differently
+            name = voices_name(embedder, audio_sha, transcript_sha)
+            fresh = not (self.conv_dir(conv_id) / name).exists()
+            if fresh:
+                voices = embed_voices(clips, audio.pcm, embedder)  # outside the lock: the slow part
         with self.speakers.lock:
-            prefs = self.speakers.settings()
-            current = self.speakers.labels(conv_id)
-            if self.speakers.labels_transcript(conv_id) not in (None, transcript_sha):
-                current = self._carry_over(current, self.speakers.voices(conv_id), voices)
-            states = speaker_match.assign(voices, current, speaker_match.build_models(samples, self.operating),
-                                          auto_assign=prefs["auto_assign"], op=self.operating)  # fmt: skip
-            keep = self.speakers.vector_labels(states, set(voices), raw=True)
-            self.speakers.write_voices(conv_id, name, embedder.model, embedder.model_sha, voices, keep)
-            if self.speakers.persisted(states) != self.speakers.persisted(current) or \
-                    self.speakers.labels_transcript(conv_id) not in (None, transcript_sha):
+            stored = self.speakers.labels(conv_id)
+            previous = self.speakers.labels_transcript(conv_id)
+            moved = previous not in (None, transcript_sha)
+            old_voices = self.speakers.voices_for_transcript(conv_id, previous, not_file=name) if moved else {}
+            if name is not None and not fresh:  # a retried stage: finish it with the stored voices
+                self.speakers.index_voices(conv_id, name)
+                voices = self.speakers.voices(conv_id)
+            current = self._carry_over(stored, old_voices, voices, labels) if moved else stored
+            states = current
+            if voices is not None:
+                samples = self.speakers.samples(embedder.model, embedder.model_sha)  # as of now, not before embedding
+                if samples:
+                    states = speaker_match.assign(voices, current, speaker_match.build_models(samples, self.operating),
+                                                  auto_assign=self.speakers.settings()["auto_assign"], op=self.operating)  # fmt: skip
+                if fresh:
+                    keep = self.speakers.vector_labels(states, set(voices), raw=True)
+                    self.speakers.write_voices(conv_id, name, embedder.model, embedder.model_sha, voices, keep)
+            if moved or self.speakers.persisted(states) != self.speakers.persisted(stored):
                 self.speakers.write_labels(conv_id, states, transcript_sha=transcript_sha)
-            self.speakers.remove_other_voices(conv_id, name)
+            if moved or name is not None:
+                self.speakers.remove_other_voices(conv_id, name)  # voices of an earlier transcript
 
-    def _carry_over(self, current: dict, old_voices: dict, new_voices: dict) -> dict:
+    def move_labels(self, conv_id: str, transcript: dict) -> None:
+        """Label states made for another transcript (recovery after a crash between writing the
+        transcript and its voices stage) are moved before anything uses their names."""
+        segments = transcript.get("segments") or []
+        sha = sha256_hex(canonical_json(segments).encode())
+        if self.speakers.labels_transcript(conv_id) not in (None, sha):
+            self.identify(conv_id, None, None, {}, sha, {s["speaker"] for s in segments})
+
+    def _carry_over(self, current: dict, old_voices: dict, new_voices: dict | None, labels: set[str]) -> dict:
         """Label states of the previous transcript that still apply: only where the label has the
-        same voice (a user's assignment or block survives a re-transcription that kept it)."""
+        same voice (a user's assignment or block survives a re-transcription that kept it). A
+        forgotten voice has no vector to follow, so every label that didn't carry over may be it
+        and is marked forgotten too."""
         out = {}
         for label, state in current.items():
-            old, new = old_voices.get(label), new_voices.get(label)
-            if (old is not None and new is not None and old.vector is not None and new.vector is not None
-                    and cosine_distance(old.vector, new.vector) < self.operating.threshold):  # fmt: skip
+            old, new = old_voices.get(label), (new_voices or {}).get(label)
+            if (not state.get("forgotten") and old is not None and new is not None and old.vector is not None
+                    and new.vector is not None and cosine_distance(old.vector, new.vector) < self.operating.threshold):  # fmt: skip
                 out[label] = state
+        if any(state.get("forgotten") for state in current.values()):
+            for label in labels | set(new_voices or {}):
+                out.setdefault(label, {"forgotten": True})
         return out
 
     def relabel(self, now: float) -> list[str]:
@@ -680,6 +710,8 @@ class ConversationPipeline:
     ) -> None:
         row = self._row(conv_id)
         transcript = self.load_transcript(conv_id)
+        self.move_labels(conv_id, transcript)
+        row = self._row(conv_id)  # the speakers revision this render is made from
         segments = transcript["segments"]
         language = transcript.get("language") or self.settings.stt_language
         verdict, rule = deterministic_relevance([s["text"] for s in segments], row["speech_seconds"])
@@ -769,6 +801,7 @@ class ConversationPipeline:
             note_path=relpath, stale_note_path=moved, stub_path=None, revision=revision, content_sha=content_sha,
             written_sha=generated_sha(text), edited=0, settings_json=json.dumps(snap, sort_keys=True),
             title=title_of(data), index_json=json.dumps(index, ensure_ascii=False), needs_render=0, relevance=rule,
+            rendered_speakers_revision=row["speakers_revision"],
             llm_ref=llm_cached["file"] if llm_cached else None,
             prompt_version=llm_cached["prompt_version"] if llm_cached else None,
             llm_status=llm_status, **({"skip_llm": None} if llm_cached and not cache_only else {}),

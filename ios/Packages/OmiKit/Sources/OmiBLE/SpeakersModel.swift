@@ -44,9 +44,12 @@ public final class SpeakersModel {
     public var me: Person? { people.first { $0.isMe } }
     public var others: [Person] { people.filter { !$0.isMe } }
 
+    /// Injectable for tests (no network).
+    public var session: URLSession = APIClient.defaultSession
+
     private func api() throws -> APIClient {
         guard let endpoint = engine.settings.endpoint else { throw APIError.notConfigured }
-        return APIClient(endpoint: endpoint)
+        return APIClient(endpoint: endpoint, session: session)
     }
 
     // MARK: Loading
@@ -54,14 +57,16 @@ public final class SpeakersModel {
     public func refresh() async {
         loading = true
         defer { loading = false }
+        // First and on its own: an older server fails the calls below, and must not keep the
+        // capability of the server that answered last time.
+        serverSupportsEnrollment = nil
+        serverSupportsEnrollment = try? await api().status().supportsVoiceEnrollment
         do {
             let api = try api()
             async let p = api.people()
             async let s = api.speakerSettings()
-            async let st = api.status()
             people = try await p
             settings = try await s
-            serverSupportsEnrollment = try await st.supportsVoiceEnrollment
             suggestions = settings?.unknownVoicesEnabled == true ? (try await api.speakerSuggestions()) : []
             error = nil
         } catch {
@@ -161,10 +166,18 @@ public final class SpeakersModel {
 
     public static let serverTooOld = "Update the Omi Notes server first: this one doesn't support voice enrollment, so your reading would be transcribed as a conversation."
 
-    public func startEnrollment() {
-        // Only a server that knows the enrollment events keeps the reading out of transcripts.
+    /// Asks the server it is about to talk to (not a remembered answer): only one that knows the
+    /// enrollment events keeps the reading out of transcripts.
+    public func startEnrollment() async {
+        do {
+            serverSupportsEnrollment = try await api().status().supportsVoiceEnrollment
+        } catch {
+            serverSupportsEnrollment = nil
+            enrollment = .failed("Couldn't reach the server to check it supports voice enrollment (\(Self.describe(error))).")
+            return
+        }
         guard serverSupportsEnrollment == true else {
-            enrollment = .failed(serverSupportsEnrollment == false ? Self.serverTooOld : "Couldn't reach the server to check it supports voice enrollment.")
+            enrollment = .failed(Self.serverTooOld)
             return
         }
         do {

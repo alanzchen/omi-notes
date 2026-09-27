@@ -838,10 +838,13 @@ class Worker:
         seqs = sorted(already | {c["chunk_sequence"] for c in chunks})
         Vault.write_json(self.vault.capture_json_path(device, capture_id), self._evidence_for(capture, set(seqs)))
         for chunk in chunks:
+            tomb_path = self.vault.tombstone_path(device, capture_id, chunk["chunk_sequence"])
+            if tomb_path.exists():  # an earlier pass got this far (its .omnc may be gone): resume
+                continue
             path = self.vault.root / chunk["path"]
             header = parse_envelope(path.read_bytes()).header.model_dump(mode="json")
             tomb = {"sha256": chunk["sha256"], "size": chunk["size"], "header": header, "deleted_at": now}
-            Vault.write_json(self.vault.tombstone_path(device, capture_id, chunk["chunk_sequence"]), tomb, pretty=False)
+            Vault.write_json(tomb_path, tomb, pretty=False)
         for chunk in chunks:
             remove(self.vault.root / chunk["path"])
         with self.db.tx() as conn:

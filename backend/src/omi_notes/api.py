@@ -35,6 +35,11 @@ def create_app(
 ) -> FastAPI:
     if not settings.omi_notes_token:
         raise RuntimeError("OMI_NOTES_TOKEN is not set (run `omi-notes pair` to generate one)")
+    # Before anything that writes (VAULT.json, the index sweep): a second server must not touch
+    # the vault or the live index at all. The lifespan takes the lock for real.
+    probe = api_lock(Vault(settings.vault_dir, lock_root=settings.lock_dir))
+    if probe.held_elsewhere():
+        raise VaultBusy(f"another backend (pid {probe.owner()}) is already serving this vault ({settings.vault_dir})")
     vault = Vault.open(settings)
     lease = vault.foreign_live_lease()
     if lease and not take_over:

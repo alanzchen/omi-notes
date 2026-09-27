@@ -22,7 +22,7 @@ from pathlib import Path
 
 from .spool import make_dirs_durable
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -229,6 +229,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     claim_expires REAL,
     record_sha TEXT,
     speakers_revision INTEGER NOT NULL DEFAULT 0,
+    rendered_speakers_revision INTEGER,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     finalized_at REAL,
@@ -422,6 +423,7 @@ COLUMN_SOURCES: dict[str, dict[str, str]] = {
             "audio_sha", "stt_ref", "transcript_sha", "llm_ref", "llm_status", "relevance", "prompt_version",
             "language", "done_at",
         )},  # fmt: skip
+        "rendered_speakers_revision": "conversation.json render.speakers_revision (the labels the note shows)",
         "error": "conversation.json failure (else operational: last re-render error)",
         "error_kind": "conversation.json failure (else operational)",
         "failed_stage": "conversation.json failure",

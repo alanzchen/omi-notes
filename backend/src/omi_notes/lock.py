@@ -1,22 +1,23 @@
-"""Host locks of a vault: `_omi/locks/*.lock`, one `flock` per role (docs/vault.md, "Writer ownership").
+"""Host locks of a vault (docs/vault.md, "Writer ownership"), one `flock` per role.
 
 - `api.lock`: at most one HTTP server per vault on this host (it writes chunks, events and speaker
-  changes). A second `serve` refuses to start, whatever its INDEX_DIR.
+  changes). A second `serve` refuses to start, before it writes anything.
 - `worker.lock`: at most one process runs the pipeline. Maintenance commands (`reprocess`,
-  `retry-failed`, `rebuild-index`) try to take it: if they get it they run inline, otherwise they
-  only queue work (DB flags) for the running worker.
+  `retry-failed`) try to take it: if they get it they run inline, otherwise they only queue work
+  (DB flags) for the running worker. `rebuild-index` needs both.
 - `speakers.lock` (`SpeakerLock`): serializes speaker-label read-modify-writes between the API and
   the worker, also when the worker is a separate process.
 
-The files live in the vault so that every process using it finds them, whatever index it uses;
-they only ever hold a pid, and `flock` state is per host (never synced). The vault's
-`_omi/writer.json` lease is the advisory cross-host part. `flock` locks belong to the open file, so
-they are released automatically when the process dies.
+They live in one folder per vault *path* under LOCK_DIR (default: next to the index root), so every
+process using a vault on this host finds them whatever its INDEX_DIR — and never inside the synced
+vault. The vault's `_omi/writer.json` lease is the advisory cross-host part. `flock` locks belong
+to the open file, so they are released automatically when the process dies.
 """
 
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import os
 import threading
 from pathlib import Path
@@ -47,6 +48,22 @@ class WorkerLock:
         self._fd = fd
         return True
 
+    def held_elsewhere(self) -> bool:
+        """Another process (or handle) holds it. Creates nothing: without the file nobody does."""
+        if self._fd is not None:
+            return False
+        try:
+            fd = os.open(self.path, os.O_RDONLY)
+        except FileNotFoundError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)  # closing drops a lock we just took
+        return False
+
     def owner(self) -> str:
         """The pid written by the holder (diagnostics only)."""
         try:
@@ -68,7 +85,10 @@ class WorkerLock:
 
 
 def locks_dir(vault) -> Path:
-    return vault.omi / "locks"
+    from .vault import default_index_root
+
+    root = vault.lock_root or default_index_root().parent / "locks"
+    return root / hashlib.sha256(os.path.realpath(vault.root).encode()).hexdigest()[:16]
 
 
 def worker_lock(vault) -> WorkerLock:

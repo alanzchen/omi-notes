@@ -252,6 +252,7 @@ class EnrollmentProcessor:
         with store.lock:
             if verdict["state"] == "accepted":
                 request = f"enrollment:{w.enrollment_id}"  # a crash before the result: reuse the sample
+                store.sync_samples()  # (including one whose index write failed)
                 done = store.sample_for_request(request)
                 me = store.me()
                 if done is not None:

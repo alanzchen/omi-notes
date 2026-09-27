@@ -42,6 +42,8 @@ class Settings(BaseSettings):
     vault_dir: Path = Path("~/Documents/OmiNotes")
     # Where the disposable SQLite index lives (default: Application Support / XDG state).
     index_dir: Path | None = None
+    # Host locks, one folder per vault path, whatever INDEX_DIR says (default: next to the index root).
+    lock_dir: Path | None = None
     # Pre-vault settings: only read to refuse an unmigrated install (`omi-notes migrate-vault`).
     notes_dir: Path | None = None
     data_dir: Path | None = None
@@ -98,7 +100,7 @@ class Settings(BaseSettings):
     worker_tick_seconds: float = 5.0
 
     @field_validator(
-        "vault_dir", "index_dir", "notes_dir", "data_dir", "vad_model_path", "diarization_segmentation_model",
+        "vault_dir", "index_dir", "lock_dir", "notes_dir", "data_dir", "vad_model_path", "diarization_segmentation_model",
         "diarization_embedding_model", "speaker_model", mode="after",
     )
     @classmethod

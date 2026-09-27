@@ -82,6 +82,7 @@ def uuid7_time(value: str) -> float | None:
 class Vault:
     root: Path
     info: dict = field(default_factory=dict)
+    lock_root: Path | None = None  # LOCK_DIR (`lock.locks_dir`)
 
     # -- layout ----------------------------------------------------------------------------------
 
@@ -173,7 +174,7 @@ class Vault:
         newer format, and a `_omi/` folder without `VAULT.json` (an incomplete sync or an
         interrupted migration: "incomplete sync is not an empty vault")."""
         check_legacy(settings)
-        vault = cls(settings.vault_dir)
+        vault = cls(settings.vault_dir, lock_root=settings.lock_dir)
         if vault.vault_json.exists():
             vault.info = json.loads(vault.vault_json.read_text())
             if int(vault.info.get("format", 0)) > FORMAT:

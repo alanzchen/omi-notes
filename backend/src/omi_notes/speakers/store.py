@@ -416,15 +416,16 @@ class SpeakerStore:
         """Drop every stored vector the rule no longer allows. Idempotent and independent of how
         we got here (a setting change, raw deletion, forgetting, or a crash in the middle of one)."""
         pruned = 0
-        for r in self.db.query("SELECT DISTINCT conversation_id FROM voices WHERE vector IS NOT NULL"):
-            conv_id = r["conversation_id"]
-            row = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
-            stored = {v["label"] for v in self.db.query(
-                "SELECT label FROM voices WHERE conversation_id=? AND vector IS NOT NULL", (conv_id,))}  # fmt: skip
-            keep = self.vector_labels(self.labels(conv_id), stored, raw=row is not None and self.raw_available(row))
-            if stored - keep:
-                self.prune_vectors(conv_id, keep)
-                pruned += 1
+        with self.lock:  # never publish a voices file read before a concurrent forget
+            for r in self.db.query("SELECT DISTINCT conversation_id FROM voices WHERE vector IS NOT NULL"):
+                conv_id = r["conversation_id"]
+                row = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
+                stored = {v["label"] for v in self.db.query(
+                    "SELECT label FROM voices WHERE conversation_id=? AND vector IS NOT NULL", (conv_id,))}  # fmt: skip
+                keep = self.vector_labels(self.labels(conv_id), stored, raw=row is not None and self.raw_available(row))
+                if stored - keep:
+                    self.prune_vectors(conv_id, keep)
+                    pruned += 1
         return pruned
 
     def voices(self, conv_id: str) -> dict[str, VoiceRow]:
@@ -526,11 +527,31 @@ class SpeakerStore:
             voices = current or voices
         return voices[-1].name if voices else None
 
-    def remove_other_voices(self, conv_id: str, keep: str) -> None:
+    def remove_other_voices(self, conv_id: str, keep: str | None) -> None:
         """Voices of an earlier transcript (their labels no longer apply) are deleted."""
         for path in self.conv_dir(conv_id).glob("voices-*.json"):
             if path.name != keep:
                 remove(path)
+        if keep is None:
+            self.db.execute("DELETE FROM voices WHERE conversation_id=?", (conv_id,))
+
+    def voices_for_transcript(self, conv_id: str, transcript_sha: str | None, *, not_file: str | None = None) -> dict[str, VoiceRow]:
+        """The stored voices made for an (earlier) transcript, read from its file (`not_file`: the
+        new transcript's, which a crashed attempt may already have indexed)."""
+        if not transcript_sha:
+            return {}
+        for path in self.conv_dir(conv_id).glob(f"voices-*-{transcript_sha[:8]}.json"):
+            data = Vault.read_json(path) or {}
+            return {
+                label: VoiceRow(label, decode_vector(e["vector_b64"]) if e.get("vector_b64") else None, e.get("seconds") or 0.0,
+                                e.get("turns") or 0, e.get("spread") or 0.0, e.get("rms_db"), e.get("clips") or [],
+                                data.get("model"), data.get("model_sha"))
+                for label, e in (data.get("labels") or {}).items()
+            }  # fmt: skip
+        indexed = self.db.one("SELECT file FROM voices WHERE conversation_id=? LIMIT 1", (conv_id,))
+        if indexed is None or indexed["file"] == not_file or re.search(r"-[0-9a-f]{8}\.json$", indexed["file"] or ""):
+            return {}
+        return self.voices(conv_id)  # a voices file from before transcript-keyed names
 
     def labels_transcript(self, conv_id: str) -> str | None:
         """The transcript the stored label states were made for (None: no states yet)."""

@@ -537,8 +537,11 @@ def _sweep_speakers(db: Database, vault: Vault) -> int:
     from .speakers.store import SpeakerStore
 
     store = SpeakerStore(vault, db)
-    changed = int(store.scan_people()) + int(store.sync_samples())
-    for r in db.query("SELECT id FROM conversations WHERE status <> 'open'"):
-        changed += int(store.sync_conversation(r["id"]))
+    with store.lock:  # a separate worker process sweeps while the API may be writing labels
+        changed = int(store.scan_people()) + int(store.sync_samples())
+        for r in db.query("SELECT id FROM conversations WHERE status <> 'open'"):
+            if store.sync_conversation(r["id"]):
+                changed += 1
+                db.set_meta("relabel_pending", "1")  # its dependent work (renders, other assignments)
     return changed
 

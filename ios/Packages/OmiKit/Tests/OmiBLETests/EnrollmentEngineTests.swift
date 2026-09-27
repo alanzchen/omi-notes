@@ -36,14 +36,38 @@ import OmiProtocol
             .compactMap { try? JSONSerialization.jsonObject(with: Data(contentsOf: $0.url)) as? [String: Any] }
     }
 
-    @MainActor @Test func theAppOnlyEnrollsAgainstAServerThatSupportsIt() throws {
+    @MainActor func speakers(_ engine: OmiEngine) -> SpeakersModel {
+        let model = SpeakersModel(engine: engine)
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [ServerStub.self]
+        model.session = URLSession(configuration: config)
+        return model
+    }
+
+    @MainActor @Test func theAppOnlyEnrollsAgainstAServerThatSupportsIt() async throws {
         let (engine, _, root) = try makeEngine()
-        let speakers = SpeakersModel(engine: engine)
-        #expect(speakers.serverSupportsEnrollment == nil && !speakers.canStartEnrollment)
-        speakers.startEnrollment()
-        guard case .failed(let reason) = speakers.enrollment else { Issue.record("started without a server check"); return }
-        #expect(reason.contains("server"))
+        let model = speakers(engine)
+        #expect(model.serverSupportsEnrollment == nil && !model.canStartEnrollment)
+        ServerStub.routes = ["/v1/status": (200, #"{"ok":true,"server_version":"0.0.9"}"#)]  // an older server
+        await model.startEnrollment()
+        guard case .failed(let reason) = model.enrollment else { Issue.record("started against an older server"); return }
+        #expect(reason == SpeakersModel.serverTooOld)
         #expect(events(root).isEmpty, "no start event was written")
+    }
+
+    @MainActor @Test func aFailedRefreshForgetsTheLastServersCapabilities() async throws {
+        let (engine, _, _) = try makeEngine()
+        let model = speakers(engine)
+        ServerStub.routes = [
+            "/v1/status": (200, #"{"ok":true,"features":["voice_enrollment"]}"#),
+            "/v1/people": (200, #"{"people":[]}"#),
+            "/v1/speakers/settings": (200, #"{"acknowledged_at":null,"unknown_voices_enabled":false,"auto_assign":true}"#),
+        ]
+        await model.refresh()
+        #expect(model.serverSupportsEnrollment == true)
+        ServerStub.routes = ["/v1/status": (200, #"{"ok":true}"#)]  // rolled back: no People API, no feature
+        await model.refresh()
+        #expect(model.serverSupportsEnrollment == false && !model.canStartEnrollment)
     }
 
     @Test func enrollmentWindowIsMarkedAndItsAudioHeldUntilTheStartIsAcknowledged() async throws {
@@ -95,4 +119,21 @@ import OmiProtocol
         #expect(data["enrollment_id"] as? String == id && data["outcome"] as? String == "interrupted")
         #expect(engine.snapshotNow().activeEnrollmentId == nil)
     }
+}
+
+
+/// Canned JSON by path for `SpeakersModel` (404 otherwise).
+final class ServerStub: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var routes: [String: (Int, String)] = [:]
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let (status, body) = Self.routes[request.url?.path ?? ""] ?? (404, #"{"error":"not_found","detail":"no route"}"#)
+        let resp = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
+        client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
 }

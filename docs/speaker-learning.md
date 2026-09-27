@@ -68,8 +68,8 @@ relative to `/Users/alan/Developer/_ref/omi`.
 ## Enrollment (wearer, through the pendant)
 
 1. The app requires a live, flowing capture and a server whose `/v1/status` lists the
-   `voice_enrollment` feature (an older server would transcribe the reading), shows consent text,
-   then ~6 sentences (~50 s).
+   `voice_enrollment` feature — asked again right before starting, never a remembered answer (an
+   older server would transcribe the reading) — shows consent text, then ~6 sentences (~50 s).
 2. At start the phone journals an outbox event `voice_enrollment_start` (`capture_id`, `offset_us`,
    `enrollment_id`) and **holds that capture's chunks from the start offset until the start event
    is acknowledged**, so enrollment speech can never reach STT unmarked. A start event that went
@@ -114,7 +114,13 @@ exists → "Is this you?". Dismissals persist with a 7-day cooldown (cf. Omi
   is on and the raw audio exists; a forgotten label's never. The rule is re-applied idempotently on
   every retention pass and after every settings change, so a cleanup a crash interrupted finishes.
 - A voices file is keyed by model, model hash, audio and transcript: a new transcript gets new
-  voices, and an earlier assignment survives only where its label still has the same voice.
+  voices, and an earlier assignment survives only where its label still has the same voice. A
+  forgotten voice has no vector to follow, so after a re-transcription every label that didn't
+  carry over is forgotten too. Label states are moved before anything renders or summarizes a new
+  transcript, also after a crash between the two.
+- A note records the `speakers.json` revision it was rendered from (`render.speakers_revision`);
+  any other revision re-renders it, however the labels changed (a correction during a render, a
+  recovered file, a rebuild).
 
 ## API (bearer auth; errors in the existing shape)
 

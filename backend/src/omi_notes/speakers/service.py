@@ -182,7 +182,8 @@ class SpeakerService:
             if label not in {s["speaker"] for s in transcript.get("segments") or []}:
                 raise ApiError(404, "not_found", f"conversation has no speaker {label}")
             done = self.store.request_result(conv_id, request_id)
-            if done is not None:  # a retry of an applied request: answer with the current state
+            if done is not None:  # a retry of an applied request: finish its work, answer with the current state
+                self.db.set_meta("relabel_pending", "1")
                 return Outcome(row["speakers_revision"], self._label_list(conv_id, transcript), [], done.get("sample", "none"))
             if expected != row["speakers_revision"]:
                 raise ApiError(409, "stale_revision", f"speakers are at revision {row['speakers_revision']}")
@@ -205,15 +206,17 @@ class SpeakerService:
                 state |= {"person_id": None, "source": None}
             state["not"] = sorted(blocked)
             previous = (states.get(label) or {}).get("person_id")
+            removed = 0
             if previous and previous != state.get("person_id"):
                 # the user took this label back from `previous`: so is the voiceprint it gave them
-                self.store.remove_samples(conv_id, label, previous)
+                removed = self.store.remove_samples(conv_id, label, previous)
             states[label] = state
             revision = self.store.write_labels(conv_id, states, transcript_sha=row["transcript_sha"],
                                                request=(request_id, {"label": label, "person_id": person_id, "sample": sample}))  # fmt: skip
             if row["note_path"]:
                 self.pipeline._set(conv_id, needs_render=1, next_attempt_at=None)
-            relabeled = self._relabel(exclude={conv_id}) if sample in ("created", "exists") or person_id else []
+            # people's voices changed (a sample added or taken back): every assignment is re-run
+            relabeled = self._relabel(exclude={conv_id}) if sample in ("created", "exists") or person_id or removed else []
             # the relabel pass may also refresh this conversation's other labels: report the latest
             revision = self.db.one("SELECT speakers_revision FROM conversations WHERE id=?", (conv_id,))[0]
             return Outcome(revision, self._label_list(conv_id, transcript), relabeled, sample)

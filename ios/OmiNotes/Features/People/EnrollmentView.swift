@@ -94,7 +94,7 @@ struct EnrollmentView: View {
                     .font(.footnote).foregroundStyle(.orange)
             }
             Button {
-                speakers.startEnrollment()
+                Task { await speakers.startEnrollment() }
             } label: {
                 Text("Start reading").frame(maxWidth: .infinity)
             }

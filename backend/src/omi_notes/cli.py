@@ -70,7 +70,6 @@ def serve(
     import uvicorn
 
     from .api import create_app
-    from .lock import api_lock
     from .vault import VaultError
 
     settings = _settings()
@@ -80,11 +79,6 @@ def serve(
     except VaultError as exc:
         typer.secho(str(exc), fg=typer.colors.RED)
         raise typer.Exit(2) from exc
-    probe = api_lock(application.state.vault)  # the app takes it at startup; this only gives a clean message
-    if not probe.acquire():
-        typer.secho(f"Another backend (pid {probe.owner()}) is already serving this vault.", fg=typer.colors.RED)
-        raise typer.Exit(2)
-    probe.release()
     uvicorn.run(application, host=host or settings.host, port=port or settings.port, log_level="info")
 
 
@@ -570,12 +564,12 @@ def rebuild_index() -> None:
         lock.release()
         typer.secho("A server or worker is running on this vault: stop it first.", fg=typer.colors.RED)
         raise typer.Exit(1)
-    serving.release()
-    try:
+    try:  # both held throughout: nothing may open the index while it is replaced
         db = open_index(settings, vault, sweep_orphans=False, force_rebuild=True)
         counts = {t: db.one(f"SELECT COUNT(*) AS n FROM {t}")["n"] for t in ("captures", "chunks", "events", "conversations")}
         reason = db.meta("read_only")
     finally:
+        serving.release()
         lock.release()
     typer.echo("Rebuilt the index: " + ", ".join(f"{n} {t}" for t, n in counts.items()))
     if reason:

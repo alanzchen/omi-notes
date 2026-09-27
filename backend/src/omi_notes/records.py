@@ -65,6 +65,8 @@ RENDER_COLUMNS = {
     "language": ("language", "str"),
     "relevance": ("relevance", "str"),
     "done_at": ("done_at", "float"),
+    # the speakers.json revision the note was rendered from: any other revision means re-render
+    "speakers_revision": ("rendered_speakers_revision", "int"),
 }
 
 
@@ -114,7 +116,7 @@ def record_from_row(row, known_through: dict[str, int]) -> dict:
         "failure": None,
     }
     if row["note_path"]:
-        render = {key: _out(row[col], kind) for key, spec in RENDER_COLUMNS.items() if spec for col, kind in [spec]}
+        render = {key: _out(_get(row, col), kind) for key, spec in RENDER_COLUMNS.items() if spec for col, kind in [spec]}
         render["kind"] = (json.loads(row["index_json"]) if row["index_json"] else {}).get("kind")
         record["render"] = render
     if row["status"] == "failed":

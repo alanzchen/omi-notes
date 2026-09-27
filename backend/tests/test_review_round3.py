@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 import time
 import uuid
@@ -10,10 +11,14 @@ import uuid
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from typer.testing import CliRunner
 
+from omi_notes import api as api_mod
+from omi_notes import rebuild as rebuild_mod
 from omi_notes.api import create_app
+from omi_notes.cli import app as cli
 from omi_notes.db import Database
-from omi_notes.lock import worker_lock
+from omi_notes.lock import api_lock, worker_lock
 from omi_notes.pipeline import conversations as conversations_mod
 from omi_notes.pipeline.worker import Worker
 from omi_notes.providers.fake import FakeStt
@@ -24,11 +29,11 @@ from omi_notes.speakers.service import SpeakerService
 from omi_notes.util import canonical_json, sha256_hex
 from omi_notes.vault import Vault, VaultError
 
-from .conftest import AUTH, make_settings
+from .conftest import AUTH, cli_env, make_settings
 from .helpers import STARTED, T0, convs, replay, silence
 from .test_enrollment import CountingStt, start_event
 from .test_enrollment import voice as reading
-from .test_speaker_learning import ALAN, PRIYA, CountingLlm, FakeEmbedder, dialogue, name_label, new_person, talk
+from .test_speaker_learning import ALAN, PRIYA, RAVI, CountingLlm, FakeEmbedder, dialogue, name_label, new_person, talk
 
 
 def make_env(settings):
@@ -380,3 +385,293 @@ def test_a_crash_after_writing_a_note_is_not_mistaken_for_a_user_edit(env, monke
     worker.tick(T0 + 5000)
     (after,) = [r for r in convs(worker) if r["id"] == row["id"]]
     assert after["edited"] == 0 and after["needs_render"] == 0, dict(after)
+
+
+# == second pass (review of 7e41e5a) ==================================================================
+
+
+def test_a_rejected_second_server_writes_nothing(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    with TestClient(create_app(settings, start_worker=False)):
+        opened = []
+        monkeypatch.setattr(api_mod, "open_index", lambda *a, **k: opened.append(1))
+        other = make_settings(tmp_path, index_dir=tmp_path / "another-index", timezone="Europe/Berlin")
+        with pytest.raises(VaultError, match="already serving"):
+            create_app(other, start_worker=False)
+        assert not opened, "no index sweep"
+        assert "Europe/Berlin" not in (settings.vault_dir / "_omi" / "VAULT.json").read_text()
+
+
+def test_rebuild_index_keeps_servers_out_while_it_runs(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    create_app(settings, start_worker=False)
+    seen = {}
+    real = rebuild_mod.open_index
+
+    def watching(*args, **kwargs):
+        seen["serving_blocked"] = api_lock(Vault.open(settings)).held_elsewhere()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(rebuild_mod, "open_index", watching)
+    result = CliRunner().invoke(cli, ["rebuild-index"], env=cli_env(settings))
+    assert result.exit_code == 0, result.output
+    assert seen["serving_blocked"] is True
+
+
+def test_a_forgotten_voice_stays_forgotten_after_retranscription(env):
+    _, client, worker = env
+    acknowledge(client, unknown=True)
+    row = talk(client, worker, dialogue(ALAN, PRIYA))
+    me = new_person(client, "Alan", me=True)
+    name_label(client, row["id"], "S1", me)
+    priya = new_person(client, "Priya", attest_knows=True)
+    name_label(client, row["id"], "S2", priya)
+    assert client.delete(f"/v1/people/{priya}", headers=AUTH).status_code == 200
+    worker.providers._stt = LaterStt()  # Priya's voice is S1 now
+    worker.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1, force_restt = 1 WHERE id=?", (row["id"],))
+    worker.tick(T0 + 800)
+    worker.tick(T0 + 810)
+    stored = voices_file(worker, row["id"])["labels"]
+    assert "vector_b64" not in stored["S1"], "the forgotten voice was stored again under its new label"
+
+
+def test_raw_expiry_resumes_after_a_crash_between_deleting_files_and_the_index(env, monkeypatch):
+    settings, client, worker = env
+    acknowledge(client, unknown=True)
+    row = talk(client, worker, dialogue(ALAN, PRIYA))
+    me = new_person(client, "Alan", me=True)
+    name_label(client, row["id"], "S1", me)
+    assert "vector_b64" in voices_file(worker, row["id"])["labels"]["S2"]
+    later = time.time() + (settings.raw_retention_days + 1) * 86400
+    real_tx = worker.db.tx
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_tx()
+
+    monkeypatch.setattr(worker.db, "tx", flaky)
+    worker.retention(later)
+    assert not list(settings.vault_dir.rglob("*.omnc")), "the files were deleted…"
+    assert worker.db.one("SELECT COUNT(*) AS n FROM chunks WHERE raw_deleted=0")["n"] > 0, "…the index commit was not"
+    monkeypatch.setattr(worker.db, "tx", real_tx)
+    worker.retention(later + 10)
+    assert worker.db.one("SELECT COUNT(*) AS n FROM chunks WHERE raw_deleted=0")["n"] == 0
+    stored = voices_file(worker, row["id"])["labels"]
+    assert "vector_b64" in stored["S1"] and "vector_b64" not in stored["S2"]
+
+
+def test_vector_reconciliation_waits_for_a_speaker_change_in_progress(env):
+    _, _, worker = env
+    store = worker.pipeline.speakers
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def holder():
+        with store.lock:
+            entered.set()
+            release.wait(5)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    assert entered.wait(5)
+    r = threading.Thread(target=lambda: (store.reconcile_vectors(), finished.set()))
+    r.start()
+    assert not finished.wait(0.3), "reconciliation ran while a speaker change held the lock"
+    release.set()
+    t.join(5)
+    r.join(5)
+    assert finished.is_set()
+
+
+def test_a_retranscription_that_crashed_before_its_voices_stage_never_misnames_after_a_rebuild(env, monkeypatch):
+    settings, client, worker = env
+    row = talk(client, worker, dialogue(ALAN, PRIYA))
+    me = new_person(client, "Alan", me=True)
+    name_label(client, row["id"], "S1", me)
+    worker.tick(T0 + 700)
+    assert "[[Alan]]" in (settings.vault_dir / row["note_path"]).read_text()
+    worker.providers._stt = LaterStt()
+
+    def crash(*args, **kwargs):
+        raise OSError("crashed right after transcript.json")
+
+    monkeypatch.setattr(worker.pipeline, "identify", crash)
+    worker.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1, force_restt = 1 WHERE id=?", (row["id"],))
+    worker.tick(T0 + 800)
+    db = open_index(settings, Vault.open(settings), force_rebuild=True)
+    fresh = Worker(settings, db)
+    fresh.providers._embedder, fresh.providers._llm = FakeEmbedder(), CountingLlm()
+    fresh.tick(T0 + 900)
+    fresh.tick(T0 + 910)
+    assert db.one("SELECT person_id FROM speaker_labels WHERE conversation_id=? AND label='S1'", (row["id"],)) is None
+    assert "[[Alan]]" not in (settings.vault_dir / row["note_path"]).read_text(), "Priya's voice is S1 now"
+    assert not list(worker.vault.conversation_dir(row["id"]).glob("voices-*.json")), "the old voices no longer apply"
+
+
+class ShorterStt(FakeStt):
+    """Misses the last turn: a new transcript, but S1 is still the first voice."""
+
+    def transcribe(self, request):
+        response = super().transcribe(request)
+        response["results"]["utterances"] = response["results"]["utterances"][:-1]
+        return response
+
+
+def test_a_retranscription_that_kept_the_voices_keeps_the_names_even_when_retried(env, monkeypatch):
+    _, client, worker = env
+    row = talk(client, worker, dialogue(ALAN, PRIYA))
+    me = new_person(client, "Alan", me=True)
+    name_label(client, row["id"], "S1", me)
+    store = worker.pipeline.speakers
+    real = store.write_labels
+    calls = {"n": 0}
+
+    def failing(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("crashed after the voices file")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(store, "write_labels", failing)
+    worker.providers._stt = ShorterStt()
+    worker.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1, force_restt = 1 WHERE id=?", (row["id"],))
+    worker.tick(T0 + 800)
+    worker.tick(T0 + 5000)
+    worker.tick(T0 + 5010)
+    assert calls["n"] >= 2
+    after = labels(client, row["id"])
+    assert after["S1"]["person_id"] == me and after["S1"]["source"] == "user", "same voice: the correction carried over"
+
+
+def test_a_retried_voices_stage_finishes_the_label_move(env, monkeypatch):
+    _, client, worker = env
+    row = talk(client, worker, dialogue(ALAN, PRIYA))
+    me = new_person(client, "Alan", me=True)
+    name_label(client, row["id"], "S1", me)
+    store = worker.pipeline.speakers
+    real = store.write_labels
+    calls = {"n": 0}
+
+    def failing(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("crashed after the voices file")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(store, "write_labels", failing)
+    worker.providers._stt = LaterStt()
+    worker.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1, force_restt = 1 WHERE id=?", (row["id"],))
+    worker.tick(T0 + 800)
+    assert calls["n"] == 1
+    worker.tick(T0 + 5000)
+    worker.tick(T0 + 5010)
+    assert labels(client, row["id"])["S1"]["person_id"] is None
+    assert len(list(worker.vault.conversation_dir(row["id"]).glob("voices-*.json"))) == 1
+
+
+def test_a_correction_during_a_render_is_rendered_too(env, monkeypatch):
+    settings, client, worker = env
+    row = talk(client, worker, dialogue(ALAN, PRIYA))
+    me = new_person(client, "Alan", me=True)
+    name_label(client, row["id"], "S1", me)
+    pipeline = worker.pipeline
+    real = pipeline.voice_names
+    raced = {}
+
+    def racing(conv_id):
+        names = real(conv_id)
+        if not raced:
+            raced["yes"] = True
+            priya = new_person(client, "Priya")
+            assert name_label(client, row["id"], "S2", priya).status_code == 200
+        return names
+
+    monkeypatch.setattr(pipeline, "voice_names", racing)
+    worker.tick(T0 + 1000)  # renders the names read before the correction
+    monkeypatch.setattr(pipeline, "voice_names", real)
+    worker.tick(T0 + 1100)
+    assert raced and "[[Priya]]" in (settings.vault_dir / row["note_path"]).read_text()
+
+
+def test_a_label_request_that_failed_after_its_file_write_still_renders(env, monkeypatch):
+    settings, client, worker = env
+    row = talk(client, worker, dialogue(ALAN, PRIYA))
+    me = new_person(client, "Alan", me=True)
+    worker.tick(T0 + 600)
+    pipeline = worker.pipeline
+    real = pipeline._set
+    failed = {}
+
+    def failing(conv_id, **fields):
+        if fields.get("needs_render") == 1 and not failed:
+            failed["yes"] = True
+            raise OSError("crashed before scheduling the render")
+        return real(conv_id, **fields)
+
+    monkeypatch.setattr(pipeline, "_set", failing)
+    revision = client.get(f"/v1/conversations/{row['id']}/speakers", headers=AUTH).json()["revision"]
+    body = {"person_id": me, "expected_revision": revision, "request_id": "once"}
+    with pytest.raises(OSError):
+        client.put(f"/v1/conversations/{row['id']}/speakers/S1", json=body, headers=AUTH)
+    monkeypatch.setattr(pipeline, "_set", real)
+    assert client.put(f"/v1/conversations/{row['id']}/speakers/S1", json=body, headers=AUTH).status_code == 200
+    worker.tick(T0 + 1000)
+    assert "[[Alan]]" in (settings.vault_dir / row["note_path"]).read_text()
+
+
+def active_me(client, worker) -> tuple[str, list[dict]]:
+    me = new_person(client, "Alan", me=True)
+    rows = []
+    for day in (6, 5, 4):
+        row = talk(client, worker, dialogue(ALAN, RAVI, seed=day), day=day)
+        assert name_label(client, row["id"], "S1", me).json()["sample"] == "created"
+        rows.append(row)
+    assert {p["name"]: p for p in client.get("/v1/people", headers=AUTH).json()["people"]}["Alan"]["auto_active"]
+    return me, rows
+
+
+def test_taking_back_a_confirmation_withdraws_automatic_names_it_enabled(env):
+    _, client, worker = env
+    me, rows = active_me(client, worker)
+    fresh = talk(client, worker, dialogue(ALAN, PRIYA, seed=40), day=1)
+    assert labels(client, fresh["id"])["S1"]["person_id"] == me
+    name_label(client, rows[0]["id"], "S1", None)  # Alan now has two confirmations: not active
+    assert labels(client, fresh["id"])["S1"]["person_id"] is None
+
+
+def test_an_enrollment_sample_whose_index_write_failed_is_not_duplicated(env, monkeypatch):
+    _, client, worker = env
+    store = worker.pipeline.speakers
+    real = store._index_sample
+    calls = {"n": 0}
+
+    def flaky(data):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(data)
+
+    monkeypatch.setattr(store, "_index_sample", flaky)
+    enrolled(client, worker)
+    worker.tick(T0 + 420)
+    assert calls["n"] >= 2
+    assert len(list(worker.vault.people.glob("*/samples/*.json"))) == 1
+
+
+def test_identification_uses_the_voices_known_after_embedding(env, monkeypatch):
+    _, client, worker = env
+    me, _ = active_me(client, worker)
+    real = conversations_mod.embed_voices
+    forgot = {}
+
+    def forgetting(*args, **kwargs):
+        if not forgot:
+            forgot["yes"] = True
+            assert client.delete(f"/v1/people/{me}", headers=AUTH).status_code == 200
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(conversations_mod, "embed_voices", forgetting)
+    fresh = talk(client, worker, dialogue(ALAN, PRIYA, seed=40), day=1)
+    assert forgot and labels(client, fresh["id"])["S1"]["person_id"] is None
