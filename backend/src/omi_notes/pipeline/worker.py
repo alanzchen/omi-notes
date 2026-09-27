@@ -9,7 +9,8 @@ Each `tick(now)`:
 5. advance closed conversations through STT → LLM → markdown;
 6. refresh in-progress stubs, daily indexes and `_status.md`;
 7. hourly raw-retention cleanup.
-`now` is injectable so tests can drive time. `run_forever` holds `DATA_DIR/worker.lock`.
+`now` is injectable so tests can drive time. `run_forever` holds the host lock (index dir) and the
+vault's writer lease, renews the lease and stops writing if another writer takes it (fencing).
 """
 
 from __future__ import annotations
@@ -29,10 +30,15 @@ from ..envelope import OPUS_CODECS, parse_envelope
 from ..ingest import seal_end_epoch
 from ..lock import WorkerLock
 from ..notes.writer import remove
+from ..rebuild import advance_processed
+from ..records import record_from_row, write_record
 from ..settings import Settings
-from ..util import uuid7
+from ..speakers import enroll
+from ..util import uuid7_for
+from ..vault import LEASE_RENEW_SECONDS, LeaseError, Vault
 from . import segmenter as seg
 from .conversations import (
+    BOOKMARK_REACH,
     PENDING,
     SOURCE_LABEL,
     ConversationPipeline,
@@ -65,10 +71,13 @@ class Worker:
     ) -> None:
         self.settings = settings
         self.db = db
+        self.vault = Vault.open(settings)
         self.clock = clock
+        self.take_over = False
         self.vad = vad or make_vad(settings.vad_backend, settings.vad_model_path, settings.vad_threshold)
         self.providers = providers or Providers(settings)
         self.pipeline = ConversationPipeline(settings, db, self.providers, self.vad.vad.name, self.vad.warning)
+        self.enrollments = enroll.EnrollmentProcessor(self)
         self.params = seg.Params(
             gap=settings.conversation_gap_seconds,
             provisional_wait_open=settings.provisional_wait_open_seconds,
@@ -76,7 +85,7 @@ class Worker:
             soft_max=settings.soft_max_conversation_seconds,
             hard_max=settings.hard_max_conversation_seconds,
         )
-        self.lock = WorkerLock(settings.data_dir)
+        self.lock = WorkerLock(db.path.parent)
         self._decoders: OrderedDict[str, tuple[int, CaptureTimeline, VadStream]] = OrderedDict()
         self._last_retention = 0.0
         self._reconciled = False
@@ -85,35 +94,96 @@ class Worker:
 
     def tick(self, now: float | None = None) -> dict:
         now = self.clock() if now is None else now
+        blocked = read_only_reason(self.db)
+        if blocked:
+            self._status(now, force=False)
+            return {"chunks": 0, "segmentation_changes": 0, "conversations": 0, "read_only": blocked}
         if not self._reconciled:
             self.pipeline.reconcile_days()  # daily indexes may be stale after a crash
             self._reconciled = True
         self.pipeline.reconcile_moves(now)
         chunks = self.process_chunks(now)
         self.finalize_sealed(now)
-        self.reconcile_dropped(now)
-        self.apply_late_events(now)
-        changed = self.segment_all(now)
-        advanced = self.pipeline.run(now)
-        self.pipeline.render_stubs()
-        self.pipeline.render_dailies()
-        try:
-            self.pipeline.render_status(__version__)
-        except OSError:
-            log.exception("could not write _status.md")
-        if now - self._last_retention >= RETENTION_INTERVAL:
+        if self.replaying and not self._ready_chunks():
+            # Recreate the estimated overwritten-record losses without refreshing notes: the
+            # records already hold whatever those losses changed before the rebuild.
+            self.reconcile_dropped(now, silent=True)
+            self.db.set_meta("replay_pending", None)
+            log.info("replay after the index rebuild finished")
+        changed = advanced = 0
+        if not self.replaying:
+            # Gated during a replay: they read speech/coverage/losses the replay is still re-deriving.
+            self.reconcile_dropped(now)
+            self.apply_late_events(now)
+            changed = self.segment_all(now)
+            try:
+                self.pipeline.relabel(now)
+            except Exception:
+                log.exception("could not re-run speaker assignment")
+            try:
+                self.enrollments.run(now)
+            except Exception:
+                log.exception("could not process voice enrollments")
+            advanced = self.pipeline.run(now)
+            self.pipeline.render_stubs(now)
+            self.pipeline.render_dailies()
+        self._status(now)
+        if not self.replaying and now - self._last_retention >= RETENTION_INTERVAL:
+            self.check_divergence()
             self.retention(now)
             self._last_retention = now
         return {"chunks": chunks, "segmentation_changes": changed, "conversations": advanced}
+
+    def check_divergence(self) -> list[str]:
+        """Sync conflict copies / duplicate records under `_omi/` stop all writes until resolved."""
+        problems = self.vault.divergence()
+        reason = ("vault divergence (a sync conflict): " + "; ".join(problems[:5])) if problems else None
+        if reason != self.db.meta("divergence"):
+            if reason:
+                log.error("%s", reason)
+            self.db.set_meta("divergence", reason)
+        return problems
+
+    @property
+    def replaying(self) -> bool:
+        return self.db.meta("replay_pending") == "1"
+
+    def _ready_chunks(self) -> bool:
+        return self.db.one(
+            """SELECT 1 FROM chunks c JOIN captures k ON k.capture_id = c.capture_id
+               WHERE c.status='pending' AND c.chunk_sequence = k.processed_through + 1 LIMIT 1"""
+        ) is not None
+
+    def _status(self, now: float, force: bool = False) -> None:
+        try:
+            self.pipeline.render_status(__version__, now, force=force)
+        except OSError:
+            log.exception("could not write _status.md")
 
     def run_forever(self, stop: threading.Event) -> None:
         if not self.lock.acquire():
             log.error("another worker holds %s; this process only accepts uploads", self.lock.path)
             return
         try:
+            try:
+                writer_id = self.vault.acquire_lease(take_over=self.take_over)
+            except LeaseError as exc:
+                log.error("%s", exc)
+                self.db.set_meta("fenced", str(exc))
+                return
+            self.db.set_meta("fenced", None)
+            renewed = time.time()
             self.pipeline.release_all_claims()  # we own the lock: no other worker is running
             log.info("worker started (tick %.1fs, VAD %s)", self.settings.worker_tick_seconds, self.vad.vad.name)
             while not stop.is_set():
+                if not self.vault.check_lease(writer_id):
+                    reason = "another backend took over this vault's writer lease; this one stopped writing"
+                    log.error(reason)
+                    self.db.set_meta("fenced", reason)
+                    return
+                if time.time() - renewed >= LEASE_RENEW_SECONDS:
+                    self.vault.renew_lease(writer_id)
+                    renewed = time.time()
                 try:
                     result = self.tick()
                     busy = result["chunks"] or result["conversations"]
@@ -163,13 +233,15 @@ class Worker:
         capture = self.db.one("SELECT * FROM captures WHERE capture_id=?", (capture_id,))
         chunk = self.db.one("SELECT * FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq))
         try:
-            env = parse_envelope(Path(chunk["path"]).read_bytes())
+            env = parse_envelope((self.vault.root / chunk["path"]).read_bytes())
             cached = self._decoders.pop(capture_id, None)
             timeline, vad = (cached[1], cached[2]) if cached and cached[0] == seq else self._restore(capture, seq - 1)
             timeline.ring_seen = ring_seen_check(self.db, capture["device_id"], capture_id, seq)
-            final = capture["last_chunk_sequence"] == seq
-            result = timeline.decode_chunk(env, final=final)
-            speech, open_segment = self._detect(vad, result, final)
+            # The seal's flush (pending frame, open speech) is always done by `_finalize` as the
+            # virtual chunk last + 1, whether the seal arrived before or after this chunk: the
+            # result must not depend on arrival order, or a rebuild's replay could differ.
+            result = timeline.decode_chunk(env, final=False)
+            speech, open_segment = self._detect(vad, result, False)
         except Exception as exc:  # VAD/IO errors are retryable, never "silence"
             self._chunk_failed(capture_id, seq, exc, now)
             return False
@@ -181,13 +253,11 @@ class Worker:
             coverage = [(chunk["start_epoch"], chunk["end_epoch"], "live")]
         with self.db.tx() as conn:
             self._store_detection(conn, capture, seq, result, speech, open_segment, losses, coverage, vad, now)
-            conn.execute(
-                "UPDATE captures SET processed_through=?, finalized=? WHERE capture_id=?", (seq, int(final), capture_id)
-            )
-        if not final:
-            self._decoders[capture_id] = (seq + 1, timeline, vad)
-            while len(self._decoders) > TIMELINE_CACHE:
-                self._decoders.popitem(last=False)
+            conn.execute("UPDATE captures SET processed_through=? WHERE capture_id=?", (seq, capture_id))
+            advance_processed(conn, capture_id)  # over chunks already processed (raw expired)
+        self._decoders[capture_id] = (seq + 1, timeline, vad)
+        while len(self._decoders) > TIMELINE_CACHE:
+            self._decoders.popitem(last=False)
         return True
 
     def _chunk_failed(self, capture_id: str, seq: int, exc: Exception, now: float) -> None:
@@ -240,7 +310,7 @@ class Worker:
              capture_id, seq),
         )  # fmt: skip
 
-    def reconcile_dropped(self, now: float) -> None:
+    def reconcile_dropped(self, now: float, *, silent: bool = False) -> None:
         """Losses for records the device overwrote before a sync could read them. INFO `dropped` is
         treated as a cumulative counter: the loss is the increase over the device's previous sync
         (a decrease, or a different generation, means storage was reset). Until both seals have
@@ -251,11 +321,11 @@ class Worker:
                AND dropped_reconciled=0 AND capture_started_at IS NOT NULL"""
         ):
             try:
-                self._reconcile_dropped(capture, now)
+                self._reconcile_dropped(capture, now, silent=silent)
             except Exception:
                 log.exception("could not reconcile dropped records for capture %s", capture["capture_id"])
 
-    def _reconcile_dropped(self, capture, now: float) -> None:
+    def _reconcile_dropped(self, capture, now: float, *, silent: bool = False) -> None:
         capture_id = capture["capture_id"]
         first_audio = self.db.one(
             "SELECT MIN(audio_start) AS t FROM chunks WHERE capture_id=? AND status='processed'", (capture_id,)
@@ -290,7 +360,7 @@ class Worker:
                        VALUES (?,?,?,?,?,?,0)""",
                     (capture["device_id"], *loss, "ring_dropped", delta, capture_id),
                 )
-            if old != loss or complete:
+            if (old != loss or complete) and not silent:
                 self.refresh_losses(capture["device_id"], [x for x in (old, loss) if x] + [(first_audio, first_audio)], now)
             if complete:
                 conn.execute("UPDATE captures SET dropped_reconciled=1 WHERE capture_id=?", (capture_id,))
@@ -303,12 +373,22 @@ class Worker:
         for conv in self.db.query(
             "SELECT * FROM conversations WHERE device_id=? AND status<>'open' AND end >= ? AND start <= ?", (device, lo, hi)
         ):
+            if self.db.one(
+                """SELECT 1 FROM chunks WHERE device_id=? AND raw_deleted=1 AND audio_start IS NOT NULL
+                   AND audio_start <= ? AND audio_end >= ?""",
+                (device, conv["end"] + gap, conv["start"] - gap),
+            ):
+                continue  # raw already expired around it: its recorded evidence stays as it was
             timeline = seg.DeviceTimeline(speech=[], **self._evidence(device, conv["start"] - gap - 5, conv["end"] + gap + 5, now))
             gaps, lost = seg.window_evidence(timeline, conv["start"], conv["end"], now, self.params)
             if json.dumps(gaps) != conv["gaps_json"] or abs(lost - conv["lost_seconds"]) > 1e-6:
+                fields = {"gaps_json": json.dumps(gaps), "lost_seconds": lost}
+                record = record_from_row(dict(conv) | fields, self._known_map([conv["id"]]).get(conv["id"], {}))
+                sha = write_record(self.vault, record)
                 self.db.execute(
-                    "UPDATE conversations SET gaps_json=?, lost_seconds=?, needs_render=(note_path IS NOT NULL), updated_at=? WHERE id=?",
-                    (json.dumps(gaps), lost, now, conv["id"]),
+                    """UPDATE conversations SET gaps_json=?, lost_seconds=?, needs_render=(note_path IS NOT NULL),
+                           record_sha=?, updated_at=? WHERE id=?""",
+                    (json.dumps(gaps), lost, sha, now, conv["id"]),
                 )
 
     def finalize_sealed(self, now: float) -> None:
@@ -333,7 +413,9 @@ class Worker:
         speech, _ = self._detect(vad, flushed, final=True)
         self._decoders.pop(capture["capture_id"], None)
         with self.db.tx() as conn:
-            store_speech(conn, capture["device_id"], capture["capture_id"], last, speech, None)
+            # Flushed speech belongs to the virtual chunk last + 1: a conversation finalized before
+            # the flush has known_through <= last, so it does not know this speech.
+            store_speech(conn, capture["device_id"], capture["capture_id"], last + 1, speech, None)
             conn.executemany(
                 "INSERT INTO losses (device_id, start, end, kind, count, capture_id, chunk_sequence) VALUES (?,?,?,?,?,?,?)",
                 [(capture["device_id"], a, b, kind, n, capture["capture_id"], last) for a, b, kind, n in flushed.losses],
@@ -401,28 +483,60 @@ class Worker:
 
     def device_timeline(self, device: str, now: float) -> tuple[seg.DeviceTimeline, int] | None:
         rows = self.db.query(
-            "SELECT id, start, end FROM speech WHERE device_id=? AND claimed_by IS NULL ORDER BY start", (device,)
+            """SELECT id, start, end, capture_id, chunk_sequence FROM speech
+               WHERE device_id=? AND claimed_by IS NULL ORDER BY start, capture_id, chunk_sequence, id""",
+            (device,),
         )
         if not rows:
             return None
         gap = self.params.gap
         lo = min(r["start"] for r in rows) - gap - 5
         hi = max(r["end"] for r in rows) + gap + 5
-        watermark = self.db.one("SELECT MAX(id) AS m FROM speech")["m"] or 0
+        convs = self.db.query(
+            "SELECT * FROM conversations WHERE device_id=? AND status<>'open' AND end >= ? AND start <= ? ORDER BY start",
+            (device, lo - gap, hi + gap),
+        )
+        known = self._known_map([r["id"] for r in convs])
         finalized = [
-            seg.Finalized(r["id"], r["start"], r["end"], r["speech_watermark"] or 0, bool(r["start_explicit"]), bool(r["end_explicit"]))
-            for r in self.db.query(
-                "SELECT * FROM conversations WHERE device_id=? AND status<>'open' AND end >= ? AND start <= ?",
-                (device, lo - gap, hi + gap),
-            )
+            seg.Finalized(r["id"], r["start"], r["end"], known.get(r["id"], {}), bool(r["start_explicit"]), bool(r["end_explicit"]))
+            for r in convs
         ]
-        timeline = seg.DeviceTimeline(
-            speech=[seg.Speech(r["id"], r["start"], r["end"]) for r in rows],
+        return seg.DeviceTimeline(
+            speech=[seg.Speech(r["id"], r["start"], r["end"], r["capture_id"], r["chunk_sequence"]) for r in rows],
             splits=self.effective_splits(device, lo - gap, hi + gap),
             finalized=finalized,
             **self._evidence(device, lo, hi, now),
         )
-        return timeline, watermark
+
+    def _known_map(self, conv_ids: list[str]) -> dict[str, dict[str, int]]:
+        known: dict[str, dict[str, int]] = {}
+        for i in range(0, len(conv_ids), 500):
+            part = conv_ids[i : i + 500]
+            for r in self.db.query(
+                f"SELECT * FROM known_through WHERE conversation_id IN ({','.join('?' * len(part))})", tuple(part)
+            ):
+                known.setdefault(r["conversation_id"], {})[r["capture_id"]] = r["seq"]
+        return known
+
+    def known_through(self, device: str, start: float, end: float) -> dict[str, int]:
+        """What a conversation closing now knows, per capture: everything processed so far (the
+        seal flush counts as chunk last + 1). Finalized captures whose audio is nowhere near the
+        window can never matter to it and are left out."""
+        gap = self.params.gap
+        lo, hi = start - gap - 5, end + gap + 5
+        known: dict[str, int] = {}
+        for r in self.db.query(
+            """SELECT k.capture_id, k.processed_through, k.finalized, k.last_chunk_sequence FROM captures k
+               WHERE k.device_id=? AND (k.finalized=0 OR EXISTS (
+                   SELECT 1 FROM chunks c WHERE c.capture_id = k.capture_id AND c.audio_start IS NOT NULL
+                   AND c.audio_start <= ? AND c.audio_end >= ?))""",
+            (device, hi, lo),
+        ):
+            if r["finalized"] and r["last_chunk_sequence"] is not None:
+                known[r["capture_id"]] = r["last_chunk_sequence"] + 1
+            elif r["processed_through"] >= 0:
+                known[r["capture_id"]] = r["processed_through"]
+        return known
 
     def _evidence(self, device: str, lo: float, hi: float, now: float) -> dict:
         """Coverage, capture spans, sync watermark, policy and losses around [lo, hi]."""
@@ -515,55 +629,48 @@ class Worker:
     def ring_watermark(self, device: str, now: float) -> float | None:
         return seg.ring_resolved_until(ring_captures(self.db, device, now), processed_ring_ranges(self.db, device))
 
+    def capture_reached(self, capture_id: str, t: float) -> bool:
+        """The capture's audio up to `t` has been processed (or the whole capture has)."""
+        reached = self.db.one(
+            """SELECT MAX(c.end_epoch) AS m FROM chunks c JOIN captures k ON k.capture_id = c.capture_id
+               WHERE c.capture_id=? AND c.chunk_sequence <= k.processed_through""",
+            (capture_id,),
+        )["m"]
+        cap = self.db.one("SELECT * FROM captures WHERE capture_id=?", (capture_id,))
+        complete = cap is not None and cap["last_chunk_sequence"] is not None and cap["processed_through"] >= cap["last_chunk_sequence"]
+        return complete or (reached is not None and reached >= t)
+
     def effective_splits(self, device: str, lo: float, hi: float) -> list[float]:
-        """Double-tap times in [lo, hi] whose capture audio up to that moment has been processed."""
-        splits = []
-        for ev in self.db.query(
+        """Double-tap times and voice-enrollment window boundaries in [lo, hi] whose capture audio
+        up to that moment has been processed."""
+        points = [(ev["t"], ev["capture_id"]) for ev in self.db.query(
             "SELECT * FROM event_times WHERE device_id=? AND type='button' AND code=2 AND t BETWEEN ? AND ?",
             (device, lo, hi),
-        ):
-            t = ev["t"]
-            if ev["capture_id"]:
-                reached = self.db.one(
-                    """SELECT MAX(c.end_epoch) AS m FROM chunks c JOIN captures k ON k.capture_id = c.capture_id
-                       WHERE c.capture_id=? AND c.chunk_sequence <= k.processed_through""",
-                    (ev["capture_id"],),
-                )["m"]
-                cap = self.db.one("SELECT * FROM captures WHERE capture_id=?", (ev["capture_id"],))
-                complete = cap is not None and cap["last_chunk_sequence"] is not None and cap["processed_through"] >= cap["last_chunk_sequence"]
-                if not complete and (reached is None or reached < t):
-                    continue
-            splits.append(t)
-        return splits
+        )]  # fmt: skip
+        points += [(t, cap) for t, cap in enroll.boundaries(enroll.windows(self.db, device)) if lo <= t <= hi]
+        return sorted(t for t, cap in points if not cap or self.capture_reached(cap, t))
 
     def segment_device(self, device: str, now: float) -> int:
-        built = self.device_timeline(device, now)
-        open_rows = self.db.query("SELECT * FROM conversations WHERE device_id=? AND status='open'", (device,))
-        candidates = seg.segment(built[0], now, self.params) if built else []
-        watermark = built[1] if built else 0
-        if built:
-            for speech_id in seg.fully_claimed(built[0]):
+        """Apply `segmenter.segment` for one device. Open conversations are recomputed every tick
+        (their id derives from device + start, so the same decision gets the same id after a
+        rebuild); a closing one gets its permanent record written before the index says so."""
+        timeline = self.device_timeline(device, now)
+        open_rows = {r["id"]: r for r in self.db.query("SELECT * FROM conversations WHERE device_id=? AND status='open'", (device,))}
+        candidates = seg.segment(timeline, now, self.params) if timeline else []
+        if timeline:
+            for speech_id in seg.fully_claimed(timeline):
                 self.db.execute("UPDATE speech SET claimed_by='*' WHERE id=?", (speech_id,))
-        used: set[str] = set()
+        keep: set[str] = set()
         changes = 0
+        windows = enroll.windows(self.db, device)
         for c in candidates:
-            matches = [r for r in open_rows if r["id"] not in used and r["start"] <= c.end and c.start <= r["end"]]
-            if matches:
-                conv_id = min(matches, key=lambda r: r["created_at"])["id"]
-            else:
-                conv_id = uuid7(c.start)
-                self.db.execute(
-                    "INSERT INTO conversations (id, device_id, start, end, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
-                    (conv_id, device, c.start, c.end, "open", now, now),
-                )
-                changes += 1
-            used.add(conv_id)
+            conv_id = self._conversation_id(device, c.start)
+            keep.add(conv_id)
             fields = {
                 "start": c.start,
                 "end": c.end,
                 "speech_seconds": c.speech_seconds,
                 "blocks_json": json.dumps(c.blocks),
-                "speech_ids_json": json.dumps(list(c.speech_ids)),
                 "gaps_json": json.dumps(c.audio_gaps),
                 "lost_seconds": c.lost_seconds,
                 "late_audio": int(c.late_audio),
@@ -572,38 +679,86 @@ class Worker:
                 "end_explicit": int(c.end_explicit),
                 "waiting_for": c.waiting_for or None,
             }
+            current = open_rows.get(conv_id)
+            if current is None:
+                self.db.execute(
+                    "INSERT INTO conversations (id, device_id, start, end, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+                    (conv_id, device, c.start, c.end, "open", now, now),
+                )
+                current = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
+                changes += 1
+            verdict = enroll.classify(windows, c.start, c.end, now, self.enrollments.capture_finished) if c.closed else None
+            if verdict and verdict[0] == "wait":
+                # its enrollment window's end isn't known yet: stay open, so the reading can't reach STT
+                fields["waiting_for"] = "voice enrollment"
+                if any(current[k] != v for k, v in fields.items()):
+                    fields["updated_at"] = now
+                    self.db.execute(f"UPDATE conversations SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?",
+                                    (*fields.values(), conv_id))  # fmt: skip
+                continue
             if c.closed:
                 sources, clock_suspect = self._sources(device, c.start, c.end)
-                fields |= {
-                    "status": "closed",
-                    "provisional": int(c.provisional),
-                    "speech_watermark": watermark,
-                    "finalized_at": now,
-                    "sources_json": json.dumps(sources),
-                    "clock_suspect": int(clock_suspect),
-                }
-                changes += 1
-            current = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
-            if any(current[k] != v for k, v in fields.items()):
-                fields["updated_at"] = now
-                cols = ", ".join(f"{k}=?" for k in fields)
-                self.db.execute(f"UPDATE conversations SET {cols} WHERE id=?", (*fields.values(), conv_id))
+                fields |= {"status": "closed", "provisional": int(c.provisional), "finalized_at": now,
+                           "sources_json": json.dumps(sources), "clock_suspect": int(clock_suspect), "waiting_for": None}  # fmt: skip
+                if verdict and verdict[0] == "inside":
+                    # the wearer's enrollment reading: finalized as discarded, never transcribed
+                    fields |= {"status": "discarded", "enrollment_id": verdict[1], "stub_path": None}
+                    if current["stub_path"]:
+                        remove(self.settings.vault_dir / current["stub_path"])
+                self._close(current, fields, self.known_through(device, c.start, c.end), now)
                 self.pipeline.mark_day(c.start)
-            if c.closed:
-                self.db.execute(
-                    """UPDATE speech SET claimed_by=? WHERE device_id=? AND claimed_by IS NULL AND id <= ?
-                       AND start >= ? AND end <= ?""",
-                    (conv_id, device, watermark, c.start - 1e-6, c.end + 1e-6),
-                )
-                log.info("conversation %s closed (%s)%s", conv_id, device[:8], " provisionally" if c.provisional else "")
-        for r in open_rows:
-            if r["id"] not in used:
+                changes += 1
+                log.info("conversation %s closed (%s)%s%s", conv_id, device[:8], " provisionally" if c.provisional else "",
+                         " as a voice enrollment" if verdict else "")  # fmt: skip
+            elif any(current[k] != v for k, v in fields.items()):
+                fields["updated_at"] = now
+                self.db.execute(f"UPDATE conversations SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?",
+                                (*fields.values(), conv_id))  # fmt: skip
+                self.pipeline.mark_day(c.start)
+        for conv_id, r in open_rows.items():
+            if conv_id not in keep:
                 if r["stub_path"]:
-                    remove(self.settings.notes_dir / r["stub_path"])
-                self.db.execute("DELETE FROM conversations WHERE id=?", (r["id"],))
+                    remove(self.settings.vault_dir / r["stub_path"])
+                self.db.execute("DELETE FROM conversations WHERE id=?", (conv_id,))
                 self.pipeline.mark_day(r["start"])
                 changes += 1
         return changes
+
+    def _conversation_id(self, device: str, start: float) -> str:
+        conv_id = uuid7_for(start, f"{device}|{start:.6f}")
+        clash = self.db.one("SELECT status FROM conversations WHERE id=?", (conv_id,))
+        if clash is not None and clash["status"] != "open":  # late audio starting exactly at a finalized start
+            conv_id = uuid7_for(start, f"{device}|{start:.6f}|late")
+        return conv_id
+
+    def _close(self, row, fields: dict, known: dict[str, int], now: float) -> None:
+        """Finalize: the permanent record first, then the index (row, known_through, claims)."""
+        conv_id = row["id"]
+        record = record_from_row(dict(row) | fields, known)
+        sha = write_record(self.vault, record)
+        fields = fields | {"record_sha": sha, "updated_at": now}
+        with self.db.tx() as conn:
+            conn.execute(f"UPDATE conversations SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?",
+                         (*fields.values(), conv_id))  # fmt: skip
+            conn.execute("DELETE FROM known_through WHERE conversation_id=?", (conv_id,))
+            conn.executemany("INSERT INTO known_through (conversation_id, capture_id, seq) VALUES (?,?,?)",
+                             [(conv_id, cap, seq) for cap, seq in known.items()])  # fmt: skip
+            conn.execute(
+                """UPDATE speech SET claimed_by=? WHERE device_id=? AND claimed_by IS NULL AND start >= ? AND end <= ?
+                   AND chunk_sequence <= (SELECT k.seq FROM known_through k
+                                          WHERE k.conversation_id=? AND k.capture_id = speech.capture_id)""",
+                (conv_id, row["device_id"], fields["start"] - 1e-6, fields["end"] + 1e-6, conv_id),
+            )
+            # A bookmark near finished notes may now belong to this conversation: re-render them
+            # (from cache) so a note never keeps a bookmark it lost, whatever order things arrived in.
+            reach = BOOKMARK_REACH
+            conn.execute(
+                """UPDATE conversations SET needs_render=1 WHERE device_id=? AND id<>? AND note_path IS NOT NULL
+                   AND status IN ('done','discarded','failed') AND end >= ? AND start <= ? AND EXISTS (
+                       SELECT 1 FROM event_times e WHERE e.device_id = conversations.device_id AND e.type='button'
+                       AND e.code=1 AND e.t BETWEEN conversations.start - ? AND conversations.end + ?)""",
+                (row["device_id"], conv_id, fields["start"] - 2 * reach, fields["end"] + 2 * reach, reach, reach),
+            )
 
     def _sources(self, device: str, start: float, end: float) -> tuple[list[str], bool]:
         rows = self.db.query(
@@ -634,6 +789,8 @@ class Worker:
             (r["device_id"], r["start"], r["end"])
             for r in self.db.query("SELECT device_id, start, end FROM speech WHERE claimed_by IS NULL")
         ]
+        # an undecided voice enrollment keeps its window's audio until the result is written
+        spans += [(w.device_id, w.start, w.end if w.end is not None else now) for w in self.enrollments.undecided()]
         for device, start, end in spans:
             for r in self.db.query(
                 """SELECT capture_id, MIN(chunk_sequence) AS lo, MAX(chunk_sequence) AS hi FROM chunks
@@ -642,25 +799,93 @@ class Worker:
                 (device, end + 2, start - 2),
             ):
                 protected.update((r["capture_id"], s) for s in range(r["lo"], r["hi"] + 1))
-        deleted = 0
+        by_capture: dict[str, list] = {}
         for chunk in self.db.query(
-            "SELECT * FROM chunks WHERE status='processed' AND raw_deleted=0 AND received_at < ?", (cutoff,)
+            "SELECT * FROM chunks WHERE status='processed' AND raw_deleted=0 AND received_at < ? ORDER BY capture_id, chunk_sequence",
+            (cutoff,),
         ):
-            if (chunk["capture_id"], chunk["chunk_sequence"]) in protected:
-                continue
+            if (chunk["capture_id"], chunk["chunk_sequence"]) not in protected:
+                by_capture.setdefault(chunk["capture_id"], []).append(chunk)
+        deleted = 0
+        for capture_id, chunks in by_capture.items():
             try:
-                Path(chunk["path"]).unlink(missing_ok=True)
-            except OSError:
-                log.exception("retention: could not delete %s", chunk["path"])
-                continue
-            self.db.execute(
-                "UPDATE chunks SET raw_deleted=1 WHERE capture_id=? AND chunk_sequence=?",
-                (chunk["capture_id"], chunk["chunk_sequence"]),
-            )
-            deleted += 1
+                deleted += self._expire(capture_id, chunks, now)
+            except Exception:  # one capture's problem must not stop the others
+                log.exception("retention: could not expire raw audio of capture %s", capture_id)
         if deleted:
             log.info("retention: deleted %d raw chunks", deleted)
         return deleted
+
+    def _expire(self, capture_id: str, chunks: list, now: float) -> int:
+        """Delete raw chunks of one capture: first `capture.json` (what they contributed: chunk
+        facts, coverage, losses, ring ownership, tentative speech, continuation checkpoints), then
+        a `<seq>.gone` tombstone per chunk, then the `.omnc` files, then the index."""
+        capture = self.db.one("SELECT * FROM captures WHERE capture_id=?", (capture_id,))
+        device = capture["device_id"]
+        already = {r["chunk_sequence"] for r in self.db.query(
+            "SELECT chunk_sequence FROM chunks WHERE capture_id=? AND raw_deleted=1", (capture_id,))}  # fmt: skip
+        seqs = sorted(already | {c["chunk_sequence"] for c in chunks})
+        Vault.write_json(self.vault.capture_json_path(device, capture_id), self._evidence_for(capture, set(seqs)))
+        for chunk in chunks:
+            path = self.vault.root / chunk["path"]
+            header = parse_envelope(path.read_bytes()).header.model_dump(mode="json")
+            tomb = {"sha256": chunk["sha256"], "size": chunk["size"], "header": header, "deleted_at": now}
+            Vault.write_json(self.vault.tombstone_path(device, capture_id, chunk["chunk_sequence"]), tomb, pretty=False)
+        for chunk in chunks:
+            remove(self.vault.root / chunk["path"])
+        with self.db.tx() as conn:
+            conn.executemany("UPDATE chunks SET raw_deleted=1 WHERE capture_id=? AND chunk_sequence=?",
+                             [(capture_id, c["chunk_sequence"]) for c in chunks])  # fmt: skip
+        self._prune_voices(device, chunks)
+        return len(chunks)
+
+    def _prune_voices(self, device: str, chunks: list) -> None:
+        """Unknown-voice vectors live only as long as the conversation's raw audio."""
+        starts = [c["audio_start"] for c in chunks if c["audio_start"] is not None]
+        ends = [c["audio_end"] for c in chunks if c["audio_end"] is not None]
+        if not starts:
+            return
+        for conv in self.db.query(
+            """SELECT DISTINCT v.conversation_id FROM voices v JOIN conversations c ON c.id = v.conversation_id
+               WHERE c.device_id=? AND c.end >= ? AND c.start <= ? AND v.vector IS NOT NULL""",
+            (device, min(starts) - 2, max(ends) + 2),
+        ):
+            conv_id = conv["conversation_id"]
+            keep = {label for label, state in self.pipeline.speakers.labels(conv_id).items() if state.get("person_id")}
+            self.pipeline.speakers.prune_vectors(conv_id, keep)
+
+    def _evidence_for(self, capture, seqs: set[int]) -> dict:
+        capture_id = capture["capture_id"]
+        marks = ",".join("?" * len(seqs))
+        args = (capture_id, *sorted(seqs))
+        deleted = {}
+        for c in self.db.query(f"SELECT * FROM chunks WHERE capture_id=? AND chunk_sequence IN ({marks})", args):
+            seq = c["chunk_sequence"]
+            deleted[str(seq)] = {
+                "audio_start": c["audio_start"],
+                "audio_end": c["audio_end"],
+                "runs": json.loads(c["runs_json"] or "[]"),
+                "stats": json.loads(c["stats_json"] or "{}"),
+                # continuation checkpoint: decoding can resume after the last deleted chunk of a run
+                "carry": json.loads(c["carry_json"]) if c["carry_json"] and seq + 1 not in seqs else None,
+            }
+        rows = lambda sql: [list(r) for r in self.db.query(sql.format(marks=marks), args)]  # noqa: E731
+        return {
+            "capture_id": capture_id,
+            "device_id": capture["device_id"],
+            "finalized": bool(capture["finalized"]),
+            "deleted": deleted,
+            "coverage": rows("""SELECT chunk_sequence, kind, start, end FROM coverage WHERE capture_id=?
+                                AND chunk_sequence IN ({marks}) AND kind IN ('live','ring') ORDER BY id"""),
+            "losses": rows("""SELECT chunk_sequence, start, end, kind, count FROM losses WHERE capture_id=?
+                              AND chunk_sequence IN ({marks}) AND kind <> 'ring_dropped' ORDER BY id"""),
+            "ring_seen": rows("""SELECT chunk_sequence, ring_seq, record_hash FROM ring_seen WHERE capture_id=?
+                                 AND chunk_sequence IN ({marks}) ORDER BY ring_seq"""),
+            "ring_records": rows("""SELECT chunk_sequence, ring_seq, record_hash FROM ring_records WHERE capture_id=?
+                                    AND chunk_sequence IN ({marks}) ORDER BY ring_seq"""),
+            "speech_open": rows("""SELECT chunk_sequence, start, end FROM speech WHERE capture_id=? AND open=1
+                                   AND chunk_sequence IN ({marks}) ORDER BY id"""),
+        }
 
 
 def store_speech(conn, device: str, capture_id: str, seq: int, completed: list, open_segment) -> None:
@@ -699,11 +924,18 @@ def store_speech(conn, device: str, capture_id: str, seq: int, completed: list, 
             if b - a >= MIN_SPEECH:
                 extend(b, 0)
             else:
+                # Kept only for a conversation finalized *over* them: one that knew the rows but not
+                # this chunk (a conversation finalized later saw them deleted). The rule reads
+                # known_through, not the current set of conversations, so a rebuild's replay (which
+                # has every record from the start) decides exactly as the first pass did.
                 conn.execute(
-                    """DELETE FROM speech WHERE capture_id=? AND open=1 AND claimed_by IS NULL AND NOT EXISTS (
-                           SELECT 1 FROM conversations c WHERE c.device_id = speech.device_id AND c.status <> 'open'
-                           AND c.speech_watermark >= speech.id AND c.start < speech.end AND c.end > speech.start)""",
-                    (capture_id,),
+                    """DELETE FROM speech WHERE capture_id=? AND open=1 AND NOT EXISTS (
+                           SELECT 1 FROM conversations c JOIN known_through k
+                             ON k.conversation_id = c.id AND k.capture_id = speech.capture_id
+                           WHERE c.device_id = speech.device_id AND c.status <> 'open'
+                             AND k.seq >= speech.chunk_sequence AND k.seq < ?
+                             AND c.start < speech.end AND c.end > speech.start)""",
+                    (capture_id, seq),
                 )
             conn.execute("UPDATE speech SET open=0 WHERE capture_id=? AND open=1", (capture_id,))
             tentative, seg_start = [], None
@@ -715,3 +947,12 @@ def store_speech(conn, device: str, capture_id: str, seq: int, completed: list, 
             extend(b, 1)
         else:
             insert(a, b, 1)
+
+
+def read_only_reason(db: Database) -> str | None:
+    """Why the vault must not be written right now (incomplete vault, divergence, lost lease)."""
+    for key in ("read_only", "divergence", "fenced"):
+        value = db.meta(key)
+        if value:
+            return value
+    return None

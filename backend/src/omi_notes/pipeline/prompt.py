@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-PROMPT_VERSION = 1
+PROMPT_VERSION = 2
 
 LANGUAGE_NAMES = {
     "en": "English", "de": "German", "es": "Spanish", "fr": "French", "it": "Italian",
@@ -123,6 +123,7 @@ def build_user_message(
     provisional: bool,
     audio_gaps: list[list[float]],
     now: float,
+    speaker_names: dict[str, tuple[str, bool]] | None = None,
 ) -> str:
     words = sum(len(seg["text"].split()) for seg in segments)
     started_local = datetime.fromtimestamp(start, tz)
@@ -138,6 +139,10 @@ def build_user_message(
         f"- Current local time: {now_local.strftime('%Y-%m-%dT%H:%M')}",
         f"- Device owner's name: {owner_name or 'unknown'} (never assume which speaker label is the owner)",
     ]
+    if speaker_names:
+        known = "; ".join(f"{label} = the owner ({name})" if me else f"{label} = {name}"
+                          for label, (name, me) in sorted(speaker_names.items(), key=lambda kv: _label_order(kv[0])))  # fmt: skip
+        lines.append(f"- Speakers recognized by voice: {known}. Use these names for those labels.")
     if bookmarks:
         marks = ", ".join(offset_label(b - start) for b in bookmarks)
         lines.append(f"- The owner tapped the device to bookmark moments at: {marks}. Give those moments weight.")
@@ -145,3 +150,7 @@ def build_user_message(
         lines.append("- Parts of the audio may be missing; do not speculate about what was said there.")
     lines += ["", "FULL TRANSCRIPT", *transcript_lines(segments, start)]
     return "\n".join(lines)
+
+
+def _label_order(label: str) -> tuple[int, str]:
+    return (int(label[1:]) if label[1:].isdigit() else 10**6, label)

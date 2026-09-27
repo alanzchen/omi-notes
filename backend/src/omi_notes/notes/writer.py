@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import threading
 from datetime import datetime
@@ -43,6 +44,19 @@ def extract_my_notes(text: str) -> str | None:
     if match is None or end < match.end():
         raise UserRegionError("markers are not in the My Notes section")
     return text[match.end() : end]
+
+
+def generated_sha(text: str) -> str:
+    """sha256 of a note without its My Notes content: equal before and after the user writes in
+    My Notes, different once anything else was edited (`written_sha`, docs/vault.md "Notes")."""
+    try:
+        mine = extract_my_notes(text)
+    except UserRegionError:
+        mine = None
+    if mine:
+        start = text.find(MY_NOTES_START) + len(MY_NOTES_START)
+        text = text[:start] + text[start + len(mine) :]
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def read_note_id(path: Path) -> str | None:

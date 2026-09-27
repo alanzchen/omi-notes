@@ -97,7 +97,7 @@ def convs(worker) -> list[dict]:
 
 
 def note_text(settings, row) -> str:
-    return (settings.notes_dir / row["note_path"]).read_text()
+    return (settings.vault_dir / row["note_path"]).read_text()
 
 
 __all__ = ["STARTED", "T0", "SR", "silence", "tone", "iso", "replay", "live", "live_seal", "ring_seal",

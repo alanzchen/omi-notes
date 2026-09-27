@@ -109,13 +109,13 @@ def test_f02_retention_keeps_empty_chunks_inside_a_pending_decode_range(client, 
     pcm = np.concatenate([synth_speech_like(15), silence(60), synth_speech_like(5), silence(3)])
     live(client, pcm, offline_storage=False, chunk_seconds=20)
     empty = worker.db.one("SELECT * FROM chunks WHERE chunk_sequence=2")
-    assert parse_envelope(Path(empty["path"]).read_bytes()).header.record_count == 0
+    assert parse_envelope((settings.vault_dir / empty["path"]).read_bytes()).header.record_count == 0
     worker.providers._stt = AlwaysBusyStt()
     worker.tick(T0 + 400)
     (row,) = convs(worker)
     assert row["status"] == "transcribing"
     worker.retention(time.time() + 31 * 86400)
-    assert Path(empty["path"]).exists()
+    assert (settings.vault_dir / empty["path"]).exists()
     audio = worker.pipeline.conversation_audio(worker.db.one("SELECT * FROM conversations"))
     assert len(audio.pcm) > 0
 
@@ -140,7 +140,7 @@ def test_f03_moving_a_note_keeps_my_notes_and_survives_a_failed_write(client, wo
     replay(client, SPEECH)
     worker.tick(T0 + 200)
     (row,) = convs(worker)
-    old = settings.notes_dir / row["note_path"]
+    old = settings.vault_dir / row["note_path"]
     add_my_notes(old, "Remember to call Priya.")
     worker.providers._llm = DiscardingLlm()
     for cached in worker.pipeline.conv_dir(row["id"]).glob("llm-*.json"):
@@ -193,7 +193,7 @@ def test_f04_generated_text_cannot_impersonate_the_my_notes_region(client, worke
     event(client, "button", at=T0 + 5, capture_id=capture, offset_us=5_000_000, data={"code": 1})
     worker.tick(T0 + 300)
     (row,) = convs(worker)
-    path = settings.notes_dir / row["note_path"]
+    path = settings.vault_dir / row["note_path"]
     text = path.read_text()
     assert text.count("<!-- my-notes:start -->") == 1 and text.count("<!-- my-notes:end -->") == 1
     add_my_notes(path, "Real user text")
@@ -208,13 +208,13 @@ def test_f04_ambiguous_markers_leave_the_file_untouched(client, worker, settings
     replay(client, SPEECH)
     worker.tick(T0 + 200)
     (row,) = convs(worker)
-    path = settings.notes_dir / row["note_path"]
+    path = settings.vault_dir / row["note_path"]
     add_my_notes(path, "mine\n<!-- my-notes:start -->\nconfusing")
     before = path.read_bytes()
     worker.db.execute("UPDATE conversations SET needs_render=1 WHERE id=?", (row["id"],))
     worker.tick(T0 + 300)
     assert path.read_bytes() == before
-    assert "My Notes" in (settings.notes_dir / "_status.md").read_text()
+    assert "My Notes" in (settings.vault_dir / "_status.md").read_text()
 
 
 # 5 -----------------------------------------------------------------------------------------------
@@ -331,7 +331,7 @@ def test_f10_maintenance_only_queues_work_while_a_worker_runs(client, worker, se
     replay(client, SPEECH)
     worker.tick(T0 + 200)
     (row,) = convs(worker)
-    lock = WorkerLock(settings.data_dir)
+    lock = WorkerLock(settings.db_path.parent)
     assert lock.acquire()
     try:
         result = CliRunner().invoke(cli, ["reprocess", row["id"], "--force-llm"], env=cli_env(settings))
@@ -395,7 +395,7 @@ def test_f11_republishing_after_a_crash_reuses_the_existing_file(client, worker,
         "UPDATE conversations SET note_path=NULL, status='summarizing', content_sha=NULL, revision=0 WHERE id=?", (row["id"],)
     )
     worker.tick(T0 + 300)
-    files = sorted(p.name for p in (settings.notes_dir / "Conversations").rglob("*.md"))
+    files = sorted(p.name for p in (settings.vault_dir / "Conversations").rglob("*.md"))
     assert len(files) == 1 and convs(worker)[0]["note_path"] == row["note_path"]
 
 
@@ -558,9 +558,9 @@ def test_f18_daily_index_is_rebuilt_after_a_crash(client, worker, settings, monk
     with pytest.raises(RuntimeError):
         worker.tick(T0 + 200)
     assert convs(worker)[0]["status"] == "done"
-    assert not (settings.notes_dir / "Daily").exists()
+    assert not (settings.vault_dir / "Daily").exists()
     Worker(settings, Database(settings.db_path)).tick(T0 + 300)
-    assert (settings.notes_dir / "Daily" / "2026-09-26.md").exists()
+    assert (settings.vault_dir / "Daily" / "2026-09-26.md").exists()
 
 
 # 19 ----------------------------------------------------------------------------------------------
@@ -570,7 +570,7 @@ def test_f19_rebuild_uses_the_summary_a_note_was_made_with(client, worker, setti
     replay(client, SPEECH)
     worker.tick(T0 + 200)
     (row,) = convs(worker)
-    path = settings.notes_dir / row["note_path"]
+    path = settings.vault_dir / row["note_path"]
     before = path.read_bytes()
     path.unlink()
     monkeypatch.setattr(prompt, "PROMPT_VERSION", prompt.PROMPT_VERSION + 1)

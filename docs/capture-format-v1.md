@@ -10,7 +10,8 @@ Both sides must change together. Test fixtures live in `contracts/fixtures/`.
 - The server does framing, decoding, VAD, segmentation, STT, and summarization.
 - Chunks are a **transport unit**, not a conversation boundary. Conversations are segmented
   per device on the server across all captures (live and offline storage).
-- A successful upload response means "durably stored on the server and queued". It does
+- A successful upload response means "durably stored in the server's vault (file and new parent
+  directories fsync'd, see `docs/vault.md`) and indexed/queued". It does
   **not** mean transcribed.
 - Everything is idempotent: re-uploading an identical chunk is a no-op success.
 - Nothing that the server has not acknowledged is ever evicted from the phone.
@@ -147,6 +148,7 @@ No auth. `200 {"ok": true}`.
   "stt": {"provider": "deepgram", "ready": true},
   "llm": {"provider": "anthropic", "ready": true},
   "queue": {"chunks_pending": 0, "conversations_open": 1, "conversations_pending": 0, "failed": 0},
+  "vault_dir": "/Users/alan/Notes/Omi",
   "notes_dir": "/Users/alan/Notes/Omi"
 }
 ```
@@ -160,7 +162,7 @@ Body: one envelope. Headers:
 
 | Status | Meaning | Phone action |
 |---|---|---|
-| `201` | Stored for the first time (fsync'd + committed to the ledger) | mark acknowledged (move to `sent/`) |
+| `201` | Stored for the first time (file fsync'd in the vault + index committed) | mark acknowledged (move to `sent/`) |
 | `200` | Identical chunk already stored | mark acknowledged |
 | `400` | `X-Content-SHA256` mismatch / HTTP body length mismatch | re-verify the local file's SHA-256; retry up to 5 times, then quarantine |
 | `401` | Bad token | stop, show "needs attention" |
@@ -233,6 +235,8 @@ Small JSON side events, uploaded through the same durable outbox:
 | `type` | `data` |
 |---|---|
 | `button` | `{"code": 1}` single tap = bookmark (rendered in the note); `{"code": 2}` double tap = end the current conversation now |
+| `voice_enrollment_start` | `{"enrollment_id": "<uuid>"}` with top-level `capture_id` + `offset_us` (window start on the live capture). The phone holds that capture's chunks from here until this event is acknowledged. |
+| `voice_enrollment_end` | `{"enrollment_id": "<uuid>", "end_offset_us": 55000000, "outcome": "completed" \| "cancelled" \| "interrupted"}` with top-level `capture_id` + `offset_us` (= the end). Held by the phone until the start is acknowledged. Speech inside the window is never transcribed; only `completed` windows are judged for enrollment (`docs/speaker-learning.md`). |
 | `heartbeat` | `{"battery": 83, "charging": false, "firmware_revision": "3.0.21", "model_number": "Omi CV 1", "rtc_valid": true, "offline_unread": 0, "outbox_chunks": 3, "outbox_bytes": 812345, "app_state": "background", "coverage": {"capture_id": "…", "through_offset_us": 734000000, "through_chunk_sequence": 11}}` (all optional) |
 
 `201` first receipt, `200` duplicate (same id and body), `409` same id with a different body (keep,

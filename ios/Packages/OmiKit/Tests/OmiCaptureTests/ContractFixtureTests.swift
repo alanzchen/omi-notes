@@ -18,6 +18,7 @@ import OmiProtocol
 
     static let deviceId = "8d3b5f2e-1a4c-4e6f-9b7d-2c1e0f3a4b5c"
     static let liveCaptureId = "3f2c9a61-7b4e-4d8a-9c1f-5e6d7a8b9c0d"
+    static let enrollmentId = "6a0e4c2d-9f1b-4e3a-8c7d-5b2f1e0a9d8c"
     static let ringCaptureId = "a7e41c3b-2d5f-4a69-8b0e-1f2c3d4e5f60"
     static let startWall = Date(timeIntervalSince1970: 1_790_451_125.123)  // 2026-09-26T19:32:05.123Z
 
@@ -146,6 +147,17 @@ import OmiProtocol
             coverage: CoverageWatermark(captureId: Self.liveCaptureId, throughOffsetUs: parsed.header.chunkEndOffsetUs, throughChunkSequence: 0))))
         try Self.prettyJSON(hb).write(to: out.appendingPathComponent("event_heartbeat.json"))
 
+        // A voice enrollment window over the live sample (docs/speaker-learning.md, "Enrollment").
+        let enrollStart = EventBody(deviceId: Self.deviceId, at: "2026-09-26T19:32:05.200Z",
+            payload: .voiceEnrollmentStart(VoiceEnrollmentStartData(enrollmentId: Self.enrollmentId)),
+            captureId: Self.liveCaptureId, offsetUs: 100_000)
+        try Self.prettyJSON(enrollStart).write(to: out.appendingPathComponent("event_voice_enrollment_start.json"))
+        let enrollEnd = EventBody(deviceId: Self.deviceId, at: "2026-09-26T19:32:06.000Z",
+            payload: .voiceEnrollmentEnd(VoiceEnrollmentEndData(enrollmentId: Self.enrollmentId,
+                                                                endOffsetUs: parsed.header.chunkEndOffsetUs, outcome: .completed)),
+            captureId: Self.liveCaptureId, offsetUs: parsed.header.chunkEndOffsetUs)
+        try Self.prettyJSON(enrollEnd).write(to: out.appendingPathComponent("event_voice_enrollment_end.json"))
+
         try Self.readme(live: parsed.header, liveRecords: records, liveSeal: liveSeal, ring: ringParsed.header, ringExpect: expectations, ringSeal: ringSeal)
             .write(to: out.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
         try? FileManager.default.removeItem(at: scratch)
@@ -258,6 +270,8 @@ import OmiProtocol
         - `event_button.json` — double tap (`code` 2) with `capture_id` + `offset_us`.
         - `event_heartbeat.json` — heartbeat with a coverage watermark through the end of the (rotated)
           chunk 0 of the live sample.
+        - `event_voice_enrollment_start.json` / `event_voice_enrollment_end.json` — one enrollment window
+          (`enrollment_id` \(Self.enrollmentId)) over the live sample, ending `completed`.
 
         """
     }

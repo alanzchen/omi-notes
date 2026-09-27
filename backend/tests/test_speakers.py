@@ -128,7 +128,7 @@ def test_transcript_without_speakers_fails_with_instructions(tmp_path):
     worker.tick(T0 + 200)
     (row,) = convs(worker)
     assert row["status"] == "failed" and row["error_kind"] == "diarization"
-    status = (settings.notes_dir / "_status.md").read_text()
+    status = (settings.vault_dir / "_status.md").read_text()
     assert "speaker labels" in status and "fetch-models --diarization" in status
 
 

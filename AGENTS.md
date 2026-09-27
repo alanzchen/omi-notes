@@ -8,6 +8,8 @@ Omi pendant → iPhone app (`ios/`) → your server (`backend/`) → Markdown no
 | Area | Where | Verify with |
 |---|---|---|
 | Phone ↔ server wire contract | `docs/capture-format-v1.md`, `contracts/fixtures/` | both test suites |
+| Portable storage (vault) | `docs/vault.md` | `backend/tests/test_vault*.py` |
+| Speaker learning | `docs/speaker-learning.md` | `backend/tests/test_speaker*.py`, `test_enrollment.py` |
 | Omi BLE facts (firmware-coupled) | `docs/device-protocol.md` | — |
 | Backend (Python 3.13, FastAPI, SQLite) | `backend/src/omi_notes/` | `cd backend && uv run pytest` |
 | iOS logic (Swift 6, no dependencies) | `ios/Packages/OmiKit/` (`OmiProtocol`, `OmiCapture`, `OmiBLE`) | `cd ios/Packages/OmiKit && swift test` |
@@ -27,8 +29,11 @@ Omi pendant → iPhone app (`ios/`) → your server (`backend/`) → Markdown no
 - **Durability invariants (never weaken):**
   - The phone journals every notification before anything else and never deletes audio the server
     hasn't acknowledged. Unreadable or unexplained state is quarantined or retried, never deleted.
-  - The server answers 2xx only after fsync (file, and parents of new directories) and a committed
-    ledger row. A decode, VAD, or provider error is never treated as silence.
+  - The vault folder is the only permanent state; SQLite is a disposable index rebuilt from it.
+    Every permanent fact is written to its vault file (atomically) before the index; never store
+    something only in SQLite. The server answers 2xx only after the vault file (and parents of new
+    directories) is fsync'd and the index row committed. A decode, VAD, or provider error is never
+    treated as silence.
   - Offline storage: read the 16-byte status before writing any command; never send CLEAR; send
     ADVANCE only after DONE status 0 and everything is fsync'd. On 3.0.17–3.0.19 firmware `0x12`
     means DELETE.
@@ -40,7 +45,7 @@ Omi pendant → iPhone app (`ios/`) → your server (`backend/`) → Markdown no
 - **One bad row must not stall the backend worker.** Per-row steps catch, record, back off, continue.
 - **Generated files stay out of git:** `ios/OmiNotes.xcodeproj` (run `xcodegen generate`),
   `ios/Config/Local.xcconfig` (personal team/bundle id), `backend/.env`, `backend/models/*.onnx`
-  (`omi-notes fetch-models`), `data/`, `build/`.
+  (`omi-notes fetch-models`), vaults and indexes, `build/`.
 - **Debug-only hooks stay debug-only.** Simulator automation arguments (`-OmiNotesDebug…`) and plain
   `http` for local hosts live behind `#if DEBUG`; Release builds are HTTPS-only.
 - **Providers:** STT is Deepgram or any OpenAI-compatible transcription API (`providers/openai_stt.py`);

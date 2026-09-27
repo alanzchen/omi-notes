@@ -175,18 +175,26 @@ struct HomeView: View {
                 Text(model.recentError ?? "None yet").foregroundStyle(.secondary).font(.subheadline)
             }
             ForEach(model.recent) { c in
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text(c.title ?? "Untitled").font(.body.weight(.medium))
-                        Spacer()
-                        Text(c.status).font(.caption).padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(statusColor(c.status).opacity(0.15), in: .capsule)
-                    }
-                    Text("\(Fmt.iso(c.startedAt))\(c.provisional == true ? " · provisional" : "")\(c.lateAudio == true ? " · late audio" : "")")
-                        .font(.caption).foregroundStyle(.secondary)
-                    if let path = c.notePath { Text(path).font(.caption2).foregroundStyle(.tertiary).lineLimit(1) }
+                NavigationLink {
+                    ConversationSpeakersView(model: model, conversationId: c.id, title: c.title ?? "Speakers")
+                } label: {
+                    conversationRow(c)
                 }
             }
+        }
+    }
+
+    private func conversationRow(_ c: ConversationSummary) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(c.title ?? "Untitled").font(.body.weight(.medium))
+                Spacer()
+                Text(c.status).font(.caption).padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(statusColor(c.status).opacity(0.15), in: .capsule)
+            }
+            Text("\(Fmt.iso(c.startedAt))\(c.provisional == true ? " · provisional" : "")\(c.lateAudio == true ? " · late audio" : "")")
+                .font(.caption).foregroundStyle(.secondary)
+            if let path = c.notePath { Text(path).font(.caption2).foregroundStyle(.tertiary).lineLimit(1) }
         }
     }
 

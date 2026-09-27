@@ -35,11 +35,28 @@ def _setup_logging(settings: Settings | None = None, to_file: bool = False) -> N
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", handlers=handlers)
 
 
-def _worker(settings: Settings):
-    from .db import Database
+def _worker(settings: Settings, *, sweep: bool = False):
     from .pipeline.worker import Worker
+    from .rebuild import open_index
+    from .vault import Vault
 
-    return Worker(settings, Database(settings.db_path))
+    return Worker(settings, open_index(settings, Vault.open(settings), sweep_orphans=sweep))
+
+
+TAKE_OVER_HELP = "Take the vault's writer lease from another machine (only after that backend was stopped)"
+
+
+def _settings() -> Settings:
+    """Settings, with vault problems (unmigrated install, incomplete vault) explained, not traced."""
+    from .vault import VaultError, check_legacy
+
+    settings = load_settings()
+    try:
+        check_legacy(settings)
+    except VaultError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED)
+        raise typer.Exit(2) from exc
+    return settings
 
 
 @app.command()
@@ -47,26 +64,40 @@ def serve(
     host: str = typer.Option(None, help="Bind address (default HOST, 127.0.0.1)"),
     port: int = typer.Option(None, help="Port (default PORT, 8765)"),
     no_worker: bool = typer.Option(False, "--no-worker", help="Only accept uploads; run `omi-notes worker` separately"),
+    take_over: bool = typer.Option(False, "--take-over", help=TAKE_OVER_HELP),
 ) -> None:
     """Run the HTTP API (and the processing worker, unless --no-worker)."""
     import uvicorn
 
     from .api import create_app
+    from .vault import VaultError
 
-    settings = load_settings()
+    settings = _settings()
     _setup_logging(settings, to_file=True)
-    application = create_app(settings, start_worker=not no_worker)
+    try:
+        application = create_app(settings, start_worker=not no_worker, take_over=take_over)
+    except VaultError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED)
+        raise typer.Exit(2) from exc
     uvicorn.run(application, host=host or settings.host, port=port or settings.port, log_level="info")
 
 
 @app.command()
-def worker() -> None:
+def worker(take_over: bool = typer.Option(False, "--take-over", help=TAKE_OVER_HELP)) -> None:
     """Run only the processing worker (pairs with `serve --no-worker`)."""
-    settings = load_settings()
+    from .vault import VaultError
+
+    settings = _settings()
     _setup_logging(settings, to_file=True)
     stop = threading.Event()
     try:
-        _worker(settings).run_forever(stop)
+        w = _worker(settings, sweep=True)
+    except VaultError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED)
+        raise typer.Exit(2) from exc
+    w.take_over = take_over
+    try:
+        w.run_forever(stop)
     except KeyboardInterrupt:
         stop.set()
 
@@ -186,8 +217,7 @@ def doctor() -> None:
             check(True, "Silero VAD loads in onnxruntime")
         except Exception as exc:  # noqa: BLE001 - report anything
             check(False, "Silero VAD loads in onnxruntime", str(exc))
-    check(_writable(settings.notes_dir), f"Notes folder writable: {settings.notes_dir}", "check NOTES_DIR")
-    check(_writable(settings.data_dir), f"Data folder writable: {settings.data_dir}", "check DATA_DIR")
+    _vault_checks(settings, check)
     check(bool(settings.omi_notes_token), "OMI_NOTES_TOKEN set", "run `omi-notes pair`")
     check(True, f"Timezone {settings.timezone}")
     style = None
@@ -225,6 +255,14 @@ def doctor() -> None:
     if problem is None:
         pinned = _sha256_file(segmentation) == SEGMENTATION.member_sha256 and _sha256_file(embedding) == EMBEDDING.sha256
         check(pinned, "Diarization model checksums", "run `omi-notes fetch-models --diarization`", required=False)
+    from .audio.embed import SPEAKER_MODEL, speaker_embedding_status
+
+    speaker_problem = speaker_embedding_status(settings.speaker_model)
+    check(speaker_problem is None, "Speaker recognition model (optional: names people by voice)",
+          speaker_problem or "", required=False)  # fmt: skip
+    if speaker_problem is None:
+        check(_sha256_file(settings.speaker_model) == SPEAKER_MODEL.sha256, "Speaker model checksum",
+              "run `omi-notes fetch-models --speakers`", required=False)  # fmt: skip
     if settings.llm_provider == "anthropic":
         check(bool(settings.anthropic_api_key) or bool(os.environ.get("ANTHROPIC_AUTH_TOKEN")),
               f"ANTHROPIC_API_KEY set (model {settings.llm_model}, effort {settings.llm_effort})",
@@ -248,6 +286,42 @@ def doctor() -> None:
               f"tailscale serve --bg --https=443 http://127.0.0.1:{settings.port}", required=False)  # fmt: skip
     check(shutil.which("ffmpeg") is not None, "ffmpeg (optional, for replay-wav resampling)", required=False)
     raise typer.Exit(1 if problems else 0)
+
+
+def _vault_checks(settings: Settings, check) -> None:
+    """VAULT_DIR, its index, the writer lease and sync-tool pitfalls (docs/vault.md)."""
+    from .rebuild import index_is_current
+    from .vault import Vault, VaultError, index_dir, legacy_problem, migrate_command
+
+    problem = legacy_problem(settings)
+    if problem:
+        check(False, f"Vault configured ({problem})", f"migrate once: {migrate_command(settings)}")
+        return
+    root = settings.vault_dir
+    check(_writable(root), f"Vault folder writable: {root}", "check VAULT_DIR")
+    try:
+        vault = Vault.open(settings, create=False)
+    except VaultError as exc:
+        check(not (root / "_omi").exists(), "Vault", str(exc), required=(root / "_omi").exists())
+        return
+    check(True, f"Vault {vault.vault_id} (format {vault.info.get('format')}, timezone {vault.timezone})")
+    directory = index_dir(settings, vault)
+    stale = index_is_current(directory / "index.sqlite3", vault)
+    check(stale is None, f"Index at {directory}", f"{stale}: rebuilt automatically on the next start", required=False)
+    lease = vault.foreign_live_lease()
+    check(lease is None, "No other machine is writing this vault",
+          f"{(lease or {}).get('host')} renewed its writer lease recently; stop it before starting here", required=False)  # fmt: skip
+    divergence = vault.divergence()
+    check(not divergence, "No sync conflicts under _omi/", "; ".join(divergence[:3]) + " (resolve by hand)")
+    real = os.path.realpath(root)
+    icloud = os.path.realpath(os.path.expanduser("~/Library/Mobile Documents"))
+    check(not real.startswith(icloud), "Vault is not in iCloud Drive",
+          "iCloud evicts files to the cloud and uploads gigabytes of raw audio; keep the vault on local disk", required=False)  # fmt: skip
+    raw_bytes = sum(p.stat().st_size for p in vault.raw.rglob("*.omnc")) if vault.raw.exists() else 0
+    if (root / ".obsidian").exists():
+        check(False, f"Obsidian vault ({raw_bytes / 1e9:.1f} GB of raw audio under _omi/)",
+              "Obsidian Sync copies _omi/ only with 'Sync all other types' on and enough storage "
+              "(30 days of raw audio is about 3-4 GB); exclude _omi/ from Obsidian search", required=False)  # fmt: skip
 
 
 def _fetch_verified(url: str, sha256: str, target: Path, member: str | None = None, member_sha256: str | None = None) -> None:
@@ -289,9 +363,18 @@ def _fetch_verified(url: str, sha256: str, target: Path, member: str | None = No
 @app.command("fetch-models")
 def fetch_models(
     diarization: bool = typer.Option(False, "--diarization", help="Also fetch the local speaker diarization models"),
+    speakers: bool = typer.Option(False, "--speakers", help="Also fetch the speaker recognition model (WeSpeaker)"),
 ) -> None:
-    """Download the Silero VAD model (and, with --diarization, the sherpa-onnx diarization models)."""
+    """Download the Silero VAD model (and, with --diarization / --speakers, the sherpa-onnx models)."""
     _fetch_verified(SILERO_URL, SILERO_SHA256, MODELS_DIR / "silero_vad.onnx")
+    if speakers:
+        from .audio.embed import SPEAKER_MODEL
+
+        _fetch_verified(SPEAKER_MODEL.url, SPEAKER_MODEL.sha256, load_settings().speaker_model)
+        try:
+            import sherpa_onnx  # noqa: F401
+        except ImportError:
+            typer.secho("sherpa-onnx is not installed yet: run `uv sync --extra diarization`.", fg=typer.colors.YELLOW)
     if diarization:
         from .audio.diarize import EMBEDDING, SEGMENTATION
 
@@ -436,7 +519,7 @@ def rebuild() -> None:
     settings = load_settings()
     _setup_logging()
     w = _worker(settings)
-    lock = WorkerLock(settings.data_dir)
+    lock = WorkerLock(w.db.path.parent)
     if not lock.acquire():
         n = w.db.execute(
             "UPDATE conversations SET needs_render=1, next_attempt_at=NULL WHERE status IN ('done','discarded','failed') AND note_path IS NOT NULL"
@@ -463,6 +546,127 @@ def rebuild() -> None:
     finally:
         lock.release()
     typer.echo(f"Rendered {rendered} notes and {len(days)} daily indexes; skipped {skipped}.")
+
+
+@app.command("rebuild-index")
+def rebuild_index() -> None:
+    """Rebuild the operational index from the vault (the server must be stopped). Zero provider
+    calls; the next start replays surviving raw audio and re-renders every note from cache."""
+    from .lock import WorkerLock
+    from .rebuild import open_index
+    from .vault import Vault, index_dir
+
+    settings = _settings()
+    _setup_logging()
+    vault = Vault.open(settings, create=False)
+    lock = WorkerLock(index_dir(settings, vault))
+    if not lock.acquire():
+        typer.secho("A worker is running on this vault: stop the server first.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    try:
+        db = open_index(settings, vault, sweep_orphans=False, force_rebuild=True)
+        counts = {t: db.one(f"SELECT COUNT(*) AS n FROM {t}")["n"] for t in ("captures", "chunks", "events", "conversations")}
+        reason = db.meta("read_only")
+    finally:
+        lock.release()
+    typer.echo("Rebuilt the index: " + ", ".join(f"{n} {t}" for t, n in counts.items()))
+    if reason:
+        typer.secho(f"The vault is incomplete, so it opens read-only: {reason}", fg=typer.colors.YELLOW)
+        raise typer.Exit(1)
+
+
+@app.command("migrate-vault")
+def migrate_vault(
+    notes_dir: Path = typer.Option(..., "--notes-dir", help="The old NOTES_DIR"),
+    data_dir: Path = typer.Option(..., "--data-dir", help="The old DATA_DIR (holds omi-notes.sqlite3, raw/, derived/)"),
+    vault_dir: Path = typer.Option(..., "--vault-dir", help="The vault to create (usually the same folder as NOTES_DIR)"),
+) -> None:
+    """Turn a pre-vault install into a vault (stop the server first). The old data is only read."""
+    from .migrate import MigrationError, migrate
+
+    base = load_settings()
+    settings = base.model_copy(update={"vault_dir": vault_dir.expanduser(), "notes_dir": None, "data_dir": None})
+    _setup_logging()
+    try:
+        report = migrate(settings, notes_dir, data_dir, vault_dir)
+    except MigrationError as exc:
+        typer.secho(f"Migration failed: {exc}", fg=typer.colors.RED)
+        raise typer.Exit(1) from exc
+    typer.echo(f"Copied {report.chunks} chunks ({report.tombstones} already expired), {report.seals} seals, "
+               f"{report.events} events, {report.conversations} conversations; checked {report.notes_checked} notes.")  # fmt: skip
+    for problem in report.problems:
+        typer.secho(f"  note: {problem}", fg=typer.colors.YELLOW)
+    if not report.ok:
+        for mismatch in report.mismatches:
+            typer.secho(f"  mismatch: {mismatch}", fg=typer.colors.RED)
+        typer.secho("The dry-run rebuild did not reproduce the old notes; the vault was left unfinished (no "
+                    "VAULT.json) and the old install is untouched.", fg=typer.colors.RED)  # fmt: skip
+        raise typer.Exit(1)
+    typer.echo(f"Done. In {env_file()} set VAULT_DIR={vault_dir} and remove NOTES_DIR/DATA_DIR, then start the server.")
+
+
+note_app = typer.Typer(no_args_is_help=True, help="Resolve notes edited outside their My Notes section.")
+app.add_typer(note_app, name="note")
+
+
+def _note_row(w, conversation: str):
+    rows = w.db.query("SELECT * FROM conversations WHERE id LIKE ? AND note_path IS NOT NULL", (conversation + "%",))
+    if len(rows) != 1:
+        typer.secho(f"{len(rows)} notes match {conversation!r}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    return rows[0]
+
+
+def _with_claim(w, conv_id: str, action) -> None:
+    token = w.pipeline.claim(conv_id)
+    if token is None:
+        typer.secho("The worker is working on this conversation; try again in a moment.", fg=typer.colors.YELLOW)
+        raise typer.Exit(1)
+    try:
+        action()
+    finally:
+        w.pipeline.release(conv_id, token)
+
+
+@note_app.command("overwrite")
+def note_overwrite(conversation: str = typer.Argument(..., help="Conversation id (or unique prefix)")) -> None:
+    """Re-render the note; the edited version is kept in _omi/displaced/<sha>.md."""
+    from .lock import WorkerLock
+
+    settings = _settings()
+    w = _worker(settings)
+    row = _note_row(w, conversation)
+    w.db.execute("UPDATE conversations SET edited=2, needs_render=1, next_attempt_at=NULL WHERE id=?", (row["id"],))
+    lock = WorkerLock(w.db.path.parent)
+    if not lock.acquire():
+        typer.echo("Queued for the running worker.")
+        return
+    try:
+        w.pipeline.advance(row["id"], time.time())
+    finally:
+        lock.release()
+    fresh = w.db.one("SELECT note_path, edited FROM conversations WHERE id=?", (row["id"],))
+    typer.echo(f"Re-rendered {fresh['note_path']}." if not fresh["edited"] else "The note could not be re-rendered yet.")
+
+
+@note_app.command("freeze")
+def note_freeze(conversation: str = typer.Argument(..., help="Conversation id (or unique prefix)")) -> None:
+    """Keep the note as you edited it: the server stops updating it."""
+    settings = _settings()
+    w = _worker(settings)
+    row = _note_row(w, conversation)
+    _with_claim(w, row["id"], lambda: w.pipeline._commit(row["id"], frozen=1, edited=0, needs_render=0))
+    typer.echo(f"Frozen: {row['note_path']} is no longer updated by the server.")
+
+
+@note_app.command("unfreeze")
+def note_unfreeze(conversation: str = typer.Argument(..., help="Conversation id (or unique prefix)")) -> None:
+    """Let the server update the note again (edits outside My Notes are still protected)."""
+    settings = _settings()
+    w = _worker(settings)
+    row = _note_row(w, conversation)
+    _with_claim(w, row["id"], lambda: w.pipeline._commit(row["id"], frozen=0, edited=0, needs_render=1))
+    typer.echo(f"{row['note_path']} is updated by the server again.")
 
 
 @app.command()
@@ -495,7 +699,7 @@ def reprocess(
                    force_restt = MAX(force_restt, ?), force_llm = MAX(force_llm, ?) WHERE id=?""",
             (int(restt), int(force_llm), row["id"]),
         )
-    lock = WorkerLock(settings.data_dir)
+    lock = WorkerLock(w.db.path.parent)
     if not lock.acquire():
         typer.echo(f"A worker is running: {len(rows)} conversation(s) queued for it.")
         return
@@ -529,7 +733,7 @@ def retry_failed() -> None:
         "UPDATE chunks SET status='pending', attempts=0, next_attempt_at=NULL, error=NULL WHERE status='failed'"
     ).rowcount
     typer.echo(f"Queued {convs} conversation(s) and {chunks} chunk(s).")
-    lock = WorkerLock(settings.data_dir)
+    lock = WorkerLock(w.db.path.parent)
     if not lock.acquire():
         typer.echo("A worker is running; it picks them up on its next tick.")
         return
@@ -539,6 +743,71 @@ def retry_failed() -> None:
     finally:
         lock.release()
     typer.echo(f"Processed inline: {result['chunks']} chunk(s), {result['conversations']} conversation step(s).")
+
+
+speakers_app = typer.Typer(no_args_is_help=True, help="Speaker recognition tools.")
+app.add_typer(speakers_app, name="speakers")
+
+
+@speakers_app.command("bench")
+def speakers_bench() -> None:
+    """Measure how well the confirmed voice samples separate, and recommend operating points.
+
+    Genuine distances: each sample against the centroid of the person's other samples (leave one
+    out). Impostor distances: each sample against every other person's centroid. Omi's priors are
+    SPEAKER_MATCH_THRESHOLD=0.50 and SPEAKER_MATCH_MARGIN=0.10."""
+    import numpy as np
+
+    from .speakers import match as sm
+    from .speakers.voices import centroid, cosine_distance
+
+    settings = _settings()
+    w = _worker(settings)
+    store = w.pipeline.speakers
+    store.scan_people()
+    names = {p["id"]: p["name"] for p in store.people()}
+    groups = w.db.query("SELECT model, model_sha, COUNT(*) AS n FROM samples GROUP BY model, model_sha ORDER BY n DESC")
+    if not groups:
+        typer.echo("No voice samples yet: enroll or name someone in the app first.")
+        return
+    for group in groups:
+        samples = store.samples(group["model"], group["model_sha"])
+        by_person: dict[str, list] = {}
+        for s in samples:
+            by_person.setdefault(s.person_id, []).append(s)
+        centroids = {pid: centroid([s.vector for s in items]) for pid, items in by_person.items()}
+        genuine, impostor = [], []
+        for pid, items in by_person.items():
+            for sample in items:
+                rest = [s.vector for s in items if s is not sample]
+                if rest:
+                    genuine.append(cosine_distance(sample.vector, centroid(rest)))
+                impostor += [cosine_distance(sample.vector, c) for other, c in centroids.items() if other != pid]
+        typer.echo(f"Model {group['model']} ({group['model_sha'][:12]}): {len(samples)} samples, {len(by_person)} people")
+        models = sm.build_models(samples, w.pipeline.operating)
+        for pid, items in sorted(by_person.items(), key=lambda kv: names.get(kv[0], kv[0])):
+            model = models[pid]
+            state = "auto-naming active" if model.active else f"suggestions only ({model.why_inactive})"
+            typer.echo(f"  {names.get(pid, pid[:8])}: {len(items)} samples; {state}")
+        if genuine:
+            g = np.array(genuine)
+            typer.echo(f"  same person (leave one out): mean {g.mean():.3f}, max {g.max():.3f}")
+        if impostor:
+            i = np.array(impostor)
+            typer.echo(f"  different people:            mean {i.mean():.3f}, min {i.min():.3f}")
+        threshold = w.pipeline.operating.threshold
+        if genuine and impostor:
+            false_reject = float(np.mean(np.array(genuine) >= threshold))
+            false_accept = float(np.mean(np.array(impostor) < threshold))
+            typer.echo(f"  at SPEAKER_MATCH_THRESHOLD={threshold}: false rejects {false_reject:.1%}, false accepts {false_accept:.1%}")
+            if max(genuine) < min(impostor):
+                suggested = round((max(genuine) + min(impostor)) / 2, 2)
+                margin = round(max(0.05, (min(impostor) - max(genuine)) / 2), 2)
+                typer.echo(f"  separable: suggested SPEAKER_MATCH_THRESHOLD={suggested} SPEAKER_MATCH_MARGIN={margin}")
+            else:
+                typer.echo("  not separable yet: keep the priors and confirm more samples (more days, quieter places)")
+        else:
+            typer.echo("  need samples from at least two people (or two samples each) to measure separation")
 
 
 if __name__ == "__main__":

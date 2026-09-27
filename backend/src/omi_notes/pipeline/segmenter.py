@@ -17,9 +17,9 @@ Rules:
   the gap is then a known loss) or the audio came from developer replay.
 - Otherwise the close is provisional once `now >= E + gap + wait` (`wait` is short while a live
   capture is unsealed, longer otherwise).
-- Finalized conversations are never reopened. Speech that shows up later (a higher speech id
-  than the conversation's watermark) inside or within `gap` of a finalized window becomes its own
-  conversation with `late_audio=True` and `related_id` set.
+- Finalized conversations are never reopened. Speech the conversation did not know about when it
+  was finalized (from a chunk after its `known_through` for that capture) inside or within `gap`
+  of a finalized window becomes its own conversation with `late_audio=True` and `related_id` set.
 
 Checking the *start* window as well as the end is slightly stricter than architecture.md #8
 spells out: after a reconnect, the first live speech must wait for the ring sync so late offline
@@ -33,6 +33,7 @@ audio gaps but never block closing: waiting cannot bring them back.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -49,9 +50,13 @@ MIN_REMAINDER = 0.25
 
 @dataclass(frozen=True)
 class Speech:
+    """VAD speech; `(capture_id, seq)` is the chunk that produced it (the seal flush is `last + 1`)."""
+
     id: int
     start: float
     end: float
+    capture_id: str = ""
+    seq: int = 0
 
 
 @dataclass(frozen=True)
@@ -62,14 +67,18 @@ class Span:
     end: float | None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Finalized:
     id: str
     start: float
     end: float
-    watermark: int
+    known_through: Mapping[str, int] = field(default_factory=dict)
     start_explicit: bool = False
     end_explicit: bool = False
+
+    def knows(self, s: Speech) -> bool:
+        """Speech from (capture, seq) was known at finalize iff seq <= known_through[capture]."""
+        return s.seq <= self.known_through.get(s.capture_id, -1)
 
 
 @dataclass(frozen=True)
@@ -225,7 +234,7 @@ def _unclaimed_pieces(tl: DeviceTimeline, gap: float) -> list[_Piece]:
     pieces: list[_Piece] = []
     for s in tl.speech:
         parts = [(s.start, s.end)]
-        claimed = [(f.start, f.end) for f in tl.finalized if s.id <= f.watermark]
+        claimed = [(f.start, f.end) for f in tl.finalized if f.knows(s)]
         if claimed:
             # A sliver left beside a finalized window is the tail of audio it already has.
             parts = [(a, b) for a, b in subtract(parts, claimed) if b - a >= MIN_REMAINDER]
@@ -234,7 +243,7 @@ def _unclaimed_pieces(tl: DeviceTimeline, gap: float) -> list[_Piece]:
         late_of = None
         best = float("inf")
         for f in tl.finalized:
-            if s.id <= f.watermark:
+            if f.knows(s):
                 continue
             lo = f.start - (0.0 if f.start_explicit else gap)
             hi = f.end + (0.0 if f.end_explicit else gap)
@@ -438,7 +447,7 @@ def fully_claimed(tl: DeviceTimeline) -> list[int]:
     """Speech ids entirely inside finalized windows (e.g. a row cut by a split or the hard cap)."""
     ids = []
     for s in tl.speech:
-        claimed = [(f.start, f.end) for f in tl.finalized if s.id <= f.watermark]
+        claimed = [(f.start, f.end) for f in tl.finalized if f.knows(s)]
         if claimed and not [p for p in subtract([(s.start, s.end)], claimed) if p[1] - p[0] >= MIN_REMAINDER]:
             ids.append(s.id)
     return ids

@@ -15,10 +15,10 @@ brew install opus uv                 # libopus for decoding; uv manages Python 3
 cd backend
 uv sync
 uv run omi-notes fetch-models        # Silero VAD model (~2 MB, checksum verified)
-cp .env.example .env                 # then fill in DEEPGRAM_API_KEY, ANTHROPIC_API_KEY, NOTES_DIR…
+cp .env.example .env                 # then fill in DEEPGRAM_API_KEY, ANTHROPIC_API_KEY, VAULT_DIR…
 uv run omi-notes pair                # creates OMI_NOTES_TOKEN if missing, prints the pairing QR
 tailscale serve --bg --https=443 http://127.0.0.1:8765
-uv run omi-notes doctor              # checks libopus, VAD, folders, keys, tailscale serve
+uv run omi-notes doctor              # checks libopus, VAD, vault/index, sync pitfalls, keys, tailscale serve
 ```
 
 Scan the QR code with the iPhone camera; it opens the app with
@@ -49,8 +49,12 @@ only queue the work for it (so two processes never transcribe or write the same 
 | `worker` | processing worker only |
 | `pair [--url URL]` | print the pairing QR (generates a token into `.env` if needed) |
 | `doctor` | environment checks |
-| `fetch-models [--diarization]` | download + verify the Silero VAD model (and the local diarization models) |
+| `fetch-models [--diarization] [--speakers]` | download + verify the Silero VAD model (and local diarization / speaker models) |
 | `rebuild` | re-render every note, daily index and `_status.md` from caches (no API calls) |
+| `rebuild-index` | rebuild the disposable SQLite index from the vault |
+| `migrate-vault --notes-dir … --data-dir … --vault-dir …` | move an older install into a vault (verified by a dry-run rebuild) |
+| `note overwrite\|freeze <id>` | resolve a note you edited outside My Notes |
+| `speakers bench` | how well confirmed voice samples separate; suggested thresholds |
 | `reprocess <id> \| --since YYYY-MM-DD [--restt] [--force-llm]` | redo STT/summary (caches reused unless forced; queued if a worker runs) |
 | `retry-failed` | re-queue failed conversations/chunks after fixing a key or billing problem |
 | `synth-wav [out.wav]` | two-voice test recording with macOS `say` and a 150 s pause |
@@ -78,8 +82,8 @@ All settings come from the environment or `backend/.env`; see [`.env.example`](.
 | Variable | Default | Meaning |
 |---|---|---|
 | `OMI_NOTES_TOKEN` | — | bearer token shared with the phone (required) |
-| `NOTES_DIR` | `~/Documents/OmiNotes` | where notes are written |
-| `DATA_DIR` | `~/.local/share/omi-notes` | ledger, raw chunks, caches, logs |
+| `VAULT_DIR` | `~/Documents/OmiNotes` | the vault: notes + `_omi/` (everything permanent; see below) |
+| `INDEX_DIR` | Application Support | disposable SQLite index + logs (rebuilt from the vault) |
 | `HOST` / `PORT` | `127.0.0.1` / `8765` | bind address |
 | `TIMEZONE` | this Mac's zone | times and filenames in notes |
 | `OWNER_NAME` | — | shown for action items you own |
@@ -129,12 +133,14 @@ speaker labels fails with instructions in `_status.md`, unless `STT_DIARIZATION=
 ## The notes folder
 
 ```
-NOTES_DIR/
+VAULT_DIR/
   Conversations/2026/2026-09/2026-09-26 1403 Team Finalizes Q2 Budget.md
   Daily/2026-09-26.md                    deterministic index of the day (no LLM)
   _in-progress/2026-09-26 1715 (recording) c7f3a2.md
   _discarded/2026-09-26 1240 c91e0b.md   judged not worth keeping; transcript kept
   _status.md                             devices, queue, errors
+  People/Alan.md                         one note per person (speaker learning)
+  _omi/                                  machine data: raw audio, records, results, voiceprints
 ```
 
 Each conversation note has YAML frontmatter (`id`, `status`, `provisional`, `late_audio`,
@@ -156,6 +162,44 @@ timestamped transcript.
   recording hasn't synced), the note is written after a wait with `provisional: true`. Audio that
   arrives after a note was written becomes its own note with `late_audio: true` and a `related`
   link; finished notes are never merged.
+
+## The vault (portable storage)
+
+`VAULT_DIR` is the only permanent state ([docs/vault.md](../docs/vault.md)). `_omi/` holds the phone's
+uploaded chunks and seals, events, one `conversation.json` record per finished conversation (with
+its transcript and provider results), people's voiceprints, and `VAULT.json`. The SQLite index
+outside the vault is only an operational cache:
+
+- **Move or back up:** stop the server, copy the folder, point `VAULT_DIR` at the copy. The new
+  backend rebuilds its index from the files (no transcription or LLM calls) and continues.
+- `omi-notes rebuild-index` rebuilds on demand; a missing or mismatched index is rebuilt at start.
+  A vault with records whose files haven't synced yet opens **read-only** instead of guessing.
+- One backend writes to a vault at a time (`_omi/writer.json` lease; `serve --take-over` only after
+  stopping the other one). Keep the writer's vault on local disk; sync tools may replicate it
+  outward. `doctor` warns about iCloud Drive and Obsidian Sync settings ("Sync all other types",
+  storage for ~3–4 GB of raw audio per 30 days).
+- **Upgrading an older install** (`NOTES_DIR` + `DATA_DIR`): the server refuses to start and prints
+  `omi-notes migrate-vault --notes-dir … --data-dir … --vault-dir …`, which copies everything into
+  a vault and verifies it with a dry-run rebuild before you switch.
+- **Edited notes:** if you edit a note outside **My Notes**, the server stops updating it and
+  `_status.md` lists it. Resolve with `omi-notes note overwrite <id>` (your version is kept in
+  `_omi/displaced/`) or `omi-notes note freeze <id>` (keep yours; no more updates).
+
+## Speaker learning
+
+Enroll your voice and name people from the iPhone app (People tab); see
+[docs/speaker-learning.md](../docs/speaker-learning.md). Setup:
+`uv sync --extra diarization && uv run omi-notes fetch-models --speakers` (WeSpeaker ResNet34).
+
+- People are `People/<Name>.md` notes (identity is `omi_person_id` in the frontmatter, so renaming
+  the file is fine); voiceprints live in `_omi/people/<id>/`. Notes show names instead of
+  "Speaker N" and list `people:` in their frontmatter.
+- Automatic naming only switches on per person after ≥ 3 confirmations on ≥ 2 days (plus a
+  leave-one-out check); enrollment alone doesn't activate it. Relabeling re-renders notes from
+  cache (no LLM call); "Re-summarize with names" is an explicit action.
+- Voice enrollment happens through the pendant; the reading is never transcribed.
+- `omi-notes speakers bench` reports how well your confirmed samples separate and suggests
+  thresholds. Recurring-unknown-voice suggestions are opt-in; voiceprints never leave the server.
 
 ## Privacy
 

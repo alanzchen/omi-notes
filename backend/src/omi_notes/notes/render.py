@@ -56,6 +56,8 @@ class NoteData:
     lost_seconds: float = 0.0
     clock_suspect: bool = False
     speaker_labels_consistent: bool = True
+    # Speaker labels recognized by voice → the person's People note name (docs/speaker-learning.md).
+    voice_names: dict[str, str] = field(default_factory=dict)
 
 
 def neutralize(text: str) -> str:
@@ -83,7 +85,13 @@ def sanitized(d: NoteData) -> NoteData:
     fields = {k: one_line(v) if isinstance(v, str) else v for k, v in
               (("discard_reason", d.discard_reason), ("summary_error", d.summary_error),
                ("related", d.related), ("device", d.device))}  # fmt: skip
-    return replace(d, notes=notes, segments=segments, **fields)
+    voice_names = {label: _link_safe(one_line(name)) for label, name in d.voice_names.items()}
+    return replace(d, notes=notes, segments=segments, voice_names=voice_names, **fields)
+
+
+def _link_safe(name: str) -> str:
+    """A People note name usable inside `[[...]]`."""
+    return "".join(ch for ch in name if ch not in "[]|#^") or "?"
 
 
 def _local(epoch: float, tz: ZoneInfo) -> datetime:
@@ -94,8 +102,11 @@ def _iso(epoch: float | None, tz: ZoneInfo) -> str | None:
     return None if epoch is None else _local(epoch, tz).isoformat(timespec="seconds")
 
 
-def speaker_label(label: str, notes: ConversationNotes | None) -> str:
-    """`S2` → `Priya (Speaker 2)` when named, else `Speaker 2`."""
+def speaker_label(label: str, notes: ConversationNotes | None, voice_names: dict[str, str] | None = None) -> str:
+    """`S2` → `Priya` when recognized by voice, `Priya (Speaker 2)` when the summary named it (a
+    hint from the transcript), else `Speaker 2`."""
+    if voice_names and label in voice_names:
+        return voice_names[label]
     number = label[1:] if label.startswith("S") and label[1:].isdigit() else label
     generic = f"Speaker {number}"
     name = notes.speaker_names.get(label) if notes else None
@@ -121,7 +132,7 @@ def _clock(epoch: float, tz: ZoneInfo) -> str:
 
 
 def _transcript_line(seg: dict, d: NoteData) -> str:
-    return f"**{_clock(seg['start'], d.tz)} · {speaker_label(seg['speaker'], d.notes)}:** {seg['text']}"
+    return f"**{_clock(seg['start'], d.tz)} · {speaker_label(seg['speaker'], d.notes, d.voice_names)}:** {seg['text']}"
 
 
 def _duration_text(seconds: float) -> str:
@@ -137,6 +148,13 @@ def frontmatter(d: NoteData) -> dict:
     notes = d.notes if d.status != "transcript_only" else None
     items = notes.action_items if notes else []
     words = sum(len(s["text"].split()) for s in d.segments)
+    labels = sorted({s["speaker"] for s in d.segments}, key=lambda x: (int(x[1:]) if x[1:].isdigit() else 10**6, x))
+    speakers: int | list[str] = len(labels)
+    people: dict = {}
+    if d.voice_names:
+        # Read-only projections of speakers.json (Obsidian links them to the People notes).
+        speakers = [f"{label}: [[{d.voice_names[label]}]]" if label in d.voice_names else f"{label}: ?" for label in labels]
+        people = {"people": list(dict.fromkeys(f"[[{d.voice_names[label]}]]" for label in labels if label in d.voice_names))}
     return {
         "id": d.id,
         "type": "omi-conversation",
@@ -151,7 +169,8 @@ def frontmatter(d: NoteData) -> dict:
         "ended_at": _iso(d.end, d.tz),
         "duration_min": round((d.end - d.start) / 60, 1),
         "speech_min": round(d.speech_seconds / 60, 1),
-        "speakers": len({s["speaker"] for s in d.segments}),
+        "speakers": speakers,
+        **people,
         "word_count": words,
         "language": d.language,
         "device": d.device,

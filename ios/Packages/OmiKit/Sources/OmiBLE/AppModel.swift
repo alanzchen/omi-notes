@@ -36,9 +36,11 @@ public final class AppModel {
     public private(set) var logs: [LogLine] = []
 
     public let engine: OmiEngine
+    public let speakers: SpeakersModel
 
     public init(engine: OmiEngine) {
         self.engine = engine
+        speakers = SpeakersModel(engine: engine)
         engine.setSnapshotSink { [weak self] s in
             Task { @MainActor [weak self] in self?.snapshot = s }
         }

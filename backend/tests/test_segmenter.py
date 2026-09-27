@@ -21,7 +21,8 @@ P = Params()
 
 
 def speech(*intervals: tuple[float, float], first_id: int = 1) -> list[Speech]:
-    return [Speech(first_id + i, a, b) for i, (a, b) in enumerate(intervals)]
+    # One capture whose chunk i produced speech row i: "known through chunk 5" = the old watermark 5.
+    return [Speech(first_id + i, a, b, "cap", first_id + i) for i, (a, b) in enumerate(intervals)]
 
 
 def live(speech_list, *, cov=((-500.0, 10_000.0),), spans=((-500.0, None),), **kw) -> DeviceTimeline:
@@ -243,21 +244,21 @@ def test_gap_under_20s_after_soft_cap_does_not_split():
 
 
 def test_late_speech_near_finalized_window_is_its_own_note():
-    fin = Finalized("conv-a", 0, 60, watermark=5)
+    fin = Finalized("conv-a", 0, 60, known_through={"cap": 5})
     tl = live(speech((0, 60), first_id=3) + speech((100, 110), first_id=7), finalized=[fin])
     (c,) = segment(tl, now=1000, p=P)
     assert spans_of([c]) == [(100, 110)] and c.late_audio and c.related_id == "conv-a"
 
 
 def test_late_speech_inside_finalized_window():
-    fin = Finalized("conv-a", 0, 60, watermark=5)
+    fin = Finalized("conv-a", 0, 60, known_through={"cap": 5})
     tl = live(speech((20, 30), first_id=9), finalized=[fin])
     (c,) = segment(tl, now=1000, p=P)
     assert c.late_audio and c.related_id == "conv-a"
 
 
 def test_claimed_speech_produces_nothing_and_normal_speech_is_not_late():
-    fin = Finalized("conv-a", 0, 60, watermark=5)
+    fin = Finalized("conv-a", 0, 60, known_through={"cap": 5})
     tl = live(speech((0, 60), first_id=3) + speech((300, 310), first_id=8), finalized=[fin])
     (c,) = segment(tl, now=1000, p=P)
     assert spans_of([c]) == [(300, 310)] and not c.late_audio
@@ -265,21 +266,21 @@ def test_claimed_speech_produces_nothing_and_normal_speech_is_not_late():
 
 
 def test_speech_after_explicit_split_is_not_late():
-    fin = Finalized("conv-a", 0, 50, watermark=5, end_explicit=True)
+    fin = Finalized("conv-a", 0, 50, known_through={"cap": 5}, end_explicit=True)
     tl = live(speech((60, 70), first_id=8), finalized=[fin])
     (c,) = segment(tl, now=1000, p=P)
     assert not c.late_audio
 
 
 def test_groups_never_span_a_finalized_conversation():
-    fin = Finalized("conv-a", 100, 110, watermark=5)
+    fin = Finalized("conv-a", 100, 110, known_through={"cap": 5})
     tl = live(speech((40, 50), (160, 170), first_id=8), finalized=[fin])
     cands = segment(tl, now=1000, p=P)
     assert len(cands) == 2 and all(c.late_audio for c in cands)
 
 
 def test_partially_claimed_interval_leaves_remainder():
-    fin = Finalized("conv-a", 0, 50, watermark=5, end_explicit=True)
+    fin = Finalized("conv-a", 0, 50, known_through={"cap": 5}, end_explicit=True)
     tl = live(speech((0, 100), first_id=1), finalized=[fin], splits=[50.0])
     (c,) = segment(tl, now=1000, p=P)
     assert spans_of([c]) == [(50, 100)] and c.start_explicit

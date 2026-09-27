@@ -38,8 +38,13 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=None, extra="ignore", case_sensitive=False)
 
     omi_notes_token: str = ""
-    notes_dir: Path = Path("~/Documents/OmiNotes")
-    data_dir: Path = Path("~/.local/share/omi-notes")
+    # The one data setting: notes and everything permanent (docs/vault.md).
+    vault_dir: Path = Path("~/Documents/OmiNotes")
+    # Where the disposable SQLite index lives (default: Application Support / XDG state).
+    index_dir: Path | None = None
+    # Pre-vault settings: only read to refuse an unmigrated install (`omi-notes migrate-vault`).
+    notes_dir: Path | None = None
+    data_dir: Path | None = None
     host: str = "127.0.0.1"
     port: int = 8765
     timezone: str = Field(default_factory=system_timezone)
@@ -62,6 +67,12 @@ class Settings(BaseSettings):
     diarization_threshold: float = 0.5
     diarization_segmentation_model: Path = MODELS_DIR / "pyannote-segmentation-3-0.onnx"
     diarization_embedding_model: Path = MODELS_DIR / "nemo_en_titanet_small.onnx"
+    # Speaker recognition (docs/speaker-learning.md): inert until someone is enrolled or named.
+    speaker_model: Path = MODELS_DIR / "wespeaker_en_voxceleb_resnet34_LM.onnx"
+    speaker_auto_assign: bool = True
+    # Operating points (Omi's priors; `omi-notes speakers bench` recommends calibrated values).
+    speaker_match_threshold: float = 0.50
+    speaker_match_margin: float = 0.10
 
     llm_provider: Literal["anthropic", "openai", "fake", "none"] = "anthropic"
     anthropic_api_key: str = ""
@@ -87,12 +98,12 @@ class Settings(BaseSettings):
     worker_tick_seconds: float = 5.0
 
     @field_validator(
-        "notes_dir", "data_dir", "vad_model_path", "diarization_segmentation_model", "diarization_embedding_model",
-        mode="after",
+        "vault_dir", "index_dir", "notes_dir", "data_dir", "vad_model_path", "diarization_segmentation_model",
+        "diarization_embedding_model", "speaker_model", mode="after",
     )
     @classmethod
-    def _expand(cls, value: Path) -> Path:
-        return value.expanduser()
+    def _expand(cls, value: Path | None) -> Path | None:
+        return value.expanduser() if value is not None else None
 
     @field_validator("timezone", mode="after")
     @classmethod
@@ -113,20 +124,21 @@ class Settings(BaseSettings):
         return [t.strip() for t in self.stt_keyterms.split(",") if t.strip()][:100]
 
     @property
-    def db_path(self) -> Path:
-        return self.data_dir / "omi-notes.sqlite3"
-
-    @property
     def raw_dir(self) -> Path:
-        return self.data_dir / "raw"
+        return self.vault_dir / "_omi" / "raw"
 
     @property
-    def derived_dir(self) -> Path:
-        return self.data_dir / "derived"
+    def db_path(self) -> Path:
+        """The index database of the vault at VAULT_DIR (reads `_omi/VAULT.json`)."""
+        from .vault import Vault, index_dir
+
+        return index_dir(self, Vault.open(self, create=False)) / "index.sqlite3"
 
     @property
     def logs_dir(self) -> Path:
-        return self.data_dir / "logs"
+        from .vault import default_index_root
+
+        return (self.index_dir or default_index_root()).parent / "logs"
 
 
 def load_settings(**overrides: object) -> Settings:

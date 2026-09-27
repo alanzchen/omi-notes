@@ -24,7 +24,7 @@ On the Mac that will run the server:
 ```bash
 make setup                       # brew opus/uv/xcodegen, uv sync, fetch the VAD model
 cp backend/.env.example backend/.env
-#   fill in DEEPGRAM_API_KEY and ANTHROPIC_API_KEY (NOTES_DIR/TIMEZONE optional)
+#   fill in DEEPGRAM_API_KEY and ANTHROPIC_API_KEY (VAULT_DIR/TIMEZONE optional)
 make pair                        # generates the token, prints a QR code for the app
 tailscale serve --bg --https=443 http://127.0.0.1:8765
 make server                      # or backend/scripts/install-launchd.sh to start at login
@@ -36,7 +36,7 @@ On the iPhone (Tailscale connected):
 2. Scan the `make pair` QR code with the Camera app and confirm the server shown.
 3. Disconnect the official Omi app (the pendant accepts one phone at a time), then pick your pendant.
 
-Notes appear in `NOTES_DIR` about two minutes after a conversation ends:
+Notes appear in the vault folder (`VAULT_DIR`) about two minutes after a conversation ends:
 
 ```
 OmiNotes/
@@ -45,9 +45,16 @@ OmiNotes/
   _in-progress/                # stubs while a conversation is still open
   _discarded/                  # noise / mic checks, kept with their transcript
   _status.md                   # device, queue and error status
+  People/                      # one note per person you've taught the server
+  _omi/                        # machine data: audio, records, transcripts, voiceprints
 ```
 
 Anything you write between the `My Notes` markers in a note is preserved when it is regenerated.
+
+**The folder is the whole system state.** Copy it to another machine, point a backend at it, and
+it rebuilds its (disposable) index from the files, with no transcription or LLM calls
+([docs/vault.md](docs/vault.md)). In the app's **People** tab you can teach it your voice and
+name people, so notes say who spoke ([docs/speaker-learning.md](docs/speaker-learning.md)).
 
 ## Try it without a pendant or API keys
 

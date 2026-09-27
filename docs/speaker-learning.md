@@ -27,7 +27,10 @@ relative to `/Users/alan/Developer/_ref/omi`.
   assignments; cap 20). Automatic matches never become samples (no drift).
 - Accept a label → person iff cosine distance < **0.50** (Omi pooled threshold), runner-up margin
   ≥ **0.10**, evidence ≥ **5 s** from ≥ 2 clean turns, label not mixed. Several labels may map to
-  one person (diarization over-splits). `source: user` assignments are sticky; `not: [pid]` blocks
+  one person (diarization over-splits), but within a conversation the label closest to a person is
+  the runner-up for the others: another label keeps that name only if it is < 0.10 further (with
+  only one enrolled person there is no other runner-up; end to end, two different `say` voices sat
+  0.04 and 0.44 from the enrolled one). `source: user` assignments are sticky; `not: [pid]` blocks
   a person for that label.
 - **Per-person activation gate:** automatic naming is on by default (`SPEAKER_AUTO_ASSIGN=true`),
   but applies to a person only once they have ≥ 3 confirmed samples from ≥ 2 sessions on different

@@ -204,6 +204,25 @@ public struct EventWriter: Sendable {
         try write(EventBody(deviceId: deviceId, at: ISO8601UTC.format(clock.wallNow()), payload: .heartbeat(data)))
     }
 
+    @discardableResult
+    public func voiceEnrollmentStart(enrollmentId: String, deviceId: String, captureId: String, offsetUs: Int64) throws -> OutboxItem {
+        try write(EventBody(
+            deviceId: deviceId, at: ISO8601UTC.format(clock.wallNow()),
+            payload: .voiceEnrollmentStart(VoiceEnrollmentStartData(enrollmentId: enrollmentId)),
+            captureId: captureId, offsetUs: offsetUs))
+    }
+
+    @discardableResult
+    public func voiceEnrollmentEnd(
+        enrollmentId: String, deviceId: String, captureId: String, endOffsetUs: Int64,
+        outcome: VoiceEnrollmentEndData.Outcome
+    ) throws -> OutboxItem {
+        try write(EventBody(
+            deviceId: deviceId, at: ISO8601UTC.format(clock.wallNow()),
+            payload: .voiceEnrollmentEnd(VoiceEnrollmentEndData(enrollmentId: enrollmentId, endOffsetUs: endOffsetUs, outcome: outcome)),
+            captureId: captureId, offsetUs: endOffsetUs))
+    }
+
     private func write(_ body: EventBody) throws -> OutboxItem {
         let id = idGenerator().uuidString.lowercased()
         return try outbox.write(try ContractJSON.encode(body), kind: .event(eventId: id))

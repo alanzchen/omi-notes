@@ -112,6 +112,27 @@ testing needs no Beta App Review; external testers do. The app ships with an ori
 Pendant button: **single tap** = bookmark (shown in the note); **double tap** = end the current
 conversation now. A 3 s long press powers the pendant off.
 
+## People and voices
+
+The **People** tab teaches your server who is speaking (see
+[`docs/speaker-learning.md`](../docs/speaker-learning.md)):
+
+- **Teach my voice:** enter your name (it becomes `People/<Name>.md`), wear the pendant, and read six
+  short sentences. The phone only marks the time window (a `voice_enrollment_start` event, then
+  `voice_enrollment_end`); the server pulls your voice from the normal pendant audio. Chunks from
+  that window are held on the phone until the server has acknowledged the start, so the reading is
+  never transcribed as a conversation.
+- **Name people in a conversation:** Home › Recent conversations › a conversation lists its
+  speakers with a playable clip and excerpt. Tap one to pick you, a person, a new person, or
+  "unknown". Naming someone other than you needs a one-time acknowledgment and their knowledge.
+- **Automatic names** show an "auto" badge with the evidence (distance, margin, seconds). They only
+  switch on for a person after several confirmations on different days; until then the app
+  suggests. "Re-summarize with names" rewrites the summary with the names (one LLM call).
+- **Who is this?** (opt-in) lists voices that keep recurring. **Forget voice** deletes that person's
+  voiceprints from the server.
+
+Clips are rendered by the server as WAV and played from memory; the phone never decodes Opus.
+
 ## What happens while it runs
 
 - Each BLE connection is one *live capture*. Audio notifications are appended to a CRC-protected
@@ -162,7 +183,7 @@ shows the (token-redacted) log.
 - Debug builds accept automation launch arguments:
   `-OmiNotesDebugServerURL http://localhost:8765 -OmiNotesDebugToken <token>` to configure the
   server, `-OmiNotesDebugOpenURL 'omi-notes://configure?…'` to open the pairing sheet,
-  `-OmiNotesDebugTab home|settings|debug|pairing` to open a screen, and
+  `-OmiNotesDebugTab home|people|settings|debug|pairing` to open a screen, and
   `-OmiNotesDebugHomeBottom YES` to scroll Home to the upload/notes sections.
   `xcrun simctl spawn booted defaults write <bundle-id> omi.simulatedDevice -bool YES` turns on
   the simulated device before launch.

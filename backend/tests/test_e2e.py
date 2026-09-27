@@ -16,8 +16,8 @@ T0 = STARTED.timestamp()
 
 
 def snapshot(settings):
-    return {p.relative_to(settings.notes_dir).as_posix(): (p.read_bytes(), p.stat().st_mtime_ns)
-            for p in settings.notes_dir.rglob("*.md")}  # fmt: skip
+    return {p.relative_to(settings.vault_dir).as_posix(): (p.read_bytes(), p.stat().st_mtime_ns)
+            for p in settings.vault_dir.rglob("*.md")}  # fmt: skip
 
 
 def ring_sync_seal(client, covers_until: datetime) -> None:
@@ -77,9 +77,12 @@ def test_two_conversations_end_to_end(client, worker, settings):
     assert [c["status"] for c in recent] == ["done", "done"]
     assert {c["note_path"] for c in recent} == set(conversations)
 
-    # Re-running is a no-op: same bytes, untouched files, unchanged state.
-    rows = [dict(r) for r in worker.db.query("SELECT * FROM conversations ORDER BY id")]
+    # Re-running is a no-op: same bytes, untouched files, unchanged state (_status.md is rewritten
+    # at most once a minute, so it catches up first).
     worker.tick(T0 + 500)
+    notes = snapshot(settings)
+    rows = [dict(r) for r in worker.db.query("SELECT * FROM conversations ORDER BY id")]
+    worker.tick(T0 + 600)
     worker.tick(T0 + 5000)
     assert snapshot(settings) == notes
     assert [dict(r) for r in worker.db.query("SELECT * FROM conversations ORDER BY id")] == rows

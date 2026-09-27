@@ -48,3 +48,5 @@ with a 16 kHz mono libopus decoder.
 - `event_button.json` — double tap (`code` 2) with `capture_id` + `offset_us`.
 - `event_heartbeat.json` — heartbeat with a coverage watermark through the end of the (rotated)
   chunk 0 of the live sample.
+- `event_voice_enrollment_start.json` / `event_voice_enrollment_end.json` — one enrollment window
+  (`enrollment_id` 6a0e4c2d-9f1b-4e3a-8c7d-5b2f1e0a9d8c) over the live sample, ending `completed`.

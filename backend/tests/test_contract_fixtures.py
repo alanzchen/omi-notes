@@ -94,3 +94,7 @@ def test_swift_fixtures_are_accepted_by_the_api(client):
         r = client.put(f"/v1/events/{hashlib.md5(event.name.encode()).hexdigest()[:8]}-0000-4000-8000-000000000000",
                        content=event.read_bytes(), headers=AUTH)  # fmt: skip
         assert r.status_code == 201, (event.name, r.text)
+    # the phone's enrollment start and end join into one window (the audio is still unprocessed)
+    enrollment = json.loads((SWIFT_DIR / "event_voice_enrollment_start.json").read_text())["data"]["enrollment_id"]
+    r = client.get(f"/v1/speakers/enrollments/{enrollment}", headers=AUTH)
+    assert r.status_code == 200 and r.json() == {"state": "processing"}, r.text

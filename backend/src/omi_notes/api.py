@@ -12,26 +12,37 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from . import PROTOCOL_VERSION, __version__
-from .db import Database
 from .envelope import MAX_BODY_BYTES
-from .ingest import ApiError, capture_status, put_chunk, put_event, put_seal
-from .pipeline.conversations import queue_counts
-from .pipeline.worker import Worker
+from .ingest import ApiError, Ingest, capture_status
+from .pipeline.conversations import ConversationPipeline, Providers, queue_counts
+from .pipeline.worker import Worker, read_only_reason
+from .rebuild import open_index
 from .settings import Settings
+from .speakers.service import SpeakerService
 from .util import iso_utc_epoch
+from .vault import LeaseError, Vault
 
 log = logging.getLogger(__name__)
 MAX_JSON_BYTES = 64 * 1024
 
 
-def create_app(settings: Settings, *, start_worker: bool = True, worker: Worker | None = None) -> FastAPI:
+def create_app(
+    settings: Settings, *, start_worker: bool = True, worker: Worker | None = None, take_over: bool = False
+) -> FastAPI:
     if not settings.omi_notes_token:
         raise RuntimeError("OMI_NOTES_TOKEN is not set (run `omi-notes pair` to generate one)")
-    db = Database(settings.db_path)
-    settings.notes_dir.mkdir(parents=True, exist_ok=True)
+    vault = Vault.open(settings)
+    lease = vault.foreign_live_lease()
+    if lease and not take_over:
+        raise LeaseError(
+            f"{lease.get('host')} (pid {lease.get('pid')}) is writing this vault. Stop it first, or pass "
+            "--take-over once it is stopped."
+        )
+    db = open_index(settings, vault)
+    ingest = Ingest(db, vault, settings, read_only=lambda: read_only_reason(db))
     token = settings.omi_notes_token.encode()
 
     @asynccontextmanager
@@ -39,7 +50,8 @@ def create_app(settings: Settings, *, start_worker: bool = True, worker: Worker 
         stop = threading.Event()
         thread = None
         if start_worker:
-            w = worker or Worker(settings, Database(settings.db_path))
+            w = worker or Worker(settings, db)
+            w.take_over = take_over
             thread = threading.Thread(target=w.run_forever, args=(stop,), name="omi-notes-worker", daemon=True)
             thread.start()
         yield
@@ -50,6 +62,10 @@ def create_app(settings: Settings, *, start_worker: bool = True, worker: Worker 
     app = FastAPI(title="omi-notes", version=__version__, lifespan=lifespan)
     app.state.db = db
     app.state.settings = settings
+    app.state.vault = vault
+    app.state.ingest = ingest
+    pipeline = worker.pipeline if worker is not None else ConversationPipeline(settings, db, Providers(settings), "api", None)
+    app.state.speakers = SpeakerService(pipeline)
 
     @app.exception_handler(ApiError)
     async def _api_error(_: Request, exc: ApiError) -> JSONResponse:
@@ -111,21 +127,23 @@ def create_app(settings: Settings, *, start_worker: bool = True, worker: Worker 
                 or (settings.llm_provider == "openai" and bool(settings.llm_base_url)),
             },
             "queue": queue_counts(db),
-            "notes_dir": str(settings.notes_dir),
+            "vault_dir": str(settings.vault_dir),
+            "notes_dir": str(settings.vault_dir),
+            "read_only": read_only_reason(db),
         }
 
     @app.put("/v1/captures/{capture_id}/chunks/{chunk_sequence}")
     async def upload_chunk(capture_id: str, chunk_sequence: int, request: Request) -> JSONResponse:
         body = await read_body(request, MAX_BODY_BYTES)
         status_code, payload = await run_in_threadpool(
-            put_chunk, db, settings, capture_id, chunk_sequence, body, request.headers.get("x-content-sha256")
+            ingest.put_chunk, capture_id, chunk_sequence, body, request.headers.get("x-content-sha256")
         )
         return JSONResponse(payload, status_code=status_code)
 
     @app.put("/v1/captures/{capture_id}/seal")
     async def seal(capture_id: str, request: Request) -> JSONResponse:
         raw = await read_json(request)
-        status_code, payload = await run_in_threadpool(put_seal, db, capture_id, raw)
+        status_code, payload = await run_in_threadpool(ingest.put_seal, capture_id, raw)
         return JSONResponse(payload, status_code=status_code)
 
     @app.get("/v1/captures/{capture_id}")
@@ -138,7 +156,7 @@ def create_app(settings: Settings, *, start_worker: bool = True, worker: Worker 
     @app.put("/v1/events/{event_id}")
     async def event(event_id: str, request: Request) -> JSONResponse:
         raw = await read_json(request)
-        status_code, payload = await run_in_threadpool(put_event, db, event_id, raw)
+        status_code, payload = await run_in_threadpool(ingest.put_event, event_id, raw)
         return JSONResponse(payload, status_code=status_code)
 
     @app.get("/v1/conversations/recent")
@@ -160,5 +178,97 @@ def create_app(settings: Settings, *, start_worker: bool = True, worker: Worker 
                 for r in rows
             ]
         }
+
+    # -- people & voices (docs/speaker-learning.md, "API") --------------------------------------
+
+    def writable() -> None:
+        reason = read_only_reason(db)
+        if reason:
+            raise ApiError(503, "vault_read_only", reason)
+
+    def speakers(request: Request) -> SpeakerService:
+        return request.app.state.speakers
+
+    @app.get("/v1/people")
+    def list_people(request: Request) -> dict:
+        return {"people": speakers(request).people()}
+
+    @app.put("/v1/people/{person_id}")
+    async def put_person(person_id: str, request: Request) -> JSONResponse:
+        body = await read_json(request)
+        if not isinstance(body, dict):
+            raise ApiError(422, "invalid_body", "expected a JSON object")
+        writable()
+        status_code, person = await run_in_threadpool(speakers(request).put_person, person_id, body)
+        return JSONResponse(person, status_code=status_code)
+
+    @app.delete("/v1/people/{person_id}")
+    def delete_person(person_id: str, request: Request, delete_note: bool = False) -> dict:
+        writable()
+        affected = speakers(request).forget(person_id, delete_note=delete_note)
+        return {"person_id": person_id, "voice_forgotten": True, "note_deleted": delete_note,
+                "relabeled_conversations": affected}  # fmt: skip
+
+    @app.get("/v1/conversations/{conv_id}/speakers")
+    def conversation_speakers(conv_id: str, request: Request) -> dict:
+        return speakers(request).conversation_speakers(conv_id)
+
+    @app.put("/v1/conversations/{conv_id}/speakers/{label}")
+    async def put_speaker(conv_id: str, label: str, request: Request) -> dict:
+        body = await read_json(request)
+        if not isinstance(body, dict):
+            raise ApiError(422, "invalid_body", "expected a JSON object")
+        writable()
+        outcome = await run_in_threadpool(speakers(request).assign, conv_id, label, body)
+        return {"revision": outcome.revision, "labels": outcome.labels, "relabeled_conversations": outcome.relabeled,
+                "sample": outcome.sample}  # fmt: skip
+
+    @app.post("/v1/conversations/{conv_id}/resummarize")
+    def resummarize(conv_id: str, request: Request) -> JSONResponse:
+        writable()
+        speakers(request).resummarize(conv_id)
+        return JSONResponse({"conversation_id": conv_id, "queued": True}, status_code=202)
+
+    @app.get("/v1/speakers/suggestions")
+    def suggestions(request: Request, limit: int = 5) -> dict:
+        return {"suggestions": speakers(request).suggestions(max(1, min(limit, 20)))}
+
+    @app.post("/v1/speakers/suggestions/{suggestion_id}/dismiss")
+    def dismiss(suggestion_id: str, request: Request) -> Response:
+        writable()
+        speakers(request).dismiss(suggestion_id)
+        return Response(status_code=204)
+
+    @app.post("/v1/speakers/suggestions/{suggestion_id}/assign")
+    async def assign_suggestion(suggestion_id: str, request: Request) -> dict:
+        body = await read_json(request)
+        if not isinstance(body, dict):
+            raise ApiError(422, "invalid_body", "expected a JSON object")
+        writable()
+        changed = await run_in_threadpool(speakers(request).assign_suggestion, suggestion_id, body)
+        return {"relabeled_conversations": changed}
+
+    @app.get("/v1/speakers/settings")
+    def get_speaker_settings(request: Request) -> dict:
+        return speakers(request).get_settings()
+
+    @app.put("/v1/speakers/settings")
+    async def put_speaker_settings(request: Request) -> dict:
+        body = await read_json(request)
+        if not isinstance(body, dict):
+            raise ApiError(422, "invalid_body", "expected a JSON object")
+        writable()
+        return await run_in_threadpool(speakers(request).put_settings, body)
+
+    @app.get("/v1/speakers/enrollments/{enrollment_id}")
+    def enrollment_status(enrollment_id: str, request: Request) -> dict:
+        result = speakers(request).enrollment_status(enrollment_id)
+        if result is None:
+            raise ApiError(404, "unknown_enrollment", "no voice enrollment with this id")
+        return result
+
+    @app.get("/v1/clips/{clip_id}")
+    def clip(clip_id: str, request: Request) -> Response:
+        return Response(speakers(request).clip_wav(clip_id), media_type="audio/wav")
 
     return app

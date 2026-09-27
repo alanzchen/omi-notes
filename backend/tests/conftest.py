@@ -22,8 +22,8 @@ FIXTURES = Path(__file__).parent / "fixtures"
 def make_settings(tmp_path: Path, **overrides) -> Settings:
     values = dict(
         omi_notes_token=TOKEN,
-        notes_dir=tmp_path / "notes",
-        data_dir=tmp_path / "data",
+        vault_dir=tmp_path / "notes",
+        index_dir=tmp_path / "index",
         stt_provider="fake",
         llm_provider="fake",
         vad_backend="energy",
@@ -32,6 +32,7 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
         # Local diarization stays off in tests unless a test injects a diarizer.
         diarization_segmentation_model=tmp_path / "no-segmentation.onnx",
         diarization_embedding_model=tmp_path / "no-embedding.onnx",
+        speaker_model=tmp_path / "no-speaker-model.onnx",
     )
     values.update(overrides)
     return Settings(**values)
@@ -48,8 +49,8 @@ def hermetic_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 def cli_env(settings: Settings) -> dict[str, str]:
     return {
         "OMI_NOTES_TOKEN": settings.omi_notes_token,
-        "NOTES_DIR": str(settings.notes_dir),
-        "DATA_DIR": str(settings.data_dir),
+        "VAULT_DIR": str(settings.vault_dir),
+        "INDEX_DIR": str(settings.index_dir),
         "STT_PROVIDER": settings.stt_provider,
         "LLM_PROVIDER": settings.llm_provider,
         "VAD_BACKEND": settings.vad_backend,
@@ -68,7 +69,7 @@ def client(settings: Settings) -> TestClient:
 
 
 @pytest.fixture
-def worker(settings: Settings, client: TestClient) -> Worker:  # client first: creates the schema
+def worker(settings: Settings, client: TestClient) -> Worker:  # client first: opens the vault and index
     return Worker(settings, Database(settings.db_path))
 
 

@@ -147,17 +147,43 @@ public struct ButtonData: Codable, Equatable, Sendable {
     public init(code: Int) { self.code = code }
 }
 
+/// `voice_enrollment_start`: the wearer starts reading enrollment prompts. `capture_id`/`offset_us`
+/// (top level) mark the window start on the live capture's monotonic clock.
+public struct VoiceEnrollmentStartData: Codable, Equatable, Sendable {
+    public var enrollmentId: String
+    public init(enrollmentId: String) { self.enrollmentId = enrollmentId }
+    enum CodingKeys: String, CodingKey { case enrollmentId = "enrollment_id" }
+}
+
+/// `voice_enrollment_end`: the window end and how the attempt ended.
+public struct VoiceEnrollmentEndData: Codable, Equatable, Sendable {
+    public enum Outcome: String, Codable, Sendable { case completed, cancelled, interrupted }
+    public var enrollmentId: String
+    public var endOffsetUs: Int64
+    public var outcome: Outcome
+    public init(enrollmentId: String, endOffsetUs: Int64, outcome: Outcome) {
+        self.enrollmentId = enrollmentId
+        self.endOffsetUs = endOffsetUs
+        self.outcome = outcome
+    }
+    enum CodingKeys: String, CodingKey {
+        case enrollmentId = "enrollment_id", endOffsetUs = "end_offset_us", outcome
+    }
+}
+
 /// `PUT /v1/events/{event_id}` body.
 public struct EventBody: Encodable, Sendable, Equatable {
     public enum Payload: Sendable, Equatable {
         case button(ButtonData)
         case heartbeat(HeartbeatData)
+        case voiceEnrollmentStart(VoiceEnrollmentStartData)
+        case voiceEnrollmentEnd(VoiceEnrollmentEndData)
     }
 
     public var deviceId: String
     public var at: String
     public var payload: Payload
-    /// Button events: the live capture and monotonic offset they belong to.
+    /// Button and enrollment events: the live capture and monotonic offset they belong to.
     public var captureId: String?
     public var offsetUs: Int64?
 
@@ -173,6 +199,8 @@ public struct EventBody: Encodable, Sendable, Equatable {
         switch payload {
         case .button: return "button"
         case .heartbeat: return "heartbeat"
+        case .voiceEnrollmentStart: return "voice_enrollment_start"
+        case .voiceEnrollmentEnd: return "voice_enrollment_end"
         }
     }
 
@@ -190,6 +218,8 @@ public struct EventBody: Encodable, Sendable, Equatable {
         switch payload {
         case .button(let d): try c.encode(d, forKey: .data)
         case .heartbeat(let d): try c.encode(d, forKey: .data)
+        case .voiceEnrollmentStart(let d): try c.encode(d, forKey: .data)
+        case .voiceEnrollmentEnd(let d): try c.encode(d, forKey: .data)
         }
         try c.encodeIfPresent(captureId, forKey: .captureId)
         try c.encodeIfPresent(offsetUs, forKey: .offsetUs)

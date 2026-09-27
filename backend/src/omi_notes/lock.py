@@ -1,4 +1,7 @@
-"""`DATA_DIR/worker.lock`: at most one process runs the pipeline at a time.
+"""`<index dir>/worker.lock`: at most one process on this host runs the pipeline for a vault.
+
+It lives next to the index, outside the synced vault (docs/vault.md, "Writer ownership"); the
+vault's `_omi/writer.json` lease is the advisory cross-host part.
 
 The worker holds an exclusive `flock` for its whole life. Maintenance commands (`reprocess`,
 `retry-failed`, `rebuild`) try to take it: if they get it they run inline, otherwise they only
@@ -14,8 +17,8 @@ from pathlib import Path
 
 
 class WorkerLock:
-    def __init__(self, data_dir: Path) -> None:
-        self.path = data_dir / "worker.lock"
+    def __init__(self, directory: Path) -> None:
+        self.path = directory / "worker.lock"
         self._fd: int | None = None
 
     @property

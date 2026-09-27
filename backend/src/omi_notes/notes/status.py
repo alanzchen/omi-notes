@@ -25,6 +25,10 @@ class StatusSnapshot:
     failed_conversations: list[dict] = field(default_factory=list)
     attention: list[dict] = field(default_factory=list)  # finished notes that could not be updated
     failed_chunks: list[dict] = field(default_factory=list)
+    edited: list[dict] = field(default_factory=list)  # notes edited outside My Notes (re-render postponed)
+    conflict_copies: list[str] = field(default_factory=list)  # "<path> (copy of <note>)"
+    read_only: str | None = None  # the vault is not written (incomplete sync, divergence, lost lease)
+    replaying: bool = False
 
 
 def _t(epoch: float | None, tz: ZoneInfo) -> str:
@@ -33,6 +37,10 @@ def _t(epoch: float | None, tz: ZoneInfo) -> str:
 
 def render_status(s: StatusSnapshot, tz: ZoneInfo) -> str:
     out = ["# Omi Notes status", ""]
+    if s.read_only:
+        out += [f"> [!danger] Not writing to this vault: {s.read_only}", ""]
+    if s.replaying:
+        out += ["> [!info] Rebuilding the index: raw audio is being replayed before new notes are made.", ""]
     if s.vad_warning:
         out += [f"> [!danger] {s.vad_warning}", ""]
     diarization = [c for c in s.failed_conversations if c.get("error_kind") == "diarization"]
@@ -95,6 +103,21 @@ def render_status(s: StatusSnapshot, tz: ZoneInfo) -> str:
         for c in s.attention:
             out.append(f"- {_t(c['start'], tz)} `{c['id'][:8]}` {c.get('note_path') or ''}: {c.get('error') or ''}")
         out += ["", "The note was left untouched; it is retried automatically (for My Notes problems, fix the markers).", ""]
+    if s.edited:
+        out += ["## Notes edited outside My Notes", ""]
+        for c in s.edited:
+            out.append(f"- {_t(c['start'], tz)} [[{c['note_path'][:-3]}]] (`{c['id'][:8]}`)")
+        out += [
+            "",
+            "These notes changed outside their My Notes section, so updates to them are postponed. Choose one:",
+            "- keep the server's version: `omi-notes note overwrite <id>` (your version is saved to `_omi/displaced/`)",
+            "- keep yours for good: `omi-notes note freeze <id>` (the server stops updating that note)",
+            "",
+        ]
+    if s.conflict_copies:
+        out += ["## Conflicting copies", ""]
+        out += [f"- {line}" for line in s.conflict_copies]
+        out += ["", "A sync tool made these copies; they are left alone. Delete the ones you don't need.", ""]
     if s.failed_chunks:
         out += ["## Failed chunks", ""]
         out += [f"- `{c['capture_id'][:8]}` #{c['chunk_sequence']}: {c.get('error') or ''}" for c in s.failed_chunks]

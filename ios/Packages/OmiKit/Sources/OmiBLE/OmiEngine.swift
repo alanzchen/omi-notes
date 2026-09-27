@@ -62,6 +62,8 @@ public struct EngineSnapshot: Equatable, Sendable {
     public var lastButton: String?
     public var recoveredCaptures = 0
     public var quarantined: [String] = []
+    /// Voice enrollment window currently open on the live capture, if any.
+    public var activeEnrollmentId: String?
 
     public init() {}
 }
@@ -105,6 +107,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     public private(set) var uploader: Uploader!
     private var ringWriter: RingCaptureWriter!
     public private(set) var ledger: RingCaptureLedger!
+    public private(set) var enrollmentGate: EnrollmentGate!
     /// Recording and uploads are gated on launch recovery.
     public private(set) var recoveryComplete = false
     private var cursors: RingCursorStore!
@@ -140,6 +143,8 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     private var recoveredCaptures = 0
     private var processedThrough: [String: Int] = [:]
     private var simReconnectWork: DispatchWorkItem?
+    private struct ActiveEnrollment { var id: String; var captureId: String; var deviceId: String }
+    private var activeEnrollment: ActiveEnrollment?
 
     public var storagePolicy: StorageGuardPolicy { config.storagePolicy }
     public var retentionPolicy = RetentionPolicy()
@@ -163,6 +168,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         deviceMemory = DeviceMemory(stateDir: dirs.state)
         cursors = RingCursorStore(stateDir: dirs.state)
         ledger = RingCaptureLedger(dirs: dirs, outbox: outbox)
+        enrollmentGate = EnrollmentGate(stateDir: dirs.state, outbox: outbox)
         processedThrough = JSONFile.load([String: Int].self, from: processedURL) ?? [:]
 
         // Capture pipeline (objects only; no scanning here).
@@ -191,7 +197,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         uploader = Uploader(
             outbox: outbox, state: UploadStateStore(url: dirs.state.appendingPathComponent("upload-state.json")),
             transport: transport, queue: queue, config: { settings.serverConfig() })
-        uploader.gate = ledger
+        uploader.gate = CompositeUploadGate([ledger, enrollmentGate])
         uploader.enabled = false  // until recovery completes
         uploader.onStatusChange = { [weak self] in self?.scheduleSnapshot() }
         backgroundTransport?.onCompletion = { [weak self] id, status, body, error in
@@ -429,6 +435,78 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
 
     public func runRetentionNow() { queue.async { self.runRetention() } }
 
+    // MARK: Voice enrollment (docs/speaker-learning.md, "Enrollment")
+
+    public enum EnrollmentError: Error, LocalizedError, Equatable {
+        case notRecording, alreadyRunning, writeFailed(String)
+        public var errorDescription: String? {
+            switch self {
+            case .notRecording: return "The pendant isn't streaming audio yet. Wear it, wait for Recording, then try again."
+            case .alreadyRunning: return "A voice enrollment is already running."
+            case .writeFailed(let why): return "Could not start enrollment: \(why)"
+            }
+        }
+    }
+
+    /// Opens an enrollment window on the live capture: journals `voice_enrollment_start` and holds
+    /// the capture's chunks from here until the server acknowledges it. Returns the enrollment id.
+    public func startVoiceEnrollment() throws -> String {
+        try queue.sync { try self.startEnrollment() }
+    }
+
+    private func startEnrollment() throws -> String {
+        do {
+            guard activeEnrollment == nil else { throw EnrollmentError.alreadyRunning }
+            guard let s = session, recorder.isActive, let captureId = recorder.captureId, let offset = recorder.nowOffsetUs() else {
+                throw EnrollmentError.notRecording
+            }
+            let id = UUID().uuidString.lowercased()
+            do {
+                let item = try events.voiceEnrollmentStart(enrollmentId: id, deviceId: s.deviceId, captureId: captureId, offsetUs: offset)
+                guard case .event(let eventId) = item.kind else { throw EnrollmentError.writeFailed("unexpected outbox item") }
+                try enrollmentGate.hold(.init(
+                    enrollmentId: id, captureId: captureId, fromSequence: recorder.stats.chunkSequence,
+                    startEventId: eventId, endEventId: nil))
+            } catch let e as EnrollmentError {
+                throw e
+            } catch {
+                throw EnrollmentError.writeFailed("\(error)")
+            }
+            activeEnrollment = ActiveEnrollment(id: id, captureId: captureId, deviceId: s.deviceId)
+            log(.info, "enrollment", "voice enrollment \(id) started at \(offset) µs of \(captureId)")
+            scheduleReconcile()
+            scheduleSnapshot()
+            return id
+        }
+    }
+
+    /// Closes the window (`voice_enrollment_end`) and rotates the chunk so the audio uploads.
+    public func finishVoiceEnrollment(outcome: VoiceEnrollmentEndData.Outcome) {
+        queue.async { self.finishEnrollment(outcome: outcome) }
+    }
+
+    private func finishEnrollment(outcome: VoiceEnrollmentEndData.Outcome) {
+        guard let e = activeEnrollment else { return }
+        activeEnrollment = nil
+        guard recorder.captureId == e.captureId, let end = recorder.nowOffsetUs() else {
+            log(.warning, "enrollment", "capture of enrollment \(e.id) already ended; no end event")
+            return
+        }
+        do {
+            let item = try events.voiceEnrollmentEnd(
+                enrollmentId: e.id, deviceId: e.deviceId, captureId: e.captureId, endOffsetUs: end, outcome: outcome)
+            if case .event(let eventId) = item.kind { enrollmentGate.attachEndEvent(enrollmentId: e.id, endEventId: eventId) }
+        } catch {
+            log(.error, "enrollment", "end event write failed: \(error)")
+        }
+        if outcome != .interrupted {
+            withBackgroundTask("enrollment-rotate") { recorder.rotateNow(reason: .forced) }
+        }
+        log(.info, "enrollment", "voice enrollment \(e.id) ended (\(outcome.rawValue)) at \(end) µs")
+        scheduleReconcile()
+        scheduleSnapshot()
+    }
+
     public func sendHeartbeatNow() { queue.async { self.writeHeartbeat(reason: "manual") } }
 
     // MARK: Lifecycle
@@ -513,6 +591,8 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
 
     private func endSession(reason: SealReason) {
         guard let s = session else { return }
+        // Close an open enrollment window while the capture (and its clock) still exists.
+        finishEnrollment(outcome: .interrupted)
         let r = pendingDisconnectReason ?? reason
         pendingDisconnectReason = nil
         session = nil
@@ -859,6 +939,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         s.lastButton = lastButton
         s.recoveredCaptures = recoveredCaptures
         s.quarantined = quarantined
+        s.activeEnrollmentId = activeEnrollment?.id
         s.connection = connectionPhase()
         return s
     }

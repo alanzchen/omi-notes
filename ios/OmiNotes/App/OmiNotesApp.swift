@@ -24,7 +24,7 @@ struct OmiNotesApp: App {
 }
 
 struct RootView: View {
-    enum Tab: String { case home, settings, debug, pairing }
+    enum Tab: String { case home, people, settings, debug, pairing }
 
     @Bindable var model: AppModel
     @State private var showOnboarding = false
@@ -35,6 +35,9 @@ struct RootView: View {
             NavigationStack { HomeView(model: model) }
                 .tabItem { Label("Home", systemImage: "waveform") }
                 .tag(Tab.home)
+            NavigationStack { PeopleView(model: model) }
+                .tabItem { Label("People", systemImage: "person.2") }
+                .tag(Tab.people)
             NavigationStack {
                 if tab == .pairing { PairingView(model: model) } else { SettingsView(model: model) }
             }
@@ -58,7 +61,7 @@ struct RootView: View {
 }
 
 extension RootView {
-    /// Simulator automation only (debug builds): `-OmiNotesDebugTab home|settings|debug|pairing`
+    /// Simulator automation only (debug builds): `-OmiNotesDebugTab home|people|settings|debug|pairing`
     /// opens that screen at launch (there is no way to tap in a headless simulator).
     static var initialTab: Tab {
         #if DEBUG

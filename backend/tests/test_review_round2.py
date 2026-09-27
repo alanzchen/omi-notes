@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-from omi_notes import db as dbmod
+from omi_notes import legacy as dbmod  # the pre-vault ledger (migrate-vault reads it)
 from omi_notes import spool
 from omi_notes.api import create_app
 from omi_notes.audio.vad import EnergyVad, VadChoice
@@ -116,8 +116,8 @@ def v1_database(path: Path) -> None:
 def test_r3_migration_backfills_normalized_seal_values(tmp_path):
     path = tmp_path / "v1.sqlite3"
     v1_database(path)
-    db = Database(path)
-    by_id = {r["capture_id"]: r for r in db.query("SELECT * FROM capture_times")}
+    db = dbmod.open_legacy(path)
+    by_id = {r["capture_id"]: r for r in db.execute("SELECT * FROM capture_times").fetchall()}
     assert by_id["live-legacy"]["seal_end_offset_us"] == 311025000
     assert by_id["live-legacy"]["seal_end"] == pytest.approx(T0 + 311.025)  # monotonic, not the stepped wall clock
     assert by_id["live-string"]["seal_end_offset_us"] == 5_000_000  # v1 accepted (coerced) numeric strings
@@ -133,14 +133,14 @@ def test_r3_migration_backfills_normalized_seal_values(tmp_path):
 def test_r4_first_http_upload_makes_every_new_directory_durable(tmp_path, monkeypatch):
     synced: list[Path] = []
     monkeypatch.setattr(spool, "fsync_dir", lambda p: synced.append(Path(p)))
-    data = tmp_path / "a" / "b" / "data"
-    settings = make_settings(tmp_path, data_dir=data)
+    vault = tmp_path / "a" / "b" / "vault"
+    settings = make_settings(tmp_path, vault_dir=vault)
     client = TestClient(create_app(settings, start_worker=False))
     capture = str(uuid.uuid4())
     body = live_envelopes(synth_speech_like(1), capture_id=capture, device_id=DEVICE, started_at=STARTED)[0]
     assert put_chunk(client, capture, 0, body).status_code == 201
-    raw = data / "raw"
-    for created in (tmp_path / "a", tmp_path / "a" / "b", data, raw, raw / DEVICE, raw / DEVICE / capture):
+    raw = vault / "_omi" / "raw"
+    for created in (tmp_path / "a", tmp_path / "a" / "b", vault, vault / "_omi", raw, raw / DEVICE, raw / DEVICE / capture):
         assert created.parent in synced, created
 
 
@@ -167,7 +167,7 @@ def test_r5_reprocess_request_during_a_running_stage_is_kept(client, worker, set
     (row,) = convs(worker)
     llm = BlockingLlm()
     worker.providers._llm = llm
-    lock = WorkerLock(settings.data_dir)
+    lock = WorkerLock(settings.db_path.parent)
     assert lock.acquire()  # a worker is "running": the CLI only queues
     try:
         runner = CliRunner()
@@ -196,8 +196,8 @@ def test_r6_an_interrupted_move_is_finished_on_restart(client, worker, settings,
     replay(client, SPEECH)
     worker.tick(T0 + 200)
     (row,) = convs(worker)
-    current = settings.notes_dir / row["note_path"]
-    old = settings.notes_dir / "_discarded" / "2026-09-26 1400 abc123.md"
+    current = settings.vault_dir / row["note_path"]
+    old = settings.vault_dir / "_discarded" / "2026-09-26 1400 abc123.md"
     old.parent.mkdir(parents=True, exist_ok=True)
     old.write_text(current.read_text())
     worker.db.execute("UPDATE conversations SET stale_note_path=? WHERE id=?", ("_discarded/2026-09-26 1400 abc123.md", row["id"]))
@@ -296,7 +296,7 @@ def test_r2b_1_an_undeletable_stale_note_never_blocks_other_work(client, worker,
     replay(client, SPEECH)
     worker.tick(T0 + 200)
     (row,) = convs(worker)
-    old = settings.notes_dir / "_discarded" / "undeletable.md"
+    old = settings.vault_dir / "_discarded" / "undeletable.md"
     old.parent.mkdir(exist_ok=True)
     old.write_text("old copy")
     worker.db.execute("UPDATE conversations SET stale_note_path=? WHERE id=?", ("_discarded/undeletable.md", row["id"]))
@@ -308,7 +308,7 @@ def test_r2b_1_an_undeletable_stale_note_never_blocks_other_work(client, worker,
         statuses = [r["status"] for r in worker.db.query("SELECT status FROM chunks WHERE capture_id=?", (later,))]
         assert statuses and set(statuses) == {"processed"}
         assert worker.db.one("SELECT stale_note_path FROM conversations WHERE id=?", (row["id"],))[0] is not None
-        assert "undeletable.md" in (settings.notes_dir / "_status.md").read_text()
+        assert "undeletable.md" in (settings.vault_dir / "_status.md").read_text()
     finally:
         old.parent.chmod(0o755)
     worker.tick(T0 + 4010)  # still backing off
@@ -356,8 +356,8 @@ def test_r2b_2_migration_turns_queued_force_flags_into_requests(tmp_path):
             (cid, DEVICE, *flags),
         )
     conn.close()
-    db = Database(path)
-    rows = {r["id"]: (r["reprocess_request"], r["reprocess_handled"]) for r in db.query("SELECT * FROM conversations")}
+    db = dbmod.open_legacy(path)
+    rows = {r["id"]: (r["reprocess_request"], r["reprocess_handled"]) for r in db.execute("SELECT * FROM conversations")}
     assert rows == {"queued-llm": (1, 0), "queued-stt": (1, 0), "idle": (0, 0)}
 
 
@@ -384,7 +384,7 @@ def test_r2b_3_late_loss_evidence_updates_a_finalized_note_without_provider_call
     worker.tick(T0 + 1700)
     row = next(r for r in convs(worker) if r["start"] >= T0)
     assert row["lost_seconds"] > 5 and json.loads(row["gaps_json"])
-    text = (settings.notes_dir / row["note_path"]).read_text()
+    text = (settings.vault_dir / row["note_path"]).read_text()
     assert "Audio missing" in text and "audio_lost_s: 0.0" not in text
     assert CountingLlm.calls == calls and row["revision"] == 2
 
@@ -415,8 +415,8 @@ def test_r3b_2_migration_4_repairs_force_flags_stranded_by_an_earlier_migration_
         (DEVICE,),
     )
     conn.close()
-    db = Database(path)
-    rows = {r["id"]: (r["reprocess_request"], r["reprocess_handled"]) for r in db.query("SELECT * FROM conversations")}
+    db = dbmod.open_legacy(path)
+    rows = {r["id"]: (r["reprocess_request"], r["reprocess_handled"]) for r in db.execute("SELECT * FROM conversations")}
     assert rows == {"stranded": (1, 0), "pending": (3, 2)}
 
 
@@ -438,7 +438,7 @@ def test_r3b_3_crash_before_refresh_does_not_skip_the_late_loss_update(client, w
     worker.tick(T0 + 1800)  # "after restart": the evidence is complete, so the refresh is redone
     row = next(r for r in convs(worker) if r["start"] >= T0)
     assert row["lost_seconds"] > 5 and json.loads(row["gaps_json"])
-    assert "Audio missing" in (settings.notes_dir / row["note_path"]).read_text()
+    assert "Audio missing" in (settings.vault_dir / row["note_path"]).read_text()
     assert worker.db.one("SELECT dropped_reconciled FROM captures WHERE capture_id=?", (gen2,))["dropped_reconciled"] == 1
 
 
@@ -461,4 +461,4 @@ def test_r4_crash_while_a_loss_estimate_shrinks_leaves_no_stale_warning(client, 
     worker.tick(T0 + 1800)  # "after restart"
     row = next(r for r in convs(worker) if r["start"] >= T0)
     assert row["lost_seconds"] == 0, "the shrunk loss must be removed from the finalized note"
-    assert "Audio missing" not in (settings.notes_dir / row["note_path"]).read_text()
+    assert "Audio missing" not in (settings.vault_dir / row["note_path"]).read_text()

@@ -50,7 +50,7 @@ def test_filename_frozen_my_notes_preserved_revision_bumped(client, worker, sett
     worker.tick(T0 + 200)
     (row,) = convs(worker)
     assert row["status"] == "done" and row["revision"] == 1
-    path = settings.notes_dir / row["note_path"]
+    path = settings.vault_dir / row["note_path"]
     text = path.read_text().replace("<!-- my-notes:start -->\n\n", "<!-- my-notes:start -->\nCall Priya back.\n")
     path.write_text(text)
 
@@ -93,7 +93,7 @@ def test_llm_auth_failure_publishes_transcript_then_retry_failed(client, worker,
     (row,) = convs(worker)
     assert row["status"] == "failed" and row["failed_stage"] == "summarizing" and row["error_kind"] == "auth"
     assert "status: transcript_only" in note_text(settings, row)
-    status_md = (settings.notes_dir / "_status.md").read_text()
+    status_md = (settings.vault_dir / "_status.md").read_text()
     assert "rejected our credentials" in status_md and "invalid x-api-key" in status_md
 
     result = CliRunner().invoke(cli, ["retry-failed"], env=cli_env(settings))
@@ -113,9 +113,9 @@ def test_stt_auth_failure_is_terminal_and_visible(tmp_path):
     worker.tick(T0 + 200)
     (row,) = convs(worker)
     assert row["status"] == "failed" and row["failed_stage"] == "transcribing" and row["note_path"] is None
-    stub = next((settings.notes_dir / "_in-progress").glob("*.md")).read_text()
+    stub = next((settings.vault_dir / "_in-progress").glob("*.md")).read_text()
     assert "Processing failed" in stub and "DEEPGRAM_API_KEY" in stub
-    assert "rejected our credentials" in (settings.notes_dir / "_status.md").read_text()
+    assert "rejected our credentials" in (settings.vault_dir / "_status.md").read_text()
 
 
 def test_transient_failure_backs_off(client, worker):
@@ -147,7 +147,7 @@ def test_filler_is_discarded_by_rules_and_kept_in_discarded_folder(client, worke
     assert row["status"] == "discarded" and row["note_path"].startswith("_discarded/")
     text = note_text(settings, row)
     assert "Discarded: only filler words" in text and "Mm-hmm." in text
-    assert "## Discarded" in (settings.notes_dir / "Daily/2026-09-26.md").read_text()
+    assert "## Discarded" in (settings.vault_dir / "Daily/2026-09-26.md").read_text()
 
 
 # -- events ----------------------------------------------------------------------------------------
@@ -181,7 +181,7 @@ def test_heartbeat_feeds_status(client, worker, settings):
     event(client, "heartbeat", at=T0, data={"battery": 83, "charging": True, "app_state": "background",
                                             "outbox_chunks": 3, "rtc_valid": False})  # fmt: skip
     worker.tick(T0 + 10)
-    status_md = (settings.notes_dir / "_status.md").read_text()
+    status_md = (settings.vault_dir / "_status.md").read_text()
     assert "Battery: 83% (charging)" in status_md and "Device clock not set" in status_md
 
 
@@ -288,13 +288,13 @@ def test_retention_deletes_old_raw_audio_only_when_done(client, worker, settings
 def test_rebuild_makes_no_api_calls_and_reproduces_notes(client, worker, settings):
     replay(client, np.concatenate([silence(1), synth_speech_like(10), silence(2)]))
     worker.tick(T0 + 200)
-    before = {p.relative_to(settings.notes_dir): p.read_bytes() for p in settings.notes_dir.rglob("*.md")}
-    for p in settings.notes_dir.rglob("*.md"):
+    before = {p.relative_to(settings.vault_dir): p.read_bytes() for p in settings.vault_dir.rglob("*.md")}
+    for p in settings.vault_dir.rglob("*.md"):
         p.unlink()
     env = cli_env(settings) | {"STT_PROVIDER": "deepgram", "LLM_PROVIDER": "anthropic"}  # no keys: any call would fail
     result = CliRunner().invoke(cli, ["rebuild"], env=env)
     assert result.exit_code == 0, result.output
-    after = {p.relative_to(settings.notes_dir): p.read_bytes() for p in settings.notes_dir.rglob("*.md")}
+    after = {p.relative_to(settings.vault_dir): p.read_bytes() for p in settings.vault_dir.rglob("*.md")}
     conversation = [p for p in before if p.parts[0] == "Conversations"]
     assert conversation and all(after[p] == before[p] for p in conversation)
     assert after[next(p for p in before if p.parts[0] == "Daily")] == before[next(p for p in before if p.parts[0] == "Daily")]
