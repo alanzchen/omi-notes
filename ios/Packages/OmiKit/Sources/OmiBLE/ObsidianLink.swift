@@ -14,7 +14,8 @@ public enum ObsidianLink {
     /// nil without a vault name or a Markdown note path.
     public static func url(vault: String, notePath: String) -> URL? {
         let name = vault.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, notePath.hasSuffix(".md"), !notePath.hasPrefix("/"), !notePath.contains("..") else { return nil }
+        guard !name.isEmpty, notePath.hasSuffix(".md"), !notePath.hasPrefix("/"),
+              !notePath.split(separator: "/").contains("..") else { return nil }
         let file = String(notePath.dropLast(3))
         return URL(string: "obsidian://open?vault=\(encode(name))&file=\(encode(file))")
     }

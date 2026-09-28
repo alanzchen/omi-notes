@@ -159,10 +159,7 @@ def test_a_crash_between_the_operation_and_the_record_is_repaired(client, worker
 def test_an_orphan_for_a_different_failure_is_superseded(client, worker, settings):
     row = failed_summary(client, worker)
     rid = str(uuid.uuid4())
-    settings.vault_dir.joinpath("_omi", "operations").mkdir(parents=True, exist_ok=True)
-    (settings.vault_dir / "_omi" / "operations" / f"{rid}.json").write_text(json.dumps({
-        "format": 1, "id": rid, "kind": "retry", "conversation_id": row["id"], "stage": "summarizing",
-        "failure_kind": "auth", "record_sha": "0" * 64, "requested_at": T0, "state": "accepted"}))  # fmt: skip
+    write_op(settings, orphan(row, rid, failure_id="another-attempt", record_sha="0" * 64))
     worker.tick(T0 + 500)
     assert op(client, rid)["state"] == "superseded" and convs(worker)[0]["status"] == "failed"
     assert worker.providers._llm.calls == 1
@@ -329,8 +326,9 @@ def test_the_sweep_rotates_past_stuck_operations(client, worker, settings, monke
     row = failed_summary(client, worker)
     monkeypatch.setattr(operations, "SWEEP_BATCH", 3)
     for _ in range(5):  # operations for a conversation that isn't there: never settled
-        write_op(settings, {"format": 1, "id": "0" + str(uuid.uuid4())[1:], "kind": "retry",
-                            "conversation_id": str(uuid.uuid4()), "state": "accepted"})  # fmt: skip
+        write_op(settings, {"format": 1, "id": "0" + str(uuid.uuid4())[1:], "kind": "retry", "stage": "summarizing",
+                            "conversation_id": str(uuid.uuid4()), "state": "accepted", "requested_at": T0,
+                            "failure_id": None, "record_sha": None})  # fmt: skip
     rid = "f" + str(uuid.uuid4())[1:]  # sorts last
     write_op(settings, orphan(row, rid))
     worker.providers._llm = CountingLlm()
@@ -364,6 +362,10 @@ def test_a_repeat_of_a_finished_retry_whose_receipt_was_lost_is_not_run_again(cl
     {"id": "X", "kind": "retry", "conversation_id": "c", "state": "accepted", "requested_at": 1},  # no format
     {"format": 1, "id": "X", "kind": "retry", "conversation_id": "c", "state": "weird", "requested_at": 1},
     {"format": 1, "id": "X", "kind": "retry", "conversation_id": "c", "state": "accepted"},  # no requested_at
+    {"format": 1, "id": "X", "kind": "retry", "conversation_id": "c", "state": "accepted", "requested_at": 1,
+     "stage": "dancing", "failure_id": None, "record_sha": None},
+    {"format": 1, "id": "X", "kind": "retry", "conversation_id": "c", "state": "accepted", "requested_at": 1,
+     "stage": "summarizing"},  # no failure binding
 ])  # fmt: skip
 def test_invalid_operation_files_are_rejected(settings, op_body):
     from omi_notes.vault import Vault
@@ -373,3 +375,15 @@ def test_invalid_operation_files_are_rejected(settings, op_body):
     write_op(settings, op_body | {"id": rid})
     with pytest.raises(operations.OperationCorrupt):
         operations.read(vault, rid)
+
+
+def test_an_orphan_waits_for_other_queued_work_instead_of_merging_with_it(client, worker, settings):
+    row = failed_summary(client, worker)
+    rid = str(uuid.uuid4())
+    write_op(settings, orphan(row, rid))  # accepted, then a crash before the record got `retry`
+    worker.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1, force_llm = 1 WHERE id=?",
+                      (row["id"],))  # a CLI `reprocess --force-llm` meanwhile  # fmt: skip
+    worker.tick(T0 + 500)  # the forced reprocess runs alone (and fails again with a new attempt id)
+    assert convs(worker)[0]["retry_op"] is None
+    worker.tick(T0 + 501)
+    assert op(client, rid)["state"] == "superseded"

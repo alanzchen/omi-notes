@@ -106,6 +106,20 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         #expect(stored.entries(server: "https://mac.ts.net|vault-a").isEmpty)
     }
 
+    @Test func anotherVaultBehindTheSameAddressStartsClean() async throws {
+        let (m, _) = try model()
+        AppServerStub.routes["/v1/conversations/recent"] = [(200, #"{"conversations":[{"id":"c1","status":"done","title":"Budget review","started_at":"2026-09-26T19:00:00.000Z"}],"next_cursor":null}"#)]
+        AppServerStub.routes["/v1/conversations/c1"] = [(200, NoteCacheTests().detailJSON)]
+        await m.refreshServer()
+        _ = try await m.conversation("c1")
+        let before = m.serverIdentity
+        AppServerStub.routes["/v1/status"] = [(200, Self.status.replacingOccurrences(of: "vault-a", with: "vault-b"))]
+        AppServerStub.routes["/v1/conversations/recent"] = [(200, #"{"conversations":[],"next_cursor":null}"#)]
+        await m.refreshServer()
+        #expect(m.serverIdentity != before && m.details.isEmpty && m.recent.isEmpty)
+        #expect(m.noteCache.lastScope?.vaultId != "vault-a" && m.savedConversations().isEmpty)
+    }
+
     @Test func busyIsNotAnAnswer() async throws {
         let (m, root) = try model()
         await m.refreshServer()

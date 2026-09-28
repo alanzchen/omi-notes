@@ -15,6 +15,7 @@ import Testing
         #expect(ObsidianLink.url(vault: "V", notePath: "a.txt") == nil)
         #expect(ObsidianLink.url(vault: "V", notePath: "../outside.md") == nil)
         #expect(ObsidianLink.url(vault: "V", notePath: "/abs.md") == nil)
+        #expect(ObsidianLink.url(vault: "V", notePath: "Notes/Wait... what.md") != nil)  // dots in a name are fine
     }
 
     @Test func theNameIsRememberedPerVaultAndTheFolderIsOnlyASuggestion() {

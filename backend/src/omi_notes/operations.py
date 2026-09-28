@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from pathlib import Path
 
@@ -35,6 +36,7 @@ FORMAT = 1
 TERMINAL = ("done", "failed", "stopped", "superseded")
 REQUIRED = ("id", "kind", "conversation_id", "state")
 STATES = ("accepted", *TERMINAL)
+STAGES = ("transcribing", "summarizing")
 SWEEP_BATCH = 50
 BUSY = ("busy", "the server is working on this conversation right now; try again in a moment")
 
@@ -66,10 +68,16 @@ def read(vault: Vault, op_id: str) -> dict | None:
         raise OperationCorrupt(500, "operation_unreadable", f"operation {op_id} is unreadable: {exc}") from exc
     if (not isinstance(op, dict) or any(not isinstance(op.get(k), str) for k in REQUIRED) or op["id"] != op_id
             or not isinstance(op.get("format"), int) or not 1 <= op["format"] <= FORMAT or op["kind"] != "retry"
-            or op["state"] not in STATES
-            or (op["state"] == "accepted" and not isinstance(op.get("requested_at"), (int, float)))):  # fmt: skip
+            or op["state"] not in STATES or (op["state"] == "accepted" and not _valid_accepted(op))):  # fmt: skip
         raise OperationCorrupt(500, "operation_unreadable", f"operation {op_id} is not a valid operation file")
     return op
+
+
+def _valid_accepted(op: dict) -> bool:
+    """An accepted operation carries what repair needs: its stage, when, and the failed attempt."""
+    at = op.get("requested_at")
+    return (op.get("stage") in STAGES and isinstance(at, (int, float)) and not isinstance(at, bool)
+            and math.isfinite(at) and "failure_id" in op and "record_sha" in op)  # fmt: skip
 
 
 def _write(vault: Vault, op: dict) -> None:
@@ -224,12 +232,15 @@ def _repair(pipeline, op: dict) -> bool:
             db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1 WHERE id=?", (row["id"],))
     elif (row["retry_op"] is None and row["status"] == "failed" and _same_failure(row, op)
           and not row["frozen"] and not row["edited"]):  # fmt: skip
+        if row["reprocess_request"] > row["reprocess_handled"]:
+            return False  # other work was queued meanwhile: let it run, then see if this failure remains
         token = pipeline.claim(row["id"])
         if token is None:
             return False  # the worker has it; try again on the next sweep
         try:
             fresh = _row(db, row["id"])
-            if fresh["retry_op"] is not None or not _same_failure(fresh, op):
+            if (fresh["retry_op"] is not None or not _same_failure(fresh, op)
+                    or fresh["reprocess_request"] > fresh["reprocess_handled"]):  # fmt: skip
                 return False
             _enqueue(pipeline, fresh, op)
         finally:

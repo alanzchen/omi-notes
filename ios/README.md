@@ -96,6 +96,10 @@ parses them.
 
 ## TestFlight
 
+> **The existing Mac Studio setup uses manual local signing and a Developer-role API key.** Follow
+> "TestFlight on this Mac" in [`AGENTS.md`](../AGENTS.md) for it; the workflow below needs an Admin
+> key and is only for a fresh cloud-signing setup.
+
 `make testflight` (or `ios/Tools/testflight.sh`) archives a Release build and uploads it to App Store
 Connect. Signing is automatic and cloud-managed through an App Store Connect API key, so no
 certificates or profiles need to be set up by hand. One-time setup, in App Store Connect:

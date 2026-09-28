@@ -68,6 +68,15 @@ public final class AppModel {
     /// configuration generation changes on every save, so A → B → A is a new server too.
     private var answeredFor: UploadConfig?
     var answeredForConfig: UploadConfig? { answeredFor }
+    /// The vault the current server last said it serves: a different one at the same address is
+    /// another server as far as everything shown here is concerned.
+    private var answeredVault: String?
+    /// Bumped whenever the server (configuration or vault) changes: an answer that was asked for
+    /// before then is dropped.
+    var dataEpoch = 0
+
+    /// Identifies what the shown data belongs to (views reset their own state when it changes).
+    public var serverIdentity: String { "\(answeredFor?.generation ?? -1)|\(answeredVault ?? "")" }
 
     public static let pageSize = 20
     /// Injectable for tests (no network).
@@ -101,6 +110,7 @@ public final class AppModel {
     /// Forgets everything a previous server said (another server, or none), people included.
     private func adopt(_ config: UploadConfig) {
         guard config != answeredFor else { return }
+        answeredVault = nil
         // Notes saved for another server (or an earlier pairing) are removed, not just hidden.
         if answeredFor != nil {
             noteCache.clear()
@@ -109,6 +119,12 @@ public final class AppModel {
             noteCache.clear()
         }
         answeredFor = config
+        forgetServerData()
+    }
+
+    /// Everything a server said, people included (a new server, or a new vault behind the same one).
+    private func forgetServerData() {
+        dataEpoch += 1
         speakers.serverChanged()
         serverStatus = nil
         serverStatusAt = nil
@@ -158,16 +174,24 @@ public final class AppModel {
             if recent.isEmpty { showSavedList(config) }
             return
         }
+        if let vault = status.vaultId {
+            if let previous = answeredVault ?? noteCache.lastScope?.vaultId, previous != vault {
+                // same address, another vault: nothing shown or saved so far belongs to it
+                forgetServerData()
+                noteCache.clear()
+            }
+            answeredVault = vault
+        }
         serverStatus = status
         serverStatusAt = Date()
-        let epoch = cacheEpoch
+        let epoch = cacheEpoch, data = dataEpoch
         async let issuesTask: [ServerIssue]? = status.supportsIssues ? try? api.issues() : []
         async let pageTask = Result { try await api.recentConversations(limit: Self.pageSize) }
         let (newIssues, page) = await (issuesTask, pageTask)
-        guard isCurrent(config) else { return }
+        guard isCurrent(config), data == dataEpoch else { return }
         if let newIssues { issues = newIssues }
         await settleRetries(api: api, config: config)
-        guard isCurrent(config) else { return }
+        guard isCurrent(config), data == dataEpoch else { return }
         switch page {
         case .success(let page):
             mergeFirstPage(page)
@@ -202,9 +226,10 @@ public final class AppModel {
         guard let endpoint = config.endpoint, config == answeredFor, let cursor = recentCursor, !loadingMore else { return }
         loadingMore = true
         defer { loadingMore = false }
+        let data = dataEpoch
         do {
             let page = try await APIClient(endpoint: endpoint, session: session).recentConversations(limit: Self.pageSize, before: cursor)
-            guard isCurrent(config), recentCursor == cursor else { return }
+            guard isCurrent(config), data == dataEpoch, recentCursor == cursor else { return }
             let ids = Set(recent.map(\.id))
             recent += page.conversations.filter { !ids.contains($0.id) }
             recentCursor = page.nextCursor
@@ -238,7 +263,7 @@ public final class AppModel {
     public func conversation(_ id: String, segmentsFrom: Int = 0) async throws -> ConversationDetail {
         let config = engine.settings.serverConfig()
         guard let endpoint = config.endpoint else { throw APIError.notConfigured }
-        let epoch = cacheEpoch
+        let epoch = cacheEpoch, data = dataEpoch
         let detail: ConversationDetail
         do {
             detail = try await APIClient(endpoint: endpoint, session: session).conversation(id, segmentsFrom: segmentsFrom)
@@ -246,7 +271,7 @@ public final class AppModel {
             if segmentsFrom == 0, isCurrent(config), details[id] == nil { showSavedDetail(id, config) }
             throw error
         }
-        guard isCurrent(config), config == answeredFor else { throw APIError.transport("The server changed; reload.") }
+        guard isCurrent(config), config == answeredFor, data == dataEpoch else { throw APIError.transport("The server changed; reload.") }
         if segmentsFrom == 0 {
             if let i = recent.firstIndex(where: { $0.id == id }) { recent[i] = detail.entry }
             details[id] = detail

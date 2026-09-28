@@ -315,7 +315,7 @@ struct WeekSection: View {
                     .frame(height: 140)
                     HStack {
                         Tile(value: "\(stats.totals.conversations)", label: "conversations")
-                        Tile(value: Fmt.duration(stats.totals.conversationS) ?? "0 min", label: "talking")
+                        Tile(value: Fmt.duration(stats.totals.conversationS) ?? "0 min", label: "conversation time")
                         Tile(value: "\(stats.totals.people)", label: stats.totals.people == 1 ? "person" : "people")
                     }
                 } header: {
@@ -325,7 +325,12 @@ struct WeekSection: View {
                 }
             }
         }
-        .task(id: model.serverStatusAt) { if let s = await model.weekStats() { stats = s } }
+        // A new server or vault starts empty; a failed fetch shows nothing rather than older numbers.
+        .task(id: "\(model.serverIdentity)|\(model.serverStatusAt?.timeIntervalSince1970 ?? 0)") {
+            let identity = model.serverIdentity
+            let fresh = await model.weekStats()
+            if identity == model.serverIdentity { stats = fresh }
+        }
     }
 
     static func weekday(_ iso: String) -> String {

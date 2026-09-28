@@ -15,6 +15,9 @@ extension AppModel {
         return nil
     }
 
+    /// The vault shown: the server's answer, else the saved copy's (offline before any answer).
+    public var currentVaultId: String? { serverStatus?.vaultId ?? cacheScope(engine.settings.serverConfig())?.vaultId }
+
     func saveForOffline(_ detail: ConversationDetail, _ config: UploadConfig) {
         guard isCurrent(config), let scope = cacheScope(config) else { return }
         noteCache.saveDetail(detail, scope: scope)
@@ -92,6 +95,7 @@ extension AppModel {
             let days = range == .week ? 6 : 29
             fromDate = Calendar.current.startOfDay(for: Calendar.current.date(byAdding: .day, value: -days, to: Date()) ?? Date())
         }
+        let data = dataEpoch
         let answer: Result<SearchResponse, Error>
         if serverStatus?.supportsSearch == true || serverStatus == nil {
             answer = await Result {
@@ -101,7 +105,7 @@ extension AppModel {
         } else {
             answer = .failure(APIError.transport("this server doesn't support search"))
         }
-        guard !Task.isCancelled, isCurrent(config) else { return .failure(CancellationError()) }
+        guard !Task.isCancelled, isCurrent(config), data == dataEpoch else { return .failure(CancellationError()) }
         switch answer {
         case .success(let r):
             return .success(SearchResult(conversations: r.conversations, nextCursor: r.nextCursor, pending: r.pending ?? 0, offline: false))
@@ -120,8 +124,9 @@ extension AppModel {
     public func weekStats() async -> ServerStats? {
         let config = engine.settings.serverConfig()
         guard let endpoint = config.endpoint, serverStatus?.supportsStats == true else { return nil }
+        let data = dataEpoch
         let stats = try? await APIClient(endpoint: endpoint, session: session).stats(days: 7)
-        return isCurrent(config) ? stats : nil
+        return isCurrent(config) && data == dataEpoch ? stats : nil
     }
 
     static func day(_ date: Date) -> String {

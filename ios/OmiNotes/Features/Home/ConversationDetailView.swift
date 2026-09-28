@@ -195,7 +195,7 @@ struct ConversationDetailView: View {
     }
 
     @ViewBuilder private func obsidianSection(_ d: ConversationDetail) -> some View {
-        if let path = d.entry.notePath, let vaultId = model.serverStatus?.vaultId {
+        if let path = d.entry.notePath, let vaultId = model.currentVaultId {
             Section {
                 if let name = ObsidianLink.vaultName(for: vaultId), let url = ObsidianLink.url(vault: name, notePath: path) {
                     Button {

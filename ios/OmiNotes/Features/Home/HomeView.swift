@@ -213,6 +213,8 @@ struct SearchResults: View {
     @State private var result: AppModel.SearchResult?
     @State private var error: String?
     @State private var loading = false
+    /// Bumped when the search changes: an answer (or "Show more") for an earlier one is dropped.
+    @State private var generation = 0
 
     var body: some View {
         Section {
@@ -227,7 +229,9 @@ struct SearchResults: View {
             }
         }
         Section {
-            if let result {
+            if let error {
+                Text(error).foregroundStyle(.secondary)
+            } else if let result {
                 if result.conversations.isEmpty {
                     Text(loading ? "Searching…" : "No matching conversations.").foregroundStyle(.secondary)
                 }
@@ -235,8 +239,6 @@ struct SearchResults: View {
                 if result.nextCursor != nil {
                     Button("Show more") { Task { await load(more: true) } }.disabled(loading)
                 }
-            } else if let error {
-                Text("Couldn't search: \(error)").foregroundStyle(.secondary)
             } else {
                 HStack { ProgressView(); Text("Searching…").foregroundStyle(.secondary).padding(.leading, 6) }
             }
@@ -247,7 +249,10 @@ struct SearchResults: View {
                 Text("\(pending) conversation\(pending == 1 ? " isn't" : "s aren't") searchable yet; the server is still indexing.")
             }
         }
-        .task(id: key) {
+        .task(id: "\(key)|\(model.serverIdentity)") {
+            generation += 1
+            result = nil
+            error = nil
             try? await Task.sleep(for: .milliseconds(300))  // wait for typing to pause
             guard !Task.isCancelled else { return }
             await load(more: false)
@@ -257,11 +262,11 @@ struct SearchResults: View {
     private var key: String { "\(query)|\(personId ?? "")|\(range.rawValue)" }
 
     private func load(more: Bool) async {
-        let asked = key
+        let asked = generation
         loading = true
         defer { loading = false }
         let answer = await model.search(query, personId: personId, range: range, before: more ? result?.nextCursor : nil)
-        guard asked == key else { return }  // the search changed meanwhile: this answer is for another one
+        guard asked == generation else { return }  // the search changed meanwhile: this answer is for another one
         switch answer {
         case .failure(is CancellationError):
             return
@@ -276,7 +281,8 @@ struct SearchResults: View {
             }
             error = nil
         case .failure(let e):
-            error = AppModel.describe(e)
+            result = nil  // never leave results that don't match the chosen search
+            error = (e as? LocalizedError)?.errorDescription ?? "Couldn't search: \(AppModel.describe(e))"
         }
     }
 }
