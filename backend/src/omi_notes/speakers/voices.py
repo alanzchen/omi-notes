@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from ..audio.diarize import Turn
 from ..pipeline.segmenter import Interval, intersect, subtract, union
 
 SAMPLE_RATE = 16000
@@ -62,9 +63,10 @@ class LabelVoice:
         return self.spread > MIXED_SPREAD
 
 
-def label_turns(response: dict) -> dict[str, list[Interval]]:
+def label_turns(response: dict, *, local_turns: list[Turn] | None = None) -> dict[str, list[Interval]]:
     """Each label's utterance spans (submitted-audio seconds), labels numbered S1, S2… by first
-    appearance exactly as `transcript.segments_from_deepgram` numbers them."""
+    appearance exactly as `transcript.segments_from_deepgram` numbers them. For text-only STT,
+    retain the original local turns as evidence instead of the larger transcription windows."""
     utterances = (response.get("results") or {}).get("utterances") or []
     labels: dict[object, str] = {}
     turns: dict[str, list[Interval]] = {}
@@ -77,6 +79,11 @@ def label_turns(response: dict) -> dict[str, list[Interval]]:
         start, end = float(utt.get("start", 0)), float(utt.get("end", 0))
         if end > start:
             turns.setdefault(labels[speaker], []).append((start, end))
+    if local_turns is not None:
+        turns = {}
+        for turn in sorted(local_turns, key=lambda t: t.start):
+            if turn.speaker in labels and turn.end > turn.start:
+                turns.setdefault(labels[turn.speaker], []).append((turn.start, turn.end))
     return turns
 
 

@@ -15,6 +15,7 @@ from omi_notes.pipeline.speakers import resolve_speakers
 from omi_notes.pipeline.worker import Worker
 from omi_notes.providers import ProviderError
 from omi_notes.providers.openai_stt import OpenAICompatStt
+from omi_notes.speakers.voices import label_turns, select_clips
 
 from .conftest import AUTH, make_settings
 from .helpers import T0, convs, note_text, replay, silence
@@ -119,6 +120,55 @@ class FakeDiarizer:
     def diarize(self, pcm):
         self.calls += 1
         return [Turn(0.0, 4.2, 0), Turn(4.2, 20.0, 1)]
+
+
+def test_text_only_voice_evidence_uses_real_turns_with_transcript_label_order():
+    data = {"results": {"utterances": [
+        {"start": 0, "end": 12, "speaker": 7, "transcript": "Two speech turns in one request."},
+        {"start": 12, "end": 18, "speaker": 2, "transcript": "A second person."},
+    ]}}
+    turns = [Turn(0.5, 5, 7), Turn(6, 11, 7), Turn(13, 17, 2)]
+    spans = label_turns(data, local_turns=turns)
+    assert spans == {"S1": [(0.5, 5), (6, 11)], "S2": [(13, 17)]}
+    clips = select_clips(spans, [(0, 18)])
+    assert len({c.turn for c in clips["S1"]}) == 2
+    assert sum(c.seconds for c in clips["S1"]) >= 5
+
+
+def test_text_only_cloud_transcription_preserves_local_speakers_and_reuses_cache(tmp_path):
+    import json
+
+    settings, client, worker = pipeline(tmp_path, stt_diarization="local")
+    seen = []
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={"text": "We should ship this on Friday." if len(seen) == 1 else "I agree, after the review."})
+    worker.providers._stt = OpenAICompatStt("https://transcription.example/v1", "", "gpt-transcribe", style="json",
+                                          transport=httpx.MockTransport(handler))
+    worker.providers._diarizer = FakeDiarizer()
+    replay(client, SPEECH)
+    worker.tick(T0 + 200)
+    (row,) = convs(worker)
+    assert row["status"] == "done" and len(seen) == 2
+    transcript = json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text())
+    assert {s["speaker"] for s in transcript["segments"]} == {"S1", "S2"}
+    assert all(s["end"] > s["start"] for s in transcript["segments"])
+    assert transcript["speaker_source"] == "local"
+    worker.db.execute("UPDATE conversations SET status='closed' WHERE id=?", (row["id"],))
+    worker.tick(T0 + 300)
+    assert len(seen) == 2 and worker.providers._diarizer.calls == 1
+
+
+def test_text_only_stt_cannot_send_audio_before_local_speakers_are_available(tmp_path):
+    _, client, worker = pipeline(tmp_path, stt_diarization="local")
+    def unexpected(request):
+        pytest.fail("audio sent without local speaker windows")
+    worker.providers._stt = OpenAICompatStt("https://example.test/v1", "", "gpt-transcribe",
+                                          transport=httpx.MockTransport(unexpected))
+    replay(client, SPEECH)
+    worker.tick(T0 + 200)
+    (row,) = convs(worker)
+    assert row["status"] == "failed" and row["error_kind"] == "diarization"
 
 
 def test_transcript_without_speakers_fails_with_instructions(tmp_path):

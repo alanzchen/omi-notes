@@ -1,7 +1,7 @@
 """OpenAI-compatible transcription (`POST {base}/audio/transcriptions`, multipart) with diarization.
 
 One client for OpenAI and the servers that copied its API. They differ in how speaker labels are
-requested and returned, so requests come in four *styles* (auto-detected from the host and model,
+requested and returned, so requests come in five *styles* (auto-detected from the host and model,
 overridable with `STT_REQUEST_STYLE`):
 
 - `openai_diarized`: diarizing models (`gpt-4o-transcribe-diarize`, vLLM MOSS-Transcribe-Diarize):
@@ -13,6 +13,8 @@ overridable with `STT_REQUEST_STYLE`):
 - `verbose`: generic whisper-style servers (LocalAI, whisper.cpp server, speaches, mlx-audio, Groq):
   `verbose_json` with word + segment timestamps, `diarize=true` (ignored where unknown), keyterms
   as `prompt`.
+- `json`: text-only models such as `gpt-transcribe`. Local diarization partitions audio before
+  STT; requests return `json`, with coarse window times and stable local labels in the pipeline.
 
 Every response shape is normalized into the Deepgram-shaped dict the pipeline reads
 (`results.utterances[]` with integer `speaker`, or None when the server gave no labels). Audio
@@ -38,7 +40,7 @@ from . import ProviderError, SttRequest
 
 log = logging.getLogger(__name__)
 
-Style = Literal["openai_diarized", "mistral", "together", "verbose"]
+Style = Literal["openai_diarized", "mistral", "together", "verbose", "json"]
 SAMPLE_RATE = 16000
 MAX_CONTEXT_BIAS = 100
 # Known per-request limits (seconds). OpenAI's diarize model tops out around 1400 s (community
@@ -58,6 +60,8 @@ def resolve_style(base_url: str, model: str, configured: str = "auto") -> Style:
     host, name = _host(base_url), model.lower()
     if "diarize" in name:
         return "openai_diarized"
+    if name == "gpt-transcribe":
+        return "json"
     if host.endswith("mistral.ai") or name.rsplit("/", 1)[-1].startswith("voxtral"):
         return "mistral"
     if host.endswith("together.xyz") or host.endswith("together.ai"):
@@ -66,6 +70,8 @@ def resolve_style(base_url: str, model: str, configured: str = "auto") -> Style:
 
 
 def default_max_seconds(style: str, base_url: str) -> float:
+    if style == "json":
+        return 30.0
     host = _host(base_url)
     return _LIMITS.get((style, host), _LIMITS.get((style, None), 0.0))
 
@@ -101,7 +107,11 @@ class OpenAICompatStt:
     @property
     def cache_tag(self) -> str:
         """Part of the STT cache key: a different request style is a different transcription."""
-        return self.style
+        return f"json-turns-v1-{self.max_seconds:g}" if self.style == "json" else self.style
+
+    @property
+    def needs_speaker_windows(self) -> bool:
+        return self.style == "json"
 
     def transcribe(self, request: SttRequest) -> dict:
         if self.max_seconds and request.duration > self.max_seconds:
@@ -115,7 +125,14 @@ class OpenAICompatStt:
 
     def _transcribe_part(self, offset: float, part: SttRequest) -> list[tuple[float, dict]]:
         try:
-            return [(offset, normalize_response(self._post(part)))]
+            data = self._post(part)
+            if self.style == "json":
+                if not isinstance(data.get("text"), str):
+                    raise ProviderError("JSON transcription response is missing text", kind="response")
+                # This response has no word timing; the pipeline sends one local speaker window.
+                data = {"text": data["text"], "duration": part.duration,
+                        "languages": data.get("languages"), "language": data.get("language")}
+            return [(offset, normalize_response(data))]
         except _TooLarge:
             if len(part.blocks) < 2:
                 raise ProviderError(
@@ -132,7 +149,17 @@ class OpenAICompatStt:
     def fields(self, request: SttRequest) -> dict[str, str | list[str]]:
         fields: dict[str, str | list[str]] = {"model": self.model}
         language = request.language if request.language and request.language != "multi" else None
-        if self.style == "openai_diarized":
+        if self.style == "json":
+            fields["response_format"] = "json"
+            if self.model == "gpt-transcribe":
+                if language:
+                    fields["languages[]"] = [language]
+                if request.keyterms:
+                    fields["keywords[]"] = request.keyterms
+                language = None
+            elif request.keyterms:
+                fields["prompt"] = ", ".join(request.keyterms)
+        elif self.style == "openai_diarized":
             fields["response_format"] = "diarized_json"
             if _host(self.base_url) == "api.openai.com":
                 fields["chunking_strategy"] = "auto"
@@ -262,6 +289,9 @@ def normalize_response(data: dict) -> dict:
         utterances.append({"start": 0.0, "end": end, "transcript": str(data["text"]).strip(), "speaker": None})
     channel: dict = {}
     language = data.get("language")
+    if not language and isinstance(data.get("languages"), list) and data["languages"]:
+        first = data["languages"][0]
+        language = first.get("code") if isinstance(first, dict) else None
     if isinstance(language, str) and language.strip():
         channel["detected_language"] = _LANGUAGE_CODES.get(language.strip().lower(), language.strip())
     return {"results": {"channels": [channel], "utterances": utterances}}

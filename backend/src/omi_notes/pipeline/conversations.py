@@ -65,6 +65,7 @@ from .relevance import deterministic_relevance
 from .segmenter import RingCapture, ring_resolved_until
 from .speakers import SpeakerResult, resolve_speakers
 from .transcript import ConversationAudio, assemble, detected_language, merge_same_speaker, segments_from_deepgram
+from .turn_transcription import transcribe_windows
 
 log = logging.getLogger(__name__)
 
@@ -469,7 +470,19 @@ class ConversationPipeline:
             raise ProviderError("no decodable audio under this conversation's speech", terminal=True, kind="audio")
         audio_sha = sha256_hex(audio.pcm.tobytes() + canonical_json([list(b) for b in audio.blocks_out]).encode())
         stt = self.providers.stt
+        windowed = getattr(stt, "needs_speaker_windows", False)
+        turns = None
+        if windowed:
+            if self.settings.stt_diarization not in ("auto", "local"):
+                raise ProviderError("text-only STT requires STT_DIARIZATION=local or auto", terminal=True, kind="diarization")
+            turns = self._local_turns(conv_id, audio, audio_sha)
+            if turns is None:
+                raise ProviderError("text-only STT requires the local diarization models", terminal=True, kind="diarization")
+            if not turns:
+                raise ProviderError("text-only STT needs local diarization; no speaker turns are available", kind="diarization")
         tag = f"-{_slug(stt.cache_tag)}" if getattr(stt, "cache_tag", "") else ""
+        if windowed:
+            tag += f"-{_slug(self.providers.diarizer.tag)}"
         base = f"stt-{stt.name}{tag}-{_slug(stt.model)}-{_slug(self.settings.stt_language)}-{audio_sha[:16]}"
         conv_dir = self.conv_dir(conv_id)
         name = _reusable(conv_dir, base, row["stt_ref"], row["skip_stt"])
@@ -477,15 +490,16 @@ class ConversationPipeline:
         if path.exists():
             cached = json.loads(path.read_text())
         else:
-            response = stt.transcribe(
-                SttRequest(flac=audio.flac(), duration=audio.duration, blocks=audio.blocks_out,
-                           language=self.settings.stt_language, keyterms=self.settings.keyterms)
-            )  # fmt: skip
+            request = SttRequest(flac=audio.flac(), duration=audio.duration, blocks=audio.blocks_out,
+                                 language=self.settings.stt_language, keyterms=self.settings.keyterms)
+            response = transcribe_windows(stt, audio, request, turns, path) if windowed else stt.transcribe(request)
             cached = {"created_at": now, "provider": stt.name, "model": stt.model, "response": response}
             atomic_write_bytes(path, json.dumps(cached).encode())
-        speakers = self._speakers(conv_id, cached["response"], audio, audio_sha)
+        speakers = SpeakerResult(cached["response"], "local", True) if windowed else self._speakers(conv_id, cached["response"], audio, audio_sha)
         segments = merge_same_speaker(segments_from_deepgram(speakers.response, audio.timemap))
-        clips = select_clips(label_turns(speakers.response), usable_spans(audio.blocks_out, self._losses_out(row, audio)))
+        overlaps = cached["response"].get("omi_notes", {}).get("overlap_spans", []) if windowed else []
+        clips = select_clips(label_turns(speakers.response, local_turns=turns),
+                             usable_spans(audio.blocks_out, self._losses_out(row, audio) + overlaps))
         language = self.settings.stt_language
         if language == "multi":
             language = detected_language(cached["response"]) or language
@@ -496,6 +510,7 @@ class ConversationPipeline:
             "stt": f"{cached['provider']}/{cached['model']}" + ("+local-diarization" if speakers.source == "local" else ""),
             "speaker_source": speakers.source,
             "speaker_labels_consistent": speakers.consistent,
+            "timing_source": "local_speaker_windows" if windowed else "provider",
             "stt_file": name,
             "transcribed_at": cached["created_at"],
             "submitted_seconds": round(audio.duration, 3),
@@ -551,9 +566,9 @@ class ConversationPipeline:
             current = self._carry_over(stored, old_voices, voices, labels, self.speakers.had_forgotten(conv_id)) if moved else stored
             states = current
             if voices is not None:
-                samples = self.speakers.samples(embedder.model, embedder.model_sha)  # as of now, not before embedding
-                if samples:
-                    states = speaker_match.assign(voices, current, speaker_match.build_models(samples, self.operating),
+                models = self.speakers.models(embedder.model, embedder.model_sha, self.operating)
+                if models:
+                    states = speaker_match.assign(voices, current, models,
                                                   auto_assign=self.speakers.settings()["auto_assign"], op=self.operating)  # fmt: skip
             if fresh:
                 keep = self.speakers.vector_labels(states, set(voices), raw=True)
@@ -652,7 +667,7 @@ class ConversationPipeline:
             key = next(((v.model, v.model_sha) for v in voices.values()), None)
             if key is not None:
                 if key not in models_by_voice:
-                    models_by_voice[key] = speaker_match.build_models(self.speakers.samples(*key), self.operating)
+                    models_by_voice[key] = self.speakers.models(*key, self.operating)
                 states = speaker_match.assign(voices, current, models_by_voice[key], auto_assign=prefs["auto_assign"],
                                               op=self.operating)  # fmt: skip
             else:
@@ -678,18 +693,18 @@ class ConversationPipeline:
         """Speaker labels per STT_DIARIZATION (see `pipeline.speakers`). Local diarization runs on
         the submitted PCM (same clock as the provider's timestamps) and is cached."""
 
-        def local_turns() -> list[Turn] | None:
-            diarizer = self.providers.diarizer
-            if diarizer is None:
-                return None
-            path = self.conv_dir(conv_id) / f"diarization-{_slug(diarizer.tag)}-{audio_sha[:16]}.json"
-            if path.exists():
-                return [Turn(*t) for t in json.loads(path.read_text())["turns"]]
-            turns = diarizer.diarize(audio.pcm)
-            atomic_write_bytes(path, json.dumps({"turns": [[t.start, t.end, t.speaker] for t in turns]}).encode())
-            return turns
+        return resolve_speakers(response, self.settings.stt_diarization, lambda: self._local_turns(conv_id, audio, audio_sha))
 
-        return resolve_speakers(response, self.settings.stt_diarization, local_turns)
+    def _local_turns(self, conv_id: str, audio: ConversationAudio, audio_sha: str) -> list[Turn] | None:
+        diarizer = self.providers.diarizer
+        if diarizer is None:
+            return None
+        path = self.conv_dir(conv_id) / f"diarization-{_slug(diarizer.tag)}-{audio_sha[:16]}.json"
+        if path.exists():
+            return [Turn(*t) for t in json.loads(path.read_text())["turns"]]
+        turns = diarizer.diarize(audio.pcm)
+        atomic_write_bytes(path, json.dumps({"turns": [[t.start, t.end, t.speaker] for t in turns]}).encode())
+        return turns
 
     # -- LLM + render ----------------------------------------------------------------------------
 

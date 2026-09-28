@@ -201,6 +201,46 @@ def test_activation_needs_three_samples_from_two_days_beyond_enrollment_and_leav
     assert "leave-one-out" in sm.build_models(polluted)["alan"].why_inactive
 
 
+def test_wearer_can_calibrate_from_three_separately_confirmed_recordings_on_one_day():
+    enrolled = [sample("alan", ALAN, 0, source="enrollment")]
+    confirmed = [sample("alan", ALAN, i) for i in (1, 2, 3)]
+    assert sm.build_models(enrolled + confirmed, wearer_id="alan")["alan"].active
+    assert not sm.build_models(enrolled + confirmed)["alan"].active
+    assert not sm.build_models(enrolled, wearer_id="alan")["alan"].active
+    assert not sm.build_models(confirmed, wearer_id="alan")["alan"].active
+    same_recording = [sm.Sample(s.id, s.person_id, s.vector, s.source, s.day, "one-recording", s.created_at) for s in confirmed]
+    assert not sm.build_models(enrolled + same_recording, wearer_id="alan")["alan"].active
+    polluted = enrolled + confirmed + [sample("alan", PRIYA, 4)]
+    assert "leave-one-out" in sm.build_models(polluted, wearer_id="alan")["alan"].why_inactive
+    # The 20-sample centroid cap must not forget that this wearer was enrolled.
+    many = enrolled + [sample("alan", ALAN, i) for i in range(1, sm.SAMPLE_CAP + 1)]
+    assert sm.build_models(many, wearer_id="alan")["alan"].active
+
+
+def test_calibrated_wearer_can_match_one_long_turn_with_independent_clean_clips():
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    samples = [sample("alan", ALAN, 0, source="enrollment")] + [sample("alan", ALAN, i) for i in (1, 2, 3)]
+    models = sm.build_models(samples, wearer_id="alan")
+    long_turn = LabelVoice("S1", [Clip(0, 10, 0), Clip(10, 17, 0)], vector=vec(ALAN, 9))
+    assert sm.match(long_turn, models).accepted
+    assert sm.assign({"S1": long_turn}, {}, models, auto_assign=True)["S1"]["source"] == "auto"
+    # Stored voices use plain interval pairs; relabeling must apply exactly the same rule.
+    stored = SimpleNamespace(vector=long_turn.vector, seconds=17, turns=1, mixed=False, clips=[[0, 10], [10, 17]])
+    assert sm.match(stored, models).accepted
+    assert not sm.match(long_turn, sm.build_models(samples)).accepted  # other people keep two turns
+    assert not sm.match(long_turn, sm.build_models(samples[:2], wearer_id="alan")).accepted
+    assert not sm.match(replace(long_turn, clips=[Clip(0, 17, 0)]), models).accepted
+    assert not sm.match(replace(long_turn, clips=[Clip(0, 10, 0), Clip(1, 8, 0)]), models).accepted
+    assert not sm.match(replace(long_turn, spread=0.7), models).accepted
+    # A close-ish centroid is insufficient for this exception, even below the normal 0.50.
+    basis = np.zeros(32, dtype=np.float32); basis[0] = 1
+    moderate = basis * 0.7; moderate[1] = np.sqrt(1 - 0.7**2)
+    models["alan"].centroid = basis
+    assert not sm.match(replace(long_turn, vector=moderate), models).accepted
+
+
 def test_assign_keeps_user_labels_and_blocked_people_and_auto_names_only_active_people():
     active = [sample("alan", ALAN, 0, source="enrollment")] + [sample("alan", ALAN, i, day=f"2026-09-2{i}") for i in (1, 2, 3)]
     inactive = [sample("priya", PRIYA, i) for i in (1, 2)]

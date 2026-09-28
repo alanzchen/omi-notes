@@ -109,6 +109,24 @@ def test_default_request_limits():
     assert provider.max_seconds == 600
 
 
+def test_gpt_transcribe_json_request_and_local_window_duration():
+    provider, seen = stt("https://transcription.example/v1", "gpt-transcribe", [{"text": "A useful reminder.", "languages": [{"code": "en"}]}])
+    response = provider.transcribe(audio_with_blocks([2.0]))
+    fields = form(seen[0])
+    assert fields["response_format"] == ["json"]
+    assert fields["languages[]"] == ["en"] and "language" not in fields
+    assert fields["keywords[]"] == ["Omi", "Priya"]
+    assert "diarize" not in fields and "timestamp_granularities[]" not in fields
+    assert response["results"]["utterances"][0]["end"] == 2.0
+    assert response["results"]["channels"][0]["detected_language"] == "en"
+
+
+def test_json_response_without_text_is_an_error_not_silence():
+    provider, _ = stt("https://transcription.example/v1", "gpt-transcribe", [{"unexpected": "shape"}], style="json")
+    with pytest.raises(ProviderError, match="text"):
+        provider.transcribe(audio_with_blocks([2.0]))
+
+
 # -- request fields --------------------------------------------------------------------------------
 
 

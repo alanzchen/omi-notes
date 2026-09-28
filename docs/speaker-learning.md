@@ -19,6 +19,9 @@ relative to `/Users/alan/Developer/_ref/omi`.
   excluding spacers/losses; longest first, up to 30 s in clips ≤ 10 s (cf. Omi
   `backend/utils/stt/sync_speaker_evidence.py`). Label centroid = duration-weighted normalized
   mean; "mixed" if clip spread > 0.6. Skipped when `speaker_labels_consistent = false`.
+  With text-only cloud transcription, use the original local diarizer turns for recognition,
+  rather than the larger windows sent to STT; speaker labels follow transcript order and
+  overlapping speech stays excluded. HTTP request boundaries are not extra voice evidence.
 - Unmatched labels' vectors are kept in memory only, unless **unknown-voice storage** is opted in.
 
 ## Matching
@@ -35,9 +38,17 @@ relative to `/Users/alan/Developer/_ref/omi`.
 - **Per-person activation gate:** automatic naming is on by default (`SPEAKER_AUTO_ASSIGN=true`),
   but applies to a person only once they have ≥ 3 confirmed samples from ≥ 2 sessions on different
   days beyond enrollment **and** a leave-one-out check passes (each sample matches the centroid of
-  the others within threshold and margin). Before that: suggestions only. Enrollment alone is
-  same-session evidence and does not activate auto-naming. Auto names carry an "auto" badge and
+  the others within threshold and margin). For the **wearer only**, an accepted enrollment plus
+  confirmations from ≥ 3 distinct recordings can activate naming on the same day; the
+  leave-one-out check still applies. This lets the wearer explicitly calibrate their own voice
+  without a calendar delay. Repeated labels from one recording do not meet that exception.
+  Before activation: suggestions only. Enrollment alone does not activate auto-naming.
+  Auto names carry an "auto" badge and
   show similarity evidence (distance, margin, seconds), never a "probability".
+- **Continuous wearer speech:** once enrolled and active, a single long turn can qualify with
+  ≥ 10 s of evidence, ≥ 2 disjoint clean clips of ≥ 3 s each, and a stricter distance < 0.25.
+  Margin and mixed-voice checks still apply. This avoids rejecting a long monologue just because
+  local diarization correctly sees one continuous turn. Other people retain the ≥ 2-turn rule.
 - Whenever people/samples change, the worker re-runs the pure assignment over stored voices and
   re-renders the notes whose labels changed — **from cache, no LLM call**. "Re-summarize with
   names" is an explicit action.

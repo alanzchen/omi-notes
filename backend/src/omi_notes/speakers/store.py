@@ -32,7 +32,7 @@ from ..notes.writer import remove, sanitize_title, write_if_changed
 from ..spool import atomic_write_bytes, fsync_dir
 from ..util import canonical_json, sha256_hex
 from ..vault import Vault
-from .match import Sample
+from .match import Operating, Sample, build_models
 from .voices import LabelVoice, decode_vector, encode_vector
 
 log = logging.getLogger(__name__)
@@ -176,6 +176,10 @@ class SpeakerStore:
 
     def me(self):
         return self.db.one("SELECT * FROM people WHERE me=1 ORDER BY name LIMIT 1")
+
+    def models(self, model: str, model_sha: str, op: Operating):
+        me = self.me()
+        return build_models(self.samples(model, model_sha), op, wearer_id=me["id"] if me else None)
 
     def put_person(self, person_id: str, name: str, *, me: bool | None = None, attest: bool = False,
                    now: float | None = None) -> bool:  # fmt: skip

@@ -7,7 +7,10 @@
   (Omi's pooled operating points — priors, recalibrated by `omi-notes speakers bench`).
 - Automatic naming applies to a person only once they are *active*: ≥ 3 confirmed samples beyond
   enrollment, from ≥ 2 sessions on different days, and every sample matches the centroid of the
-  others within threshold and margin (leave-one-out). Enrollment alone never activates.
+  others within threshold and margin (leave-one-out). An enrolled wearer can instead calibrate
+  with confirmations from ≥ 3 distinct recordings on one day. Enrollment alone never activates.
+- An active enrolled wearer may match one continuous turn with ≥ 10 s, two disjoint ≥ 3 s clips,
+  and distance < 0.25; margin and mixed-voice checks still apply.
 - `source: user` assignments are sticky; `not` blocks a person for that label. Several labels may
   map to one person (diarization over-splits), but only when they are about as close: within one
   conversation the closest label is the runner-up for the others (margin 0.10).
@@ -19,7 +22,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .voices import centroid, cosine_distance
+from .voices import Clip, centroid, cosine_distance
 
 THRESHOLD = 0.50
 MARGIN = 0.10
@@ -28,6 +31,9 @@ MARGIN = 0.10
 SAME_VOICE = 0.25
 MIN_EVIDENCE = 5.0
 MIN_TURNS = 2
+WEARER_CONTINUOUS_SECONDS = 10.0
+WEARER_CONTINUOUS_DISTANCE = 0.25
+WEARER_CLIP_SECONDS = 3.0
 SAMPLE_CAP = 20
 ACTIVE_SAMPLES = 3
 ACTIVE_DAYS = 2
@@ -60,6 +66,7 @@ class PersonModel:
     samples: list[Sample] = field(default_factory=list)
     active: bool = False
     why_inactive: str = ""
+    enrolled_wearer: bool = False
 
 
 @dataclass(frozen=True)
@@ -77,14 +84,15 @@ def confirmed(samples: list[Sample]) -> list[Sample]:
     return sorted(keep, key=lambda s: (s.created_at, s.id))[-SAMPLE_CAP:]
 
 
-def build_models(samples: list[Sample], op: Operating = Operating()) -> dict[str, PersonModel]:
+def build_models(samples: list[Sample], op: Operating = Operating(), *, wearer_id: str | None = None) -> dict[str, PersonModel]:
     by_person: dict[str, list[Sample]] = {}
     for s in samples:
         by_person.setdefault(s.person_id, []).append(s)
     models = {}
     for pid, items in by_person.items():
         chosen = confirmed(items)
-        models[pid] = PersonModel(pid, centroid([s.vector for s in chosen]) if chosen else None, chosen)
+        models[pid] = PersonModel(pid, centroid([s.vector for s in chosen]) if chosen else None, chosen,
+                                  enrolled_wearer=pid == wearer_id and any(s.source == "enrollment" for s in items))
     for model in models.values():
         model.active, model.why_inactive = activation(model, models, op)
     return models
@@ -97,7 +105,11 @@ def activation(model: PersonModel, models: dict[str, PersonModel], op: Operating
         sessions_by_day.setdefault(s.day, set()).add(s.session)
     if len(beyond) < ACTIVE_SAMPLES:
         return False, f"needs {ACTIVE_SAMPLES} confirmed samples beyond enrollment ({len(beyond)} so far)"
-    if len([d for d in sessions_by_day if d]) < ACTIVE_DAYS:
+    wearer_calibrated = (
+        model.enrolled_wearer
+        and len({s.session for s in beyond if s.session}) >= ACTIVE_SAMPLES
+    )
+    if not wearer_calibrated and len([d for d in sessions_by_day if d]) < ACTIVE_DAYS:
         return False, f"needs samples from {ACTIVE_DAYS} different days"
     others = [m for m in models.values() if m.id != model.id and m.centroid is not None]
     for sample in model.samples:
@@ -133,11 +145,26 @@ def match(voice, models: dict[str, PersonModel], exclude: set[str] = frozenset()
         reasons.append(f"distance {distance:.2f} ≥ {op.threshold}")
     if margin is not None and margin < op.margin:
         reasons.append(f"runner-up margin {margin:.2f} < {op.margin}")
-    if voice.seconds < op.min_evidence or voice.turns < op.min_turns:
+    continuous_wearer = (
+        models[pid].enrolled_wearer and models[pid].active and distance < WEARER_CONTINUOUS_DISTANCE
+        and voice.seconds >= WEARER_CONTINUOUS_SECONDS and _independent_clips(voice) >= MIN_TURNS
+    )
+    if voice.seconds < op.min_evidence or (voice.turns < op.min_turns and not continuous_wearer):
         reasons.append(f"evidence {voice.seconds:.1f} s from {voice.turns} turns")
     if voice.mixed:
         reasons.append("mixed voices under one label")
     return Match(pid, round(distance, 4), None if margin is None else round(margin, 4), not reasons, "; ".join(reasons))
+
+
+def _independent_clips(voice) -> int:
+    """Long continuous speech can contain independent clean evidence without a speaker change.
+    Count disjoint clips ≥ 3 s, with the same rule for in-memory and persisted voices."""
+    spans = [(c.start, c.end) if isinstance(c, Clip) else tuple(c) for c in getattr(voice, "clips", [])]
+    count, end = 0, float("-inf")
+    for a, b in sorted(spans):
+        if a >= end and b - a >= WEARER_CLIP_SECONDS:
+            count, end = count + 1, b
+    return count
 
 
 def assign(voices: dict[str, object], current: dict[str, dict], models: dict[str, PersonModel], *, auto_assign: bool,

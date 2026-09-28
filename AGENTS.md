@@ -167,20 +167,29 @@ settings before changing it; repository defaults are not the deployed configurat
 | System service | `/Library/LaunchDaemons/com.omi-notes.server.plist`, runs as `alan` |
 | Rotating log | `/Users/alan/Library/Application Support/omi-notes/index/logs/omi-notes.log` |
 
-- **Models:** local MLX Audio at `http://127.0.0.1:8000/v1`, Whisper
-  `mlx-community/whisper-large-v3-turbo-asr-fp16` (pinned snapshot in runtime `STT_MODEL`),
-  `STT_PROVIDER=openai`, `STT_REQUEST_STYLE=verbose`, `STT_DIARIZATION=local`,
-  `STT_MAX_REQUEST_SECONDS=30`. The request limit avoided repeated Whisper text in the verified
-  sample; local sherpa-onnx diarization still covers the full conversation. Speaker models are
-  pyannote segmentation + TitaNet, and WeSpeaker for recognition.
+- **Transcription:** `STT_PROVIDER=openai`, `STT_BASE_URL=https://codex-transcription.zenan.ch/v1`,
+  `STT_MODEL=gpt-transcribe`, `STT_REQUEST_STYLE=json`, `STT_DIARIZATION=local`,
+  `STT_MAX_REQUEST_SECONDS=30`. This proxy returns text without word timings or speaker labels.
+  `pipeline/turn_transcription.py` partitions audio using local diarization before STT and caches
+  each request; never feed a whole text-only transcript to post-hoc speaker assignment.
+  Timestamps are coarse window boundaries. Recognition uses the original local turns, excluding
+  overlap/loss. Local models are Silero VAD, pyannote segmentation + TitaNet for diarization, and
+  WeSpeaker for recognition. Enrollment audio and embeddings never go to providers.
 - **Summaries:** `LLM_PROVIDER=openai`, `LLM_BASE_URL=https://cliproxyapi.cool.zenan.ch/v1`,
-  `LLM_MODEL=gpt-6-luna`, `LLM_JSON_MODE=auto`, as requested by the user. Audio transcription and
-  speaker processing stay local; transcripts go to this summary provider. Credentials stay in
+  `LLM_MODEL=gpt-6-luna`, `LLM_JSON_MODE=auto`, as requested by the user. Ordinary speech goes to
+  the transcription proxy; transcripts go to the summary provider. Credentials stay in
   `server.env`. Read only selected non-secret fields when diagnosing; never dump the whole file.
-- **Local speech service:** `com.local.mlx-audio` is an existing login LaunchAgent. Its PATH must
-  include `/opt/homebrew/bin` for ffmpeg. The backend starts as a system daemon, but speech inference
-  still needs login; FileVault also requires an unlock after a cold boot. Do not claim the entire
-  pipeline works before login just because the backend is running.
+- **Previous local speech service:** `com.local.mlx-audio` remains an existing login LaunchAgent
+  (Whisper large-v3-turbo); it is no longer a backend dependency. Do not remove it as part of a
+  backend update. Local VAD/diarization/recognition run in the backend process. FileVault still
+  requires an unlock after a cold boot; verify actual boot behavior before claiming unattended use.
+- **Wearer calibration:** an accepted enrollment plus explicit confirmations from ≥ 3 distinct
+  recordings can activate same-day naming, with the existing leave-one-out and match checks.
+  Other people still require confirmations across ≥ 2 days. Enrollment alone is insufficient.
+  A calibrated wearer can also match a long single turn with ≥ 10 s, two disjoint ≥ 3 s clips,
+  and distance < 0.25; margin and mixed-voice checks still apply (`docs/speaker-learning.md`).
+  Alan confirmed the six existing real recordings were all him; their labels were corrected via
+  the speaker API. Each assignment needs a globally unique `request_id` for sample deduplication.
 - **Storage preference:** the user chose Obsidian Sync and no separate backup. Do not set up Time
   Machine or another backup workflow. Do not assume Sync is configured: verify the remote vault
   connection and inclusion of `_omi/`/other file types when that work is requested. Keep the SQLite

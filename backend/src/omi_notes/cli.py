@@ -786,7 +786,6 @@ def speakers_bench() -> None:
     SPEAKER_MATCH_THRESHOLD=0.50 and SPEAKER_MATCH_MARGIN=0.10."""
     import numpy as np
 
-    from .speakers import match as sm
     from .speakers.voices import centroid, cosine_distance
 
     settings = _settings()
@@ -812,7 +811,7 @@ def speakers_bench() -> None:
                     genuine.append(cosine_distance(sample.vector, centroid(rest)))
                 impostor += [cosine_distance(sample.vector, c) for other, c in centroids.items() if other != pid]
         typer.echo(f"Model {group['model']} ({group['model_sha'][:12]}): {len(samples)} samples, {len(by_person)} people")
-        models = sm.build_models(samples, w.pipeline.operating)
+        models = store.models(group["model"], group["model_sha"], w.pipeline.operating)
         for pid, items in sorted(by_person.items(), key=lambda kv: names.get(kv[0], kv[0])):
             model = models[pid]
             state = "auto-naming active" if model.active else f"suggestions only ({model.why_inactive})"

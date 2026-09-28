@@ -54,8 +54,7 @@ class SpeakerService:
         self.store.scan_people()
         embedder = self.pipeline.providers.embedder
         key = (embedder.model, embedder.model_sha) if embedder else None
-        samples = self.store.samples(*key) if key else []
-        models = speaker_match.build_models(samples, self.pipeline.operating) if samples else {}
+        models = self.store.models(*key, self.pipeline.operating) if key else {}
         out = []
         for p in self.store.people():
             rows = self.db.query("SELECT * FROM samples WHERE person_id=?", (p["id"],))
@@ -321,7 +320,7 @@ class SpeakerService:
                                                         np.frombuffer(r["vector"], dtype="<f4").astype(np.float32),
                                                         r["seconds"], day, r["rms_db"]))  # fmt: skip
         key = (embedder.model, embedder.model_sha) if embedder else None
-        models = speaker_match.build_models(self.store.samples(*key), self.pipeline.operating) if key else {}
+        models = self.store.models(*key, self.pipeline.operating) if key else {}
         dismissed = {k: float(v) for k, v in prefs["dismissed"].items()}
         found = speaker_suggest.suggestions(candidates, models, me_exists=self.store.me() is not None, dismissed=dismissed,
                                             now=now, limit=len(candidates) or 1)  # fmt: skip
@@ -432,4 +431,3 @@ class SpeakerService:
         buf = io.BytesIO()
         sf.write(buf, pcm, 16000, format="WAV", subtype="PCM_16")
         return buf.getvalue()
-

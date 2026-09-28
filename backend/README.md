@@ -102,7 +102,7 @@ All settings come from the environment or `backend/.env`; see [`.env.example`](.
 | `STT_MODEL` / `STT_LANGUAGE` | `nova-3` / `en` | transcription model and language (`multi` = detect) |
 | `STT_KEYTERMS` | — | comma-separated terms to boost |
 | `STT_BASE_URL` / `STT_API_KEY` | `https://api.openai.com/v1` / — | OpenAI-compatible server and bearer token (empty = none) |
-| `STT_REQUEST_STYLE` | `auto` | `openai_diarized`, `mistral`, `together` or `verbose` (auto-detected from host/model) |
+| `STT_REQUEST_STYLE` | `auto` | `openai_diarized`, `mistral`, `together`, `verbose` or text-only `json` (auto-detected from host/model) |
 | `STT_MAX_REQUEST_SECONDS` | per service | longest audio per request; longer audio is split (0 = unlimited) |
 | `STT_DIARIZATION` | `auto` | speaker labels from `provider`, `local` diarization, `auto`, or `off` |
 | `DIARIZATION_NUM_SPEAKERS` / `DIARIZATION_THRESHOLD` | `0` / `0.5` | local diarization: fixed count, or clustering threshold |
@@ -139,6 +139,15 @@ conversations in pieces cut between speech blocks. Their speaker labels restart 
 with `STT_DIARIZATION=auto` local diarization (when installed) labels the whole conversation instead;
 without it the note warns that labels are not consistent across pieces. A transcript without any
 speaker labels fails with instructions in `_status.md`, unless `STT_DIARIZATION=off`.
+
+For text-only `gpt-transcribe`, use `STT_REQUEST_STYLE=json` (also auto-detected) and
+`STT_DIARIZATION=local` or `auto`. Local diarization runs first over the whole conversation;
+each speaker window is sent separately, split at 30 seconds by default. Successful requests are
+cached individually for retries. Labels stay consistent across requests; timestamps describe
+audio windows, not individual words. Recognition uses the original local turns, excluding overlap
+and known audio loss. Missing local models or turns cause an error, never a one-speaker fallback.
+The configured transcription service receives ordinary speech audio; voice enrollment and
+recognition embeddings remain local.
 
 ## The notes folder
 
@@ -205,7 +214,8 @@ Enroll your voice and name people from the iPhone app (People tab); see
   the file is fine); voiceprints live in `_omi/people/<id>/`. Notes show names instead of
   "Speaker N" and list `people:` in their frontmatter.
 - Automatic naming only switches on per person after ≥ 3 confirmations on ≥ 2 days (plus a
-  leave-one-out check); enrollment alone doesn't activate it. Relabeling re-renders notes from
+  leave-one-out check). An enrolled wearer can instead activate with confirmations from ≥ 3
+  distinct recordings on the same day; enrollment alone doesn't activate it. Relabeling re-renders notes from
   cache (no LLM call); "Re-summarize with names" is an explicit action.
 - Voice enrollment happens through the pendant; the reading is never transcribed.
 - `omi-notes speakers bench` reports how well your confirmed samples separate and suggests

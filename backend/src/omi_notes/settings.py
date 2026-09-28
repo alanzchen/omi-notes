@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     # OpenAI-compatible transcriptions (STT_PROVIDER=openai): Mistral, OpenAI, Together, vLLM, LocalAI, ...
     stt_base_url: str = "https://api.openai.com/v1"
     stt_api_key: str = ""
-    stt_request_style: Literal["auto", "openai_diarized", "mistral", "together", "verbose"] = "auto"
+    stt_request_style: Literal["auto", "openai_diarized", "mistral", "together", "verbose", "json"] = "auto"
     # Longest audio per request; unset = the style's known limit, 0 = unlimited.
     stt_max_request_seconds: float | None = None
     # Where speaker labels come from; transcripts without them fail unless this is "off".
