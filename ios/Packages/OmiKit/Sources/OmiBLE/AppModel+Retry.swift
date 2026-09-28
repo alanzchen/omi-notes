@@ -26,50 +26,53 @@ extension AppModel {
             return
         }
         retryMessages[conversationId] = nil
-        await send(entry, api: APIClient(endpoint: endpoint, session: session), config: config)
+        await send(entry, api: APIClient(endpoint: endpoint, session: session), config: config, data: dataEpoch)
     }
 
-    func send(_ entry: RetryStore.Entry, api: APIClient, config: UploadConfig) async {
+    /// `data`: the data epoch the request belongs to; an answer after a server or vault change is dropped.
+    func send(_ entry: RetryStore.Entry, api: APIClient, config: UploadConfig, data: Int) async {
+        func current() -> Bool { isCurrent(config) && data == dataEpoch }
         do {
             let op = try await api.retry(conversationId: entry.conversationId, requestId: entry.requestId)
-            guard isCurrent(config) else { return }
+            guard current() else { return }
             retryStore.record(op, for: entry.requestId)
             retries[entry.conversationId] = op
         } catch APIError.http(409, let detail) where detail.hasPrefix("busy") {
             // Not an answer: the server is mid-way (or other work is queued). Same id next time.
-            guard isCurrent(config) else { return }
+            guard current() else { return }
             retryMessages[entry.conversationId] = Self.retryRefusal(detail) + " The app asks again automatically."
         } catch APIError.http(let code, let detail) where (400..<500).contains(code) {
-            guard isCurrent(config) else { return }
+            guard current() else { return }
             retryStore.settle(entry.requestId)  // answered: repeating this id can't help
             retries[entry.conversationId] = nil
             retryMessages[entry.conversationId] = Self.retryRefusal(detail)
         } catch {
             // No answer, or the server failed: keep the id and ask again on the next refresh.
-            guard isCurrent(config) else { return }
+            guard current() else { return }
             retryMessages[entry.conversationId] = "Couldn't confirm the retry yet (\(Self.describe(error))). The app asks again automatically."
         }
     }
 
     /// On every refresh: follow unsettled retries of this server, re-sending those with no answer.
-    func settleRetries(api: APIClient, config: UploadConfig) async {
+    func settleRetries(api: APIClient, config: UploadConfig, data: Int) async {
+        func current() -> Bool { isCurrent(config) && data == dataEpoch }
         guard let key = retryServerKey, serverStatus?.supportsRetry == true else { return }
         for entry in retryStore.entries(server: key) {
-            guard isCurrent(config) else { return }
+            guard current() else { return }
             if let op = entry.operation {
                 do {
                     let fresh = try await api.operation(op.id)
-                    guard isCurrent(config) else { return }
+                    guard current() else { return }
                     retryStore.record(fresh, for: entry.requestId)
                     retries[entry.conversationId] = fresh
                 } catch APIError.http(404, _) {
-                    await send(entry, api: api, config: config)  // accepted state was lost: the same id again
+                    await send(entry, api: api, config: config, data: data)  // accepted state was lost: the same id again
                 } catch {
-                    guard isCurrent(config) else { return }
+                    guard current() else { return }
                     retries[entry.conversationId] = op  // keep showing the last known state
                 }
             } else {
-                await send(entry, api: api, config: config)
+                await send(entry, api: api, config: config, data: data)
             }
         }
     }

@@ -152,6 +152,7 @@ public final class AppModel {
         }
         server = .checking
         lastCheckAt = Date()
+        let data = dataEpoch  // before any await: a reset while we wait makes this answer stale
         let api = APIClient(endpoint: endpoint, session: session)
         let reach: ServerReachability
         var status: ServerStatus?
@@ -166,7 +167,7 @@ public final class AppModel {
         } catch {
             reach = .unreachable(Self.describe(error))
         }
-        guard isCurrent(config) else { return }  // the server changed while we were asking
+        guard isCurrent(config), data == dataEpoch else { return }  // the server changed while we were asking
         server = reach
         guard let status else {
             // Shown conversations (if any) are now of unknown freshness; an empty list isn't "none yet".
@@ -184,13 +185,14 @@ public final class AppModel {
         }
         serverStatus = status
         serverStatusAt = Date()
-        let epoch = cacheEpoch, data = dataEpoch
+        let epoch = cacheEpoch
+        guard data == dataEpoch else { return }  // a vault change just reset everything
         async let issuesTask: [ServerIssue]? = status.supportsIssues ? try? api.issues() : []
         async let pageTask = Result { try await api.recentConversations(limit: Self.pageSize) }
         let (newIssues, page) = await (issuesTask, pageTask)
         guard isCurrent(config), data == dataEpoch else { return }
         if let newIssues { issues = newIssues }
-        await settleRetries(api: api, config: config)
+        await settleRetries(api: api, config: config, data: data)
         guard isCurrent(config), data == dataEpoch else { return }
         switch page {
         case .success(let page):

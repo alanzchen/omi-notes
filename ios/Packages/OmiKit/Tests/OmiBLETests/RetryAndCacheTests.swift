@@ -10,11 +10,14 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var routes: [String: [(Int, String)]] = [:]
     nonisolated(unsafe) static var requests: [(path: String, body: Data)] = []
     nonisolated(unsafe) static var offline = false
+    /// path → seconds to hold the next answer to that path (once).
+    nonisolated(unsafe) static var delayNext: [String: TimeInterval] = [:]
 
     static func reset() {
         routes = [:]
         requests = []
         offline = false
+        delayNext = [:]
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -41,9 +44,16 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         let (status, text) = queue.count > 1 ? queue.removeFirst() : queue[0]
         Self.routes[path] = queue
         let resp = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
-        client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data(text.utf8))
-        client?.urlProtocolDidFinishLoading(self)
+        let answer: @Sendable () -> Void = { [self] in
+            client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: Data(text.utf8))
+            client?.urlProtocolDidFinishLoading(self)
+        }
+        if let delay = Self.delayNext.removeValue(forKey: path) {
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: answer)
+        } else {
+            answer()
+        }
     }
     override func stopLoading() {}
 }
@@ -118,6 +128,21 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         await m.refreshServer()
         #expect(m.serverIdentity != before && m.details.isEmpty && m.recent.isEmpty)
         #expect(m.noteCache.lastScope?.vaultId != "vault-a" && m.savedConversations().isEmpty)
+    }
+
+    @Test func aLateAnswerFromBeforeAVaultChangeIsDropped() async throws {
+        let (m, _) = try model()
+        await m.refreshServer()  // vault-a
+        let vaultB = Self.status.replacingOccurrences(of: "vault-a", with: "vault-b")
+        // the next status answer (vault-a, stale) is slow; the one after (vault-b) is fast
+        AppServerStub.routes["/v1/status"] = [(200, Self.status), (200, vaultB)]
+        AppServerStub.delayNext["/v1/status"] = 0.6
+        async let slow: Void = m.refreshServer()
+        try await Task.sleep(for: .milliseconds(150))
+        await m.refreshServer()
+        #expect(m.serverStatus?.vaultId == "vault-b")
+        await slow
+        #expect(m.serverStatus?.vaultId == "vault-b" && m.serverIdentity.hasSuffix("vault-b"))
     }
 
     @Test func busyIsNotAnAnswer() async throws {

@@ -58,10 +58,14 @@ public final class SpeakersModel {
 
     /// The server this model's people and settings came from.
     private var loadedFor: UploadConfig?
+    /// Bumped by `serverChanged` (also for another vault at the same address): a refresh that
+    /// started before then must not bring the old people back.
+    private var generation = 0
 
     /// Another server (or none) is configured: nothing the previous one said may be shown or sent
     /// back, including a copy of its recognition settings.
     public func serverChanged() {
+        generation += 1
         loadedFor = nil
         people = []
         settings = nil
@@ -84,6 +88,8 @@ public final class SpeakersModel {
         defer { loading = false }
         let config = engine.settings.serverConfig()
         if config != loadedFor { serverChanged() }
+        let asked = generation
+        func current() -> Bool { engine.settings.serverConfig() == config && generation == asked }
         guard let endpoint = config.endpoint else {
             error = Self.describe(APIError.notConfigured)
             return
@@ -93,21 +99,21 @@ public final class SpeakersModel {
         // capability of the server that answered last time.
         serverSupportsEnrollment = nil
         let supports = try? await api.status().supportsVoiceEnrollment
-        guard engine.settings.serverConfig() == config else { return }
+        guard current() else { return }
         serverSupportsEnrollment = supports
         do {
             async let p = api.people()
             async let s = api.speakerSettings()
             let (newPeople, newSettings) = try await (p, s)
             let newSuggestions = newSettings.unknownVoicesEnabled == true ? (try await api.speakerSuggestions()) : []
-            guard engine.settings.serverConfig() == config else { return }  // answered by a server no longer configured
+            guard current() else { return }  // answered for a server (or vault) no longer shown
             people = newPeople
             settings = newSettings
             suggestions = newSuggestions
             loadedFor = config
             error = nil
         } catch {
-            if engine.settings.serverConfig() == config { self.error = Self.describe(error) }
+            if current() { self.error = Self.describe(error) }
         }
     }
 
