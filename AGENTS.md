@@ -95,7 +95,7 @@ Reuse the existing app, signing assets, API key and tester group while they rema
 | Upload configuration | `~/.appstoreconnect/omi-notes-upload.json` (`key_id`, `issuer_id`, `key_path`, `app_id`) |
 | Private API key | `~/.appstoreconnect/private_keys/AuthKey_<key_id>.p8`, file mode `0600`; role is **Developer** |
 | Internal Testing group | `b442156a-468f-491b-923c-489bd9548859` |
-| Last verified release | `0.1.0 (2)`, `VALID`, `IN_BETA_TESTING`; query Apple for the next build number |
+| Last verified release | `0.1.0 (3)` (2026-09-27), `VALID`, `IN_BETA_TESTING`; query Apple for the next build number |
 
 **Use manual local signing and upload the exported IPA.** `ios/Tools/testflight.sh` / `make testflight`
 uses automatic cloud signing and expects an Admin key; it is not the workflow for the current
@@ -163,7 +163,7 @@ settings before changing it; repository defaults are not the deployed configurat
 | Index base | `/Users/alan/Library/Application Support/omi-notes/index/production` |
 | Locks | `/Users/alan/Library/Application Support/omi-notes/locks` |
 | Release root | `/Users/alan/.local/share/omi-notes/releases/` |
-| Current backend | `/Users/alan/.local/share/omi-notes/current/backend` |
+| Current backend | `/Users/alan/.local/share/omi-notes/current/backend` (release `20260927-203301-d4767d2-with-local`, source = commit `e0cf5f8`; index schema 7) |
 | System service | `/Library/LaunchDaemons/com.omi-notes.server.plist`, runs as `alan` |
 | Rotating log | `/Users/alan/Library/Application Support/omi-notes/index/logs/omi-notes.log` |
 
@@ -211,14 +211,25 @@ settings before changing it; repository defaults are not the deployed configurat
    root-owned plist but runs the service as `alan`. Inspect/regenerate its staged plist first.
    System installation needs administrator authentication. Prepare all artifacts before requesting
    that authentication, and show any command the user must run in a normal, copyable chat message.
-   Do not reinstall the disabled login service alongside the system daemon.
+   Do not reinstall the disabled login service alongside the system daemon. The installer waits for
+   the old service to disappear after `bootout`; bootstrapping too early fails with
+   `Bootstrap failed: 5: Input/output error` and leaves no server running. If that happens, run
+   `sudo launchctl bootstrap system /Library/LaunchDaemons/com.omi-notes.server.plist` once the
+   old service is gone (`launchctl print system/com.omi-notes.server` fails).
 4. For a restart without changing the plist, gracefully `SIGTERM` the verified `alan`-owned service
    PID; launchd's KeepAlive restarts it. Confirm the new PID and readiness. Alternatively use
    `sudo launchctl kickstart -k system/com.omi-notes.server` when administrator access is available.
 5. A small source hotfix to the active release must be explicit and reversible: verify the old
    hash, retain prior source/manifest under `hotfixes/<timestamp>/`, replace files atomically,
-   update `release.json`, restart gracefully and verify. Apply the same change to the repository.
-   Never leave an unrecorded difference between deployed code and its source manifest.
+   update `release.json`, restart gracefully and verify. Apply the same change to the repository
+   **and commit it**: a later release is built from commits, and an uncommitted hotfix would be
+   silently removed. Never leave an unrecorded difference between deployed code and its source
+   manifest.
+6. Build a release only from committed source. Other agents may share this checkout: check
+   `git status` and stage explicit files, never `git add -A` over someone else's work.
+7. **Vault format:** the first app retry (`POST /v1/conversations/{id}/retry`) raises `VAULT.json`
+   to format 2, and a backend older than `bb838fb` then refuses the vault. Roll back only to a
+   release that reads format 2; never lower the marker by hand.
 
 For runtime maintenance, use the release's `.venv/bin/omi-notes` with the external environment
 file, not an unconfigured checkout command. `retry-failed` and `reprocess` queue work when the
