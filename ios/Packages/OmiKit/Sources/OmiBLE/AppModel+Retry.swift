@@ -32,6 +32,7 @@ extension AppModel {
     /// `data`: the data epoch the request belongs to; an answer after a server or vault change is dropped.
     func send(_ entry: RetryStore.Entry, api: APIClient, config: UploadConfig, data: Int) async {
         func current() -> Bool { isCurrent(config) && data == dataEpoch }
+        guard current() else { return }  // never send a retry meant for a previous server or vault
         do {
             let op = try await api.retry(conversationId: entry.conversationId, requestId: entry.requestId)
             guard current() else { return }

@@ -145,6 +145,21 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         #expect(m.serverStatus?.vaultId == "vault-b" && m.serverIdentity.hasSuffix("vault-b"))
     }
 
+    @Test func aLateNotFoundAfterAVaultChangeSendsNothing() async throws {
+        let (m, _) = try model()
+        await m.refreshServer()
+        AppServerStub.routes["/v1/conversations/conv-1/retry"] = [(202, Self.opJSON("op-1", "queued"))]
+        await m.retry(conversationId: "conv-1")
+        AppServerStub.routes["/v1/operations/op-1"] = [(404, #"{"error":"not_found","detail":"unknown operation"}"#)]
+        AppServerStub.delayNext["/v1/operations/op-1"] = 0.6
+        async let following: Void = m.refreshServer()  // asks about op-1; the answer is late
+        try await Task.sleep(for: .milliseconds(200))
+        AppServerStub.routes["/v1/status"] = [(200, Self.status.replacingOccurrences(of: "vault-a", with: "vault-b"))]
+        await m.refreshServer()
+        await following
+        #expect(sentRequestIds().count == 1)  // the old vault's retry was not sent to the new one
+    }
+
     @Test func busyIsNotAnAnswer() async throws {
         let (m, root) = try model()
         await m.refreshServer()
