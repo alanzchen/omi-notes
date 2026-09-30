@@ -65,6 +65,7 @@ from .relevance import deterministic_relevance
 from .segmenter import RingCapture, ring_resolved_until
 from .speakers import SpeakerResult, resolve_speakers
 from .transcript import ConversationAudio, assemble, detected_language, merge_same_speaker, segments_from_deepgram
+from .turn_transcription import CACHE_FORMAT as WINDOW_CACHE_FORMAT
 from .turn_transcription import transcribe_windows
 
 log = logging.getLogger(__name__)
@@ -479,12 +480,15 @@ class ConversationPipeline:
             if turns is None:
                 raise ProviderError("text-only STT requires the local diarization models", terminal=True, kind="diarization")
             # A diarizer that fails raises (retried); one that ran and found no turns won't find them on a
-            # retry either. Its audio is still transcribed, as one window whose speaker is explicitly unknown:
-            # no invented speakers, no voiceprints, and an empty transcript is discarded as no speech.
+            # retry either. Its audio is still transcribed as one window, only to learn whether it holds
+            # words: none ⇒ discarded as no speech; words ⇒ `speakers_unknown`, a terminal status that
+            # keeps the audio and invents no speaker (docs/architecture.md #11).
         unlabeled = windowed and not turns
         tag = f"-{_slug(stt.cache_tag)}" if getattr(stt, "cache_tag", "") else ""
         if windowed:
-            tag += f"-{_slug(self.providers.diarizer.tag)}"
+            # the whole-conversation response depends on the windowing version and the vocabulary sent too
+            keyterms = sha256_hex(canonical_json(list(self.settings.keyterms)).encode())[:8]
+            tag += f"-{_slug(self.providers.diarizer.tag)}-w{WINDOW_CACHE_FORMAT}-k{keyterms}"
         base = f"stt-{stt.name}{tag}-{_slug(stt.model)}-{_slug(self.settings.stt_language)}-{audio_sha[:16]}"
         conv_dir = self.conv_dir(conv_id)
         name = _reusable(conv_dir, base, row["stt_ref"], row["skip_stt"])
@@ -505,6 +509,10 @@ class ConversationPipeline:
         else:
             speakers = self._speakers(conv_id, cached["response"], audio, audio_sha)
         segments = merge_same_speaker(segments_from_deepgram(speakers.response, audio.timemap))
+        if unlabeled and any(s["text"].strip() for s in segments):
+            raise ProviderError("words were transcribed, but local speaker separation found no speakers; "
+                                "no note is made so no speaker is invented (the audio and its text are kept)",
+                                terminal=True, kind="speakers_unknown")  # fmt: skip
         overlaps = cached["response"].get("omi_notes", {}).get("overlap_spans", []) if windowed else []
         clips = {} if unlabeled else select_clips(label_turns(speakers.response, local_turns=turns),
                                                   usable_spans(audio.blocks_out, self._losses_out(row, audio) + overlaps))

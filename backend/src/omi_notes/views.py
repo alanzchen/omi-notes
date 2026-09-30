@@ -44,6 +44,8 @@ def failure_message(kind: str | None, stage: str | None) -> str:
         "notes": "The note's My Notes section is ambiguous, so the server won't overwrite it.",
         "io": "The server couldn't write the note file.",
         "move": "The server couldn't move the note file.",
+        "speakers_unknown": "Words were heard, but the server found no separate speakers, so no note was made. "
+                            "The audio is kept.",
     }.get(kind or "", f"The {service} failed.")
 
 
@@ -69,6 +71,8 @@ def next_step(kind: str | None, stage: str | None, *, retrying: bool) -> str:
         return "The server stopped retrying after several attempts." + mac + " Once the service works again, " + retry
     if kind == "notes":
         return "Fix the My Notes markers in the note by hand, " + retry
+    if kind == "speakers_unknown":
+        return "Nothing is lost. Retry after the speaker-separation models are updated, " + retry
     if kind in ("io", "move"):
         return "Check the vault folder's disk space and permissions, " + retry
     return "See _status.md in your vault for details, " + retry

@@ -275,9 +275,7 @@ def test_no_speaker_turns_with_no_words_is_discarded_as_no_speech_keeping_its_tr
     assert transcript["submitted_seconds"] > 0  # the audio is still referenced, nothing deleted
 
 
-def test_no_speaker_turns_with_words_keeps_the_note_and_says_the_speaker_is_unknown(tmp_path):
-    import json
-
+def test_no_speaker_turns_with_words_is_an_explicit_status_not_an_invented_speaker(tmp_path):
     settings, client, worker = pipeline(tmp_path, stt_diarization="local")
     seen = []
     worker.providers._stt = text_only(seen, "Remind me to call the dentist tomorrow.")
@@ -285,12 +283,38 @@ def test_no_speaker_turns_with_words_keeps_the_note_and_says_the_speaker_is_unkn
     replay(client, SPEECH)
     worker.tick(T0 + 200)
     (row,) = convs(worker)
-    assert row["status"] == "done" and len(seen) == 1
-    transcript = json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text())
-    assert [s["text"] for s in transcript["segments"]] == ["Remind me to call the dentist tomorrow."]
-    assert transcript["speaker_source"] == "unlabeled"
-    assert not worker.db.query("SELECT 1 FROM voices WHERE conversation_id=?", (row["id"],))  # no voiceprint from it
-    assert "speaker is unknown" in note_text(settings, row)
+    # not retried six times, and nothing attributed to a made-up "Speaker 1"
+    assert row["status"] == "failed" and row["error_kind"] == "speakers_unknown" and row["attempts"] == 1
+    assert not (worker.pipeline.conv_dir(row["id"]) / "transcript.json").exists()
+    assert not worker.db.query("SELECT 1 FROM speaker_labels WHERE conversation_id=?", (row["id"],))
+    assert row["note_path"] is None and len(seen) == 1
+    for t in range(3):
+        worker.tick(T0 + 300 + t * 4000)
+    assert len(seen) == 1 and convs(worker)[0]["status"] == "failed"  # no pointless retries
+    (issue,) = [i for i in client.get("/v1/issues", headers=AUTH).json()["issues"] if i["code"] == "conversation_failed"]
+    assert "speaker" in issue["message"] and "kept" in issue["message"]
+
+
+def test_a_reprocess_that_finds_no_turns_keeps_the_earlier_note_and_its_speakers(tmp_path):
+    settings, client, worker = pipeline(tmp_path, stt_diarization="local")
+    seen = []
+    worker.providers._stt = text_only(seen, "We should ship this on Friday.")
+    worker.providers._diarizer = FakeDiarizer()
+    replay(client, SPEECH)
+    worker.tick(T0 + 200)
+    (row,) = convs(worker)
+    assert row["status"] == "done"
+    before = note_text(settings, row)
+    labels = client.get(f"/v1/conversations/{row['id']}/speakers", headers=AUTH).json()["labels"]
+    worker.providers._diarizer = NoTurnsDiarizer()
+    for cached in worker.pipeline.conv_dir(row["id"]).glob("diarization-*.json"):
+        cached.unlink()
+    worker.db.execute("UPDATE conversations SET status='closed' WHERE id=?", (row["id"],))
+    worker.tick(T0 + 300)
+    (after,) = convs(worker)
+    assert after["status"] == "failed" and after["error_kind"] == "speakers_unknown"
+    assert note_text(settings, after) == before  # the earlier note stays as it was
+    assert client.get(f"/v1/conversations/{row['id']}/speakers", headers=AUTH).json()["labels"] == labels
 
 
 def test_a_failing_diarizer_is_retried_not_treated_as_no_speech(tmp_path):
@@ -303,3 +327,19 @@ def test_a_failing_diarizer_is_retried_not_treated_as_no_speech(tmp_path):
     (row,) = convs(worker)
     assert row["status"] in ("closed", "transcribing") and row["attempts"] == 1 and row["next_attempt_at"]
     assert seen == []  # no audio went out without speaker information
+
+
+def test_changed_request_settings_are_not_hidden_by_a_whole_conversation_cache(tmp_path):
+    settings, client, worker = pipeline(tmp_path, stt_diarization="local")
+    seen = []
+    worker.providers._stt = text_only(seen, "We should ship this on Friday.")
+    worker.providers._diarizer = FakeDiarizer()
+    replay(client, SPEECH)
+    worker.tick(T0 + 200)
+    (row,) = convs(worker)
+    first = len(seen)
+    assert row["status"] == "done" and first >= 1
+    worker.pipeline.settings.stt_keyterms = "Omi,Priya"  # a new vocabulary hint
+    worker.db.execute("UPDATE conversations SET status='closed' WHERE id=?", (row["id"],))
+    worker.tick(T0 + 300)
+    assert len(seen) > first  # asked again with the new request, not answered from the old response

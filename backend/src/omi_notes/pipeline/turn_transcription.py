@@ -11,8 +11,9 @@ the answer keeps the window's speaker and times (never the padded length).
 
 A window's cached answer is keyed on exactly what was sent (samples, length, speech blocks,
 language, keyterms, provider, model, request style), not on its position: a change in segmentation
-or padding can never reuse text made from other audio. Older position-named caches are ignored,
-not deleted.
+or padding can never reuse text made from other audio. Older position-named caches are ignored
+(this code doesn't delete them; the pipeline's usual clean-up of unreferenced result files removes
+them once the conversation completes).
 """
 
 from __future__ import annotations
