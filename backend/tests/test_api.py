@@ -188,3 +188,42 @@ def test_recent_conversations_only_offer_speakers_after_transcription(client, wo
     (finished,) = client.get("/v1/conversations/recent", headers=AUTH).json()["conversations"]
     assert finished["id"] == recording["id"] and finished["speakers_ready"] is True
     assert client.get(f"/v1/conversations/{finished['id']}/speakers", headers=AUTH).status_code == 200
+
+
+def test_a_phone_that_hangs_up_mid_upload_is_not_an_internal_error(client, new_id, settings, caplog):
+    """iOS background sessions drop connections; the upload is simply not stored (the phone retries)."""
+    import asyncio
+    import logging
+
+    capture = new_id()
+    body = envelopes(capture)[0]
+    sent = []
+    messages = iter([{"type": "http.request", "body": body[:100], "more_body": True}, {"type": "http.disconnect"}])
+
+    async def receive():
+        return next(messages)
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "PUT", "scheme": "https",
+             "path": f"/v1/captures/{capture}/chunks/0", "raw_path": f"/v1/captures/{capture}/chunks/0".encode(),
+             "query_string": b"", "root_path": "", "client": ("100.64.0.1", 1), "server": ("127.0.0.1", 18765),
+             "headers": [(b"authorization", AUTH["Authorization"].encode()), (b"content-length", str(len(body)).encode()),
+                         (b"x-content-sha256", hashlib.sha256(body).hexdigest().encode())]}  # fmt: skip
+    with caplog.at_level(logging.INFO):
+        asyncio.run(client.app(scope, receive, send))
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not list(settings.raw_dir.rglob("0.omnc"))  # nothing half-written
+    assert any("disconnected" in r.getMessage() for r in caplog.records)
+
+
+def test_a_genuine_internal_error_still_surfaces(client, monkeypatch):
+    def broken(*args, **kwargs):
+        raise RuntimeError("disk exploded")
+    monkeypatch.setattr(client.app.state.ingest, "put_event", broken)
+    import pytest as _pytest
+
+    with _pytest.raises(RuntimeError):
+        client.put(f"/v1/events/{'0' * 8}-0000-4000-8000-000000000000",
+                   json={"device_id": DEVICE, "type": "button", "at": iso_utc(STARTED), "data": {"code": 1}}, headers=AUTH)

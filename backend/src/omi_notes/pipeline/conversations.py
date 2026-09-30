@@ -478,8 +478,10 @@ class ConversationPipeline:
             turns = self._local_turns(conv_id, audio, audio_sha)
             if turns is None:
                 raise ProviderError("text-only STT requires the local diarization models", terminal=True, kind="diarization")
-            if not turns:
-                raise ProviderError("text-only STT needs local diarization; no speaker turns are available", kind="diarization")
+            # A diarizer that fails raises (retried); one that ran and found no turns won't find them on a
+            # retry either. Its audio is still transcribed, as one window whose speaker is explicitly unknown:
+            # no invented speakers, no voiceprints, and an empty transcript is discarded as no speech.
+        unlabeled = windowed and not turns
         tag = f"-{_slug(stt.cache_tag)}" if getattr(stt, "cache_tag", "") else ""
         if windowed:
             tag += f"-{_slug(self.providers.diarizer.tag)}"
@@ -492,14 +494,20 @@ class ConversationPipeline:
         else:
             request = SttRequest(flac=audio.flac(), duration=audio.duration, blocks=audio.blocks_out,
                                  language=self.settings.stt_language, keyterms=self.settings.keyterms)
-            response = transcribe_windows(stt, audio, request, turns, path) if windowed else stt.transcribe(request)
+            window_turns = [Turn(0.0, audio.duration, 0)] if unlabeled else turns
+            response = transcribe_windows(stt, audio, request, window_turns, path) if windowed else stt.transcribe(request)
             cached = {"created_at": now, "provider": stt.name, "model": stt.model, "response": response}
             atomic_write_bytes(path, json.dumps(cached).encode())
-        speakers = SpeakerResult(cached["response"], "local", True) if windowed else self._speakers(conv_id, cached["response"], audio, audio_sha)
+        if unlabeled:
+            speakers = SpeakerResult(cached["response"], "unlabeled", False)
+        elif windowed:
+            speakers = SpeakerResult(cached["response"], "local", True)
+        else:
+            speakers = self._speakers(conv_id, cached["response"], audio, audio_sha)
         segments = merge_same_speaker(segments_from_deepgram(speakers.response, audio.timemap))
         overlaps = cached["response"].get("omi_notes", {}).get("overlap_spans", []) if windowed else []
-        clips = select_clips(label_turns(speakers.response, local_turns=turns),
-                             usable_spans(audio.blocks_out, self._losses_out(row, audio) + overlaps))
+        clips = {} if unlabeled else select_clips(label_turns(speakers.response, local_turns=turns),
+                                                  usable_spans(audio.blocks_out, self._losses_out(row, audio) + overlaps))
         language = self.settings.stt_language
         if language == "multi":
             language = detected_language(cached["response"]) or language
@@ -835,6 +843,7 @@ class ConversationPipeline:
             discard_reason=discard_reason, summary_error=summary_error, owner_name=snap["owner_name"],
             lost_seconds=row["lost_seconds"], clock_suspect=bool(row["clock_suspect"]),
             speaker_labels_consistent=transcript.get("speaker_labels_consistent", True),
+            speakers_unknown=transcript.get("speaker_source") == "unlabeled",
             voice_names={label: name for label, (name, _) in self.voice_names(conv_id).items()},
         )  # fmt: skip
         content_sha = sha256_hex(render_note(data, "").encode())

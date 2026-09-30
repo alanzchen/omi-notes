@@ -56,6 +56,8 @@ class NoteData:
     lost_seconds: float = 0.0
     clock_suspect: bool = False
     speaker_labels_consistent: bool = True
+    # Local diarization found no speaker turns: one window, speaker explicitly unknown.
+    speakers_unknown: bool = False
     # Speaker labels recognized by voice → the person's People note name (docs/speaker-learning.md).
     voice_names: dict[str, str] = field(default_factory=dict)
 
@@ -231,7 +233,13 @@ def render_note(d: NoteData, my_notes: str | None = None) -> str:
             "(short dropouts are concealed).",
             "",
         ]
-    if not d.speaker_labels_consistent:
+    if d.speakers_unknown:
+        out += [
+            "> [!warning] Local speaker separation found no distinct speaker in this audio, so the speaker is "
+            "unknown.",
+            "",
+        ]
+    elif not d.speaker_labels_consistent:
         out += [
             "> [!warning] Speaker labels restart in each part this audio was transcribed in, so the same person "
             "may appear under different labels. Install local diarization for consistent speakers.",

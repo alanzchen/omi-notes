@@ -229,3 +229,77 @@ def test_status_reports_openai_stt_readiness(tmp_path):
     settings, client, _ = pipeline(tmp_path)
     stt = client.get("/v1/status", headers=AUTH).json()["stt"]
     assert stt["provider"] == "openai" and stt["ready"] is True and stt["model"] == settings.stt_model
+
+
+class NoTurnsDiarizer:
+    """Local diarization ran and found no speaker turns (a fragment too short to cluster)."""
+
+    tag = "no-turns"
+
+    def __init__(self):
+        self.calls = 0
+
+    def diarize(self, pcm):
+        self.calls += 1
+        return []
+
+
+class BrokenDiarizer:
+    tag = "broken"
+
+    def diarize(self, pcm):
+        raise RuntimeError("onnxruntime session failed")
+
+
+def text_only(seen, text):
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={"text": text})
+    return OpenAICompatStt("https://transcription.example/v1", "", "gpt-transcribe", style="json",
+                           transport=httpx.MockTransport(handler))
+
+
+def test_no_speaker_turns_with_no_words_is_discarded_as_no_speech_keeping_its_transcript(tmp_path):
+    import json
+
+    settings, client, worker = pipeline(tmp_path, stt_diarization="local")
+    seen = []
+    worker.providers._stt = text_only(seen, "")
+    worker.providers._diarizer = NoTurnsDiarizer()
+    replay(client, SPEECH)
+    worker.tick(T0 + 200)
+    (row,) = convs(worker)
+    assert row["status"] == "discarded" and row["error"] is None and len(seen) == 1  # asked once, not retried
+    transcript = json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text())
+    assert transcript["speaker_source"] == "unlabeled" and transcript["speaker_labels_consistent"] is False
+    assert transcript["submitted_seconds"] > 0  # the audio is still referenced, nothing deleted
+
+
+def test_no_speaker_turns_with_words_keeps_the_note_and_says_the_speaker_is_unknown(tmp_path):
+    import json
+
+    settings, client, worker = pipeline(tmp_path, stt_diarization="local")
+    seen = []
+    worker.providers._stt = text_only(seen, "Remind me to call the dentist tomorrow.")
+    worker.providers._diarizer = NoTurnsDiarizer()
+    replay(client, SPEECH)
+    worker.tick(T0 + 200)
+    (row,) = convs(worker)
+    assert row["status"] == "done" and len(seen) == 1
+    transcript = json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text())
+    assert [s["text"] for s in transcript["segments"]] == ["Remind me to call the dentist tomorrow."]
+    assert transcript["speaker_source"] == "unlabeled"
+    assert not worker.db.query("SELECT 1 FROM voices WHERE conversation_id=?", (row["id"],))  # no voiceprint from it
+    assert "speaker is unknown" in note_text(settings, row)
+
+
+def test_a_failing_diarizer_is_retried_not_treated_as_no_speech(tmp_path):
+    _, client, worker = pipeline(tmp_path, stt_diarization="local")
+    seen = []
+    worker.providers._stt = text_only(seen, "")
+    worker.providers._diarizer = BrokenDiarizer()
+    replay(client, SPEECH)
+    worker.tick(T0 + 200)
+    (row,) = convs(worker)
+    assert row["status"] in ("closed", "transcribing") and row["attempts"] == 1 and row["next_attempt_at"]
+    assert seen == []  # no audio went out without speaker information

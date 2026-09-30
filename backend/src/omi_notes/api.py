@@ -15,6 +15,7 @@ from datetime import time as dt_time
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
+from starlette.requests import ClientDisconnect
 
 from . import PROTOCOL_VERSION, __version__, operations, search, views
 from .envelope import MAX_BODY_BYTES
@@ -124,10 +125,15 @@ def create_app(
             if int(declared) > limit:
                 raise ApiError(413, "too_large", f"body exceeds {limit} bytes")
         body = bytearray()
-        async for part in request.stream():
-            body.extend(part)
-            if len(body) > limit:
-                raise ApiError(413, "too_large", f"body exceeds {limit} bytes")
+        try:
+            async for part in request.stream():
+                body.extend(part)
+                if len(body) > limit:
+                    raise ApiError(413, "too_large", f"body exceeds {limit} bytes")
+        except ClientDisconnect:
+            # iOS background sessions drop uploads; nothing was stored and the phone sends it again
+            log.info("client disconnected during %s %s after %d bytes", request.method, request.url.path, len(body))
+            raise ApiError(499, "client_disconnected", "the client went away before the body arrived") from None
         if declared is not None and int(declared) != len(body):
             raise ApiError(400, "length_mismatch", "body length does not match Content-Length")
         return bytes(body)
