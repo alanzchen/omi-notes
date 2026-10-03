@@ -163,8 +163,8 @@ settings before changing it; repository defaults are not the deployed configurat
 | Index base | `/Users/alan/Library/Application Support/omi-notes/index/production` |
 | Locks | `/Users/alan/Library/Application Support/omi-notes/locks` |
 | Release root | `/Users/alan/.local/share/omi-notes/releases/` |
-| Current backend | `/Users/alan/.local/share/omi-notes/current/backend` (release `20260927-203301-d4767d2-with-local`, source = commit `e0cf5f8`; index schema 7) |
-| System service | `/Library/LaunchDaemons/com.omi-notes.server.plist`, runs as `alan` |
+| Current backend | release `20260930-005903-2afefbb` (source = commit `2afefbb`; index schema 7), live since 2026-10-03 02:08 CDT. The `current` symlink still names the old release; the service plist's absolute path is what runs |
+| Service | System daemon `/Library/LaunchDaemons/com.omi-notes.server.plist` (runs as `alan`), **being retired for a user LaunchAgent** in `gui/504` (Alan's decision, 2026-10-03). Check which one is live with `~/.config/omi-notes/user-service.sh status` |
 | Rotating log | `/Users/alan/Library/Application Support/omi-notes/index/logs/omi-notes.log` |
 
 - **Transcription:** `STT_PROVIDER=openai`, `STT_BASE_URL=https://codex-transcription.zenan.ch/v1`,
@@ -196,6 +196,17 @@ settings before changing it; repository defaults are not the deployed configurat
   index outside sync and run only one backend writer against the vault.
 
 ### Updating or restarting the backend
+
+**User LaunchAgent (target, from 2026-10-03).** Alan chose a user-level service: no sudo for updates.
+- One-time switch-over (needs Alan's password once):
+  `sudo ~/.config/omi-notes/retire-system-daemon.sh && ~/.config/omi-notes/user-service.sh start`.
+  The retire script stops, disables and moves the system plist into `~/.config/omi-notes/system-daemon-retired/`; it deletes nothing and starts nothing.
+- After that, deploy a release by making its plist with that release's
+  `python -m omi_notes.launchd --write-plist ~/.config/omi-notes/user-agent/com.omi-notes.server.<name>.plist`
+  (no `UserName`; credentials stay in the env file), then running `user-service.sh deploy <plist>`. It stops the old server, confirms it is gone (job, pid, port, vault locks), starts the new one, checks readiness, and restores the previous plist on failure. `user-service.sh rollback` goes back one step.
+- Never run the system installer (`install-release.sh`) or bootstrap the system daemon while the agent exists. A LaunchAgent runs only while Alan is logged in (it stops at logout, and after a reboot it waits for login).
+
+The steps below describe the system daemon; they apply only until the switch-over.
 
 1. Prepare a tested release under `releases/` with its own `.venv` (`uv sync --frozen --extra
    diarization`), required models and a `release.json` source-hash manifest. Keep credentials and
