@@ -140,6 +140,10 @@ testing needs no Beta App Review; external testers do. The app ships with an ori
 Pendant button: **single tap** = bookmark (shown in the note); **double tap** = end the current
 conversation now. A 3 s long press powers the pendant off.
 
+The **Pendant** tab shows the pendant at a glance: connection and recording state, battery and
+firmware, audio collected from the pendant's own storage, and uploads waiting on this phone, with
+the same reconnect, pair, forget and retry actions as Settings and Diagnostics.
+
 ## People and voices
 
 The **People** tab teaches your server who is speaking (see
@@ -212,7 +216,7 @@ shows the (token-redacted) log.
 - Debug builds accept automation launch arguments:
   `-OmiNotesDebugServerURL http://localhost:8765 -OmiNotesDebugToken <token>` to configure the
   server, `-OmiNotesDebugOpenURL 'omi-notes://configure?…'` to open the pairing sheet,
-  `-OmiNotesDebugTab home|people|server|settings|pairing|diagnostics|debug` to open a screen,
+  `-OmiNotesDebugTab home|pendant|people|server|settings|pairing|diagnostics|debug` to open a screen,
   `-OmiNotesDebugOpenConversation YES` to open the newest conversation and
   `-OmiNotesDebugSearch <text>` to start with a search. `-omi.onboarded YES` skips onboarding.
   `xcrun simctl spawn booted defaults write <bundle-id> omi.simulatedDevice -bool YES` turns on

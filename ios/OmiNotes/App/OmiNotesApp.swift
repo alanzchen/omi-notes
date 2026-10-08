@@ -24,7 +24,7 @@ struct OmiNotesApp: App {
 }
 
 struct RootView: View {
-    enum Tab: String { case home, people, server }
+    enum Tab: String { case home, pendant, people, server }
     /// What the Settings sheet opens on.
     enum SettingsPage: String, Identifiable { case main, pairing; var id: String { rawValue } }
 
@@ -46,6 +46,9 @@ struct RootView: View {
             }
             .tabItem { Label("Home", systemImage: "waveform") }
             .tag(Tab.home)
+            NavigationStack { PendantView(model: model, onFix: fix) }
+                .tabItem { Label("Pendant", systemImage: "wave.3.right.circle") }
+                .tag(Tab.pendant)
             NavigationStack { PeopleView(model: model) }
                 .tabItem { Label("People", systemImage: "person.2") }
                 .tag(Tab.people)
@@ -101,7 +104,7 @@ struct RootView: View {
 }
 
 extension RootView {
-    /// Simulator automation only (debug builds): `-OmiNotesDebugTab home|people|server|settings|pairing|diagnostics|debug`
+    /// Simulator automation only (debug builds): `-OmiNotesDebugTab home|pendant|people|server|settings|pairing|diagnostics|debug`
     /// opens that screen at launch (there is no way to tap in a headless simulator).
     static var initialTab: Tab {
         #if DEBUG
