@@ -14,10 +14,10 @@ from datetime import time as dt_time
 
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.requests import ClientDisconnect
 
-from . import PROTOCOL_VERSION, __version__, operations, search, views
+from . import PROTOCOL_VERSION, __version__, operations, recording, search, views
 from .envelope import MAX_BODY_BYTES
 from .ingest import ApiError, Ingest, capture_status
 from .lock import api_lock
@@ -181,7 +181,7 @@ def create_app(
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes
-            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "search", "stats"],
+            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "search", "stats"],
             "vault_id": vault.vault_id,
         }
 
@@ -260,6 +260,17 @@ def create_app(
         # still changing: show nothing that could belong to another generation
         return body | {"summary": None, "summary_state": "updating", "transcript": None, "transcript_state": "updating",
                        "speakers": [], "speaker_names": [], "preview": None}  # fmt: skip
+
+    @app.get("/v1/conversations/{conv_id}/recording")
+    async def recording_info(conv_id: str) -> dict:
+        """The note's recording: playable duration, span, gaps and time map (rendered once, cached)."""
+        return await run_in_threadpool(recording.describe, app.state.speakers.pipeline, conv_id)
+
+    @app.get("/v1/conversations/{conv_id}/recording.wav")
+    async def recording_wav(conv_id: str) -> FileResponse:
+        """The playable audio as 16 kHz mono WAV, with byte ranges (the phone streams and seeks)."""
+        path = await run_in_threadpool(recording.wav_file, app.state.speakers.pipeline, conv_id)
+        return FileResponse(path, media_type="audio/wav")
 
     @app.post("/v1/conversations/{conv_id}/retry")
     async def retry(conv_id: str, request: Request) -> JSONResponse:

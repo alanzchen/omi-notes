@@ -416,9 +416,9 @@ class ConversationPipeline:
 
     # -- audio + STT -----------------------------------------------------------------------------
 
-    def conversation_audio(self, row: sqlite3.Row) -> ConversationAudio:
-        """Re-decode exactly the chunks under this conversation's speech blocks."""
-        blocks = [tuple(b) for b in json.loads(row["blocks_json"])]
+    def conversation_audio(self, row: sqlite3.Row, blocks: list[tuple[float, float]] | None = None) -> ConversationAudio:
+        """Re-decode exactly the chunks under this conversation's speech blocks (or `blocks`)."""
+        blocks = [tuple(b) for b in json.loads(row["blocks_json"])] if blocks is None else blocks
         if not blocks:
             return assemble([], [])
         lo, hi = min(b[0] for b in blocks), max(b[1] for b in blocks)

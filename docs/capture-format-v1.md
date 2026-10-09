@@ -159,7 +159,7 @@ No auth. `200 {"ok": true}`.
                "backing_off": 0, "oldest_waiting_ended_at": "…", "oldest_pending_chunk_received_at": null,
                "stt": {"last_ok_at": "…", "last_error_at": null, "last_error_kind": null}, "llm": null},
   "vault_id": "…",
-  "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "search", "stats"]
+  "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "search", "stats"]
 }
 ```
 
@@ -439,6 +439,32 @@ stay failures to fix). The operation has `kind: "keep"`; once `done` the convers
 a transcript-only note (cached text reused, no summary, no speaker labels or voiceprints), it leaves
 `/v1/issues` and the failed counts, and its detail carries `resolution`. Nothing is deleted. If the
 attempt fails for another reason, that failure is listed as usual. The decision is permanent.
+
+### `GET /v1/conversations/{id}/recording`
+
+The note's recording, for listening: everything retained from the conversation's start to its end
+(quiet between speech included), cut from the same raw chunks the transcript came from, in order;
+never another conversation's audio. Rendered once into a size-bounded cache beside the index.
+
+```json
+{"available": true, "reason": null, "duration_s": 742.5, "partial": true,
+ "span": {"started_at": "…", "ended_at": "…", "seconds": 750.5},
+ "gaps": [{"started_at": "…", "ended_at": "…", "seconds": 8.0}],
+ "timemap": [[0.0, 1790000000.0, 300.0], [300.0, 1790000308.0, 442.5]],
+ "url": "/v1/conversations/{id}/recording.wav"}
+```
+
+`duration_s` is what can be played. Wall-clock time with no recorded audio is a `gap` (not filled
+with silence); `timemap` places each playable part on the clock as `[playable offset s, wall-clock
+epoch, seconds]`. Unavailable: `available: false` with `reason` `expired` (raw audio past
+retention), `no_audio`, `in_progress`, or `too_long` (over 4 hours). `404` for unknown ids and voice
+enrollment readings.
+
+### `GET /v1/conversations/{id}/recording.wav`
+
+The playable audio, 16 kHz mono PCM16 WAV, with HTTP byte ranges (`206`), so a player streams and
+seeks without downloading it all. Bearer auth like every other endpoint; never a token in the URL.
+`410 audio_expired`, `409` for the other unavailable reasons.
 
 ### `GET /v1/operations/{id}`
 
