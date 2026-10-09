@@ -72,9 +72,13 @@ struct PendantView: View {
                 .padding(.bottom, 24)
             }
             .background(Pendant.background.ignoresSafeArea())
+            // The warm canvas is a fixed light design: its text, dividers and controls use the light
+            // scheme so they stay readable in Dark Mode. Pushed pages keep the system's scheme.
+            .environment(\.colorScheme, .light)
         }
         .navigationTitle("Pendant")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarColorScheme(.light, for: .navigationBar)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
