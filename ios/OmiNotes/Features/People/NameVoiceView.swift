@@ -518,6 +518,20 @@ final class VoicePlayer: NSObject, AVAudioPlayerDelegate {
     private var cache: [String: Data] = [:]
     private var player: AVAudioPlayer?
     private var ticker: Task<Void, Never>?
+    private var focus: NSObjectProtocol?
+
+    override init() {
+        super.init()
+        focus = NotificationCenter.default.addObserver(forName: .omiAudioWillPlay, object: nil, queue: .main) { [weak self] note in
+            let sender = note.object.map { ObjectIdentifier($0 as AnyObject) }
+            MainActor.assumeIsolated {
+                guard let self, sender != ObjectIdentifier(self), self.isPlaying else { return }
+                self.player?.pause()  // another sound started: one at a time
+                self.isPlaying = false
+                self.ticker?.cancel()
+            }
+        }
+    }
 
     var progress: Double { duration.map { $0 > 0 ? elapsed / $0 : 0 } ?? 0 }
 
@@ -570,6 +584,7 @@ final class VoicePlayer: NSObject, AVAudioPlayerDelegate {
             try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio)
             try? AVAudioSession.sharedInstance().setActive(true)
             if player.currentTime >= player.duration - 0.05 { player.currentTime = 0 }
+            NotificationCenter.default.post(name: .omiAudioWillPlay, object: self)
             player.play()
             isPlaying = true
             tick()

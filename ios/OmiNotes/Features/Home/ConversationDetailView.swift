@@ -36,6 +36,9 @@ struct ConversationDetailView: View {
             if let detail {
                 if detail.entry.status == "failed", model.detailSavedAt[summary.id] == nil { fixSection(detail) }
                 caveats(detail)
+                if model.canPlayRecordings, detail.entry.status != "open", model.detailSavedAt[summary.id] == nil {
+                    NoteRecordingSection(model: model, entry: detail.entry).id(detail.id)
+                }
                 summarySection(detail)
                 if let s = detail.summary { details(s) }
                 myNotes(detail)

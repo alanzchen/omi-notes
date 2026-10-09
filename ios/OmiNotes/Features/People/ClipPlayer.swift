@@ -13,6 +13,18 @@ final class ClipPlayer: NSObject, AVAudioPlayerDelegate {
     private(set) var loading: String?
     private(set) var message: String?
     private var player: AVAudioPlayer?
+    private var focus: NSObjectProtocol?
+
+    override init() {
+        super.init()
+        focus = NotificationCenter.default.addObserver(forName: .omiAudioWillPlay, object: nil, queue: .main) { [weak self] note in
+            let sender = note.object.map { ObjectIdentifier($0 as AnyObject) }
+            MainActor.assumeIsolated {
+                guard let self, sender != ObjectIdentifier(self) else { return }
+                self.stop()  // another sound started: one at a time
+            }
+        }
+    }
 
     func toggle(_ clipId: String, speakers: SpeakersModel) {
         if playing == clipId {
@@ -32,6 +44,7 @@ final class ClipPlayer: NSObject, AVAudioPlayerDelegate {
             try AVAudioSession.sharedInstance().setActive(true)
             let p = try AVAudioPlayer(data: data)
             p.delegate = self
+            NotificationCenter.default.post(name: .omiAudioWillPlay, object: self)
             p.play()
             player = p
             playing = clipId
