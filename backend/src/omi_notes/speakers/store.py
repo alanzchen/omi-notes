@@ -485,7 +485,9 @@ class SpeakerStore:
         keys = ("person_id", "source", "distance", "margin", "evidence_s", "not")
         out = {}
         for label, state in sorted(states.items()):
-            if not (state.get("person_id") or state.get("not") or state.get("distance") is not None or state.get("forgotten")):
+            # `source: unknown`: the owner said this voice stays unknown (kept for good, never auto-named)
+            if not (state.get("person_id") or state.get("not") or state.get("distance") is not None or state.get("forgotten")
+                    or state.get("source") == "unknown"):  # fmt: skip
                 continue
             out[label] = {k: (sorted(state.get(k) or []) if k == "not" else state.get(k)) for k in keys}
             if state.get("forgotten"):

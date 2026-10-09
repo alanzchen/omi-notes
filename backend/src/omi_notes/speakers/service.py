@@ -25,12 +25,14 @@ from . import enroll
 from . import match as speaker_match
 from . import suggest as speaker_suggest
 from .store import voices_name
+from ..vault import Vault
 from .voices import Clip, embed_voices
 
 log = logging.getLogger(__name__)
 
 MAX_CLIP_SECONDS = 10.0
 EXCERPT_CHARS = 140
+CLIP_TEXT_CHARS = 240
 
 
 @dataclass
@@ -164,13 +166,42 @@ class SpeakerService:
                 "margin": st.get("margin"),
                 "evidence_s": st.get("evidence_s"),
                 "clip_id": f"{conv_id}.{label}.0" if clips.get(label) else None,
+                "clips": self._clip_list(conv_id, transcript, label, clips.get(label) or []),
                 "excerpt": text[:EXCERPT_CHARS],
+                "kept_unknown": st.get("source") == "unknown",
             })  # fmt: skip
+        return out
+
+    def _clip_list(self, conv_id: str, transcript: dict, label: str, spans: list) -> list[dict]:
+        """Each playable clip with the transcript text it overlaps (phrase level: the transcript has
+        no word timing to align with, so nothing is highlighted), never another sentence's."""
+        timemap = transcript.get("timemap") or []
+
+        def wall(t: float) -> float:
+            for out_start, wall_start, duration in timemap:
+                if out_start <= t <= out_start + duration:
+                    return wall_start + (t - out_start)
+            near = min(timemap, key=lambda m: min(abs(t - m[0]), abs(t - m[0] - m[2])), default=None)
+            return near[1] + min(max(t - near[0], 0.0), near[2]) if near else t
+
+        segments = [seg for seg in transcript.get("segments") or [] if seg["speaker"] == label]
+        out = []
+        for i, (a, b) in enumerate(spans):
+            b = min(b, a + MAX_CLIP_SECONDS)
+            lo, hi = wall(a), wall(b)
+            hits = [seg["text"] for seg in segments if seg["start"] < hi and seg["end"] > lo]
+            if not hits and segments:  # coarse timing (text-only STT windows): the nearest of this voice
+                mid = (lo + hi) / 2
+                hits = [min(segments, key=lambda seg: abs((seg["start"] + seg["end"]) / 2 - mid))["text"]]
+            text = " ".join(hits)
+            out.append({"id": f"{conv_id}.{label}.{i}", "seconds": round(b - a, 2), "started_at": iso_utc_epoch(lo),
+                        "text": text[:CLIP_TEXT_CHARS] + ("…" if len(text) > CLIP_TEXT_CHARS else "")})  # fmt: skip
         return out
 
     def assign(self, conv_id: str, label: str, body: dict) -> Outcome:
         person_id = body.get("person_id")
         not_person = body.get("not_person_id")
+        keep_unknown = body.get("keep_unknown", False)
         expected = body.get("expected_revision")
         request_id = body.get("request_id")
         if not isinstance(expected, int) or isinstance(expected, bool):
@@ -180,6 +211,8 @@ class SpeakerService:
         for value, what in ((person_id, "person_id"), (not_person, "not_person_id")):
             if value is not None and (not isinstance(value, str) or not UUID_RE.match(value)):
                 raise ApiError(422, "invalid_body", f"{what} must be a lowercase UUID or null")
+        if not isinstance(keep_unknown, bool) or (keep_unknown and person_id):
+            raise ApiError(422, "invalid_body", "keep_unknown is a boolean and excludes person_id")
         with self.store.lock:
             self.store.sync_conversation(conv_id)  # an earlier attempt may have failed after its file write
             self.store.sync_samples()
@@ -211,6 +244,10 @@ class SpeakerService:
                 blocked.discard(person_id)
                 state |= {"person_id": person_id, "source": "user", "forgotten": False}
                 sample, sample_id = self._sample_for(row, transcript, label, person_id, request_id)
+            elif keep_unknown:
+                # durable: an older backend would recompute this state away, so it must refuse the vault
+                self.vault.raise_format(4)
+                state |= {"person_id": None, "source": "unknown"}
             elif not not_person:
                 state |= {"person_id": None, "source": None}
             state["not"] = sorted(blocked)
@@ -225,8 +262,11 @@ class SpeakerService:
             if sample_id:
                 state["samples"] = sorted(set(state.get("samples") or []) | {sample_id})
             states[label] = state
-            revision = self.store.write_labels(conv_id, states,
-                                               request=(request_id, {"label": label, "person_id": person_id, "sample": sample}))  # fmt: skip
+            # what this request changed, so an undo can put back exactly that (and only while it stands)
+            change = {"before": self.store.persisted({label: before}).get(label),
+                      "after": self.store.persisted({label: state}).get(label)}  # fmt: skip
+            revision = self.store.write_labels(conv_id, states, request=(request_id, {
+                "label": label, "person_id": person_id, "sample": sample, "keep_unknown": keep_unknown} | change))  # fmt: skip
             if row["note_path"]:
                 self.pipeline._set(conv_id, needs_render=1, next_attempt_at=None)
             # people's voices changed (a sample added or taken back): every assignment is re-run
@@ -309,7 +349,7 @@ class SpeakerService:
         for r in self.db.query(
             """SELECT v.*, c.start, c.blocks_json, c.device_id FROM voices v JOIN conversations c ON c.id = v.conversation_id
                LEFT JOIN speaker_labels l ON l.conversation_id = v.conversation_id AND l.label = v.label
-               WHERE v.vector IS NOT NULL AND (l.person_id IS NULL)"""
+               WHERE v.vector IS NOT NULL AND (l.person_id IS NULL) AND COALESCE(l.source, '') <> 'unknown'"""
         ):
             if embedder and (r["model"], r["model_sha"]) != (embedder.model, embedder.model_sha):
                 continue
@@ -335,10 +375,34 @@ class SpeakerService:
             rep = s.representative
             transcript = self._transcript(rep.conversation_id)
             excerpt = next((seg["text"] for seg in transcript.get("segments") or [] if seg["speaker"] == rep.label), "")
+            clips = self._clip_list(rep.conversation_id, transcript, rep.label,
+                                    self._clips(rep.conversation_id, transcript).get(rep.label) or [])  # fmt: skip
             out.append({"id": s.id, "kind": s.kind, "person_id": s.person_id,
                         "clip_id": f"{rep.conversation_id}.{rep.label}.0", "seconds": s.seconds,
-                        "excerpt": excerpt[:EXCERPT_CHARS], "conversations": s.conversations, "days": s.days})  # fmt: skip
+                        "excerpt": (clips[0]["text"] if clips else excerpt)[:EXCERPT_CHARS],
+                        "conversations": s.conversations, "days": s.days,
+                        "conversation": self._context(rep.conversation_id),
+                        "clips": [c | {"conversation_id": rep.conversation_id} for c in clips],
+                        "other_day": self._other_day(s, rep),
+                        "scope": [self._context(c) for c in sorted({m.conversation_id for m in s.members})]})  # fmt: skip
         return out
+
+    def _context(self, conv_id: str) -> dict:
+        row = self.db.one("SELECT id, start, title, note_path FROM conversations WHERE id=?", (conv_id,))
+        return {"id": conv_id, "started_at": iso_utc_epoch(row["start"]) if row else None,
+                "title": row["title"] if row and row["note_path"] else None}  # fmt: skip
+
+    def _other_day(self, s, rep) -> dict | None:
+        """A clip of the same voice from another day, when the suggestion has one."""
+        for m in sorted(s.members, key=lambda m: (-m.seconds, m.key)):
+            if m.day == rep.day:
+                continue
+            transcript = self._transcript(m.conversation_id)
+            clips = self._clip_list(m.conversation_id, transcript, m.label,
+                                    self._clips(m.conversation_id, transcript).get(m.label) or [])  # fmt: skip
+            if clips:
+                return clips[0] | {"conversation_id": m.conversation_id, "conversation": self._context(m.conversation_id)}
+        return None
 
     def dismiss(self, suggestion_id: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -369,6 +433,72 @@ class SpeakerService:
                              "request_id": f"{request_id}:{member.conversation_id}:{member.label}"})  # fmt: skip
                 touched.append(member.conversation_id)
             return sorted(set(touched) | set(self._relabel()))
+
+    def keep_unknown_suggestion(self, suggestion_id: str, body: dict, now: float | None = None) -> list[str]:
+        """The owner keeps this recurring voice unknown, in every conversation it covers: durable
+        (speakers.json), unlike the 7-day `dismiss`."""
+        now = time.time() if now is None else now
+        request_id = body.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            raise ApiError(422, "invalid_body", "request_id is required")
+        with self.store.lock:
+            found, _ = self._suggestions(now)
+            suggestion = next((s for s in found if s.id == suggestion_id), None)
+            if suggestion is None:
+                raise ApiError(404, "not_found", "the suggestion no longer exists")
+            for member in suggestion.members:
+                row = self.db.one("SELECT * FROM conversations WHERE id=?", (member.conversation_id,))
+                self.assign(member.conversation_id, member.label,
+                            {"person_id": None, "keep_unknown": True, "expected_revision": row["speakers_revision"],
+                             "request_id": f"{request_id}:{member.conversation_id}:{member.label}"})  # fmt: skip
+            return sorted({m.conversation_id for m in suggestion.members})
+
+    def undo(self, body: dict) -> dict:
+        """Put back what one naming request (a label, or every label of a suggestion) changed, label
+        by label, only where that change still stands; voiceprints it created are removed, the
+        person and their other confirmations stay. Repeating the same undo answers the same."""
+        request_id, undo_id = body.get("request_id"), body.get("undo_request_id")
+        for value, what in ((request_id, "request_id"), (undo_id, "undo_request_id")):
+            if not isinstance(value, str) or not value or len(value) > 100:
+                raise ApiError(422, "invalid_body", f"{what} is required")
+        undone: set[str] = set()
+        skipped: set[str] = set()
+        with self.store.lock:
+            self.store.sync_samples()
+            for path in sorted(self.vault.conversations.glob("*/*/speakers.json")):
+                conv_id = path.parent.name
+                requests = (Vault.read_json(path) or {}).get("requests") or {}
+                mine = {k: v for k, v in requests.items() if k == request_id or k.startswith(request_id + ":")}
+                for key, rec in mine.items():
+                    if "after" not in rec:
+                        continue  # made before undo existed: nothing recorded to put back
+                    done_key = f"{undo_id}:{key}"
+                    if done_key in requests:
+                        undone.add(conv_id)
+                        continue
+                    self.store.sync_conversation(conv_id)
+                    states = self.store.labels(conv_id)
+                    label = rec["label"]
+                    current = self.store.persisted({label: states.get(label) or {}}).get(label)
+                    after = rec["after"] or {}
+                    if (current or {}).get("person_id") != after.get("person_id") or (current or {}).get("source") != after.get("source"):
+                        skipped.add(conv_id)  # changed since: the later decision stands
+                        continue
+                    before = dict(rec["before"] or {})
+                    created = set((after.get("samples") or [])) - set(before.get("samples") or [])
+                    if created and after.get("person_id"):
+                        self.store.remove_sample_ids(after["person_id"], sorted(created))
+                    existing = {r["id"] for r in self.db.query("SELECT id FROM samples")}
+                    before["samples"] = [x for x in before.get("samples") or [] if x in existing]
+                    states[label] = before
+                    self.store.write_labels(conv_id, states, request=(done_key, {"label": label, "undo_of": key}))
+                    row = self.db.one("SELECT note_path FROM conversations WHERE id=?", (conv_id,))
+                    if row and row["note_path"]:
+                        self.pipeline._set(conv_id, needs_render=1, next_attempt_at=None)
+                    undone.add(conv_id)
+            if undone:
+                self._relabel()
+        return {"undone": sorted(undone), "skipped": sorted(skipped - undone)}
 
     # -- settings --------------------------------------------------------------------------------
 

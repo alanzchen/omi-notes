@@ -40,8 +40,10 @@ operational index. Copy the folder anywhere, point a backend at it, and it rebui
 ```
 
 `VAULT.json` `format` is 1 until the first app retry raises it to 2 (records may then carry retry
-state), and the first keep from the phone raises it to 3 (records may carry `resolution`); an older
-backend refuses a newer vault instead of rewriting records without that state.
+state), the first keep from the phone raises it to 3 (records may carry `resolution`), and the
+first "keep unknown" of a voice raises it to 4 (`speakers.json` label states may be
+`source: "unknown"`); an older backend refuses a newer vault instead of rewriting records without
+that state.
 
 No lock files, temp files, logs, or caches that aren't referenced results live in the vault.
 

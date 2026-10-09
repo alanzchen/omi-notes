@@ -119,7 +119,25 @@ speech (Omi `SIGNIFICANT_SECONDS`) whose raw audio still exists; average-linkage
 0.50; suggest clusters spanning ≥ 3 conversations on ≥ 2 days, ranked by conversations × seconds,
 max 5. Near an existing person → "Is this Priya?"; the loudest recurring voice while no `me`
 exists → "Is this you?". Dismissals persist with a 7-day cooldown (cf. Omi
-`backend/routers/speaker_tag_prompts.py`). Unknown embeddings are pruned with raw retention.
+`backend/routers/speaker_tag_prompts.py`). "Keep unknown" is different and permanent: every member
+label gets `source: "unknown"` in its `speakers.json` (sticky like a user name: never auto-named,
+never suggested again, kept across rebuilds and re-transcriptions; the owner can still name it
+later). Unknown embeddings are pruned with raw retention.
+
+## Naming from the phone
+
+- Every clip comes with the transcript text it overlaps (phrase level: segments have no word
+  timing, so the phone shows the phrase without highlighting), never the label's first sentence.
+- A suggestion carries the conversation its representative clip is from, up to 3 clips there, one
+  clip from another day when a member has one (`other_day`), and its `scope`: every conversation
+  naming it would change, which the phone confirms before assigning.
+- Every label change records what it changed (`before`/`after` in the request entry of
+  `speakers.json`). `POST /v1/speakers/undo` puts back exactly that, label by label, only where the
+  change still stands (a later decision is left alone and reported as skipped); voiceprints that
+  request created are removed, the person and their other confirmations stay. A voiceprint an
+  assignment took away from a previously named person cannot be restored by undo.
+- Naming re-renders notes from cache; it never queues a new summary (that stays the explicit
+  "Re-summarize with names").
 
 ## Consent (design as if BIPA / Texas CUBI apply)
 
@@ -159,11 +177,14 @@ exists → "Is this you?". Dismissals persist with a 7-day cooldown (cf. Omi
 | `GET /v1/people` | `{people:[{id,name,me,note_path,samples,sessions,auto_active,voice_ready}]}` |
 | `PUT /v1/people/{uuid}` | `{name, me?, attest_knows?}` → 201/200 (client-minted id ⇒ idempotent; creates `People/<Name>.md`) |
 | `DELETE /v1/people/{id}[?delete_note=true]` | forget voice (and optionally the note) |
-| `GET /v1/conversations/{id}/speakers` | `{revision, transcript_sha, labels:[{label,person_id,name,source,distance,margin,evidence_s,clip_id,excerpt}], audio_available}` |
-| `PUT /v1/conversations/{id}/speakers/{label}` | `{person_id\|null, not_person_id?, expected_revision, request_id}` → `{revision, labels, relabeled_conversations}`; stale revision → 409; `request_id` dedupes sample creation |
+| `GET /v1/conversations/{id}/speakers` | `{revision, transcript_sha, labels:[{label,person_id,name,source,distance,margin,evidence_s,clip_id,clips:[{id,seconds,started_at,text}],excerpt,kept_unknown}], audio_available}` |
+| `PUT /v1/conversations/{id}/speakers/{label}` | `{person_id\|null, not_person_id?, keep_unknown?, expected_revision, request_id}` → `{revision, labels, relabeled_conversations}`; stale revision → 409; `request_id` dedupes sample creation; `keep_unknown: true` (with `person_id: null`) keeps the label unknown for good |
 | `POST /v1/conversations/{id}/resummarize` | 202 (forced-LLM reprocess) |
-| `GET /v1/speakers/suggestions?limit=5` | `{suggestions:[{id,kind,person_id?,clip_id,seconds,excerpt,conversations,days}]}` (empty unless opted in) |
-| `POST /v1/speakers/suggestions/{id}/dismiss` | 204 |
+| `GET /v1/speakers/suggestions?limit=5` | `{suggestions:[{id,kind,person_id?,clip_id,seconds,excerpt,conversations,days,conversation:{id,started_at,title},clips:[…,conversation_id],other_day:{…clip,conversation_id,conversation}\|null,scope:[{id,started_at,title}]}]}` (empty unless opted in) |
+| `POST /v1/speakers/suggestions/{id}/dismiss` | 204 (hidden for 7 days; older phones) |
+| `POST /v1/speakers/suggestions/{id}/assign` | `{person_id, request_id}` → `{relabeled_conversations}`; each member label is assigned under `request_id:<conversation>:<label>` |
+| `POST /v1/speakers/suggestions/{id}/keep-unknown` | `{request_id}` → `{conversations}`; permanent (vault format 4) |
+| `POST /v1/speakers/undo` | `{request_id, undo_request_id}` → `{undone:[conversation ids], skipped:[…]}`; idempotent per `undo_request_id` |
 | `GET /v1/speakers/settings` / `PUT` | `{acknowledged_at, unknown_voices_enabled, auto_assign}` |
 | `GET /v1/speakers/enrollments/{enrollment_id}` | `{state, speech_s, reason?}` |
 | `GET /v1/clips/{clip_id}` | `audio/wav` 16 kHz mono PCM16 ≤ 10 s, rendered on demand; bounds validated to the label's turns; `410 Gone` when raw is expired |
@@ -173,9 +194,14 @@ The app downloads clips with an authenticated `URLSession` data task and plays t
 
 ## iOS screens
 
+- **Name this voice** (servers with the `name_voice` feature): one voice at a time — listen
+  (play only on tap; waveform from the clip's own samples; clip and other-day choices only when
+  they exist), answer ("Yes, Priya", "This is me", people shortcuts, search or add with a one-tap
+  consent confirmation), then the next voice; a saved toast with Undo; "Not sure" skips for this
+  session only, "Keep unknown" is permanent. Opened from Home ("N voices to name"), People, and a
+  conversation's speakers. A suggestion's scope is confirmed before it is assigned or kept unknown.
 - **People & Voices:** "You" card (enrollment state, "Teach my voice"); people list (samples,
-  auto-active badge, swipe "Forget voice"); "Who is this?" suggestions (when opted in) with play,
-  excerpt, "4 conversations · 3 days", actions: This is me / pick person / New person… / Dismiss.
+  auto-active badge, swipe "Forget voice"); "Who is this?" suggestions (when opted in).
 - **Enrollment sheet:** consent → pre-check (pendant streaming) → prompts → result polling.
 - **Conversation speakers** (from recent conversations): each label with clip, excerpt, name,
   "auto" badge + evidence; tap to assign; "Re-summarize with names".

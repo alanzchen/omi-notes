@@ -38,7 +38,9 @@ log = logging.getLogger(__name__)
 # exists. A vault is only raised to 2 when the first retry is accepted, so an older backend refuses
 # it rather than rewriting records without that state.
 # 3: conversation records may carry `resolution` (kept from the phone with the speaker unknown).
-FORMAT = 3
+# 4: speakers.json label states may be `source: "unknown"` (the owner kept a voice unknown); an older
+# backend would recompute them away.
+FORMAT = 4
 OMI = "_omi"
 LEASE_RENEW_SECONDS = 5 * 60
 LEASE_STALE_SECONDS = 15 * 60

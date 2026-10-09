@@ -181,7 +181,7 @@ def create_app(
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes
-            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "search", "stats"],
+            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "search", "stats"],
             "vault_id": vault.vault_id,
         }
 
@@ -379,6 +379,23 @@ def create_app(
         writable()
         changed = await run_in_threadpool(speakers(request).assign_suggestion, suggestion_id, body)
         return {"relabeled_conversations": changed}
+
+    @app.post("/v1/speakers/suggestions/{suggestion_id}/keep-unknown")
+    async def keep_unknown_suggestion(suggestion_id: str, request: Request) -> dict:
+        body = await read_json(request)
+        if not isinstance(body, dict):
+            raise ApiError(422, "invalid_body", "expected a JSON object")
+        writable()
+        changed = await run_in_threadpool(speakers(request).keep_unknown_suggestion, suggestion_id, body)
+        return {"conversations": changed}
+
+    @app.post("/v1/speakers/undo")
+    async def undo_naming(request: Request) -> dict:
+        body = await read_json(request)
+        if not isinstance(body, dict):
+            raise ApiError(422, "invalid_body", "expected a JSON object")
+        writable()
+        return await run_in_threadpool(speakers(request).undo, body)
 
     @app.get("/v1/speakers/settings")
     def get_speaker_settings(request: Request) -> dict:

@@ -11,7 +11,7 @@
   with confirmations from ≥ 3 distinct recordings on one day. Enrollment alone never activates.
 - An active enrolled wearer may match one continuous turn with ≥ 10 s, two disjoint ≥ 3 s clips,
   and distance < 0.25; margin and mixed-voice checks still apply.
-- `source: user` assignments are sticky; `not` blocks a person for that label. Several labels may
+- `source: user` assignments and `source: unknown` ("keep unknown") are sticky; `not` blocks a person for that label. Several labels may
   map to one person (diarization over-splits), but only when they are about as close: within one
   conversation the closest label is the runner-up for the others (margin 0.10).
 """
@@ -175,8 +175,8 @@ def assign(voices: dict[str, object], current: dict[str, dict], models: dict[str
     for label in sorted(set(voices) | set(current), key=_label_key):
         state = dict(current.get(label) or {})
         blocked = set(state.get("not") or [])
-        if state.get("source") == "user" and state.get("person_id"):
-            out[label] = state
+        if (state.get("source") == "user" and state.get("person_id")) or state.get("source") == "unknown":
+            out[label] = state  # the owner decided: a name, or "keep unknown"
             continue
         found = match(voices.get(label), models, blocked, op)
         fresh = {"person_id": None, "source": None, "distance": found.distance, "margin": found.margin,
