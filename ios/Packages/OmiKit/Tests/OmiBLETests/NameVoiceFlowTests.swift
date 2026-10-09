@@ -151,7 +151,28 @@ final class VoiceServerStub: URLProtocol, @unchecked Sendable {
         let flow = NameVoiceFlow(speakers: speakers, items: [VoiceItem(suggestion: try suggestion())])
         await flow.name(Self.priya)
         await flow.undo()
-        #expect(flow.isFinished && flow.error?.contains("later choice") == true)
+        #expect(flow.isFinished && flow.error?.hasPrefix("Couldn't undo") == true && flow.undoable == nil)
+        #expect(flow.saved.count == 1)  // still named on the server: the done screen must say so
+    }
+
+    @Test func aPartlyUndoneNamingSaysWhatStayed() async throws {
+        let speakers = try model()
+        VoiceServerStub.routes["POST /v1/speakers/suggestions/sug1/assign"] = [(200, #"{"relabeled_conversations":[]}"#)]
+        VoiceServerStub.routes["POST /v1/speakers/undo"] = [(200, #"{"undone":["c1","c2"],"skipped":["c3"]}"#)]
+        let flow = NameVoiceFlow(speakers: speakers, items: [VoiceItem(suggestion: try suggestion())])
+        await flow.name(Self.priya)
+        await flow.undo()
+        #expect(flow.current?.id == "s:sug1")  // asked again
+        #expect(flow.error == "Undone in 2 conversations; 1 had changed since and was left as it is.")
+    }
+
+    @Test func aClipWithoutMatchingTextHasNoQuoteAndNoOtherSentence() throws {
+        let json = #"{"id":"s","kind":"who_is_this","clip_id":"c.S1.0","excerpt":"an unrelated first sentence","clips":[{"id":"c.S1.0","text":""}]}"#
+        let item = VoiceItem(suggestion: try APIClient.snakeDecoder.decode(SpeakerSuggestion.self, from: Data(json.utf8)))
+        #expect(item.clips.first?.text?.isEmpty == true)
+        let older = #"{"id":"s","kind":"who_is_this","clip_id":"c.S1.0","excerpt":"an unrelated first sentence"}"#
+        let legacy = VoiceItem(suggestion: try APIClient.snakeDecoder.decode(SpeakerSuggestion.self, from: Data(older.utf8)))
+        #expect(legacy.clips.first?.text == nil)  // the first sentence is not the clip's text
     }
 
     @Test func theWaveformComesFromTheClipsSamples() {

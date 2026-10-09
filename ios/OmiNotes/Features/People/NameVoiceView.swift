@@ -191,6 +191,9 @@ struct NameVoiceView: View {
                 // phrase level: the transcript has no word timing, so nothing is highlighted
                 Text("“\(text)”").font(.body).foregroundStyle(.primary).lineLimit(4)
                     .accessibilityLabel("Said around this clip: \(text)")
+            } else if clip != nil {
+                // never another moment's sentence in its place
+                Text("No transcript text lines up with this clip.").font(.footnote).foregroundStyle(.secondary)
             }
             clipChoices(item)
         }
@@ -352,7 +355,7 @@ struct NameVoiceView: View {
 
     private var confirmTitle: String {
         switch confirming {
-        case .name(let p): return p.isMe ? "Is this voice yours?" : "Name this voice \(p.name)?"
+        case .name(let p): return "Label this voice as \(p.name)?"
         case .add(let n): return "Add \(n)?"
         case .keepUnknown: return "Keep this voice unknown?"
         case nil: return ""

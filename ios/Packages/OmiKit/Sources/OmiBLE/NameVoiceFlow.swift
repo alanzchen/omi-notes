@@ -53,14 +53,15 @@ public struct VoiceItem: Identifiable, Equatable, Sendable {
         case "is_this_you": question = .isThisYou
         default: question = .whoIsThis
         }
-        let clips = s.clips ?? s.clipId.map { [SpeakerClip(id: $0, text: s.excerpt)] } ?? []
+        // an older server's excerpt is the speaker's first sentence, not this clip's: never shown as its text
+        let clips = s.clips ?? s.clipId.map { [SpeakerClip(id: $0)] } ?? []
         self.init(target: .suggestion(s), question: question, context: s.conversation, clips: clips,
                   otherDay: s.otherDay, scope: s.scope ?? (s.conversation.map { [$0] } ?? []))
     }
 
     /// A speaker of one conversation: asks about its current name if it has one.
     public init(label l: SpeakerLabel, in conversation: ConversationContext) {
-        let clips = l.clips ?? l.clipId.map { [SpeakerClip(id: $0, text: l.excerpt)] } ?? []
+        let clips = l.clips ?? l.clipId.map { [SpeakerClip(id: $0)] } ?? []
         self.init(target: .label(conversationId: conversation.id, label: l.label),
                   question: l.personId.map { .isThis(personId: $0) } ?? .whoIsThis,
                   context: conversation, clips: clips, scope: [conversation])
@@ -134,18 +135,21 @@ public final class NameVoiceFlow {
             if case .label(let conv, _) = last.item.target { revisions[conv] = nil }
             undoTimer?.cancel()
             undoable = nil
-            saved.removeAll { $0.requestId == last.requestId }
             if r.undone.isEmpty && !r.skipped.isEmpty {
-                error = "It was changed again since, so that later choice was kept."
+                // the answer still stands on the server, so it stays among the saved ones
+                error = "Couldn't undo: it was changed again since, or the earlier voice is no longer kept. Nothing was changed."
                 return
             }
+            saved.removeAll { $0.requestId == last.requestId }
             // ask about the same voice again, right here
             if let at = items.firstIndex(where: { $0.id == last.item.id }), at < index {
                 items.remove(at: at)
                 index -= 1
             }
             items.insert(last.item, at: index)
-            error = nil
+            let left = Set(r.skipped).subtracting(r.undone).count
+            error = left == 0 ? nil : "Undone in \(r.undone.count) conversation\(r.undone.count == 1 ? "" : "s"); "
+                + "\(left) had changed since and \(left == 1 ? "was" : "were") left as it is."
         } catch {
             self.error = "Couldn't undo: \(SpeakersModel.describe(error))"
         }
