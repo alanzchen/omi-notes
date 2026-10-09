@@ -386,14 +386,19 @@ What needs attention, most urgent first, bounded and sanitized:
 
 ```json
 {"issues": [{"code": "conversation_failed", "severity": "action", "message": "The summary service rejected the server's credentials.",
-             "next_step": "Fix the provider settings on the server, then run `omi-notes retry-failed` on the Mac.",
-             "conversation_id": "…", "started_at": "…", "title": null}]}
+             "next_step": "This needs a fix on the server. Once it's fixed, Retry here processes it again.",
+             "server_step": "Fix the provider's key, account or settings on the server, then retry on the server with `omi-notes retry-failed`.",
+             "retryable": true, "conversation_id": "…", "started_at": "…", "title": null}]}
 ```
 
 Codes: `read_only` (with `detail`), `worker_stopped`, `chunks_failed` (with `count`),
 `conversation_failed`, `note_conflict`, `conversation_retrying`. Severity is `action` (someone must
-do something) or `delayed` (the server retries on its own). `next_step` depends on whether the
-server will try again, and commands in it name this deployment's `omi-notes` and environment file.
+do something) or `delayed` (the server retries on its own). `next_step` is plain guidance for the
+phone (no commands): whoever holds the phone may not run the server. `server_step` is the server
+operator's step; its commands name this deployment's `omi-notes` and environment file (the phone
+shows it under Diagnostics). `retryable` (conversation issues) is false when a retry from the phone
+can't help until something changes on the server (for example `speakers_unknown`). Both fields are
+optional for older servers: a missing `retryable` means true.
 
 ### `POST /v1/conversations/{id}/retry`
 
@@ -406,7 +411,7 @@ the retry is durable in the vault (docs/vault.md, "Operations"):
 
 ```json
 {"operation": {"id": "…", "kind": "retry", "conversation_id": "…", "stage": "summarizing", "state": "queued",
-               "requested_at": "…", "finished_at": null, "message": "Waiting for the server to start"}}
+               "requested_at": "…", "finished_at": null, "message": "Queued on the server"}}
 ```
 
 `state`: `accepted`, `queued`, `running`, `backing_off`, `blocked` (the note was edited or frozen

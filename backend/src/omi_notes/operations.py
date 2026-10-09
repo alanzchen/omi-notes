@@ -328,7 +328,7 @@ def view(pipeline, op_id: str) -> dict:
 
 _MESSAGES = {
     "accepted": "Retry accepted",
-    "queued": "Waiting for the server to start",
+    "queued": "Queued on the server",
     "running": "Retrying now",
     "backing_off": "The service is still having trouble; the server tries again on its own",
     "blocked": "Waiting: the note was edited or frozen on the server",

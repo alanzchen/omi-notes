@@ -44,8 +44,8 @@ def failure_message(kind: str | None, stage: str | None) -> str:
         "notes": "The note's My Notes section is ambiguous, so the server won't overwrite it.",
         "io": "The server couldn't write the note file.",
         "move": "The server couldn't move the note file.",
-        "speakers_unknown": "Words were heard, but the server found no separate speakers, so no note was made. "
-                            "The audio is kept.",
+        "speakers_unknown": "The server got a few words from a very short sound but found no speaker in it, so no note "
+                            "was made. The audio and its text are kept.",
     }.get(kind or "", f"The {service} failed.")
 
 
@@ -58,12 +58,12 @@ def command(args: str) -> str:
     return f"`{prefix}{shlex.quote(str(exe)) if exe.exists() else 'omi-notes'} {args}`"
 
 
-def next_step(kind: str | None, stage: str | None, *, retrying: bool) -> str:
-    """What to do, given whether the server will try again on its own (`retrying`) or gave up."""
+def server_step(kind: str | None, stage: str | None, *, retrying: bool) -> str:
+    """What the server's operator does, with this deployment's commands (Diagnostics on the phone)."""
     mac = " If transcription runs on a Mac, make sure it is awake and logged in." if stage == "transcribing" else ""
     if retrying:
         return ("The server retries on its own." + mac) if kind in ("transient", None, "io", "move") else \
-            "The server retries on its own, but this usually needs a fix first: " + next_step(kind, stage, retrying=False)
+            "The server retries on its own, but this usually needs a fix first: " + server_step(kind, stage, retrying=False)
     retry = f"then retry on the server with {command('retry-failed')}."
     if kind in ("auth", "billing", "config"):
         return "Fix the provider's key, account or settings on the server, " + retry
@@ -76,6 +76,22 @@ def next_step(kind: str | None, stage: str | None, *, retrying: bool) -> str:
     if kind in ("io", "move"):
         return "Check the vault folder's disk space and permissions, " + retry
     return "See _status.md in your vault for details, " + retry
+
+
+def next_step(kind: str | None, stage: str | None, *, retrying: bool) -> str:
+    """What the phone shows: plain words, no commands (the phone's owner may not run the server)."""
+    if retrying:
+        return "The server retries on its own; nothing to do on this phone."
+    if kind == "speakers_unknown":
+        return "Retrying won't help until the server's speaker separation changes; nothing to do on this phone."
+    if kind == "notes":
+        return "The note's My Notes section needs fixing on the server before it can be updated."
+    return "This needs a fix on the server. Once it's fixed, Retry here processes it again."
+
+
+def retryable(kind: str | None) -> bool:
+    """Whether a retry from the phone can help without a change on the server first."""
+    return kind != "speakers_unknown"
 
 
 # -- conversation state ---------------------------------------------------------------------------
@@ -336,18 +352,21 @@ def server_issues(db, *, read_only: str | None, worker: bool, limit: int = ISSUE
     out: list[dict] = []
     if read_only:
         out.append({"code": "read_only", "severity": "action", "message": "The server stopped writing to the vault.",
-                    "detail": read_only, "next_step": f"See _status.md in your vault; {command('doctor')} on the server explains the fix."})  # fmt: skip
+                    "detail": read_only, "next_step": "This needs a fix on the server.",
+                    "server_step": f"See _status.md in your vault; {command('doctor')} on the server explains the fix."})  # fmt: skip
     if not worker:
         out.append({"code": "worker_stopped", "severity": "action", "message": "The processing worker isn't running.",
-                    "next_step": "Restart the Omi Notes service on the server."})  # fmt: skip
+                    "next_step": "This needs a fix on the server.", "server_step": "Restart the Omi Notes service on the server."})  # fmt: skip
     chunks = db.one("SELECT COUNT(*) AS n FROM chunks WHERE status='failed'")["n"]
     if chunks:
         out.append({"code": "chunks_failed", "severity": "action", "count": chunks,
                     "message": f"{chunks} uploaded audio file{'s' if chunks != 1 else ''} couldn't be processed.",
-                    "next_step": f"See _status.md in your vault, then retry on the server with {command('retry-failed')}."})  # fmt: skip
+                    "next_step": "This needs a fix on the server. Once it's fixed, they can be tried again.",
+                    "server_step": f"See _status.md in your vault, then retry on the server with {command('retry-failed')}."})  # fmt: skip
 
-    def conv(r, code: str, severity: str, message: str, step: str) -> dict:
-        return {"code": code, "severity": severity, "message": message, "next_step": step,
+    def conv(r, code: str, severity: str, message: str, step: str, server: str, can_retry: bool = True) -> dict:
+        return {"code": code, "severity": severity, "message": message, "next_step": step, "server_step": server,
+                "retryable": can_retry,
                 "conversation_id": r["id"], "started_at": iso_utc_epoch(r["start"]),
                 "title": r["title"] if r["note_path"] else None}  # fmt: skip
 
@@ -356,17 +375,19 @@ def server_issues(db, *, read_only: str | None, worker: bool, limit: int = ISSUE
             message = "Transcript ready; summary unavailable. " + failure_message(r["error_kind"], "summarizing")
         else:
             message = failure_message(r["error_kind"], r["failed_stage"])
-        out.append(conv(r, "conversation_failed", "action", message, next_step(r["error_kind"], r["failed_stage"], retrying=False)))
+        out.append(conv(r, "conversation_failed", "action", message, next_step(r["error_kind"], r["failed_stage"], retrying=False),
+                        server_step(r["error_kind"], r["failed_stage"], retrying=False), retryable(r["error_kind"])))  # fmt: skip
     for r in db.query(f"SELECT * FROM conversations WHERE edited=1 AND frozen=0 AND note_path IS NOT NULL AND {LISTED} "
                       "ORDER BY start DESC LIMIT ?", (limit,)):  # fmt: skip
         out.append(conv(r, "note_conflict", "action", "The note was changed outside My Notes; the server stopped updating it.",
+                        "The server keeps your edited version and stops updating it until this is settled on the server.",
                         f"On the server, run {command('note overwrite ' + r['id'])} to replace it (your version is kept "
-                        f"aside), or {command('note freeze ' + r['id'])} to keep your version."))  # fmt: skip
+                        f"aside), or {command('note freeze ' + r['id'])} to keep your version.", False))  # fmt: skip
     for r in db.query(f"SELECT * FROM conversations WHERE status IN ('closed','transcribing','summarizing') AND error IS NOT NULL "
                       f"AND next_attempt_at IS NOT NULL AND {LISTED} ORDER BY start DESC LIMIT ?", (limit,)):  # fmt: skip
         stage = _stage(r["status"])
         out.append(conv(r, "conversation_retrying", "delayed", failure_message(r["error_kind"], stage) + " Retrying.",
-                        next_step(r["error_kind"], stage, retrying=True)))  # fmt: skip
+                        next_step(r["error_kind"], stage, retrying=True), server_step(r["error_kind"], stage, retrying=True), False))  # fmt: skip
     return out[:limit]
 
 

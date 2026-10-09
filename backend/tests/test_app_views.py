@@ -93,7 +93,7 @@ def test_summary_failure_is_transcript_only_with_a_sanitized_reason(client, work
     assert body["summary_error"] == "The summary service rejected the server's credentials."
     (issue,) = problems(client)
     assert issue["code"] == "conversation_failed" and issue["conversation_id"] == row["id"]
-    assert "x-api-key" not in json.dumps(issue) and "retry-failed" in issue["next_step"]
+    assert "x-api-key" not in json.dumps(issue) and "retry-failed" in issue["server_step"]
     queue = get(client, "/v1/status")["queue"]
     assert queue["conversations_failed"] == 1 and queue["chunks_failed"] == 0 and queue["failed"] == 1
 
@@ -236,11 +236,12 @@ def test_guidance_follows_whether_the_server_will_retry(client, worker):
     worker.db.execute("UPDATE conversations SET status='failed', failed_stage='transcribing', error_kind='transient', "
                       "note_path=NULL, error='x' WHERE id=?", (row["id"],))  # fmt: skip
     (issue,) = problems(client)
-    assert "stopped retrying" in issue["next_step"] and "retry-failed" in issue["next_step"]
-    assert "retries on its own" not in issue["next_step"]
+    assert "stopped retrying" in issue["server_step"] and "retry-failed" in issue["server_step"]
+    assert "retries on its own" not in issue["server_step"]
     worker.db.execute("UPDATE conversations SET status='transcribing', next_attempt_at=? WHERE id=?", (T0 + 999, row["id"]))
     (issue,) = problems(client)
-    assert issue["code"] == "conversation_retrying" and issue["next_step"].startswith("The server retries on its own.")
+    assert issue["code"] == "conversation_retrying" and issue["server_step"].startswith("The server retries on its own.")
+    assert issue["next_step"].startswith("The server retries on its own") and issue["retryable"] is False
 
 
 def test_commands_name_this_deployment_and_the_full_id(client, worker, monkeypatch):
@@ -248,7 +249,8 @@ def test_commands_name_this_deployment_and_the_full_id(client, worker, monkeypat
     row = finished(client, worker)
     worker.db.execute("UPDATE conversations SET edited=1 WHERE id=?", (row["id"],))
     (issue,) = problems(client)
-    assert row["id"] in issue["next_step"] and "OMI_NOTES_ENV_FILE=/Users/me/.config/omi-notes/server.env" in issue["next_step"]
+    assert row["id"] in issue["server_step"] and "OMI_NOTES_ENV_FILE=/Users/me/.config/omi-notes/server.env" in issue["server_step"]
+    assert "`" not in issue["next_step"]
 
 
 @pytest.mark.parametrize("content", [b"{not json", b"[1, 2]", b"\xff\xfe"])
@@ -316,3 +318,30 @@ def test_stats_count_kept_conversations_per_local_day(client, worker, settings):
     assert day["date"] == (STARTED + timedelta(days=1)).astimezone(worker.pipeline.tz).date().isoformat()
     assert day["conversation_s"] > 0 and day["speech_s"] > 0 and day["people"] == 0
     assert get(client, "/v1/stats?days=500")["days"].__len__() == 90
+
+
+def test_phone_guidance_is_plain_and_server_commands_are_separate(client, worker, monkeypatch):
+    # The phone's owner usually can't run anything on the server: what the phone shows has no command
+    # lines, and the operator's command (naming this deployment) travels separately.
+    monkeypatch.setenv("OMI_NOTES_ENV_FILE", "/Users/me/.config/omi-notes/server.env")
+    row = finished(client, worker)
+    worker.db.execute("UPDATE conversations SET status='failed', failed_stage='transcribing', error_kind='transient', "
+                      "note_path=NULL, error='x' WHERE id=?", (row["id"],))  # fmt: skip
+    (issue,) = problems(client)
+    assert "`" not in issue["next_step"] and "OMI_NOTES_ENV_FILE" not in issue["next_step"]
+    assert "retry-failed" in issue["server_step"] and "/Users/me/.config/omi-notes/server.env" in issue["server_step"]
+    assert issue["retryable"] is True
+
+
+def test_no_speaker_failures_say_a_retry_from_the_phone_cannot_help(client, worker):
+    row = finished(client, worker)
+    worker.db.execute("UPDATE conversations SET status='failed', failed_stage='transcribing', error_kind='speakers_unknown', "
+                      "note_path=NULL, error='x' WHERE id=?", (row["id"],))  # fmt: skip
+    (issue,) = problems(client)
+    assert issue["code"] == "conversation_failed" and issue["retryable"] is False
+    assert "kept" in issue["message"] and "`" not in issue["next_step"] and "nothing to do on this phone" in issue["next_step"]
+
+
+def test_a_queued_retry_does_not_claim_the_server_is_down():
+    from omi_notes import operations
+    assert operations._MESSAGES["queued"] == "Queued on the server"
