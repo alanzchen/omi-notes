@@ -49,6 +49,14 @@ public struct RecordingTimeline: Equatable, Sendable {
         return Date(timeIntervalSince1970: part.wallStart + min(max(offset - part.offset, 0), part.seconds))
     }
 
+    /// The playable offset where a clock time was recorded; nil when that moment has no audio (a
+    /// gap, or outside the recording).
+    public func offset(at wall: Date) -> Double? {
+        let t = wall.timeIntervalSince1970
+        guard let part = parts.first(where: { t >= $0.wallStart - 0.5 && t <= $0.wallStart + $0.seconds }) else { return nil }
+        return part.offset + min(max(t - part.wallStart, 0), part.seconds)
+    }
+
     /// Playable offsets (0…1 of the duration) where an unrecorded gap sits between two parts.
     public var gapMarks: [Double] {
         guard duration > 0 else { return [] }

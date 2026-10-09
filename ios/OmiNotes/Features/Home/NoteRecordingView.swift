@@ -11,18 +11,9 @@ import SwiftUI
 struct NoteRecordingSection: View {
     let model: AppModel
     let entry: ConversationSummary
-    @State private var player: NoteRecordingController
+    /// Owned by the note's detail, so a highlight can cue it.
+    let player: NoteRecordingController
     @State private var scrubbing: Double?
-
-    init(model: AppModel, entry: ConversationSummary) {
-        self.model = model
-        self.entry = entry
-        let id = entry.id
-        _player = State(initialValue: NoteRecordingController(
-            conversationId: id,
-            fetchInfo: { try await model.recordingClient().recordingInfo(id) },
-            makeEngine: { _ in AVRecordingEngine(api: try model.recordingClient(), conversationId: id) }))
-    }
 
     var body: some View {
         Section {
@@ -109,11 +100,16 @@ struct NoteRecordingSection: View {
     @ViewBuilder private var status: some View {
         switch player.state {
         case .idle:
-            Text("Tap play to listen. The audio stays on your server and streams as you play.")
-                .font(.caption).foregroundStyle(.secondary)
+            if let cue = player.cueNote {
+                Label(cue, systemImage: "sparkles").font(.caption).foregroundStyle(ValueStyle.recommended)
+            } else {
+                Text("Tap play to listen. The audio stays on your server and streams as you play.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         case .loading:
             Text("Loading the recording…").font(.caption).foregroundStyle(.secondary)
         case .ready:
+            if let cue = player.cueNote { Text(cue).font(.caption).foregroundStyle(.secondary) }
             if let line = player.detailLine { Text(line).font(.caption).foregroundStyle(.secondary) }
         case .failed(let message):
             HStack(alignment: .firstTextBaseline) {

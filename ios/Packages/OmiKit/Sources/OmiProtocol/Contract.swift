@@ -355,6 +355,8 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
     public var supportsNameVoice: Bool { features?.contains("name_voice") == true }
     /// A note's recording can be played (`/v1/conversations/{id}/recording`).
     public var supportsRecording: Bool { features?.contains("recording") == true }
+    /// Value assessments, highlights and the owner's priority choice.
+    public var supportsValueNotes: Bool { features?.contains("value_notes") == true }
     public var supportsSearch: Bool { features?.contains("search") == true }
     public var supportsStats: Bool { features?.contains("stats") == true }
 }
@@ -396,6 +398,8 @@ public struct ConversationSummary: Codable, Equatable, Hashable, Sendable, Ident
     public var lateAudio: Bool?
     public var provisional: Bool?
     public var speakersReady: Bool?
+    /// What the summary says it's worth, and the owner's own choice (servers with `value_notes`).
+    public var value: ConversationValue?
 
     /// A placeholder until the server's answer arrives (e.g. opened from an issue).
     public init(id: String, status: String, startedAt: String? = nil, title: String? = nil) {
@@ -444,7 +448,72 @@ public struct ConversationSummary: Codable, Equatable, Hashable, Sendable, Ident
         case lateAudio = "late_audio"
         case provisional
         case speakersReady = "speakers_ready"
+        case value
     }
+}
+
+/// The summary's own assessment of a conversation, next to the owner's explicit choice. Separate on
+/// purpose: a recommendation never hides anything; only the owner's "less useful" lowers a row.
+public struct ConversationValue: Codable, Equatable, Hashable, Sendable {
+    public struct Choice: Codable, Equatable, Hashable, Sendable {
+        /// `important`, `less_useful`, or `auto` (the owner hasn't chosen).
+        public var state: String
+        public var revision: Int?
+        public var setAt: String?
+
+        public init(state: String, revision: Int? = nil, setAt: String? = nil) {
+            self.state = state
+            self.revision = revision
+            self.setAt = setAt
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case state, revision
+            case setAt = "set_at"
+        }
+    }
+
+    /// `high`, `normal`, `low`, `unknown`, `legacy` (summarized before assessments), `pending`, `failed`.
+    public var assessment: String?
+    /// `conversation`, `dictation`, `reflection`, `call`, `media`, `mixed`, `unknown`: a hint only.
+    public var interaction: String?
+    public var recommended: Bool?
+    /// The first highlight's title, for recommended conversations.
+    public var highlight: String?
+    public var user: Choice?
+
+    public init(assessment: String? = nil, interaction: String? = nil, recommended: Bool? = nil, highlight: String? = nil,
+                user: Choice? = nil) {
+        self.assessment = assessment
+        self.interaction = interaction
+        self.recommended = recommended
+        self.highlight = highlight
+        self.user = user
+    }
+}
+
+/// A span worth revisiting; `target` only when its transcript lines are valid for the summary.
+public struct ConversationHighlight: Codable, Equatable, Hashable, Sendable {
+    public struct Target: Codable, Equatable, Hashable, Sendable {
+        public var firstSegment: Int
+        public var lastSegment: Int
+        public var startAt: String?
+        public var endAt: String?
+        /// `coarse`: transcription windows, not word-aligned; `segment`: the segment's own time.
+        public var timing: String?
+
+        enum CodingKeys: String, CodingKey {
+            case timing
+            case firstSegment = "first_segment"
+            case lastSegment = "last_segment"
+            case startAt = "start_at"
+            case endAt = "end_at"
+        }
+    }
+
+    public var title: String
+    public var why: String?
+    public var target: Target?
 }
 
 public struct RecentConversationsResponse: Decodable, Equatable, Sendable {
@@ -487,4 +556,13 @@ public enum ISO8601UTC {
         f.formatOptions = [.withInternetDateTime]
         return f.date(from: string)
     }
+}
+
+/// `PUT /v1/conversations/{id}/priority`.
+public struct PriorityAnswer: Decodable, Equatable, Sendable {
+    public var state: String
+    public var revision: Int?
+    public var setAt: String?
+    /// False: an older choice than the stored one; the stored (newer) state is returned.
+    public var applied: Bool?
 }

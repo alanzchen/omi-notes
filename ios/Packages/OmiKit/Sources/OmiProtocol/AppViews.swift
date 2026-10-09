@@ -84,6 +84,9 @@ public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
     public var transcript: Transcript?
     /// How the owner resolved it from the phone, with the condition it resolved (kept as history).
     public var resolution: Resolution?
+    /// Why the summary thinks it's worth revisiting, and the spans to revisit (`value_notes`).
+    public var valueReasons: [String]?
+    public var highlights: [ConversationHighlight]?
 
     /// `resolution`: e.g. kept as a transcript with the speaker unknown.
     public struct Resolution: Codable, Equatable, Sendable {
@@ -121,6 +124,8 @@ public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
         case summary
         case transcriptState = "transcript_state"
         case speakers, transcript, resolution
+        case valueReasons = "value_reasons"
+        case highlights
     }
 
     public init(from decoder: Decoder) throws {
@@ -143,6 +148,8 @@ public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
         speakers = try c.decodeIfPresent([Speaker].self, forKey: .speakers) ?? []
         transcript = try c.decodeIfPresent(Transcript.self, forKey: .transcript)
         resolution = try? c.decodeIfPresent(Resolution.self, forKey: .resolution)
+        valueReasons = try? c.decodeIfPresent([String].self, forKey: .valueReasons)
+        highlights = try? c.decodeIfPresent([ConversationHighlight].self, forKey: .highlights)
     }
 
     /// The same flat shape the server sends (so a saved copy decodes like a fresh one).
@@ -166,6 +173,8 @@ public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
         try c.encode(speakers, forKey: .speakers)
         try c.encodeIfPresent(transcript, forKey: .transcript)
         try c.encodeIfPresent(resolution, forKey: .resolution)
+        try c.encodeIfPresent(valueReasons, forKey: .valueReasons)
+        try c.encodeIfPresent(highlights, forKey: .highlights)
     }
 
     /// Everything the server has is loaded (a saved copy may hold only the first transcript pages).

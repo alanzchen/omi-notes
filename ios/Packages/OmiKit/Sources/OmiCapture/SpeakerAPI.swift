@@ -62,6 +62,13 @@ extension APIClient {
         _ = try await raw("POST", "/v1/speakers/suggestions/\(id)/dismiss")
     }
 
+    /// The owner's choice for a conversation; the later choice (by `setAt`) wins on the server.
+    public func putPriority(_ conversationId: String, state: String, requestId: String, setAt: Date) async throws -> PriorityAnswer {
+        struct Body: Encodable { var state: String; var requestId: String; var setAt: String }
+        return try await json("PUT", "/v1/conversations/\(conversationId)/priority",
+                              body: Body(state: state, requestId: requestId, setAt: ISO8601UTC.format(setAt)))
+    }
+
     public func speakerSettings() async throws -> SpeakerSettings { try await json("GET", "/v1/speakers/settings") }
 
     @discardableResult

@@ -35,7 +35,7 @@ final class FakeEngine: RecordingEngine {
 }
 
 @MainActor
-@Suite struct NoteRecordingLifecycleTests {
+@Suite(.serialized) struct NoteRecordingLifecycleTests {
     static let info = try! JSONDecoder.snake.decode(RecordingInfo.self, from: Data(
         #"{"available":true,"duration_s":49.84,"span":{"seconds":49.84},"gaps":[],"partial":false,"timemap":[[0,1000,49.84]]}"#.utf8))
 
@@ -124,6 +124,28 @@ final class FakeEngine: RecordingEngine {
         h.engines[1].ready.open(.success(()))
         await retry.value
         #expect(h.controller.state == .ready && h.controller.isPlaying)
+    }
+
+    @Test func aHighlightCueStartsThereOrSaysThereIsNoAudio() async {
+        // playable 0–20 s = clock 1000–1020; nothing recorded for clock 1020–1030; 20–30 s = 1030–1040
+        let gapped = try! JSONDecoder.snake.decode(RecordingInfo.self, from: Data(
+            #"{"available":true,"duration_s":30,"span":{"seconds":40},"gaps":[{"seconds":10}],"partial":true,"timemap":[[0,1000,20],[20,1030,10]]}"#.utf8))
+        let engines = Gate<RecordingInfo>()
+        var made: [FakeEngine] = []
+        let c = NoteRecordingController(conversationId: "c", fetchInfo: { try await engines.wait() },
+                                        makeEngine: { _ in let e = FakeEngine(); made.append(e); return e })
+        c.cue(at: Date(timeIntervalSince1970: 1035), approximate: true)
+        #expect(c.cueNote?.hasPrefix("Play starts around") == true && made.isEmpty)   // nothing plays or loads yet
+        let tap = Task { await c.toggle() }
+        await settle()
+        engines.open(.success(gapped))
+        await settle()
+        made[0].ready.open(.success(()))
+        await tap.value
+        #expect(c.isPlaying && c.current == 25 && c.cueNote == nil)                   // after the gap: offset 25 s
+        c.pause()
+        c.cue(at: Date(timeIntervalSince1970: 1025), approximate: false)              // inside the gap
+        #expect(c.current == 25 && c.cueNote?.hasPrefix("That moment has no recorded audio") == true)
     }
 
     @Test func theWholeInitialLoadIsBounded() async {

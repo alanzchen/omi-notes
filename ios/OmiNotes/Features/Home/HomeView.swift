@@ -42,6 +42,7 @@ struct HomeView: View {
                     }
                 }
                 needsYouSection
+                WorthRevisitingSection(model: model)
                 conversationSections
             } else {
                 SearchResults(model: model, query: query)
@@ -122,7 +123,12 @@ struct HomeView: View {
         } else {
             ForEach(days, id: \.day) { group in
                 Section(group.day) {
-                    ForEach(group.rows) { c in ConversationLink(model: model, conversation: c) }
+                    // only the owner's explicit "less useful" moves a row (into a collapsed group)
+                    let demoted = group.rows.filter { model.priorityState(of: $0).state == "less_useful" }
+                    ForEach(group.rows.filter { model.priorityState(of: $0).state != "less_useful" }) { c in
+                        ConversationLink(model: model, conversation: c)
+                    }
+                    if !demoted.isEmpty { LessUsefulGroup(model: model, rows: demoted) }
                 }
             }
             Section {
@@ -156,23 +162,30 @@ struct ConversationLink: View {
     let model: AppModel
     let conversation: ConversationSummary
 
+    private var row: ConversationRow {
+        ConversationRow(conversation: conversation, priority: model.priorityState(of: conversation))
+    }
+
     var body: some View {
         // A saved copy can be read even before (or without) the server saying what it supports.
         if model.serverStatus?.supportsConversationDetail == true || model.recentSavedAt != nil
             || model.details[conversation.id] != nil {
-            NavigationLink { ConversationDetailView(model: model, summary: conversation) } label: { ConversationRow(conversation: conversation) }
+            NavigationLink { ConversationDetailView(model: model, summary: conversation) } label: { row }
+                .modifier(PriorityActions(model: model, conversation: conversation))
         } else if conversation.canReviewSpeakers {
             NavigationLink {
                 ConversationSpeakersView(model: model, conversationId: conversation.id, title: conversation.title ?? "Speakers", startedAt: conversation.startedAt)
-            } label: { ConversationRow(conversation: conversation) }
+            } label: { row }
         } else {
-            ConversationRow(conversation: conversation)
+            row
         }
     }
 }
 
 struct ConversationRow: View {
     let conversation: ConversationSummary
+    /// The owner's choice (and whether it is still being saved).
+    var priority: (state: String, pending: Bool) = ("auto", false)
     @Environment(\.dynamicTypeSize) private var typeSize
 
     private var c: ConversationSummary { conversation }
@@ -180,11 +193,22 @@ struct ConversationRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             AdaptiveStack(vertical: typeSize.isAccessibilitySize) {
-                Text(title).font(.body.weight(.medium)).lineLimit(typeSize.isAccessibilitySize ? 4 : 2)
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    if priority.state == "important" {
+                        Image(systemName: "star.fill").font(.caption).foregroundStyle(ValueStyle.important)
+                            .accessibilityLabel("Marked important")
+                    }
+                    Text(title).font(.body.weight(.medium)).lineLimit(typeSize.isAccessibilitySize ? 4 : 2)
+                    if priority.pending {
+                        Image(systemName: "clock.arrow.circlepath").font(.caption2).foregroundStyle(.secondary)
+                            .accessibilityLabel("Saving your choice")
+                    }
+                }
                 if !typeSize.isAccessibilitySize { Spacer(minLength: 8) }
                 if c.displayState.code != "ready" { StateChip(state: c.displayState) }
             }
             Text(meta).font(.caption).foregroundStyle(.secondary)
+            if c.isRecommended, priority.state != "less_useful" { WorthRevisitingLine(highlight: c.value?.highlight) }
             if let preview = c.preview {
                 Text(preview).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
             } else if c.displayState.code != "ready" {

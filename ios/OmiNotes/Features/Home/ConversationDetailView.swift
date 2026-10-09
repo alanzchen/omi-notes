@@ -9,6 +9,21 @@ import SwiftUI
 struct ConversationDetailView: View {
     let model: AppModel
     let summary: ConversationSummary
+    /// Opened from a highlight: cue the player there (nothing plays until play is tapped).
+    var focusHighlight: Int?
+    @State private var recording: NoteRecordingController
+    @State private var cued = false
+
+    init(model: AppModel, summary: ConversationSummary, focusHighlight: Int? = nil) {
+        self.model = model
+        self.summary = summary
+        self.focusHighlight = focusHighlight
+        let id = summary.id
+        _recording = State(initialValue: NoteRecordingController(
+            conversationId: id,
+            fetchInfo: { try await model.recordingClient().recordingInfo(id) },
+            makeEngine: { _ in AVRecordingEngine(api: try model.recordingClient(), conversationId: id) }))
+    }
 
     @State private var error: String?
     @State private var loadingMore = false
@@ -22,6 +37,7 @@ struct ConversationDetailView: View {
     private var entry: ConversationSummary { detail?.entry ?? summary }
 
     var body: some View {
+        ScrollViewReader { proxy in
         List {
             header
             if let saved = model.detailSavedAt[summary.id] {
@@ -37,8 +53,10 @@ struct ConversationDetailView: View {
                 if detail.entry.status == "failed", model.detailSavedAt[summary.id] == nil { fixSection(detail) }
                 caveats(detail)
                 if model.canPlayRecordings, detail.entry.status != "open", model.detailSavedAt[summary.id] == nil {
-                    NoteRecordingSection(model: model, entry: detail.entry).id(detail.id)
+                    NoteRecordingSection(model: model, entry: detail.entry, player: recording).id("recording")
                 }
+                ValueDetailSection(detail: detail, canPlay: model.canPlayRecordings && model.detailSavedAt[summary.id] == nil,
+                                   onPlay: { h in play(h, proxy: proxy) }, onShow: { h in show(h, proxy: proxy) })
                 summarySection(detail)
                 if let s = detail.summary { details(s) }
                 myNotes(detail)
@@ -57,8 +75,24 @@ struct ConversationDetailView: View {
                 }
             }
         }
+        .onChange(of: detail?.highlights) { _, _ in cueFocus() }
+        }
         .navigationTitle(entry.title == nil ? "Conversation" : "")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if model.supportsValueNotes, entry.status != "open" {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        PriorityMenuItems(model: model, conversation: entry)
+                    } label: {
+                        let state = model.priority(of: entry).state
+                        Image(systemName: state == "important" ? "star.fill" : state == "less_useful" ? "arrow.down.to.line" : "star")
+                            .foregroundStyle(state == "important" ? ValueStyle.important : Color.accentColor)
+                    }
+                    .accessibilityLabel("Importance")
+                }
+            }
+        }
         // Also after coming back from the speakers screen: names may have changed.
         .onAppear { Task { await load() } }
         .fullScreenCover(item: $naming, onDismiss: { Task { await load() } }) { run in
@@ -136,6 +170,37 @@ struct ConversationDetailView: View {
                 if let line = speechLine(d) { Text(line).font(.caption).foregroundStyle(.secondary) }
             }
         }
+    }
+
+    // MARK: Highlights
+
+    /// A highlight tapped: play from its moment (when the recording has audio there), else its text.
+    private func play(_ h: ConversationHighlight, proxy: ScrollViewProxy) {
+        guard let t = h.target, let at = t.startAt.flatMap(ISO8601UTC.parse) else { return show(h, proxy: proxy) }
+        withAnimation { proxy.scrollTo("recording", anchor: .top) }
+        Task {
+            if await recording.play(from: at, approximate: t.timing == "coarse") == false { show(h, proxy: proxy) }
+        }
+    }
+
+    private func show(_ h: ConversationHighlight, proxy: ScrollViewProxy) {
+        withAnimation { showTranscript = true }
+        let first = h.target?.firstSegment
+        Task {
+            while let first, detail?.transcript.map({ $0.segments.count <= first && $0.nextFrom != nil }) == true {
+                await loadMoreTranscript()
+            }
+            try? await Task.sleep(for: .milliseconds(350))  // the transcript opens first, then scroll to it
+            withAnimation { proxy.scrollTo(first.map { "seg-\($0)" } ?? "transcript", anchor: .top) }
+        }
+    }
+
+    /// Opened from Home's "Worth revisiting": cue the player at the highlight (no autoplay).
+    private func cueFocus() {
+        guard !cued, let i = focusHighlight, let hs = detail?.highlights, hs.indices.contains(i),
+              let t = hs[i].target, let at = t.startAt.flatMap(ISO8601UTC.parse) else { return }
+        cued = true
+        recording.cue(at: at, approximate: t.timing == "coarse")
     }
 
     private var when: String {
@@ -304,7 +369,7 @@ struct ConversationDetailView: View {
         Section {
             if let t = d.transcript {
                 DisclosureGroup(isExpanded: $showTranscript) {
-                    ForEach(Array(t.segments.enumerated()), id: \.offset) { _, seg in
+                    ForEach(Array(t.segments.enumerated()), id: \.offset) { index, seg in
                         VStack(alignment: .leading, spacing: 2) {
                             HStack {
                                 Text(seg.name ?? ConversationDetail.anonymous(seg.speaker)).font(.caption.weight(.semibold))
@@ -314,6 +379,7 @@ struct ConversationDetailView: View {
                             Text(seg.text).font(.subheadline).textSelection(.enabled)
                         }
                         .accessibilityElement(children: .combine)
+                        .id("seg-\(index)")
                     }
                     if t.nextFrom != nil {
                         Button {
@@ -335,6 +401,7 @@ struct ConversationDetailView: View {
         } header: {
             if d.transcript == nil { Text("Transcript") }
         }
+        .id("transcript")
     }
 
     private func transcriptMessage(_ d: ConversationDetail) -> String {

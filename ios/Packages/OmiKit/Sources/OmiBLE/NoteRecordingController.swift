@@ -39,6 +39,10 @@ public final class NoteRecordingController {
     public private(set) var isPlaying = false
     public private(set) var gapMarks: [Double] = []
     public private(set) var detailLine: String?
+    /// Where play starts next (a highlight's moment), and what the card says about it.
+    public private(set) var cueWall: Date?
+    public private(set) var cueNote: String?
+    private var timeline: RecordingTimeline?
 
     private let fetchInfo: @MainActor () async throws -> RecordingInfo
     private let makeEngine: @MainActor (RecordingInfo) throws -> RecordingEngine
@@ -69,7 +73,10 @@ public final class NoteRecordingController {
         case .ready:
             isPlaying ? pause() : play()
         case .idle, .failed:
-            if await prepare() { play() }
+            if await prepare() {
+                applyCue()
+                play()
+            }
         case .loading, .unavailable:
             break
         }
@@ -90,7 +97,8 @@ public final class NoteRecordingController {
                 return false
             }
             duration = total
-            gapMarks = RecordingTimeline(info).gapMarks
+            timeline = RecordingTimeline(info)
+            gapMarks = timeline?.gapMarks ?? []
             let engine = try makeEngine(info)
             engine.onFailure = { [weak self, weak engine] reason in
                 guard let self, let engine, self.engine === engine else { return }  // only the current player
@@ -161,6 +169,39 @@ public final class NoteRecordingController {
         NotificationCenter.default.post(name: .omiAudioWillPlay, object: self)
         engine.play()
         isPlaying = true
+    }
+
+    /// Starts the next play at a highlight's clock time (`approximate`: transcription windows). Nothing
+    /// plays until play is tapped; the mapping happens once the recording's time map is known.
+    public func cue(at wall: Date, approximate: Bool) {
+        cueWall = wall
+        let clock = wall.formatted(date: .omitted, time: .shortened)
+        cueNote = approximate ? "Play starts around \(clock), the highlighted part." : "Play starts at \(clock), the highlighted part."
+        if state == .ready { applyCue() }
+    }
+
+    /// Plays from a highlight now (an explicit tap). False when that moment has no audio.
+    @discardableResult
+    public func play(from wall: Date, approximate: Bool) async -> Bool {
+        cue(at: wall, approximate: approximate)
+        if state == .ready {
+            let mapped = cueWall == nil
+            play()
+            return mapped
+        }
+        await toggle()
+        return state == .ready && cueNote?.hasPrefix("That moment") != true
+    }
+
+    private func applyCue() {
+        guard let wall = cueWall, let timeline else { return }
+        cueWall = nil
+        if let offset = timeline.offset(at: wall) {
+            seek(to: offset)
+            cueNote = nil
+        } else {
+            cueNote = "That moment has no recorded audio, so play starts where you are. Its text is in the transcript."
+        }
     }
 
     public func pause() {

@@ -52,6 +52,12 @@ public final class AppModel {
     public internal(set) var retries: [String: RetryOperation] = [:]
     /// A short outcome to show next to a retry button (by conversation id; "chunks" for audio files).
     public internal(set) var retryMessages: [String: String] = [:]
+    /// Why a priority choice couldn't be saved, per conversation.
+    public internal(set) var priorityMessages: [String: String] = [:]
+    /// Bumped when a priority choice changes, so views showing it update.
+    public internal(set) var priorityRevision = 0
+    /// The latest choice made in this session, per conversation (its answer is the one shown).
+    var priorityLatest: [String: String] = [:]
     #if DEBUG
     /// Set by `debugUseServerFixture` (simulator screenshots only).
     var debugServerFixture = false
@@ -59,6 +65,7 @@ public final class AppModel {
     /// Pause between the few status checks right after a Retry tap (shortened in tests).
     var retryFollowUpInterval: Duration = .seconds(2)
     let retryStore: RetryStore
+    let priorityStore: PriorityStore
     /// Opt-in alerts for problems this phone observes (Settings).
     public let problemAlerts = ProblemAlerts()
     public let noteCache: NoteCache
@@ -93,6 +100,7 @@ public final class AppModel {
         self.noteCache = noteCache
         speakers = SpeakersModel(engine: engine)
         retryStore = RetryStore(url: engine.config.dirs.root.appendingPathComponent("app-retries.json"))
+        priorityStore = PriorityStore(url: engine.config.dirs.root.appendingPathComponent("app-priorities.json"))
         engine.setSnapshotSink { [weak self] s in
             Task { @MainActor [weak self] in
                 self?.snapshot = s
@@ -206,6 +214,8 @@ public final class AppModel {
         switch page {
         case .success(let page):
             mergeFirstPage(page)
+            await settlePriorities(api: api, data: data)
+            guard isCurrent(config), data == dataEpoch else { return }
             recentError = nil
             recentLoadedAt = Date()
             recentSavedAt = nil
