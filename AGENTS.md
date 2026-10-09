@@ -163,7 +163,7 @@ settings before changing it; repository defaults are not the deployed configurat
 | Index base | `/Users/alan/Library/Application Support/omi-notes/index/production` |
 | Locks | `/Users/alan/Library/Application Support/omi-notes/locks` |
 | Release root | `/Users/alan/.local/share/omi-notes/releases/` |
-| Current backend | release `20260930-005903-2afefbb` (source = commit `2afefbb`; index schema 7), live since 2026-10-03 02:08 CDT. The `current` symlink still names the old release; the service plist's absolute path is what runs |
+| Current backend | release `20261009-152100-968bcdb` (source = commit `968bcdb`; index schema 8), live since 2026-10-09 15:22 CDT. The first phone keep raises the vault to format 3; from then on only releases at or after `a8c74d2` start, so `968bcdb` is the recovery target, not `ea1e561`. The `current` symlink may name an older release; the service plist's absolute path is what runs |
 | Service | User LaunchAgent `com.omi-notes.server` in `gui/504` (Alan's decision; switched 2026-10-03 11:29). The system daemon is retired: booted out, disabled, plist moved to `~/.config/omi-notes/system-daemon-retired/`. Check with `~/.config/omi-notes/user-service.sh status` |
 | Rotating log | `/Users/alan/Library/Application Support/omi-notes/index/logs/omi-notes.log` |
 
