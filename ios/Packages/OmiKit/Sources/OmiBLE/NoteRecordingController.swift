@@ -180,28 +180,42 @@ public final class NoteRecordingController {
         if state == .ready { applyCue() }
     }
 
-    /// Plays from a highlight now (an explicit tap). False when that moment has no audio.
+    /// Plays from a highlight now (an explicit tap). True only when play starts at that moment; when
+    /// it has no recorded audio the whole recording plays from the start (said on the card) and the
+    /// answer is false, so the screen also opens the transcript there.
     @discardableResult
     public func play(from wall: Date, approximate: Bool) async -> Bool {
-        cue(at: wall, approximate: approximate)
+        cueWall = wall
+        cueNote = nil
+        let mapped: Bool
         if state == .ready {
-            let mapped = cueWall == nil
+            mapped = applyCue()
             play()
-            return mapped
+        } else {
+            await toggle()
+            mapped = state == .ready && lastCueMapped
         }
-        await toggle()
-        return state == .ready && cueNote?.hasPrefix("That moment") != true
+        return mapped
     }
 
-    private func applyCue() {
-        guard let wall = cueWall, let timeline else { return }
+    private var lastCueMapped = false
+
+    /// Moves to the cued moment. Without audio there, the whole recording from the start (never the
+    /// old position, which would be an unrelated moment). True when it mapped.
+    @discardableResult
+    private func applyCue() -> Bool {
+        guard let wall = cueWall, let timeline else { return false }
         cueWall = nil
         if let offset = timeline.offset(at: wall) {
             seek(to: offset)
             cueNote = nil
+            lastCueMapped = true
         } else {
-            cueNote = "That moment has no recorded audio, so play starts where you are. Its text is in the transcript."
+            seek(to: 0)
+            cueNote = "That moment has no recorded audio, so the whole recording plays from the start. Its text is in the transcript."
+            lastCueMapped = false
         }
+        return lastCueMapped
     }
 
     public func pause() {

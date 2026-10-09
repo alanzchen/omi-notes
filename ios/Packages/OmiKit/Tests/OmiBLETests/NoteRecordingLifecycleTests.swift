@@ -145,7 +145,61 @@ final class FakeEngine: RecordingEngine {
         #expect(c.isPlaying && c.current == 25 && c.cueNote == nil)                   // after the gap: offset 25 s
         c.pause()
         c.cue(at: Date(timeIntervalSince1970: 1025), approximate: false)              // inside the gap
-        #expect(c.current == 25 && c.cueNote?.hasPrefix("That moment has no recorded audio") == true)
+        #expect(c.current == 0 && c.cueNote?.hasPrefix("That moment has no recorded audio") == true)  // whole recording
+    }
+
+    /// Recorded 12:00–12:01 (offset 0–60) and 12:02–12:03 (offset 60–120); 12:01–12:02 has no audio.
+    static let twoParts = try! JSONDecoder.snake.decode(RecordingInfo.self, from: Data(
+        #"{"available":true,"duration_s":120,"span":{"seconds":180},"gaps":[{"seconds":60}],"partial":true,"timemap":[[0,43200,60],[60,43320,60]]}"#.utf8))
+
+    func ready(_ info: RecordingInfo) async -> (NoteRecordingController, [FakeEngine]) {
+        let gate = Gate<RecordingInfo>()
+        final class Box { var engines: [FakeEngine] = [] }
+        let box = Box()
+        let c = NoteRecordingController(conversationId: "c", fetchInfo: { try await gate.wait() },
+                                        makeEngine: { _ in let e = FakeEngine(); box.engines.append(e); return e })
+        let tap = Task { await c.toggle() }
+        await settle()
+        gate.open(.success(info))
+        await settle()
+        box.engines[0].ready.open(.success(()))
+        await tap.value
+        return (c, box.engines)
+    }
+
+    @Test func aHighlightWithNoAudioNeverClaimsAPreciseSeekOrResumesAnUnrelatedPlace() async {
+        let gapMoment = Date(timeIntervalSince1970: 43275)  // 12:01:15, inside the gap
+        // already prepared, paused at 25 s: the whole recording plays from the start, labelled, and false
+        let (c, engines) = await ready(Self.twoParts)
+        c.pause()
+        c.seek(to: 25)
+        let mapped = await c.play(from: gapMoment, approximate: false)
+        #expect(!mapped, "a gap is not a successful seek: the transcript opens")
+        #expect(c.isPlaying && c.current == 0 && engines[0].plays == 2, "the whole recording, from the start")
+        #expect(c.cueNote?.contains("whole recording") == true)
+
+        // cold: the same fallback after loading
+        let gate = Gate<RecordingInfo>()
+        final class Box { var engines: [FakeEngine] = [] }
+        let box = Box()
+        let cold = NoteRecordingController(conversationId: "c2", fetchInfo: { try await gate.wait() },
+                                           makeEngine: { _ in let e = FakeEngine(); box.engines.append(e); return e })
+        let tap = Task { await cold.play(from: gapMoment, approximate: true) }
+        await settle()
+        gate.open(.success(Self.twoParts))
+        await settle()
+        box.engines[0].ready.open(.success(()))
+        #expect(await tap.value == false)
+        #expect(cold.isPlaying && cold.current == 0 && cold.cueNote?.contains("whole recording") == true)
+
+        // a moment with audio still seeks precisely, and plain play/pause still resumes in place
+        cold.pause()
+        #expect(await cold.play(from: Date(timeIntervalSince1970: 43330), approximate: false))  // 12:02:10 → 70 s
+        #expect(cold.current == 70 && cold.cueNote == nil)
+        cold.pause()
+        cold.seek(to: 90)
+        await cold.toggle()
+        #expect(cold.isPlaying && cold.current == 90)
     }
 
     @Test func theWholeInitialLoadIsBounded() async {
