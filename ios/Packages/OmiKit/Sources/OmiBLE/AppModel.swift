@@ -52,6 +52,10 @@ public final class AppModel {
     public internal(set) var retries: [String: RetryOperation] = [:]
     /// A short outcome to show next to a retry button (by conversation id; "chunks" for audio files).
     public internal(set) var retryMessages: [String: String] = [:]
+    #if DEBUG
+    /// Set by `debugUseServerFixture` (simulator screenshots only).
+    var debugServerFixture = false
+    #endif
     /// Pause between the few status checks right after a Retry tap (shortened in tests).
     var retryFollowUpInterval: Duration = .seconds(2)
     let retryStore: RetryStore
@@ -146,6 +150,9 @@ public final class AppModel {
     func isCurrent(_ config: UploadConfig) -> Bool { engine.settings.serverConfig() == config }
 
     public func refreshServer() async {
+        #if DEBUG
+        if debugServerFixture { serverStatusAt = Date(); return }
+        #endif
         let config = engine.settings.serverConfig()
         adopt(config)
         guard let endpoint = config.endpoint else {
@@ -353,3 +360,16 @@ public final class AppModel {
 
     public func refreshLogs() { logs = OmiLog.shared.recent(limit: 400).reversed() }
 }
+
+#if DEBUG
+extension AppModel {
+    /// Simulator screenshots only (debug builds): show a synthetic server answer; refreshes keep it.
+    public func debugUseServerFixture(status: ServerStatus, issues: [ServerIssue]) {
+        debugServerFixture = true
+        server = .reachable(version: "fixture", detail: "")
+        serverStatus = status
+        serverStatusAt = Date()
+        self.issues = issues
+    }
+}
+#endif

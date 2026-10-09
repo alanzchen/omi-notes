@@ -33,6 +33,20 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
                 OmiLog.shared.log(.error, "app", "debug server configuration failed: \(error)")
             }
         }
+        // `-OmiNotesDebugServerIssues YES` shows a synthetic server answer with two failed conversations
+        // shaped like the live server's speakers_unknown issues (screenshots of the Server tab).
+        if UserDefaults.standard.bool(forKey: "OmiNotesDebugServerIssues") {
+            let status = #"{"ok":true,"vault_id":"fixture-vault","features":["issues","retry","conversation_detail","search","stats"],"queue":{"chunks_pending":0,"conversations_open":0,"conversations_pending":0,"failed":2,"conversations_failed":2,"chunks_failed":0,"conversations_retrying":0,"notes_conflicted":0},"worker":{"present":true},"stt":{"provider":"fixture","ready":true},"llm":{"provider":"fixture","ready":true},"last_note_at":"2026-10-09T14:00:00.000Z"}"#
+            let message = "The server got a few words from a very short sound but found no speaker in it, so no note was made. The audio and its text are kept."
+            func issue(_ id: String, _ at: String) -> String {
+                #"{"code":"conversation_failed","severity":"action","message":"\#(message)","next_step":"Retrying won't help until the server's speaker separation changes; nothing to do on this phone.","server_step":"Nothing is lost. Retry after the speaker-separation models are updated, then retry on the server with `omi-notes retry-failed`.","retryable":false,"conversation_id":"\#(id)","started_at":"\#(at)","title":null}"#
+            }
+            let issues = #"{"issues":["# + issue("00000000-fixture-0001", "2026-09-29T22:08:09.000Z") + "," + issue("00000000-fixture-0002", "2026-09-29T19:23:04.000Z") + "]}"
+            if let st = try? JSONDecoder().decode(ServerStatus.self, from: Data(status.utf8)),
+               let list = try? JSONDecoder().decode(ServerIssuesResponse.self, from: Data(issues.utf8)) {
+                model.debugUseServerFixture(status: st, issues: list.issues)
+            }
+        }
         // `-OmiNotesDebugOpenURL omi-notes://configure?…` exercises the URL-scheme sheet without the system prompt.
         if let raw = UserDefaults.standard.string(forKey: "OmiNotesDebugOpenURL"), let link = URL(string: raw) {
             model.handleOpenURL(link)

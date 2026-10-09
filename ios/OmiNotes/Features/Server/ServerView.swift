@@ -186,8 +186,12 @@ struct IssueRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Label(issue.message, systemImage: issue.needsAction ? "exclamationmark.triangle.fill" : "clock.badge.exclamationmark")
-                .foregroundStyle(issue.needsAction ? .red : .orange).font(.subheadline.weight(.medium))
+            Label {
+                Text(issue.message).foregroundStyle(.primary)
+            } icon: {
+                Image(systemName: issue.needsAction ? "exclamationmark.triangle.fill" : "clock.badge.exclamationmark").foregroundStyle(.orange)
+            }
+            .font(.subheadline)
             if let detail = issue.detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
             if let step = issue.phoneStep { Text(step).font(.caption).foregroundStyle(.secondary) }
             if issue.code == "conversation_failed", let id = issue.conversationId, model.canRetry, issue.canRetryFromPhone {

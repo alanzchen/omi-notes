@@ -12,11 +12,6 @@ struct DiagnosticsView: View {
 
     var body: some View {
         List {
-            connectionSection
-            PendantDeviceSection(snapshot: s)
-            LiveRecordingSection(snapshot: s)
-            PendantSyncSection(snapshot: s)
-            UploadsSection(model: model, showQuarantined: true)
             if !model.issues.isEmpty {
                 Section {
                     ForEach(model.issues) { issue in
@@ -35,6 +30,11 @@ struct DiagnosticsView: View {
                     Text("For whoever runs the server: commands run in Terminal on that computer.")
                 }
             }
+            connectionSection
+            PendantDeviceSection(snapshot: s)
+            LiveRecordingSection(snapshot: s)
+            PendantSyncSection(snapshot: s)
+            UploadsSection(model: model, showQuarantined: true)
             Section {
                 NavigationLink("Recent log") { LogView(model: model) }
             } footer: {
