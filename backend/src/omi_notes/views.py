@@ -262,9 +262,57 @@ def note_file(root: Path, row: sqlite3.Row) -> dict:
 # -- responses ------------------------------------------------------------------------------------
 
 
+def value(pipeline, row: sqlite3.Row, notes: ConversationNotes | None, summary_state: str) -> dict:
+    """The machine's assessment (from this conversation's own summary, prompt v3+) next to the owner's
+    explicit choice. Separate on purpose: a recommendation never hides or moves anything, and only the
+    owner's "less useful" lowers a row. Older summaries are "legacy", never guessed."""
+    from . import priority
+
+    if row["status"] == "open":
+        assessment = "pending"
+    elif notes is None:
+        assessment = {"pending": "pending", "updating": "pending", "failed": "failed", "unavailable": "failed"}.get(
+            summary_state, "unknown")
+    elif notes.value is None:
+        assessment = "legacy"
+    else:
+        assessment = notes.value.level
+    recommended = assessment == "high"
+    choice = priority.read(pipeline, row["id"]) if row["status"] != "open" else None
+    return {
+        "assessment": assessment,
+        "interaction": notes.interaction if notes else None,
+        "recommended": recommended,
+        "highlight": notes.highlights[0].title if recommended and notes and notes.highlights else None,
+        "user": priority.view(choice),
+    }
+
+
+def highlights(conv_dir: Path, notes: ConversationNotes | None, segments: list[dict] | None) -> list[dict]:
+    """Highlights with a target only when their segment indices are valid for the transcript the
+    summary was made from; otherwise no target (the phone opens the whole note)."""
+    if notes is None or not notes.highlights:
+        return []
+    try:
+        timing = json.loads((conv_dir / "transcript.json").read_text()).get("timing_source")
+    except (OSError, ValueError):
+        timing = None
+    out = []
+    for h in notes.highlights:
+        target = None
+        a, b = h.first_segment, h.last_segment
+        if segments and a is not None and b is not None and 0 <= a <= b < len(segments):
+            target = {"first_segment": a, "last_segment": b, "start_at": iso_utc_epoch(segments[a]["start"]),
+                      "end_at": iso_utc_epoch(segments[b]["end"]),
+                      # text-only STT windows: times are approximate, not word-aligned
+                      "timing": "coarse" if timing == "local_speaker_windows" else "segment"}  # fmt: skip
+        out.append({"title": h.title, "why": h.why, "target": target})
+    return out
+
+
 def summary_row(pipeline, row: sqlite3.Row) -> dict:
     """One `/v1/conversations/recent` entry."""
-    notes, _ = summary(pipeline.conv_dir(row["id"]), row)
+    notes, summary_state = summary(pipeline.conv_dir(row["id"]), row)
     names = speaker_names(pipeline.speakers, row["id"], row["transcript_sha"])
     overview = notes.overview if notes else ""
     return {
@@ -284,6 +332,7 @@ def summary_row(pipeline, row: sqlite3.Row) -> dict:
         "provisional": bool(row["provisional"]),
         # nothing to review when no speaker was separated
         "speakers_ready": row["status"] != "open" and row["transcript_sha"] is not None and not _kept(row),
+        "value": value(pipeline, row, notes, summary_state),
     }
 
 
@@ -318,6 +367,8 @@ def detail(pipeline, row: sqlite3.Row, *, segments_from: int = 0) -> dict:
         "my_notes_unreadable": note["my_notes_unreadable"],
         "discard_reason": idx.get("discard_reason") if row["status"] == "discarded" else None,
         "resolution": resolution(row),
+        "value_reasons": (notes.value.reasons if notes and notes.value else []),
+        "highlights": highlights(conv_dir, notes if summary_state == "ready" else None, segments),
         "transcript_sha": row["transcript_sha"],
         "speakers_revision": row["speakers_revision"],
         "revision": row["revision"],

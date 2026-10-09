@@ -159,7 +159,7 @@ No auth. `200 {"ok": true}`.
                "backing_off": 0, "oldest_waiting_ended_at": "…", "oldest_pending_chunk_received_at": null,
                "stt": {"last_ok_at": "…", "last_error_at": null, "last_error_kind": null}, "llm": null},
   "vault_id": "…",
-  "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "search", "stats"]
+  "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats"]
 }
 ```
 
@@ -439,6 +439,40 @@ stay failures to fix). The operation has `kind: "keep"`; once `done` the convers
 a transcript-only note (cached text reused, no summary, no speaker labels or voiceprints), it leaves
 `/v1/issues` and the failed counts, and its detail carries `resolution`. Nothing is deleted. If the
 attempt fails for another reason, that failure is listed as usual. The decision is permanent.
+
+### Value and the owner's choice (`value_notes`)
+
+Every list and search entry carries `value`; the detail adds `value_reasons` and `highlights`:
+
+```json
+"value": {"assessment": "high", "interaction": "dictation", "recommended": true,
+          "highlight": "The weekend plan",
+          "user": {"state": "auto", "revision": 0, "set_at": null}},
+"value_reasons": ["A plan worth keeping"],
+"highlights": [{"title": "The weekend plan", "why": "What was decided",
+                "target": {"first_segment": 3, "last_segment": 5, "start_at": "…", "end_at": "…",
+                           "timing": "coarse"}}]
+```
+
+- `assessment` comes from this conversation's own summary (prompt v3, the same LLM call; it adds
+  output tokens): `high`, `normal`, `low`, `unknown`; `legacy` for summaries made before it existed
+  (never re-run to fill it in), `pending` / `failed` while the summary is missing. `recommended` is
+  `assessment == "high"`. `interaction` (`conversation`, `dictation`, `reflection`, `call`, `media`,
+  `mixed`, `unknown`) is a hint for the detail, not a verdict about who took part.
+- Nothing is hidden or moved by the assessment. `user` is the owner's explicit choice (`important`,
+  `less_useful`, or `auto`), which always wins.
+- A highlight's `target` exists only when its segment indices are valid for the transcript the
+  summary was made from; `timing: coarse` means the times are transcription windows (not
+  word-aligned). Map `start_at` to a playable offset with the recording's `timemap`; time inside a
+  gap or missing audio means opening the transcript instead.
+
+### `PUT /v1/conversations/{id}/priority`
+
+Body `{"state": "important" | "less_useful" | "auto", "request_id": "…", "set_at": "<ISO time of the
+owner's choice>"}` → `{"state", "revision", "set_at", "applied"}`. A repeated `request_id` answers
+the current state; a choice older than the stored one (`set_at`) is not applied (`applied: false`)
+and the newer stands. Stored in the vault (`<conversation dir>/priority.json`). `404` unknown,
+`409` still recording, `422` bad body, `503` read-only.
 
 ### `GET /v1/conversations/{id}/recording`
 

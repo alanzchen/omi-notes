@@ -148,7 +148,7 @@ def _duration_text(seconds: float) -> str:
 
 def frontmatter(d: NoteData) -> dict:
     notes = d.notes if d.status != "transcript_only" else None
-    items = notes.action_items if notes else []
+    items = [i for i in notes.action_items if not i.directed_at_ai] if notes else []
     words = sum(len(s["text"].split()) for s in d.segments)
     labels = sorted({s["speaker"] for s in d.segments}, key=lambda x: (int(x[1:]) if x[1:].isdigit() else 10**6, x))
     speakers: int | list[str] = len(labels)
@@ -259,9 +259,10 @@ def render_note(d: NoteData, my_notes: str | None = None) -> str:
             out += ["## Key Points", ""]
             for section in notes.sections:
                 out += [f"### {section.heading}", *[f"- {b}" for b in section.bullets], ""]
-        if notes.action_items:
+        owned = [i for i in notes.action_items if not i.directed_at_ai]
+        if owned:
             out += ["## Action Items", ""]
-            for item in notes.action_items:
+            for item in owned:
                 line = f"- [ ] {item.description}"
                 owner = owner_display(item, d.owner_name)
                 if owner:
@@ -272,6 +273,9 @@ def render_note(d: NoteData, my_notes: str | None = None) -> str:
                 if item.context:
                     out.append(f"    - {item.context}")
             out.append("")
+        asked = [i for i in notes.action_items if i.directed_at_ai]
+        if asked:  # dictated to an assistant: kept for reference, not the owner's tasks
+            out += ["## Asked of an Assistant", "", *[f"- {i.description}" for i in asked], ""]
         for heading, values in (("Decisions", notes.decisions), ("Open Questions", notes.open_questions)):
             if values:
                 out += [f"## {heading}", "", *[f"- {v}" for v in values], ""]

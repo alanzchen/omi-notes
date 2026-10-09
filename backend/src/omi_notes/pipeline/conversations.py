@@ -880,7 +880,7 @@ class ConversationPipeline:
         index = {
             "kind": kind,
             "emoji": notes.emoji if notes else "",
-            "action_items": [_action_text(i, snap["owner_name"]) for i in notes.action_items] if notes else [],
+            "action_items": [_action_text(i, snap["owner_name"]) for i in notes.action_items if not i.directed_at_ai] if notes else [],
             "llm_model": llm_cached["model"] if llm_cached else None,
             "llm_usage": llm_cached.get("usage", {}) if llm_cached else {},
             "stt_seconds": transcript.get("submitted_seconds", 0),

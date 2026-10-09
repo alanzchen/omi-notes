@@ -25,6 +25,12 @@ CATEGORIES = (
 
 Owner = Literal["me", "other", "unknown"]
 
+# What kind of recording it seems to be (a hint, never a verdict about who took part).
+INTERACTIONS = ("conversation", "dictation", "reflection", "call", "media", "mixed", "unknown")
+# How worth revisiting it is for the owner, as judged from this conversation alone.
+VALUE_LEVELS = ("high", "normal", "low", "unknown")
+MAX_HIGHLIGHTS = 3
+
 
 class Section(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -44,6 +50,8 @@ class ActionItem(BaseModel):
     owner_name: str | None = None
     due_date: date | None = None
     context: str | None = None
+    # an instruction or draft addressed to an AI assistant, not something the owner committed to
+    directed_at_ai: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -60,6 +68,8 @@ class ActionItem(BaseModel):
             data["owner"] = "other"
         else:
             data["owner"] = "unknown"
+        if not isinstance(data.get("directed_at_ai", False), bool):
+            data["directed_at_ai"] = False
         due = data.get("due_date")
         if due is not None:
             try:
@@ -67,6 +77,41 @@ class ActionItem(BaseModel):
             except ValueError:
                 data["due_date"] = None
         return data
+
+
+class Value(BaseModel):
+    """Personal informational value (prompt v3+). Absent on older summaries: "legacy", not low."""
+
+    model_config = ConfigDict(extra="ignore")
+    level: str = "unknown"
+    reasons: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return {"level": "unknown"}
+        data = dict(data)
+        level = data.get("level")
+        data["level"] = level.strip().lower() if isinstance(level, str) and level.strip().lower() in VALUE_LEVELS else "unknown"
+        reasons = data.get("reasons")
+        data["reasons"] = [r.strip() for r in reasons if isinstance(r, str) and r.strip()][:2] if isinstance(reasons, list) else []
+        return data
+
+
+class Highlight(BaseModel):
+    """A span worth revisiting, grounded in transcript segments (indices as numbered in the prompt)."""
+
+    model_config = ConfigDict(extra="ignore")
+    title: str = Field(min_length=1)
+    why: str = ""
+    first_segment: int | None = None
+    last_segment: int | None = None
+
+    @field_validator("first_segment", "last_segment", mode="before")
+    @classmethod
+    def _index(cls, value: Any) -> Any:
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 class CalendarEvent(BaseModel):
@@ -92,6 +137,7 @@ _ELEMENT_MODELS: dict[str, type[BaseModel]] = {
     "action_items": ActionItem,
     "events": CalendarEvent,
     "people": Person,
+    "highlights": Highlight,
 }
 _STRING_LISTS = ("decisions", "open_questions", "memorable_facts", "tags")
 
@@ -114,6 +160,10 @@ class ConversationNotes(BaseModel):
     memorable_facts: list[str] = Field(default_factory=list)
     speaker_names: dict[str, str] = Field(default_factory=dict)
     tags: list[str] = Field(default_factory=list)
+    # prompt v3+: None on older summaries (shown as legacy, never guessed)
+    interaction: str | None = None
+    value: Value | None = None
+    highlights: list[Highlight] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -145,6 +195,12 @@ class ConversationNotes(BaseModel):
             values = data.get(key)
             data[key] = [v.strip() for v in values if isinstance(v, str) and v.strip()] if isinstance(values, list) else []
         data["memorable_facts"] = data["memorable_facts"][:3]
+        if "highlights" in data:
+            data["highlights"] = data["highlights"][:MAX_HIGHLIGHTS]
+        interaction = data.get("interaction")
+        if interaction is not None:
+            interaction = interaction.strip().lower() if isinstance(interaction, str) else "unknown"
+            data["interaction"] = interaction if interaction in INTERACTIONS else "unknown"
         names = data.get("speaker_names")
         mapping: dict[str, str] = {}
         if isinstance(names, dict):
@@ -205,6 +261,7 @@ NOTES_JSON_SCHEMA: dict = _obj(
                     "owner_name": _nullable(_STR),
                     "due_date": _nullable({"type": "string", "description": "YYYY-MM-DD"}),
                     "context": _nullable(_STR),
+                    "directed_at_ai": {"type": "boolean"},
                 }
             ),
         },
@@ -224,5 +281,12 @@ NOTES_JSON_SCHEMA: dict = _obj(
         "memorable_facts": _STR_LIST,
         "speaker_names": {"type": "array", "items": _obj({"label": _STR, "name": _STR})},
         "tags": _STR_LIST,
+        "interaction": {"type": "string", "enum": list(INTERACTIONS)},
+        "value": _obj({"level": {"type": "string", "enum": list(VALUE_LEVELS)}, "reasons": _STR_LIST}),
+        "highlights": {
+            "type": "array",
+            "items": _obj({"title": _STR, "why": _STR, "first_segment": {"type": "integer"},
+                           "last_segment": {"type": "integer"}}),  # fmt: skip
+        },
     }
 )

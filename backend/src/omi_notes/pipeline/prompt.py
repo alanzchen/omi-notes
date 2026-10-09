@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-PROMPT_VERSION = 2
+PROMPT_VERSION = 3
 
 LANGUAGE_NAMES = {
     "en": "English", "de": "German", "es": "Spanish", "fr": "French", "it": "Italian",
@@ -84,6 +84,26 @@ DECISIONS, OPEN QUESTIONS, EVENTS, PEOPLE
   later (preferences, plans, relationships). Empty if none.
 - tags: up to 5 short lowercase topic tags.
 
+ACTION ITEMS ADDRESSED TO AN AI
+- When the owner dictates to or instructs an AI assistant, a draft or an instruction for that assistant ("write an
+  email saying...", "make this shorter") is not a commitment of the owner. Still list it when useful, with
+  directed_at_ai=true. Real commitments between people in the same recording keep directed_at_ai=false.
+
+INTERACTION, VALUE AND HIGHLIGHTS (judge this conversation alone; never guess about others)
+- interaction: what this recording seems to be: "conversation" (people talking with each other), "dictation" (the
+  owner speaking notes, a message or instructions, including to an AI assistant), "reflection" (thinking aloud),
+  "call" (one side of a phone or earbud call), "media" (TV, a video or a podcast playing), "mixed", or "unknown".
+  A single voice, long replies or unknown speakers do not by themselves mean media or noise.
+- value.level: how worth revisiting this is for the owner later. "high" for a meaningful moment, decision, plan,
+  insight, a personal or social experience, or valuable dictation or reflection; "normal" for ordinary but readable
+  content; "low" for little worth rereading; "unknown" when you can't tell. A conversation between people is not
+  automatically valuable, and a solo recording is not automatically worthless. value.reasons: at most two short
+  plain phrases saying why (no scores).
+- highlights: at most 3 spans the owner would most want to revisit, only when value is "high" or a span clearly
+  stands out; otherwise an empty list. title: at most 8 words; why: one short phrase. first_segment/last_segment:
+  the numbers (#N) of the transcript lines the span starts and ends on. Keep related lines in one highlight rather
+  than many small ones.
+
 DENSITY
 Follow the density guidance in the request. It is a flexible guide, not a quota: prefer one or two substantial
 bullets per section, and remove minor details if the note grows much beyond the target."""
@@ -106,8 +126,9 @@ def offset_label(seconds: float) -> str:
 
 
 def transcript_lines(segments: list[dict], start: float) -> list[str]:
-    """`[mm:ss S2] text` lines, offsets relative to the conversation start."""
-    return [f"[{offset_label(seg['start'] - start)} {seg['speaker']}] {seg['text']}" for seg in segments]
+    """`#N [mm:ss S2] text` lines (N: the segment's index, which highlights cite), offsets relative to
+    the conversation start."""
+    return [f"#{i} [{offset_label(seg['start'] - start)} {seg['speaker']}] {seg['text']}" for i, seg in enumerate(segments)]
 
 
 def build_user_message(

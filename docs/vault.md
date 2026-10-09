@@ -45,6 +45,11 @@ first "keep unknown" of a voice raises it to 4 (`speakers.json` label states may
 `source: "unknown"`); an older backend refuses a newer vault instead of rewriting records without
 that state.
 
+`<conversation dir>/priority.json` `{format, state: important|less_useful|auto, set_at, revision,
+request_id, requests}` is the owner's explicit choice for a conversation (`PUT …/priority`): read on
+demand, never derived, never overwritten by a re-summary, untouched by rebuilds and re-renders. It
+changes nothing else (note, path, keep/discard, statistics). Older backends ignore the file.
+
 No lock files, temp files, logs, or caches that aren't referenced results live in the vault.
 
 ## Index (operational only)

@@ -17,7 +17,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.requests import ClientDisconnect
 
-from . import PROTOCOL_VERSION, __version__, operations, recording, search, views
+from . import PROTOCOL_VERSION, __version__, operations, priority, recording, search, views
 from .envelope import MAX_BODY_BYTES
 from .ingest import ApiError, Ingest, capture_status
 from .lock import api_lock
@@ -181,7 +181,7 @@ def create_app(
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes
-            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "search", "stats"],
+            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats"],
             "vault_id": vault.vault_id,
         }
 
@@ -271,6 +271,16 @@ def create_app(
         """The playable audio as 16 kHz mono WAV, with byte ranges (the phone streams and seeks)."""
         path = await run_in_threadpool(recording.wav_file, app.state.speakers.pipeline, conv_id)
         return FileResponse(path, media_type="audio/wav")
+
+    @app.put("/v1/conversations/{conv_id}/priority")
+    async def put_priority(conv_id: str, request: Request) -> dict:
+        """The owner's explicit choice: important, less_useful, or auto (docs: capture-format-v1.md)."""
+        body = await read_json(request)
+        if not isinstance(body, dict):
+            raise ApiError(422, "invalid_body", "expected a JSON object")
+        if read_only_reason(db):
+            raise ApiError(503, "vault_read_only", read_only_reason(db))
+        return await run_in_threadpool(priority.put, app.state.speakers.pipeline, conv_id, body)
 
     @app.post("/v1/conversations/{conv_id}/retry")
     async def retry(conv_id: str, request: Request) -> JSONResponse:
