@@ -108,7 +108,7 @@ public final class AppModel {
     public func finishOnboarding() { engine.settings.onboarded = true }
 
     public func health(now: Date = Date()) -> SystemHealth {
-        SystemHealth.evaluate(snapshot: snapshot, server: server, status: serverStatus, statusAt: serverStatusAt, now: now)
+        SystemHealth.evaluate(snapshot: snapshot, server: server, status: serverStatus, statusAt: serverStatusAt, now: now, issues: issues)
     }
 
     // MARK: Server

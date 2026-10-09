@@ -349,6 +349,8 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
     public var supportsConversationDetail: Bool { features?.contains("conversation_detail") == true }
     public var supportsIssues: Bool { features?.contains("issues") == true }
     public var supportsRetry: Bool { features?.contains("retry") == true }
+    /// `POST /v1/conversations/{id}/keep` (keep a no-speaker result as a transcript).
+    public var supportsKeep: Bool { features?.contains("keep") == true }
     public var supportsSearch: Bool { features?.contains("search") == true }
     public var supportsStats: Bool { features?.contains("stats") == true }
 }

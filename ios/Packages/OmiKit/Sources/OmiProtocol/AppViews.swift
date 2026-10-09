@@ -82,6 +82,26 @@ public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
     public var transcriptState: String
     public var speakers: [Speaker]
     public var transcript: Transcript?
+    /// How the owner resolved it from the phone, with the condition it resolved (kept as history).
+    public var resolution: Resolution?
+
+    /// `resolution`: e.g. kept as a transcript with the speaker unknown.
+    public struct Resolution: Codable, Equatable, Sendable {
+        public struct Original: Codable, Equatable, Sendable {
+            public var code: String?
+            public var stage: String?
+            public var message: String?
+        }
+        public var kind: String
+        public var resolvedAt: String?
+        public var message: String?
+        public var original: Original?
+
+        enum CodingKeys: String, CodingKey {
+            case kind, message, original
+            case resolvedAt = "resolved_at"
+        }
+    }
 
     public var id: String { entry.id }
 
@@ -100,7 +120,7 @@ public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
         case summaryError = "summary_error"
         case summary
         case transcriptState = "transcript_state"
-        case speakers, transcript
+        case speakers, transcript, resolution
     }
 
     public init(from decoder: Decoder) throws {
@@ -122,6 +142,7 @@ public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
         transcriptState = try c.decodeIfPresent(String.self, forKey: .transcriptState) ?? "unavailable"
         speakers = try c.decodeIfPresent([Speaker].self, forKey: .speakers) ?? []
         transcript = try c.decodeIfPresent(Transcript.self, forKey: .transcript)
+        resolution = try? c.decodeIfPresent(Resolution.self, forKey: .resolution)
     }
 
     /// The same flat shape the server sends (so a saved copy decodes like a fresh one).
@@ -144,6 +165,7 @@ public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
         try c.encode(transcriptState, forKey: .transcriptState)
         try c.encode(speakers, forKey: .speakers)
         try c.encodeIfPresent(transcript, forKey: .transcript)
+        try c.encodeIfPresent(resolution, forKey: .resolution)
     }
 
     /// Everything the server has is loaded (a saved copy may hold only the first transcript pages).
@@ -155,7 +177,8 @@ public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
     }
 
     public static func anonymous(_ label: String) -> String {
-        label.hasPrefix("S") && Int(label.dropFirst()) != nil ? "Speaker \(label.dropFirst())" : label
+        if label == "unknown" { return "Speaker unknown" }  // no speaker was separated
+        return label.hasPrefix("S") && Int(label.dropFirst()) != nil ? "Speaker \(label.dropFirst())" : label
     }
 
     /// Appends the next transcript page (ignored unless it continues this one).
@@ -184,10 +207,13 @@ public struct ServerIssue: Decodable, Equatable, Sendable, Identifiable, Hashabl
     public var serverStep: String?
     /// False when a retry from the phone can't help until the server changes; missing means true.
     public var retryable: Bool?
+    /// The phone can keep it as is (a no-speaker result kept as a transcript); missing means false.
+    public var canKeep: Bool?
 
     public var id: String { "\(code):\(conversationId ?? "")" }
     public var needsAction: Bool { severity != "delayed" }
     public var canRetryFromPhone: Bool { retryable != false }
+    public var canKeepFromPhone: Bool { canKeep == true }
     /// Plain guidance for the main screens; an older server's command-bearing step is left to Diagnostics.
     public var phoneStep: String? { nextStep.flatMap { $0.contains("`") ? nil : $0 } }
     /// What the server's operator does (Diagnostics).
@@ -195,6 +221,7 @@ public struct ServerIssue: Decodable, Equatable, Sendable, Identifiable, Hashabl
 
     enum CodingKeys: String, CodingKey {
         case code, severity, message, detail, count, title, retryable
+        case canKeep = "can_keep"
         case serverStep = "server_step"
         case nextStep = "next_step"
         case conversationId = "conversation_id"
@@ -206,7 +233,7 @@ public struct ServerIssuesResponse: Decodable, Equatable, Sendable {
     public var issues: [ServerIssue]
 }
 
-/// A durable app retry (`POST /v1/conversations/{id}/retry`, `GET /v1/operations/{id}`).
+/// A durable app retry or keep (`POST /v1/conversations/{id}/retry` or `/keep`, `GET /v1/operations/{id}`).
 public struct RetryOperation: Codable, Equatable, Sendable, Identifiable {
     public var id: String
     public var kind: String?
@@ -224,7 +251,7 @@ public struct RetryOperation: Codable, Equatable, Sendable, Identifiable {
     public var displayMessage: String {
         switch state {
         case "accepted", "queued": return "Queued on the server"
-        case "running": return "Retrying now"
+        case "running": return kind == "keep" ? "Keeping it now" : "Retrying now"
         default: return message ?? state
         }
     }

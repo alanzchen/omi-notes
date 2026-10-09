@@ -50,10 +50,14 @@ public struct SystemHealth: Equatable, Sendable {
     /// A server answer older than this is shown as unknown.
     public static let staleAfter: TimeInterval = 5 * 60
 
+    /// `issues`: the server's issue list, which tells a no-speaker result the phone can keep apart
+    /// from a failure someone must fix.
     public static func evaluate(
-        snapshot s: EngineSnapshot, server: ServerReachability, status: ServerStatus?, statusAt: Date?, now: Date
+        snapshot s: EngineSnapshot, server: ServerReachability, status: ServerStatus?, statusAt: Date?, now: Date,
+        issues: [ServerIssue] = []
     ) -> SystemHealth {
-        let steps = [pendant(s), phone(s, server: server), self.server(server, status: status, statusAt: statusAt, now: now),
+        let steps = [pendant(s), phone(s, server: server),
+                     self.server(server, status: status, statusAt: statusAt, now: now, issues: issues),
                      notes(status, statusAt: statusAt, now: now)]
         let worst = steps.map(\.level).max() ?? .unknown
         let lead = steps.first { $0.level == worst }!
@@ -140,7 +144,8 @@ public struct SystemHealth: Equatable, Sendable {
         return step(.normal, "No files waiting to upload")
     }
 
-    static func server(_ reach: ServerReachability, status: ServerStatus?, statusAt: Date?, now: Date) -> Step {
+    static func server(_ reach: ServerReachability, status: ServerStatus?, statusAt: Date?, now: Date,
+                       issues: [ServerIssue] = []) -> Step {
         func step(_ level: Level, _ title: String, _ detail: String? = nil, _ fix: Fix? = nil) -> Step {
             Step(area: .server, level: level, title: title, detail: detail, fix: fix)
         }
@@ -173,10 +178,16 @@ public struct SystemHealth: Equatable, Sendable {
         }
         let failed = (q?.conversationsFailed).map { $0 + (q?.chunksFailed ?? 0) } ?? q?.failed ?? 0
         let conflicts = q?.notesConflicted ?? 0
-        if failed + conflicts > 0 {
-            let n = failed + conflicts
+        // a no-speaker result is incomplete, not broken: the phone can keep it as a transcript
+        let keepable = min(failed, issues.filter { $0.code == "conversation_failed" && $0.canKeepFromPhone }.count)
+        if failed + conflicts - keepable > 0 {
+            let n = failed + conflicts - keepable
             return step(.needsAction, "\(n) item\(n == 1 ? "" : "s") couldn't be finished on the server",
                         "The server keeps the audio. See Server for what happened.", .openServer)
+        }
+        if keepable > 0 {
+            return step(.delayed, "\(keepable) recording\(keepable == 1 ? " has" : "s have") no separable speaker",
+                        "You can keep \(keepable == 1 ? "it" : "them") as a transcript on the Server page.", .openServer)
         }
         if let retrying = q?.conversationsRetrying, retrying > 0 {
             let a = status.activity

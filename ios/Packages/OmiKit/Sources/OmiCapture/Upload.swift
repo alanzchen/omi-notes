@@ -651,6 +651,13 @@ public struct APIClient: Sendable {
         return r.operation
     }
 
+    /// Keep a no-speaker result as a transcript with the speaker unknown; answered like `retry`.
+    public func keep(conversationId: String, requestId: String) async throws -> RetryOperation {
+        let body = try JSONSerialization.data(withJSONObject: ["request_id": requestId])
+        let r: RetryOperationResponse = try await send("POST", "/v1/conversations/\(Self.queryValue(conversationId))/keep", body: body)
+        return r.operation
+    }
+
     public func operation(_ id: String) async throws -> RetryOperation {
         let r: RetryOperationResponse = try await get("/v1/operations/\(Self.queryValue(id))")
         return r.operation

@@ -95,9 +95,10 @@ public struct PendantSummary: Equatable, Sendable {
     }
 
     public static func evaluate(
-        snapshot s: EngineSnapshot, server: ServerReachability, status: ServerStatus?, statusAt: Date?, now: Date
+        snapshot s: EngineSnapshot, server: ServerReachability, status: ServerStatus?, statusAt: Date?, now: Date,
+        issues: [ServerIssue] = []
     ) -> PendantSummary {
-        let health = SystemHealth.evaluate(snapshot: s, server: server, status: status, statusAt: statusAt, now: now)
+        let health = SystemHealth.evaluate(snapshot: s, server: server, status: status, statusAt: statusAt, now: now, issues: issues)
         let pendant = health.steps.first { $0.area == .pendant }!
         let phone = health.steps.first { $0.area == .phone }!
         // Both merely delayed: the phone leads (audio not reaching the server matters more than, say, a

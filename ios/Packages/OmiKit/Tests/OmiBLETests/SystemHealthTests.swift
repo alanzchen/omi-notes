@@ -87,6 +87,23 @@ import Testing
         #expect(conflict.headline == "1 item couldn't be finished on the server")
     }
 
+    @Test func aNoSpeakerResultIsNotCriticalAndGenuineFailuresStillAre() throws {
+        func issue(_ id: String, keep: Bool) throws -> ServerIssue {
+            try JSONDecoder().decode(ServerIssue.self, from: Data(#"{"code":"conversation_failed","severity":"action","message":"m","can_keep":\#(keep),"conversation_id":"\#(id)"}"#.utf8))
+        }
+        let st = try status(["conversations_failed": 1, "failed": 1])
+        let kept = SystemHealth.evaluate(snapshot: streaming(), server: reachable(), status: st, statusAt: now.addingTimeInterval(-10), now: now,
+                                         issues: [try issue("c1", keep: true)])
+        #expect(kept.level == .delayed && kept.headline == "1 recording has no separable speaker")
+        #expect(step(kept, .server).fix == .openServer)
+        let mixed = SystemHealth.evaluate(snapshot: streaming(), server: reachable(), status: try status(["conversations_failed": 2]),
+                                          statusAt: now.addingTimeInterval(-10), now: now, issues: [try issue("c1", keep: true), try issue("c2", keep: false)])
+        #expect(mixed.level == .needsAction && mixed.headline == "1 item couldn't be finished on the server")
+        // once kept, the server's counts are zero: nothing left to show
+        let after = SystemHealth.evaluate(snapshot: streaming(), server: reachable(), status: try status(), statusAt: now.addingTimeInterval(-10), now: now)
+        #expect(after.level == .normal)
+    }
+
     @Test func olderServersFallBackToTheLegacyFailedSum() throws {
         let json = #"{"queue":{"chunks_pending":0,"conversations_open":0,"conversations_pending":0,"failed":1}}"#
         let st = try JSONDecoder().decode(ServerStatus.self, from: Data(json.utf8))

@@ -32,13 +32,7 @@ struct ConversationDetailView: View {
                 }
             }
             if let detail {
-                if detail.entry.status == "failed", model.canRetry, model.detailSavedAt[summary.id] == nil {
-                    Section {
-                        RetryControl(model: model, conversationId: detail.id)
-                    } footer: {
-                        Text("Redoes the step that failed. If a service's key or account is the problem, fix that on the server first.")
-                    }
-                }
+                if detail.entry.status == "failed", model.detailSavedAt[summary.id] == nil { fixSection(detail) }
                 caveats(detail)
                 summarySection(detail)
                 if let s = detail.summary { details(s) }
@@ -46,6 +40,7 @@ struct ConversationDetailView: View {
                 obsidianSection(detail)
                 speakersSection(detail)
                 transcriptSection(detail)
+                historySection(detail)
             } else if error == nil {
                 Section { HStack { ProgressView(); Text("Loading…").foregroundStyle(.secondary).padding(.leading, 6) } }
             }
@@ -81,6 +76,57 @@ struct ConversationDetailView: View {
                 }
             }
             .accessibilityElement(children: .combine)
+        }
+    }
+
+    /// What the phone can do about a failure: keep a no-speaker result, or retry (never a retry the
+    /// server says can't help).
+    @ViewBuilder private func fixSection(_ d: ConversationDetail) -> some View {
+        let issue = model.issues.first { $0.code == "conversation_failed" && $0.conversationId == d.id }
+        if model.canKeep, issue?.canKeepFromPhone == true {
+            Section {
+                if let issue { Text(issue.message).font(.subheadline) }
+                RetryControl(model: model, conversationId: d.id, action: .keep)
+            } footer: {
+                Text([speechLine(d), "Keeping it makes a transcript note with the speaker unknown; the audio stays on the server."]
+                    .compactMap { $0 }.joined(separator: " "))
+            }
+        } else if model.canRetry, issue?.canRetryFromPhone != false {
+            Section {
+                RetryControl(model: model, conversationId: d.id)
+            } footer: {
+                Text("Redoes the step that failed. If a service's key or account is the problem, fix that on the server first.")
+            }
+        }
+    }
+
+    /// Detected speech and the recording's length are different figures: say both.
+    private func speechLine(_ d: ConversationDetail) -> String? {
+        guard let speech = d.speechS, let length = d.entry.duration else { return nil }
+        func secs(_ v: Double) -> String { v < 10 ? String(format: "%.1f s", v) : (Fmt.duration(v) ?? "\(Int(v)) s") }
+        return "Detected speech: \(secs(speech)) in a \(secs(length)) recording."
+    }
+
+    /// How it was resolved from the phone, and what it was before (kept for good on the server).
+    @ViewBuilder private func historySection(_ d: ConversationDetail) -> some View {
+        if let r = d.resolution {
+            Section("History") {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(r.message ?? "Resolved from the phone.", systemImage: "checkmark.circle")
+                    if let at = r.resolvedAt.flatMap(ISO8601UTC.parse) {
+                        Text("\(Fmt.day(at)), \(Fmt.time(at))").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .accessibilityElement(children: .combine)
+                if let original = r.original?.message {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Before").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                        Text(original).font(.subheadline)
+                    }
+                    .accessibilityElement(children: .combine)
+                }
+                if let line = speechLine(d) { Text(line).font(.caption).foregroundStyle(.secondary) }
+            }
         }
     }
 
@@ -163,7 +209,9 @@ struct ConversationDetailView: View {
         case "pending": return d.entry.status == "open" ? "The conversation is still going. The summary comes a few minutes after it ends." : "The summary is being written."
         case "disabled": return "Summaries are turned off on your server. The transcript is below."
         case "failed": return (d.summaryError ?? "The summary couldn't be written.") + " The transcript is below."
-        case "not_applicable": return d.discardReason.map { "Skipped: \($0)" } ?? "This conversation was skipped."
+        case "not_applicable":
+            if d.resolution != nil { return "No summary: it was kept as a transcript because no speaker could be separated." }
+            return d.discardReason.map { "Skipped: \($0)" } ?? "This conversation was skipped."
         case "updating": return "The server is reprocessing this conversation. Pull to refresh in a minute."
         default: return "The summary isn't available right now."
         }
@@ -232,7 +280,7 @@ struct ConversationDetailView: View {
             } header: {
                 Text("Speakers")
             } footer: {
-                if d.speakers.contains(where: { $0.name == nil }) {
+                if d.entry.canReviewSpeakers, d.speakers.contains(where: { $0.name == nil && $0.label != "unknown" }) {
                     Text("Naming a speaker teaches the server their voice for future conversations.")
                 }
             }

@@ -65,12 +65,15 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         #"{"operation":{"id":"\#(id)","kind":"retry","conversation_id":"conv-1","stage":"summarizing","state":"\#(state)"}}"#
     }
 
-    func model() throws -> (AppModel, URL) {
-        AppServerStub.reset()
-        AppServerStub.routes["/v1/status"] = [(200, Self.status)]
-        AppServerStub.routes["/v1/issues"] = [(200, #"{"issues":[]}"#)]
-        AppServerStub.routes["/v1/conversations/recent"] = [(200, #"{"conversations":[],"next_cursor":null}"#)]
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    /// `root`: reuse an earlier model's files (an app relaunch), keeping the stub's routes.
+    func model(root existing: URL? = nil) throws -> (AppModel, URL) {
+        if existing == nil {
+            AppServerStub.reset()
+            AppServerStub.routes["/v1/status"] = [(200, Self.status)]
+            AppServerStub.routes["/v1/issues"] = [(200, #"{"issues":[]}"#)]
+            AppServerStub.routes["/v1/conversations/recent"] = [(200, #"{"conversations":[],"next_cursor":null}"#)]
+        }
+        let root = existing ?? FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let settings = SettingsStore(defaults: UserDefaults(suiteName: "omi-retry-\(UUID().uuidString)")!, tokens: InMemoryTokenStore())
         try settings.setServer(url: URL(string: "https://mac.ts.net")!, token: "tok")
         let engine = OmiEngine(config: EngineConfiguration(dirs: CaptureDirectories(root: root), appVersion: "t", useCoreBluetooth: false),
@@ -104,6 +107,61 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         // tapping again while it is unsettled reuses the id too
         await m.retry(conversationId: "conv-1")
         #expect(Set(sentRequestIds()).count == 1)
+    }
+
+    static let keepStatus = status.replacingOccurrences(of: #""retry","#, with: #""retry","keep","#)
+    static func keepJSON(_ id: String, _ state: String) -> String {
+        #"{"operation":{"id":"\#(id)","kind":"keep","conversation_id":"conv-1","stage":"transcribing","state":"\#(state)"}}"#
+    }
+    static let noSpeakerIssue = #"{"issues":[{"code":"conversation_failed","severity":"action","message":"m","retryable":false,"can_keep":true,"conversation_id":"conv-1"}]}"#
+
+    func sentKeeps() -> [String] {
+        AppServerStub.requests.filter { $0.path.hasSuffix("/keep") }
+            .compactMap { (try? JSONSerialization.jsonObject(with: $0.body)) as? [String: String] }.compactMap { $0["request_id"] }
+    }
+
+    @Test func aKeepSurvivesARelaunchAndIsSentOnceToKeep() async throws {
+        let (m, root) = try model()
+        AppServerStub.routes["/v1/status"] = [(200, Self.keepStatus)]
+        AppServerStub.routes["/v1/issues"] = [(200, Self.noSpeakerIssue)]
+        await m.refreshServer()
+        #expect(m.canKeep && m.issues.first?.canKeepFromPhone == true)
+        AppServerStub.routes["/v1/conversations/conv-1/keep"] = [(502, #"{"error":"bad_gateway"}"#), (202, Self.keepJSON("k-1", "queued"))]
+        await m.keep(conversationId: "conv-1")
+        #expect(m.retries["conv-1"] == nil && m.retryMessages["conv-1"]?.contains("asks again") == true)
+
+        // the app is relaunched before the answer: the saved request goes to /keep with the same id
+        let (relaunched, _) = try model(root: root)
+        await relaunched.refreshServer()
+        #expect(relaunched.retries["conv-1"]?.kind == "keep" && relaunched.retries["conv-1"]?.state == "queued")
+        let ids = sentKeeps()
+        #expect(ids.count == 2 && ids[0] == ids[1] && sentRequestIds().isEmpty)  // never sent as a retry
+
+        // done on the server: the failure leaves the issues and the failed count after a reload
+        AppServerStub.routes["/v1/operations/k-1"] = [(200, Self.keepJSON("k-1", "done"))]
+        AppServerStub.routes["/v1/issues"] = [(200, #"{"issues":[]}"#)]
+        AppServerStub.routes["/v1/status"] = [(200, Self.keepStatus.replacingOccurrences(of: #""failed":1"#, with: #""failed":0,"conversations_failed":0"#))]
+        await relaunched.refreshServer()
+        #expect(relaunched.retries["conv-1"]?.state == "done" && relaunched.issues.isEmpty)
+        #expect(relaunched.serverStatus?.queue?.conversationsFailed == 0)
+        #expect(RetryStore(url: root.appendingPathComponent("app-retries.json")).entries(server: "https://mac.ts.net|vault-a").isEmpty)
+        #expect(Set(sentKeeps()).count == 1)
+    }
+
+    @Test func aRefusedKeepSaysWhyAndIsNotRepeated() async throws {
+        let (m, root) = try model()
+        AppServerStub.routes["/v1/status"] = [(200, Self.keepStatus)]
+        await m.refreshServer()
+        AppServerStub.routes["/v1/conversations/conv-1/keep"] = [(409, #"{"error":"not_keepable","detail":"only a no-speaker result"}"#)]
+        await m.keep(conversationId: "conv-1")
+        #expect(m.retryMessages["conv-1"] == "This one can't be kept as it is; it needs a fix on the server.")
+        #expect(RetryStore(url: root.appendingPathComponent("app-retries.json")).entries(server: "https://mac.ts.net|vault-a").isEmpty)
+    }
+
+    @Test func anOlderServerOffersNoKeep() async throws {
+        let (m, _) = try model()
+        await m.refreshServer()
+        #expect(m.canRetry && !m.canKeep)
     }
 
     @Test func aQuickResultShowsWithoutWaitingForTheNextRefresh() async throws {

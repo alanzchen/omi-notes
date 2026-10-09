@@ -30,7 +30,7 @@ struct PendantView: View {
         if let name = Self.debugState, let fixture = PendantSummary.debugFixture(name, now: now) { return (fixture, true) }
         #endif
         return (PendantSummary.evaluate(snapshot: model.snapshot, server: model.server, status: model.serverStatus,
-                                        statusAt: model.serverStatusAt, now: now), false)
+                                        statusAt: model.serverStatusAt, now: now, issues: model.issues), false)
     }
 
     var body: some View {

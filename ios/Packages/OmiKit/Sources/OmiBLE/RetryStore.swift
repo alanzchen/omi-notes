@@ -2,7 +2,8 @@ import Foundation
 import OmiCapture
 import OmiProtocol
 
-/// Retries this phone asked a server for (capture-format-v1.md, "POST /v1/conversations/{id}/retry").
+/// Retries and keeps this phone asked a server for (capture-format-v1.md, "POST /v1/conversations/{id}/retry"
+/// and "/keep"); at most one unsettled request per conversation.
 ///
 /// An entry is written durably (atomic write + full fsync) *before* the request is sent and kept
 /// until the server's answer settles it, so a lost response, a timeout or a 5xx is retried with the
@@ -14,6 +15,8 @@ public final class RetryStore: @unchecked Sendable {
         public var conversationId: String
         public var server: String
         public var createdAt: Date
+        /// `keep`, or nil for a retry (entries saved before keeps existed are retries).
+        public var kind: String?
         /// The last answer, once there was one.
         public var operation: RetryOperation?
     }
@@ -60,13 +63,14 @@ public final class RetryStore: @unchecked Sendable {
     }
 
     /// The entry to send for this conversation: the unsettled one if any, else a new one, saved first.
-    public func begin(conversationId: String, server: String, now: Date = Date()) throws -> Entry {
+    public func begin(conversationId: String, server: String, kind: String? = nil, now: Date = Date()) throws -> Entry {
         lock.lock(); defer { lock.unlock() }
         if unreadable { throw StoreError.unreadable }
         if let existing = entries.first(where: { $0.conversationId == conversationId && $0.server == server }) {
             return existing
         }
-        let entry = Entry(requestId: UUID().uuidString.lowercased(), conversationId: conversationId, server: server, createdAt: now)
+        let entry = Entry(requestId: UUID().uuidString.lowercased(), conversationId: conversationId, server: server,
+                          createdAt: now, kind: kind)
         try persist(entries + [entry])
         return entry
     }

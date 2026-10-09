@@ -194,8 +194,12 @@ struct IssueRow: View {
             .font(.subheadline)
             if let detail = issue.detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
             if let step = issue.phoneStep { Text(step).font(.caption).foregroundStyle(.secondary) }
-            if issue.code == "conversation_failed", let id = issue.conversationId, model.canRetry, issue.canRetryFromPhone {
-                RetryControl(model: model, conversationId: id)
+            if issue.code == "conversation_failed", let id = issue.conversationId {
+                if model.canKeep, issue.canKeepFromPhone {
+                    RetryControl(model: model, conversationId: id, action: .keep)
+                } else if model.canRetry, issue.canRetryFromPhone {
+                    RetryControl(model: model, conversationId: id)
+                }
             }
             if issue.code == "chunks_failed", model.canRetry {
                 Button("Try these audio files again") { Task { await model.retryFailedAudio() } }
@@ -265,11 +269,16 @@ struct ServiceCallsRow: View {
     }
 }
 
-/// Retry a failed conversation, and follow the retry until the server says how it ended.
+/// Retry a failed conversation (or keep a no-speaker result as it is), and follow the request
+/// until the server says how it ended.
 struct RetryControl: View {
+    enum Action { case retry, keep }
+
     let model: AppModel
     let conversationId: String
+    var action: Action = .retry
     @State private var sending = false
+    @State private var confirming = false
 
     private var op: RetryOperation? { model.retries[conversationId] }
 
@@ -281,17 +290,33 @@ struct RetryControl: View {
                     Text(op.displayMessage).font(.caption).foregroundStyle(.secondary)
                 }
             } else {
-                Button(sending ? "Retrying…" : "Retry") {
-                    sending = true
-                    Task {
-                        await model.retry(conversationId: conversationId)
-                        sending = false
-                    }
+                Button(title) {
+                    if action == .keep { confirming = true } else { send() }
                 }
                 .buttonStyle(.bordered).controlSize(.small).disabled(sending)
                 if let op, op.isFinished { Text(op.displayMessage).font(.caption).foregroundStyle(op.state == "done" ? .green : .orange) }
             }
             if let msg = model.retryMessages[conversationId] { Text(msg).font(.caption).foregroundStyle(.secondary) }
+        }
+        .confirmationDialog("Keep as a transcript?", isPresented: $confirming, titleVisibility: .visible) {
+            Button("Keep as Transcript") { send() }
+        } message: {
+            Text("The automated text becomes a note with the speaker unknown, and this leaves the server's list of problems. Nothing is deleted.")
+        }
+    }
+
+    private var title: String {
+        switch action {
+        case .retry: return sending ? "Retrying…" : "Retry"
+        case .keep: return sending ? "Keeping…" : "Keep as transcript"
+        }
+    }
+
+    private func send() {
+        sending = true
+        Task {
+            if action == .keep { await model.keep(conversationId: conversationId) } else { await model.retry(conversationId: conversationId) }
+            sending = false
         }
     }
 }

@@ -154,6 +154,7 @@ struct StateChip: View {
         case "transcript_only": return "Transcript only"
         case "failed": return "Failed"
         case "discarded": return "Skipped"
+        case "kept_speaker_unknown": return "Transcript only"
         case "ready": return "Ready"
         default: return state.code.replacingOccurrences(of: "_", with: " ").capitalized
         }
@@ -164,7 +165,7 @@ struct StateChip: View {
         case "listening", "processing": return .blue
         case "retrying", "transcript_only": return .orange
         case "failed": return .red
-        case "discarded": return .gray
+        case "discarded", "kept_speaker_unknown": return .gray
         default: return .green
         }
     }

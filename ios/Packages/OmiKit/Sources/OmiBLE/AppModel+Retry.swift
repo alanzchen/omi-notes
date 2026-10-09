@@ -2,7 +2,8 @@ import Foundation
 import OmiCapture
 import OmiProtocol
 
-/// Retrying failed work from the phone (capture-format-v1.md, "POST /v1/conversations/{id}/retry").
+/// Retrying failed work from the phone, or keeping a no-speaker result as it is
+/// (capture-format-v1.md, "POST /v1/conversations/{id}/retry" and "/keep").
 extension AppModel {
     /// The retry store's key for the current server, once its vault is known.
     var retryServerKey: String? {
@@ -11,18 +12,34 @@ extension AppModel {
     }
 
     public var canRetry: Bool { serverStatus?.supportsRetry == true && retryServerKey != nil }
+    public var canKeep: Bool { serverStatus?.supportsKeep == true && retryServerKey != nil }
 
     /// Ask the server to redo a failed conversation's failed stage. The request id is saved before
     /// sending and reused until the server answers, so tapping again after a timeout never starts
     /// a second retry.
     public func retry(conversationId: String) async {
+        await request(conversationId: conversationId, kind: nil)
+    }
+
+    /// Keep a conversation whose speakers couldn't be separated as a transcript with the speaker
+    /// unknown. Durable and idempotent like a retry; the server records the decision for good.
+    public func keep(conversationId: String) async {
+        await request(conversationId: conversationId, kind: "keep")
+    }
+
+    private func request(conversationId: String, kind: String?) async {
         let config = engine.settings.serverConfig()
         guard let endpoint = config.endpoint, config == answeredForConfig, let key = retryServerKey else { return }
         let entry: RetryStore.Entry
         do {
-            entry = try retryStore.begin(conversationId: conversationId, server: key)
+            entry = try retryStore.begin(conversationId: conversationId, server: key, kind: kind)
         } catch {
             retryMessages[conversationId] = (error as? LocalizedError)?.errorDescription ?? "Couldn't save the request on this phone: \(Self.describe(error))"
+            return
+        }
+        guard entry.kind == kind else {
+            // one request per conversation at a time: never send a second one beside it
+            retryMessages[conversationId] = "An earlier request for this conversation is still waiting for the server."
             return
         }
         retryMessages[conversationId] = nil
@@ -51,7 +68,9 @@ extension AppModel {
         func current() -> Bool { isCurrent(config) && data == dataEpoch }
         guard current() else { return }  // never send a retry meant for a previous server or vault
         do {
-            let op = try await api.retry(conversationId: entry.conversationId, requestId: entry.requestId)
+            let op = entry.kind == "keep"
+                ? try await api.keep(conversationId: entry.conversationId, requestId: entry.requestId)
+                : try await api.retry(conversationId: entry.conversationId, requestId: entry.requestId)
             guard current() else { return }
             retryStore.record(op, for: entry.requestId)
             retries[entry.conversationId] = op
@@ -67,7 +86,8 @@ extension AppModel {
         } catch {
             // No answer, or the server failed: keep the id and ask again on the next refresh.
             guard current() else { return }
-            retryMessages[entry.conversationId] = "Couldn't confirm the retry yet (\(Self.describe(error))). The app asks again automatically."
+            let what = entry.kind == "keep" ? "request" : "retry"
+            retryMessages[entry.conversationId] = "Couldn't confirm the \(what) yet (\(Self.describe(error))). The app asks again automatically."
         }
     }
 
@@ -117,6 +137,7 @@ extension AppModel {
         case "note_frozen": return "The note is frozen on the server, so it can't be updated."
         case "note_conflict": return "The note was edited outside My Notes. Resolve that on the server first."
         case "busy": return "The server is working on this conversation right now. Try again in a moment."
+        case "not_keepable": return "This one can't be kept as it is; it needs a fix on the server."
         default: return "The server refused the retry (\(detail))."
         }
     }
