@@ -177,3 +177,66 @@ def test_naming_does_not_queue_a_summary(env):
         worker.tick(10**10 + t)
     assert worker.providers._llm.calls == calls  # names re-render the note from cache; no new summary
     assert get(client, "/v1/status")["features"].count("name_voice") == 1
+
+
+# -- regressions found in acceptance (coordinator's reproducers, adopted as they were) -------------
+
+
+def test_undo_restores_original_confirmed_voice_samples(env):
+    settings, client, worker = env
+    row = talk(client, worker, dialogue(ALAN, PRIYA))
+    me = new_person(client, "Alan", me=True)
+    client.put("/v1/speakers/settings", json={"acknowledged_at": "2026-09-27T10:00:00Z"}, headers=AUTH)
+    priya = new_person(client, "Priya", attest_knows=True)
+    assert name_label(client, row["id"], "S2", priya).json()["sample"] == "created"
+    before = {r["id"] for r in worker.db.query("SELECT id FROM samples WHERE person_id=?", (priya,))}
+    assert before
+    rid = str(uuid.uuid4())
+    assert name_label(client, row["id"], "S2", me, request_id=rid).status_code == 200
+    response = client.post("/v1/speakers/undo", json={"request_id": rid, "undo_request_id": str(uuid.uuid4())}, headers=AUTH)
+    assert response.status_code == 200
+    after = {r["id"] for r in worker.db.query("SELECT id FROM samples WHERE person_id=?", (priya,))}
+    assert after == before, "Undo reports success but drops original confirmed voice samples"
+    assert labels(client, row["id"])["S2"]["person_id"] == priya
+
+
+def test_clip_without_overlapping_words_does_not_quote_other_audio():
+    service = object.__new__(SpeakerService)
+    transcript = {"timemap": [[0, 1000, 100]],
+                  "segments": [{"speaker": "S1", "start": 1050, "end": 1060, "text": "Words from a different moment"}]}  # fmt: skip
+    clips = service._clip_list("fixture", transcript, "S1", [[0, 10]])
+    assert clips[0]["text"] == "", "No overlapping words: do not silently substitute a different moment"
+
+
+def test_undo_never_brings_back_a_forgotten_voice(env):
+    settings, client, worker = env
+    row = talk(client, worker, dialogue(ALAN, PRIYA))
+    me = new_person(client, "Alan", me=True)
+    client.put("/v1/speakers/settings", json={"acknowledged_at": "2026-09-27T10:00:00Z"}, headers=AUTH)
+    priya = new_person(client, "Priya", attest_knows=True)
+    name_label(client, row["id"], "S2", priya)
+    rid = str(uuid.uuid4())
+    name_label(client, row["id"], "S2", me, request_id=rid)
+    assert client.delete(f"/v1/people/{priya}", headers=AUTH).status_code == 200  # forgotten meanwhile
+    r = client.post("/v1/speakers/undo", json={"request_id": rid, "undo_request_id": "u-forgot"}, headers=AUTH).json()
+    assert r["undone"] == [] and r["skipped"] == [row["id"]]  # nothing partial: the later decision stands
+    assert not worker.db.query("SELECT 1 FROM samples WHERE person_id=?", (priya,))
+    folder = worker.pipeline.speakers.person_dir(priya)
+    assert not folder.exists() or not any(folder.rglob("*.json"))  # nothing withdrawn was kept behind
+    assert labels(client, row["id"])["S2"]["person_id"] == me
+
+
+def test_withdrawn_voiceprints_are_kept_only_for_a_bounded_time(env):
+    settings, client, worker = env
+    row = talk(client, worker, dialogue(ALAN, PRIYA))
+    me = new_person(client, "Alan", me=True)
+    client.put("/v1/speakers/settings", json={"acknowledged_at": "2026-09-27T10:00:00Z"}, headers=AUTH)
+    priya = new_person(client, "Priya", attest_knows=True)
+    name_label(client, row["id"], "S2", priya)
+    rid = str(uuid.uuid4())
+    name_label(client, row["id"], "S2", me, request_id=rid)
+    store = worker.pipeline.speakers
+    assert store.purge_withdrawn(now=10**12) >= 1  # past the undo window: deleted for good
+    r = client.post("/v1/speakers/undo", json={"request_id": rid, "undo_request_id": "u-late"}, headers=AUTH).json()
+    assert r["undone"] == [] and r["skipped"] == [row["id"]]  # no partial undo without the voiceprints
+    assert labels(client, row["id"])["S2"]["person_id"] == me

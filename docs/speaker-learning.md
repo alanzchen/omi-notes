@@ -127,15 +127,20 @@ later). Unknown embeddings are pruned with raw retention.
 ## Naming from the phone
 
 - Every clip comes with the transcript text it overlaps (phrase level: segments have no word
-  timing, so the phone shows the phrase without highlighting), never the label's first sentence.
+  timing, so the phone shows the phrase without highlighting); a clip nothing overlaps has empty
+  text, never another moment's sentence.
 - A suggestion carries the conversation its representative clip is from, up to 3 clips there, one
   clip from another day when a member has one (`other_day`), and its `scope`: every conversation
   naming it would change, which the phone confirms before assigning.
 - Every label change records what it changed (`before`/`after` in the request entry of
   `speakers.json`). `POST /v1/speakers/undo` puts back exactly that, label by label, only where the
   change still stands (a later decision is left alone and reported as skipped); voiceprints that
-  request created are removed, the person and their other confirmations stay. A voiceprint an
-  assignment took away from a previously named person cannot be restored by undo.
+  request created are removed, the person and their other confirmations stay. Taking a label from
+  a previously named person withdraws the voiceprints it gave them to
+  `<person folder>/withdrawn/<request hash>/` (inside the person's folder, so forgetting them
+  deletes these too) for 24 hours; undo puts them back. A label is undone all or nothing: if that
+  person was forgotten or the withdrawn voiceprints are past the window, it is reported as
+  skipped and nothing changes.
 - Naming re-renders notes from cache; it never queues a new summary (that stays the explicit
   "Re-summarize with names").
 

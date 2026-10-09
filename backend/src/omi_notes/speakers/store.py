@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import time
@@ -29,7 +30,7 @@ import yaml
 from ..db import Database
 from ..lock import SpeakerLock
 from ..notes.writer import remove, sanitize_title, write_if_changed
-from ..spool import atomic_write_bytes, fsync_dir
+from ..spool import atomic_write_bytes, fsync_dir, make_dirs_durable
 from ..util import canonical_json, sha256_hex
 from ..vault import Vault
 from .match import Operating, Sample, build_models
@@ -323,6 +324,70 @@ class SpeakerStore:
                 n += 1
             self.db.execute("DELETE FROM samples WHERE id=?", (sid,))
         return n
+
+    # A label taken back from a named person withdraws the voiceprints that naming gave them: kept
+    # (inside the person's folder, so forgetting them deletes these too) only long enough for an
+    # undo, then deleted for good.
+    WITHDRAWN_SECONDS = 24 * 3600
+
+    def _withdrawn_dir(self, person_id: str, request_id: str) -> Path:
+        return self.person_dir(person_id) / "withdrawn" / hashlib.sha256(request_id.encode()).hexdigest()[:16]
+
+    def withdraw_samples(self, person_id: str, sample_ids: list[str], request_id: str, now: float | None = None) -> list[str]:
+        """Take these samples out of use for an undo window; the ids actually withdrawn."""
+        folder = self._withdrawn_dir(person_id, request_id)
+        moved = []
+        for sid in sample_ids:
+            src = self.person_dir(person_id) / "samples" / f"{sid}.json"
+            if src.exists():
+                make_dirs_durable(folder)
+                os.replace(src, folder / src.name)
+                fsync_dir(folder)
+                fsync_dir(src.parent)
+                moved.append(sid)
+            elif (folder / f"{sid}.json").exists():
+                moved.append(sid)  # a retry after a crash: already withdrawn
+            self.db.execute("DELETE FROM samples WHERE id=?", (sid,))
+        if moved:
+            Vault.write_json(folder / "withdrawn.json", {"request_id": request_id, "at": time.time() if now is None else now})
+        return moved
+
+    def can_restore(self, person_id: str, sample_ids: list[str], request_id: str) -> bool:
+        """Every one of these withdrawn samples is still kept (and the person still exists)."""
+        if self.person(person_id) is None:
+            return False
+        folder = self._withdrawn_dir(person_id, request_id)
+        live = self.person_dir(person_id) / "samples"
+        return all((folder / f"{sid}.json").exists() or (live / f"{sid}.json").exists() for sid in sample_ids)
+
+    def restore_samples(self, person_id: str, sample_ids: list[str], request_id: str) -> None:
+        """Put withdrawn samples back in use (call after `can_restore`); idempotent."""
+        folder = self._withdrawn_dir(person_id, request_id)
+        live = self.person_dir(person_id) / "samples"
+        make_dirs_durable(live)
+        for sid in sample_ids:
+            src = folder / f"{sid}.json"
+            if src.exists():
+                os.replace(src, live / src.name)
+            data = Vault.read_json(live / f"{sid}.json")
+            if data and data.get("vector_b64"):
+                self._index_sample(data)
+        fsync_dir(live)
+        if folder.exists():
+            shutil.rmtree(folder)
+            fsync_dir(folder.parent)
+
+    def purge_withdrawn(self, now: float | None = None) -> int:
+        """Delete withdrawn voiceprints past the undo window; how many sets went."""
+        now = time.time() if now is None else now
+        gone = 0
+        for marker in sorted(self.vault.people.glob("*/withdrawn/*/withdrawn.json")) if self.vault.people.exists() else []:
+            at = (Vault.read_json(marker) or {}).get("at")
+            if not isinstance(at, (int, float)) or now - at > self.WITHDRAWN_SECONDS:
+                shutil.rmtree(marker.parent)
+                fsync_dir(marker.parent.parent)
+                gone += 1
+        return gone
 
     def sample_for_request(self, request_id: str):
         return self.db.one("SELECT * FROM samples WHERE request_id=?", (request_id,))

@@ -174,7 +174,7 @@ class SpeakerService:
 
     def _clip_list(self, conv_id: str, transcript: dict, label: str, spans: list) -> list[dict]:
         """Each playable clip with the transcript text it overlaps (phrase level: the transcript has
-        no word timing to align with, so nothing is highlighted), never another sentence's."""
+        no word timing to align with, so nothing is highlighted); "" when nothing overlaps it."""
         timemap = transcript.get("timemap") or []
 
         def wall(t: float) -> float:
@@ -189,11 +189,8 @@ class SpeakerService:
         for i, (a, b) in enumerate(spans):
             b = min(b, a + MAX_CLIP_SECONDS)
             lo, hi = wall(a), wall(b)
-            hits = [seg["text"] for seg in segments if seg["start"] < hi and seg["end"] > lo]
-            if not hits and segments:  # coarse timing (text-only STT windows): the nearest of this voice
-                mid = (lo + hi) / 2
-                hits = [min(segments, key=lambda seg: abs((seg["start"] + seg["end"]) / 2 - mid))["text"]]
-            text = " ".join(hits)
+            # only what overlaps the clip; no overlap means no text, never a sentence from another moment
+            text = " ".join(seg["text"] for seg in segments if seg["start"] < hi and seg["end"] > lo)
             out.append({"id": f"{conv_id}.{label}.{i}", "seconds": round(b - a, 2), "started_at": iso_utc_epoch(lo),
                         "text": text[:CLIP_TEXT_CHARS] + ("…" if len(text) > CLIP_TEXT_CHARS else "")})  # fmt: skip
         return out
@@ -252,12 +249,13 @@ class SpeakerService:
                 state |= {"person_id": None, "source": None}
             state["not"] = sorted(blocked)
             previous = before.get("person_id")
-            removed = 0
+            withdrawn: dict = {}
             if previous and previous != state.get("person_id"):
                 # the user took this label back from `previous`: so are the voiceprints it gave them,
                 # the ones the state lists (they moved with it across re-transcriptions) — never by
-                # the label number, which may have belonged to another assignment then
-                removed = self.store.remove_sample_ids(previous, before.get("samples") or [])
+                # the label number, which may have belonged to another assignment then. Withdrawn,
+                # not deleted, for an undo window (`SpeakerStore.withdraw_samples`).
+                withdrawn = {"person_id": previous, "samples": sorted(before.get("samples") or [])}
                 state["samples"] = []
             if sample_id:
                 state["samples"] = sorted(set(state.get("samples") or []) | {sample_id})
@@ -266,7 +264,11 @@ class SpeakerService:
             change = {"before": self.store.persisted({label: before}).get(label),
                       "after": self.store.persisted({label: state}).get(label)}  # fmt: skip
             revision = self.store.write_labels(conv_id, states, request=(request_id, {
-                "label": label, "person_id": person_id, "sample": sample, "keep_unknown": keep_unknown} | change))  # fmt: skip
+                "label": label, "person_id": person_id, "sample": sample, "keep_unknown": keep_unknown,
+                "withdrawn": withdrawn or None} | change))  # fmt: skip
+            # after the record that names them, so a crash in between leaves them in use, never lost
+            removed = len(self.store.withdraw_samples(withdrawn["person_id"], withdrawn["samples"], request_id)) if withdrawn else 0
+            self.store.purge_withdrawn()
             if row["note_path"]:
                 self.pipeline._set(conv_id, needs_render=1, next_attempt_at=None)
             # people's voices changed (a sample added or taken back): every assignment is re-run
@@ -456,7 +458,10 @@ class SpeakerService:
     def undo(self, body: dict) -> dict:
         """Put back what one naming request (a label, or every label of a suggestion) changed, label
         by label, only where that change still stands; voiceprints it created are removed, the
-        person and their other confirmations stay. Repeating the same undo answers the same."""
+        ones it withdrew from a previously named person are put back, and the person and their
+        other confirmations stay. Each label is all or nothing: one whose earlier person was
+        forgotten, or whose withdrawn voiceprints are gone, is skipped unchanged. Repeating the same
+        undo answers the same."""
         request_id, undo_id = body.get("request_id"), body.get("undo_request_id")
         for value, what in ((request_id, "request_id"), (undo_id, "undo_request_id")):
             if not isinstance(value, str) or not value or len(value) > 100:
@@ -485,11 +490,18 @@ class SpeakerService:
                         skipped.add(conv_id)  # changed since: the later decision stands
                         continue
                     before = dict(rec["before"] or {})
+                    withdrawn = rec.get("withdrawn") or {}
+                    if before.get("person_id") and self.store.person(before["person_id"]) is None:
+                        skipped.add(conv_id)  # that person was forgotten since: never brought back
+                        continue
+                    if withdrawn.get("samples") and not self.store.can_restore(withdrawn["person_id"], withdrawn["samples"], key):
+                        skipped.add(conv_id)  # their voiceprints are gone (forgotten, or past the window): no partial undo
+                        continue
                     created = set((after.get("samples") or [])) - set(before.get("samples") or [])
                     if created and after.get("person_id"):
                         self.store.remove_sample_ids(after["person_id"], sorted(created))
-                    existing = {r["id"] for r in self.db.query("SELECT id FROM samples")}
-                    before["samples"] = [x for x in before.get("samples") or [] if x in existing]
+                    if withdrawn.get("samples"):
+                        self.store.restore_samples(withdrawn["person_id"], withdrawn["samples"], key)
                     states[label] = before
                     self.store.write_labels(conv_id, states, request=(done_key, {"label": label, "undo_of": key}))
                     row = self.db.one("SELECT note_path FROM conversations WHERE id=?", (conv_id,))
