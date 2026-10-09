@@ -14,6 +14,8 @@ struct ConversationDetailView: View {
     @State private var loadingMore = false
     @State private var showTranscript = false
     @State private var obsidianMessage: String?
+    @State private var naming: ConversationSpeakersView.NamingRun?
+    @State private var namingMessage: String?
     @Environment(\.dynamicTypeSize) private var typeSize
 
     private var detail: ConversationDetail? { model.details[summary.id] }
@@ -56,6 +58,9 @@ struct ConversationDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         // Also after coming back from the speakers screen: names may have changed.
         .onAppear { Task { await load() } }
+        .fullScreenCover(item: $naming, onDismiss: { Task { await load() } }) { run in
+            NameVoiceView(model: model, items: run.items)
+        }
         .refreshable { await load() }
     }
 
@@ -272,9 +277,14 @@ struct ConversationDetailView: View {
                 if !d.speakers.isEmpty {
                     Text(d.speakers.map { $0.name ?? ConversationDetail.anonymous($0.label) }.joined(separator: ", "))
                 }
+                if d.entry.canReviewSpeakers, model.speakers.serverSupportsNameVoice,
+                   d.speakers.contains(where: { $0.name == nil && $0.label != "unknown" }) {
+                    Button { Task { await startNaming(d) } } label: { Label("Name voices", systemImage: "person.wave.2") }
+                    if let namingMessage { Text(namingMessage).font(.footnote).foregroundStyle(.secondary) }
+                }
                 if d.entry.canReviewSpeakers {
                     NavigationLink("Fix speaker names") {
-                        ConversationSpeakersView(model: model, conversationId: d.id, title: d.entry.title ?? "Speakers")
+                        ConversationSpeakersView(model: model, conversationId: d.id, title: d.entry.title ?? "Speakers", startedAt: d.entry.startedAt)
                     }
                 }
             } header: {
@@ -329,6 +339,19 @@ struct ConversationDetailView: View {
         case "pending": return d.entry.status == "open" ? "The transcript is made once the conversation ends." : "Transcribing…"
         case "updating": return "The server is reprocessing this conversation. Pull to refresh in a minute."
         default: return "The transcript isn't available right now."
+        }
+    }
+
+    /// The unnamed voices of this conversation, one at a time.
+    private func startNaming(_ d: ConversationDetail) async {
+        if model.speakers.settings == nil || model.speakers.people.isEmpty { await model.speakers.refresh() }
+        do {
+            let speakers = try await model.speakers.speakers(conversationId: d.id)
+            let items = VoiceItem.unnamed(speakers, in: ConversationContext(id: d.id, startedAt: d.entry.startedAt, title: d.entry.title))
+            namingMessage = items.isEmpty ? "Every voice here has a name or was kept unknown." : nil
+            if !items.isEmpty { naming = .init(items: items) }
+        } catch {
+            namingMessage = "Couldn't load the speakers: \(AppModel.describe(error))"
         }
     }
 

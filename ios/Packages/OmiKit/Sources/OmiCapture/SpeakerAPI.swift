@@ -44,6 +44,20 @@ extension APIClient {
                           body: try Self.snakeEncoder.encode(Body(personId: personId, requestId: requestId)))
     }
 
+    /// Keeps the suggested voice unknown in every conversation it covers, for good.
+    public func keepUnknownSuggestion(_ id: String, requestId: String) async throws -> [String] {
+        struct Body: Encodable { var requestId: String }
+        struct Answer: Decodable { var conversations: [String] }
+        let r: Answer = try await json("POST", "/v1/speakers/suggestions/\(id)/keep-unknown", body: Body(requestId: requestId))
+        return r.conversations
+    }
+
+    /// Puts back what one naming request changed, where it still stands.
+    public func undoNaming(requestId: String, undoRequestId: String) async throws -> UndoNamingResponse {
+        struct Body: Encodable { var requestId: String; var undoRequestId: String }
+        return try await json("POST", "/v1/speakers/undo", body: Body(requestId: requestId, undoRequestId: undoRequestId))
+    }
+
     public func dismissSuggestion(_ id: String) async throws {
         _ = try await raw("POST", "/v1/speakers/suggestions/\(id)/dismiss")
     }

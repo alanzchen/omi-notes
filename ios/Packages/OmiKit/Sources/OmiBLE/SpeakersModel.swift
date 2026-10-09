@@ -36,6 +36,8 @@ public final class SpeakersModel {
     public private(set) var loading = false
     /// nil until the server's status was read.
     public private(set) var serverSupportsEnrollment: Bool?
+    /// The server supports the "Name this voice" flow (clip text, scope, keep unknown, undo).
+    public private(set) var serverSupportsNameVoice = false
     public var enrollment: Enrollment = .idle
 
     private let engine: OmiEngine
@@ -72,6 +74,7 @@ public final class SpeakersModel {
         suggestions = []
         error = nil
         serverSupportsEnrollment = nil
+        serverSupportsNameVoice = false
         switch enrollment {
         case .idle: break
         case .checking, .reading: cancelEnrollment()
@@ -98,9 +101,10 @@ public final class SpeakersModel {
         // First and on its own: an older server fails the calls below, and must not keep the
         // capability of the server that answered last time.
         serverSupportsEnrollment = nil
-        let supports = try? await api.status().supportsVoiceEnrollment
+        let status = try? await api.status()
         guard current() else { return }
-        serverSupportsEnrollment = supports
+        serverSupportsEnrollment = status?.supportsVoiceEnrollment
+        serverSupportsNameVoice = status?.supportsNameVoice == true
         do {
             async let p = api.people()
             async let s = api.speakerSettings()
@@ -175,6 +179,38 @@ public final class SpeakersModel {
         } catch {
             self.error = Self.describe(error)
         }
+    }
+
+    // MARK: Name this voice (errors are thrown to the flow, which shows them in place)
+
+    /// Names every voice of a suggestion; `requestId` is what an undo refers to.
+    public func assignSuggestion(_ suggestion: SpeakerSuggestion, personId: String, requestId: String) async throws {
+        try await api().assignSuggestion(suggestion.id, personId: personId, requestId: requestId)
+        suggestions.removeAll { $0.id == suggestion.id }
+    }
+
+    public func keepUnknown(_ suggestion: SpeakerSuggestion, requestId: String) async throws {
+        _ = try await api().keepUnknownSuggestion(suggestion.id, requestId: requestId)
+        suggestions.removeAll { $0.id == suggestion.id }
+    }
+
+    public func assignLabel(conversationId: String, label: String, personId: String?, keepUnknown: Bool = false,
+                            revision: Int, requestId: String) async throws -> ConversationSpeakers {
+        try await api().assignSpeaker(conversationId: conversationId, label: label,
+                                      AssignSpeakerRequest(personId: personId, keepUnknown: keepUnknown ? true : nil,
+                                                           expectedRevision: revision, requestId: requestId))
+    }
+
+    public func undoNaming(requestId: String) async throws -> UndoNamingResponse {
+        try await api().undoNaming(requestId: requestId, undoRequestId: "undo-" + requestId)
+    }
+
+    /// Creates a person and answers it, or throws (the flow shows why).
+    public func addPerson(name: String, me: Bool, attestKnows: Bool) async throws -> Person {
+        let person = try await api().putPerson(id: UUID().uuidString.lowercased(),
+                                               PutPersonRequest(name: name, me: me, attestKnows: attestKnows))
+        people.append(person)
+        return person
     }
 
     public func dismiss(_ suggestion: SpeakerSuggestion) async {

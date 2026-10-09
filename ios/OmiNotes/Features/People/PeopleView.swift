@@ -9,6 +9,7 @@ struct PeopleView: View {
     @State private var showConsent = false
     @State private var forgetting: Person?
     @State private var naming: SpeakerSuggestion?
+    @State private var run: ConversationSpeakersView.NamingRun?
     @State private var player = ClipPlayer()
 
     private var speakers: SpeakersModel { model.speakers }
@@ -32,6 +33,9 @@ struct PeopleView: View {
         .sheet(isPresented: $showConsent) { RecognitionConsentView(model: model) }
         .sheet(item: $naming) { suggestion in
             SuggestionPickerView(model: model, suggestion: suggestion)
+        }
+        .fullScreenCover(item: $run, onDismiss: { Task { await speakers.refresh() } }) { r in
+            NameVoiceView(model: model, items: r.items)
         }
         .confirmationDialog(
             "Forget \(forgetting?.name ?? "")'s voice?", isPresented: .init(get: { forgetting != nil }, set: { if !$0 { forgetting = nil } }),
@@ -88,7 +92,27 @@ struct PeopleView: View {
             if speakers.suggestions.isEmpty {
                 Text("No recurring unknown voices yet.").font(.subheadline).foregroundStyle(.secondary)
             }
+            if speakers.serverSupportsNameVoice, !speakers.suggestions.isEmpty {
+                Button { run = .init(items: speakers.suggestions.map(VoiceItem.init(suggestion:))) } label: {
+                    Label("Name \(speakers.suggestions.count) voice\(speakers.suggestions.count == 1 ? "" : "s")", systemImage: "person.wave.2")
+                        .font(.body.weight(.medium))
+                }
+            }
             ForEach(speakers.suggestions) { s in
+                if speakers.serverSupportsNameVoice {
+                    Button {
+                        // this one first, then the rest
+                        run = .init(items: ([s] + speakers.suggestions.filter { $0.id != s.id }).map(VoiceItem.init(suggestion:)))
+                    } label: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(title(s)).font(.body.weight(.medium)).foregroundStyle(.primary)
+                            if let text = s.clips?.first?.text ?? s.excerpt {
+                                Text("“\(text)”").font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
+                            }
+                            Text("\(s.conversations ?? 0) conversations · \(s.days ?? 0) days").font(.caption2).foregroundStyle(.tertiary)
+                        }
+                    }
+                } else {
                 HStack(alignment: .top, spacing: 12) {
                     PlayButton(clipId: s.clipId, player: player, speakers: speakers)
                     VStack(alignment: .leading, spacing: 4) {
@@ -101,6 +125,7 @@ struct PeopleView: View {
                         }
                         .font(.subheadline)
                     }
+                }
                 }
             }
         } header: {

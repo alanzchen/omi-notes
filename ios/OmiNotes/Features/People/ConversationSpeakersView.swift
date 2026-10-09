@@ -14,21 +14,44 @@ struct ConversationSpeakersView: View {
     @State private var editing: SpeakerLabel?
     @State private var info: String?
     @State private var player = ClipPlayer()
+    @State private var naming: NamingRun?
+    var startedAt: String?
+
+    /// The voices a "Name this voice" run covers.
+    struct NamingRun: Identifiable {
+        let id = UUID()
+        let items: [VoiceItem]
+    }
 
     private var speakers: SpeakersModel { model.speakers }
+    private var context: ConversationContext { ConversationContext(id: conversationId, startedAt: startedAt, title: title) }
 
     var body: some View {
         List {
             if let data {
+                if speakers.serverSupportsNameVoice, !VoiceItem.unnamed(data, in: context).isEmpty {
+                    Section {
+                        let n = VoiceItem.unnamed(data, in: context).count
+                        Button { naming = NamingRun(items: VoiceItem.unnamed(data, in: context)) } label: {
+                            Label("Name \(n) voice\(n == 1 ? "" : "s")", systemImage: "person.wave.2")
+                        }
+                    }
+                }
                 Section {
                     ForEach(data.labels) { label in
-                        Button { editing = label } label: { row(label) }
+                        Button {
+                            if speakers.serverSupportsNameVoice {
+                                naming = NamingRun(items: [VoiceItem(label: label, in: context)])
+                            } else {
+                                editing = label
+                            }
+                        } label: { row(label) }
                             .buttonStyle(.plain)
                     }
                 } footer: {
                     Text(data.audioAvailable == false
                          ? "The audio for this conversation has expired; names can still be corrected."
-                         : "Naming someone teaches the server their voice. Automatic names show an “auto” badge.")
+                         : "Naming someone teaches the server their voice. Names the server recognized show “Recognized”.")
                 }
                 Section {
                     Button("Re-summarize with names") {
@@ -61,6 +84,9 @@ struct ConversationSpeakersView: View {
             }
         }
         .onDisappear { player.stop() }
+        .fullScreenCover(item: $naming, onDismiss: { Task { await load() } }) { run in
+            NameVoiceView(model: model, items: run.items)
+        }
     }
 
     private func row(_ label: SpeakerLabel) -> some View {
@@ -68,30 +94,20 @@ struct ConversationSpeakersView: View {
             PlayButton(clipId: label.clipId, player: player, speakers: speakers)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
-                    Text(label.name ?? "Speaker \(label.label.dropFirst())").font(.body.weight(.medium))
+                    Text(label.name ?? (label.keptUnknown == true ? "Unknown" : ConversationDetail.anonymous(label.label)))
+                        .font(.body.weight(.medium))
                     if label.isAuto {
-                        Text("auto").font(.caption2.weight(.semibold)).padding(.horizontal, 5).padding(.vertical, 1)
+                        Text("Recognized").font(.caption2.weight(.semibold)).padding(.horizontal, 5).padding(.vertical, 1)
                             .background(.blue.opacity(0.15), in: .capsule)
                     }
                     Spacer()
-                    Text(label.label).font(.caption).foregroundStyle(.tertiary)
                 }
-                if let excerpt = label.excerpt {
-                    Text("“\(excerpt)”").font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
-                }
-                if label.isAuto, let d = label.distance {
-                    Text(evidence(label, distance: d)).font(.caption2).foregroundStyle(.tertiary)
+                if let text = label.clips?.first?.text ?? label.excerpt {
+                    Text("“\(text)”").font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
                 }
             }
         }
         .contentShape(Rectangle())
-    }
-
-    private func evidence(_ label: SpeakerLabel, distance: Double) -> String {
-        var parts = [String(format: "distance %.2f", distance)]
-        if let m = label.margin { parts.append(String(format: "margin %.2f", m)) }
-        if let s = label.evidenceS { parts.append(String(format: "%.0f s of speech", s)) }
-        return parts.joined(separator: " · ")
     }
 
     private func load() async {

@@ -53,9 +53,48 @@ public struct SpeakerLabel: Decodable, Identifiable, Equatable, Sendable {
     public var margin: Double?
     public var evidenceS: Double?
     public var clipId: String?
+    /// Every playable clip of this voice with the text it overlaps (servers with `name_voice`).
+    public var clips: [SpeakerClip]?
     public var excerpt: String?
+    /// The owner kept this voice unknown for good.
+    public var keptUnknown: Bool?
     public var id: String { label }
     public var isAuto: Bool { source == "auto" }
+}
+
+/// Where a voice was heard.
+public struct ConversationContext: Decodable, Equatable, Hashable, Sendable {
+    public var id: String
+    public var startedAt: String?
+    public var title: String?
+
+    public init(id: String, startedAt: String? = nil, title: String? = nil) {
+        self.id = id
+        self.startedAt = startedAt
+        self.title = title
+    }
+}
+
+/// One playable clip (`GET /v1/clips/{id}`) and the transcript phrase it overlaps. The text has no
+/// word timing: it is shown as a phrase, never highlighted word by word.
+public struct SpeakerClip: Decodable, Equatable, Hashable, Identifiable, Sendable {
+    public var id: String
+    public var seconds: Double?
+    public var startedAt: String?
+    public var text: String?
+    public var conversationId: String?
+    /// Set for a clip from another conversation (`other_day`).
+    public var conversation: ConversationContext?
+
+    public init(id: String, seconds: Double? = nil, startedAt: String? = nil, text: String? = nil,
+                conversationId: String? = nil, conversation: ConversationContext? = nil) {
+        self.id = id
+        self.seconds = seconds
+        self.startedAt = startedAt
+        self.text = text
+        self.conversationId = conversationId
+        self.conversation = conversation
+    }
 }
 
 public struct ConversationSpeakers: Decodable, Equatable, Sendable {
@@ -69,23 +108,28 @@ public struct AssignSpeakerRequest: Encodable, Sendable {
     /// nil unassigns the label (encoded as an explicit `null`).
     public var personId: String?
     public var notPersonId: String?
+    /// Keep the label unknown for good (with a nil person).
+    public var keepUnknown: Bool?
     public var expectedRevision: Int
     /// Client-minted; the server dedupes sample creation on it.
     public var requestId: String
 
-    public init(personId: String?, notPersonId: String? = nil, expectedRevision: Int, requestId: String = UUID().uuidString.lowercased()) {
+    public init(personId: String?, notPersonId: String? = nil, keepUnknown: Bool? = nil, expectedRevision: Int,
+                requestId: String = UUID().uuidString.lowercased()) {
         self.personId = personId
         self.notPersonId = notPersonId
+        self.keepUnknown = keepUnknown
         self.expectedRevision = expectedRevision
         self.requestId = requestId
     }
 
-    enum CodingKeys: String, CodingKey { case personId, notPersonId, expectedRevision, requestId }
+    enum CodingKeys: String, CodingKey { case personId, notPersonId, keepUnknown, expectedRevision, requestId }
 
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         if let personId { try c.encode(personId, forKey: .personId) } else { try c.encodeNil(forKey: .personId) }
         try c.encodeIfPresent(notPersonId, forKey: .notPersonId)
+        if keepUnknown == true { try c.encode(true, forKey: .keepUnknown) }
         try c.encode(expectedRevision, forKey: .expectedRevision)
         try c.encode(requestId, forKey: .requestId)
     }
@@ -101,6 +145,17 @@ public struct SpeakerSuggestion: Decodable, Identifiable, Equatable, Sendable {
     public var excerpt: String?
     public var conversations: Int?
     public var days: Int?
+    /// The conversation the clips are from, other clips there, one from another day, and every
+    /// conversation naming it would change (servers with `name_voice`).
+    public var conversation: ConversationContext?
+    public var clips: [SpeakerClip]?
+    public var otherDay: SpeakerClip?
+    public var scope: [ConversationContext]?
+}
+
+public struct UndoNamingResponse: Decodable, Equatable, Sendable {
+    public var undone: [String]
+    public var skipped: [String]
 }
 
 public struct SuggestionsResponse: Decodable, Sendable { public var suggestions: [SpeakerSuggestion] }

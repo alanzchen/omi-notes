@@ -351,6 +351,8 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
     public var supportsRetry: Bool { features?.contains("retry") == true }
     /// `POST /v1/conversations/{id}/keep` (keep a no-speaker result as a transcript).
     public var supportsKeep: Bool { features?.contains("keep") == true }
+    /// Clip text, suggestion scope, durable "keep unknown" and undo for naming voices.
+    public var supportsNameVoice: Bool { features?.contains("name_voice") == true }
     public var supportsSearch: Bool { features?.contains("search") == true }
     public var supportsStats: Bool { features?.contains("stats") == true }
 }

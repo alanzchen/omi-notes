@@ -12,6 +12,7 @@ struct HomeView: View {
     private var s: EngineSnapshot { model.snapshot }
     @State private var debugOpened: ConversationSummary?
     @State private var query = HomeView.debugSearch
+    @State private var naming: ConversationSpeakersView.NamingRun?
 
     /// Simulator automation only (debug builds): `-OmiNotesDebugOpenConversation YES` opens the
     /// newest conversation once it has loaded (a headless simulator can't tap).
@@ -54,6 +55,9 @@ struct HomeView: View {
             if Self.debugOpenFirst, debugOpened == nil, id != nil { debugOpened = model.recent.first }
         }
         .navigationDestination(item: $debugOpened) { c in ConversationDetailView(model: model, summary: c) }
+        .fullScreenCover(item: $naming, onDismiss: { Task { await model.speakers.refresh() } }) { r in
+            NameVoiceView(model: model, items: r.items)
+        }
     }
 
     // MARK: Needs you
@@ -73,9 +77,17 @@ struct HomeView: View {
                     Button("Dismiss phone messages") { model.engine.clearAttention() }.font(.subheadline)
                 }
                 if newVoices > 0 {
-                    Button(action: openPeople) {
-                        Label("Improve speaker names: \(newVoices) recurring voice\(newVoices == 1 ? "" : "s") to name",
-                              systemImage: "person.wave.2")
+                    if model.speakers.serverSupportsNameVoice {
+                        Button { naming = .init(items: model.speakers.suggestions.map(VoiceItem.init(suggestion:))) } label: {
+                            VoicesCard(count: newVoices, names: model.speakers.suggestions.map { s in
+                                model.speakers.people.first { $0.id == s.personId }?.name })
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        Button(action: openPeople) {
+                            Label("Improve speaker names: \(newVoices) recurring voice\(newVoices == 1 ? "" : "s") to name",
+                                  systemImage: "person.wave.2")
+                        }
                     }
                 }
             }
@@ -151,7 +163,7 @@ struct ConversationLink: View {
             NavigationLink { ConversationDetailView(model: model, summary: conversation) } label: { ConversationRow(conversation: conversation) }
         } else if conversation.canReviewSpeakers {
             NavigationLink {
-                ConversationSpeakersView(model: model, conversationId: conversation.id, title: conversation.title ?? "Speakers")
+                ConversationSpeakersView(model: model, conversationId: conversation.id, title: conversation.title ?? "Speakers", startedAt: conversation.startedAt)
             } label: { ConversationRow(conversation: conversation) }
         } else {
             ConversationRow(conversation: conversation)
@@ -303,5 +315,36 @@ struct SavedConversationsView: View {
             }
         }
         .navigationTitle("Saved on this phone")
+    }
+}
+
+/// "3 voices to name · About a minute": one calm entry to the naming flow.
+struct VoicesCard: View {
+    let count: Int
+    /// The guessed person of each voice, if any.
+    let names: [String?]
+
+    var body: some View {
+        HStack(spacing: 12) {
+            HStack(spacing: -10) {
+                ForEach(Array(names.prefix(3).enumerated()), id: \.offset) { _, name in
+                    if let name {
+                        Avatar(name: name, size: 30)
+                    } else {
+                        Text("?").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                            .frame(width: 30, height: 30).background(Color(.tertiarySystemFill), in: .circle)
+                    }
+                }
+            }
+            .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(count) voice\(count == 1 ? "" : "s") to name").font(.body.weight(.medium))
+                Text(count <= 3 ? "About a minute" : "A few minutes").font(.subheadline).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
+        }
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
     }
 }
