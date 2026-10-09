@@ -72,13 +72,10 @@ struct PendantView: View {
                 .padding(.bottom, 24)
             }
             .background(Pendant.background.ignoresSafeArea())
-            // The warm canvas is a fixed light design: its text, dividers and controls use the light
-            // scheme so they stay readable in Dark Mode. Pushed pages keep the system's scheme.
-            .environment(\.colorScheme, .light)
+            .foregroundStyle(Pendant.ink)
         }
         .navigationTitle("Pendant")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarColorScheme(.light, for: .navigationBar)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
@@ -98,25 +95,45 @@ struct PendantView: View {
     }
 }
 
-/// Colours of the approved design.
+/// Colours of the approved design: light (approved v4) and its dark counterpart, following the
+/// system appearance. Ring tones are a little brighter in dark so they stay legible on charcoal.
 enum Pendant {
-    static let background = Color(red: 0.957, green: 0.949, blue: 0.933)  // #f4f2ee
-    static let secondary = Color(red: 0.541, green: 0.522, blue: 0.471)   // #8a8578
-    static let card = Color.white.opacity(0.78)
-    static let iconBackground = Color(red: 0.937, green: 0.925, blue: 0.902)  // #efece6
-    static let iconForeground = Color(red: 0.431, green: 0.416, blue: 0.376)  // #6e6a60
-    static let warnBackground = Color(red: 0.984, green: 0.890, blue: 0.800)  // #fbe3cc
-    static let warnForeground = Color(red: 0.706, green: 0.322, blue: 0.055)  // #b4520e
-    static let track = Color(red: 0.894, green: 0.875, blue: 0.839)       // #e4dfd6
-    static let unknownRing = Color(red: 0.827, green: 0.808, blue: 0.769) // #d3cec4
-    static let healthy = Color(red: 0.373, green: 0.620, blue: 0.455)     // #5f9e74
-    static let middle = Color(red: 0.769, green: 0.584, blue: 0.184)      // #c4952f
-    static let low = Color(red: 0.800, green: 0.353, blue: 0.267)         // #cc5a44
-    static let lowText = Color(red: 0.706, green: 0.263, blue: 0.184)     // #b4432f
-    static let indicatorOn = Color(red: 0.235, green: 0.769, blue: 0.420) // #3cc46b
-    static let indicatorOff = Color(red: 0.725, green: 0.706, blue: 0.667) // #b9b4aa
-    static let synthetic = Color(red: 0.627, green: 0.471, blue: 0.290)
-    static let syntheticBackground = Color(red: 0.953, green: 0.902, blue: 0.827)
+    static let background = Color(light: 0xf4f2ee, dark: 0x161513)
+    static let halo = Color(light: 0xece3d1, dark: 0x2a2620)
+    static let ink = Color(light: 0x1c1c1e, dark: 0xf2efe9)
+    static let secondary = Color(light: 0x8a8578, dark: 0x9d988c)
+    static let card = Color(light: 0xffffff, dark: 0x22201d, lightOpacity: 0.78, darkOpacity: 1)
+    static let cardShadow = Color(light: 0x000000, dark: 0x000000, lightOpacity: 0.04, darkOpacity: 0.30)
+    static let divider = Color(light: 0x000000, dark: 0xffffff, lightOpacity: 0.10, darkOpacity: 0.08)
+    static let iconBackground = Color(light: 0xefece6, dark: 0x302d29)
+    static let iconForeground = Color(light: 0x6e6a60, dark: 0xb8b2a6)
+    static let warnBackground = Color(light: 0xfbe3cc, dark: 0x4a2c17)
+    static let warnForeground = Color(light: 0xb4520e, dark: 0xf2a466)
+    static let track = Color(light: 0xe4dfd6, dark: 0x34312c)
+    static let unknownRing = Color(light: 0xd3cec4, dark: 0x57534c)
+    static let healthy = Color(light: 0x5f9e74, dark: 0x6fb487)
+    static let middle = Color(light: 0xc4952f, dark: 0xd8aa47)
+    static let low = Color(light: 0xcc5a44, dark: 0xe06c55)
+    static let lowText = Color(light: 0xb4432f, dark: 0xf08c76)
+    static let indicatorOn = Color(light: 0x3cc46b, dark: 0x45d176)
+    static let indicatorOff = Color(light: 0xb9b4aa, dark: 0x6b675f)
+    static let chevron = Color(light: 0xc7c7cc, dark: 0x5c5850)
+    /// The badge capsule floating on the ring.
+    static let badge = Color(light: 0xffffff, dark: 0x2c2a26, lightOpacity: 0.94, darkOpacity: 0.96)
+    static let badgeBorder = Color(light: 0x000000, dark: 0xffffff, lightOpacity: 0.06, darkOpacity: 0.08)
+    /// The action pill ("Retry"): dark on light, light on dark.
+    static let actionFill = Color(light: 0x1c1c1e, dark: 0xf2efe9)
+    static let actionText = Color(light: 0xffffff, dark: 0x1c1c1e)
+    // Pendant material: warm white ceramic in light, graphite in dark.
+    static let shellHighlight = Color(light: 0xffffff, dark: 0x57544f)
+    static let shellMid = Color(light: 0xf1efea, dark: 0x3a3834)
+    static let shellEdge = Color(light: 0xd9d5cd, dark: 0x22211e)
+    static let faceHighlight = Color(light: 0xfbfaf7, dark: 0x45423e)
+    static let faceMid = Color(light: 0xebe8e1, dark: 0x32302c)
+    static let faceEdge = Color(light: 0xe2ded5, dark: 0x2a2825)
+    static let shellShadow = Color(light: 0x6b5f4a, dark: 0x000000, lightOpacity: 0.33, darkOpacity: 0.55)
+    static let synthetic = Color(light: 0xa0784a, dark: 0xd9b07c)
+    static let syntheticBackground = Color(light: 0xf3e6d3, dark: 0x3b2f20)
 
     static func ring(_ tone: PendantSummary.Battery.Tone) -> Color {
         switch tone {
@@ -128,6 +145,17 @@ enum Pendant {
     }
 }
 
+extension Color {
+    /// A colour that follows the system appearance (light/dark), from 0xRRGGBB values.
+    init(light: UInt32, dark: UInt32, lightOpacity: Double = 1, darkOpacity: Double = 1) {
+        func ui(_ hex: UInt32, _ alpha: Double) -> UIColor {
+            UIColor(red: CGFloat((hex >> 16) & 0xff) / 255, green: CGFloat((hex >> 8) & 0xff) / 255,
+                    blue: CGFloat(hex & 0xff) / 255, alpha: alpha)
+        }
+        self.init(uiColor: UIColor { $0.userInterfaceStyle == .dark ? ui(dark, darkOpacity) : ui(light, lightOpacity) })
+    }
+}
+
 /// The pendant illustration (no display: the badge and indicator are app overlays), its 300° battery
 /// ring opening at the bottom where the battery badge sits, and one centre connection indicator.
 private struct PendantHero: View {
@@ -136,7 +164,7 @@ private struct PendantHero: View {
 
     var body: some View {
         ZStack {
-            Circle().fill(RadialGradient(colors: [Color(red: 0.925, green: 0.890, blue: 0.820), Pendant.background.opacity(0)],
+            Circle().fill(RadialGradient(colors: [Pendant.halo, Pendant.halo.opacity(0)],
                                          center: .center, startRadius: 0, endRadius: 128))
                 .frame(width: 256, height: 256)
             ring.frame(width: 216, height: 216)
@@ -169,12 +197,11 @@ private struct PendantHero: View {
     private var device: some View {
         let on = summary.connected
         return ZStack {
-            Circle().fill(RadialGradient(colors: [.white, Color(red: 0.945, green: 0.937, blue: 0.918), Color(red: 0.851, green: 0.835, blue: 0.804)],
+            Circle().fill(RadialGradient(colors: [Pendant.shellHighlight, Pendant.shellMid, Pendant.shellEdge],
                                          center: UnitPoint(x: 0.38, y: 0.30), startRadius: 0, endRadius: 92))
-                .shadow(color: Color(red: 0.42, green: 0.37, blue: 0.29).opacity(0.33), radius: 16, y: 14)
+                .shadow(color: Pendant.shellShadow, radius: 16, y: 14)
                 .shadow(color: .black.opacity(0.08), radius: 3, y: 3)
-            Circle().fill(RadialGradient(colors: [Color(red: 0.984, green: 0.980, blue: 0.969), Color(red: 0.922, green: 0.910, blue: 0.882),
-                                                  Color(red: 0.886, green: 0.871, blue: 0.835)],
+            Circle().fill(RadialGradient(colors: [Pendant.faceHighlight, Pendant.faceMid, Pendant.faceEdge],
                                          center: UnitPoint(x: 0.40, y: 0.32), startRadius: 0, endRadius: 60))
                 .padding(19)
                 .shadow(color: .black.opacity(0.06), radius: 2, y: 1)
@@ -198,7 +225,7 @@ struct BatteryBadge: View {
             case .unknown:
                 Text("Battery unknown")
             case .level(let p, let charging, let low):
-                BatteryIcon(fraction: Double(p) / 100, color: low ? Pendant.lowText : Color(white: 0.23))
+                BatteryIcon(fraction: Double(p) / 100, color: low ? Pendant.lowText : Pendant.ink.opacity(0.85))
                 if charging { Image(systemName: "bolt.fill").font(.caption2) }
                 Text(low ? "Low · \(p)%" : charging ? "\(p)% · Charging" : "\(p)%").monospacedDigit()
             }
@@ -206,16 +233,16 @@ struct BatteryBadge: View {
         .font(.subheadline.weight(.semibold))
         .foregroundStyle(color)
         .padding(.horizontal, 11).padding(.vertical, 6)
-        .background(.white.opacity(0.94), in: .capsule)
+        .background(Pendant.badge, in: .capsule)
         .shadow(color: .black.opacity(0.10), radius: 4, y: 2)
-        .overlay(Capsule().strokeBorder(.black.opacity(0.06), lineWidth: 0.5))
+        .overlay(Capsule().strokeBorder(Pendant.badgeBorder, lineWidth: 0.5))
     }
 
     private var color: Color {
         switch battery {
         case .unknown: return Pendant.secondary
         case .level(_, _, true): return Pendant.lowText
-        case .level: return Color(white: 0.11)
+        case .level: return Pendant.ink
         }
     }
 
@@ -254,7 +281,7 @@ private struct Card<Content: View>: View {
     var body: some View {
         VStack(spacing: 0, content: content)
             .background(Pendant.card, in: .rect(cornerRadius: 20))
-            .shadow(color: .black.opacity(0.04), radius: 1, y: 1)
+            .shadow(color: Pendant.cardShadow, radius: 1, y: 1)
     }
 }
 
@@ -271,7 +298,7 @@ private struct RowView: View {
                     Text(row.title).font(.subheadline.weight(.semibold))
                     if let detail = row.detail { Text(detail).font(.footnote).foregroundStyle(Pendant.secondary) }
                     if let progress = row.progress {
-                        ProgressView(value: progress).tint(Color(white: 0.11)).frame(maxWidth: 170).padding(.top, 4)
+                        ProgressView(value: progress).tint(Pendant.ink).frame(maxWidth: 170).padding(.top, 4)
                     }
                 }
                 Spacer(minLength: 0)
@@ -280,7 +307,7 @@ private struct RowView: View {
             if let fix = row.fix {
                 Button { onFix(fix) } label: {
                     Text(fix == .retryUploads ? "Retry" : fix.title).font(.subheadline.weight(.semibold)).padding(.horizontal, 14).padding(.vertical, 8)
-                        .foregroundStyle(.white).background(Color(white: 0.11), in: .capsule)
+                        .foregroundStyle(Pendant.actionText).background(Pendant.actionFill, in: .capsule)
                 }
                 .buttonStyle(.plain)
             }
@@ -318,7 +345,7 @@ private struct LinkRow: View {
             HStack {
                 Text(title).font(.body)
                 Spacer()
-                Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(Color(white: 0.78))
+                Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(Pendant.chevron)
             }
             .padding(.horizontal, 16).frame(minHeight: 48).contentShape(Rectangle())
         }
