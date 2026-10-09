@@ -128,4 +128,64 @@ import Testing
         let p = summary(s, reachable, nil)
         #expect(p.collecting?.received == 68 && p.collecting?.total == 241)
     }
+
+    @Test func recordingNeedsRecentAudioNotJustAConnection() {
+        #expect(summary(streaming(), reachable, nil).stateLine == "Recording · audio received just now")
+        var quiet = streaming()
+        quiet.live?.lastNotificationAt = now.addingTimeInterval(-300)
+        #expect(summary(quiet, reachable, nil).stateLine.hasPrefix("Connected · last audio"))
+        var none = streaming()
+        none.live = nil
+        #expect(summary(none, reachable, nil).stateLine == "Connected · no audio yet")
+        var asleep = streaming()
+        asleep.device?.noAudioYet = true
+        #expect(summary(asleep, reachable, nil).stateLine == "Connected · no audio yet")
+        var away = streaming()
+        away.connection = .waitingForDevice
+        #expect(summary(away, reachable, nil).stateLine.hasPrefix("Not connected"))
+    }
+
+    @Test func pendantStorageIsOnlyClaimedFromThisSessionsSync() {
+        var s = streaming()
+        #expect(summary(s, reachable, nil).storage == nil)  // never synced: say nothing
+        s.offline = .complete(records: 0)
+        #expect(summary(s, reachable, nil).storage == .collected(records: 0))
+        s.offline = .interrupted("link lost")
+        #expect(summary(s, reachable, nil).storage == .stopped("link lost"))
+        s.offline = .complete(records: 5)
+        s.connection = .waitingForDevice  // an earlier session's result is not current
+        #expect(summary(s, reachable, nil).storage == nil)
+    }
+
+    @Test func batteryToneBands() {
+        #expect(PendantSummary.Battery.level(percent: 82, charging: false, low: false).tone == .healthy)
+        #expect(PendantSummary.Battery.level(percent: 41, charging: false, low: false).tone == .healthy)
+        #expect(PendantSummary.Battery.level(percent: 40, charging: false, low: false).tone == .middle)
+        #expect(summary(streaming(battery: 15), reachable, nil).battery.tone == .low)
+        #expect(summary(streaming(battery: 12, charging: true), reachable, nil).battery.tone == .middle)  // charging: never low
+        #expect(PendantSummary.Battery.unknown(reason: "Not connected").tone == .unknown)
+    }
+
+    @Test func cardRowsSayOnlyWhatIsObserved() {
+        let normal = summary(streaming(), reachable, nil)
+        #expect(normal.rows.map(\.title) == ["Nothing waiting on this iPhone", "Tap once to bookmark"])
+        #expect(normal.rows[0].detail == "Last upload 1 minute ago" && !normal.rows[0].attention)
+
+        var blocked = streaming(battery: 12)
+        blocked.outbox.pendingCount = 38
+        blocked.offline = .receiving(received: 68, total: 241)
+        let b = summary(blocked, .unreachable("offline"), nil)
+        #expect(b.rows.map(\.kind) == [.phone, .storage, .gestures])  // low battery is on the ring, not a row
+        #expect(b.rows[0].title == "38 files waiting on iPhone" && b.rows[0].attention && b.rows[0].fix == .retryUploads)
+        #expect(b.rows[1].progress != nil)
+
+        var away = streaming()
+        away.connection = .waitingForDevice
+        away.device = nil
+        #expect(summary(away, reachable, nil).rows.first?.title == "Looking for your pendant")
+
+        let unpaired = summary(EngineSnapshot(), .notConfigured, nil)
+        #expect(unpaired.rows.map(\.title) == ["Pair your pendant", "No server connected"])
+        #expect(unpaired.rows[0].fix == .pairDevice)
+    }
 }

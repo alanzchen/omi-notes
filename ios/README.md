@@ -140,11 +140,12 @@ testing needs no Beta App Review; external testers do. The app ships with an ori
 Pendant button: **single tap** = bookmark (shown in the note); **double tap** = end the current
 conversation now. A 3 s long press powers the pendant off.
 
-The **Pendant** tab shows the pendant at a glance: connection and battery (unknown, never 0%, when
-the pendant isn't connected), the one thing to do if anything needs you, what was last observed on
-the pendant, this phone and the server, and the server's activity across all recordings (shown with
-its age when the server hasn't answered recently). Pendant details and Disconnect/Pair/Forget are
-under **Manage pendant**; everything else is in **Troubleshooting details**.
+The **Pendant** tab shows the pendant with a battery ring (green, amber, coral at 15% or less and
+not charging; grey dashed and "Battery unknown" when it isn't connected) and one connection dot,
+then "Recording" only when audio actually arrived in the last minute, plus a short card: an issue
+and its fix, files waiting on this iPhone, audio collected from the pendant's own storage, and the
+tap gestures. Pendant details and Disconnect/Pair/Forget are under **Manage pendant**; everything
+else is in **Troubleshooting**.
 
 ## People and voices
 
@@ -219,7 +220,7 @@ shows the (token-redacted) log.
   `-OmiNotesDebugServerURL http://localhost:8765 -OmiNotesDebugToken <token>` to configure the
   server, `-OmiNotesDebugOpenURL 'omi-notes://configure?…'` to open the pairing sheet,
   `-OmiNotesDebugTab home|pendant|people|server|settings|pairing|diagnostics|debug` to open a screen,
-  `-OmiNotesDebugPendantState normal|disconnected|unpaired|blocked` to show a synthetic Pendant tab,
+  `-OmiNotesDebugPendantState normal|mid|charging|disconnected|unpaired|blocked` to show a synthetic Pendant tab,
   `-OmiNotesDebugOpenConversation YES` to open the newest conversation and
   `-OmiNotesDebugSearch <text>` to start with a search. `-omi.onboarded YES` skips onboarding.
   `xcrun simctl spawn booted defaults write <bundle-id> omi.simulatedDevice -bool YES` turns on
