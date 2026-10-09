@@ -11,13 +11,17 @@ import SwiftUI
 struct NoteRecordingSection: View {
     let model: AppModel
     let entry: ConversationSummary
-    @State private var player: NoteRecordingPlayer
+    @State private var player: NoteRecordingController
     @State private var scrubbing: Double?
 
     init(model: AppModel, entry: ConversationSummary) {
         self.model = model
         self.entry = entry
-        _player = State(initialValue: NoteRecordingPlayer(conversationId: entry.id))
+        let id = entry.id
+        _player = State(initialValue: NoteRecordingController(
+            conversationId: id,
+            fetchInfo: { try await model.recordingClient().recordingInfo(id) },
+            makeEngine: { _ in AVRecordingEngine(api: try model.recordingClient(), conversationId: id) }))
     }
 
     var body: some View {
@@ -54,7 +58,7 @@ struct NoteRecordingSection: View {
     }
 
     private var playButton: some View {
-        Button { Task { await player.toggle(model: model) } } label: {
+        Button { Task { await player.toggle() } } label: {
             ZStack {
                 Circle().fill(playable ? Color.accentColor : Color(.systemGray4)).frame(width: 46, height: 46)
                 if player.state == .loading {
@@ -113,9 +117,9 @@ struct NoteRecordingSection: View {
             if let line = player.detailLine { Text(line).font(.caption).foregroundStyle(.secondary) }
         case .failed(let message):
             HStack(alignment: .firstTextBaseline) {
-                Text(message).font(.caption).foregroundStyle(.orange)
+                Text(message).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
                 Spacer()
-                Button("Retry") { Task { await player.toggle(model: model) } }.font(.caption.weight(.semibold))
+                Button("Retry") { Task { await player.toggle() } }.font(.caption.weight(.semibold))
             }
         case .unavailable(let message):
             Label(message, systemImage: "waveform.slash").font(.caption).foregroundStyle(.secondary)
@@ -128,166 +132,116 @@ struct NoteRecordingSection: View {
     }
 }
 
+/// AVPlayer behind a note's recording (`RecordingEngine`): streams through `RecordingLoader`, and
+/// reports a failed range, a failed item or a stall as a failure instead of looking "playing".
 @MainActor
-@Observable
-final class NoteRecordingPlayer {
-    enum State: Equatable {
-        case idle, loading, ready
-        case failed(String)
-        case unavailable(String)
-    }
+final class AVRecordingEngine: RecordingEngine {
+    var onFailure: ((String) -> Void)?
+    var onTime: ((Double) -> Void)?
+    var onEnd: (() -> Void)?
+    static let stallLimit: Duration = .seconds(15)
 
-    let conversationId: String
-    private(set) var state: State = .idle
-    private(set) var current: Double = 0
-    private(set) var duration: Double = 0
-    private(set) var isPlaying = false
-    private(set) var gapMarks: [Double] = []
-    private(set) var detailLine: String?
-    private var timeline: RecordingTimeline?
-    private var player: AVPlayer?
-    private var loader: RecordingLoader?
+    private let player: AVPlayer
+    private let item: AVPlayerItem
+    private let loader: RecordingLoader
     private var timeObserver: Any?
     private var observers: [NSObjectProtocol] = []
-    static let loadTimeout: Duration = .seconds(25)
+    private var watchdog: Task<Void, Never>?
+    private var playing = false
 
-    init(conversationId: String) {
-        self.conversationId = conversationId
-        observers.append(NotificationCenter.default.addObserver(forName: .omiAudioWillPlay, object: nil, queue: .main) { [weak self] note in
-            let sender = note.object.map { ObjectIdentifier($0 as AnyObject) }
+    init(api: APIClient, conversationId: String) {
+        loader = RecordingLoader(api: api, conversationId: conversationId)
+        let asset = AVURLAsset(url: URL(string: "omi-recording://note/\(conversationId).wav")!)
+        asset.resourceLoader.setDelegate(loader, queue: loader.queue)
+        item = AVPlayerItem(asset: asset)
+        player = AVPlayer(playerItem: item)
+        player.automaticallyWaitsToMinimizeStalling = true
+        loader.onError = { [weak self] message in
+            Task { @MainActor in self?.fail("couldn't get the audio from the server: \(message)") }
+        }
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(forName: AVPlayerItem.failedToPlayToEndTimeNotification, object: item, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.fail("the audio stopped arriving") }
+        })
+        observers.append(center.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification, object: item, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, sender != ObjectIdentifier(self) else { return }
-                self.pause()  // another sound started: one at a time
+                self?.playing = false
+                self?.onEnd?()
             }
         })
-    }
-
-    func toggle(model: AppModel) async {
-        switch state {
-        case .ready:
-            isPlaying ? pause() : play()
-        case .idle, .failed:
-            await prepare(model: model)
-            if state == .ready { play() }
-        case .loading, .unavailable:
-            break
+        timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 4), queue: .main) { [weak self] time in
+            MainActor.assumeIsolated { self?.onTime?(time.seconds) }
         }
     }
 
-    private func prepare(model: AppModel) async {
-        state = .loading
-        do {
-            let api = try model.recordingClient()
-            let info = try await api.recordingInfo(conversationId)
-            guard info.available, let total = info.durationS, total > 0 else {
-                state = .unavailable(Self.unavailableMessage(info.reason))
-                return
-            }
-            let timeline = RecordingTimeline(info)
-            self.timeline = timeline
-            duration = total
-            gapMarks = timeline.gapMarks
-            let gaps = info.gaps ?? []
-            if let span = info.span, !gaps.isEmpty {
-                let missing = gaps.reduce(0) { $0 + $1.seconds }
-                let secs = Int(missing.rounded())
-                detailLine = "Playable \(NoteRecordingSection.clock(total)) of \(NoteRecordingSection.clock(span.seconds)): "
-                    + (gaps.count == 1 ? "a gap of \(secs) s wasn't recorded." : "\(gaps.count) gaps (\(secs) s in all) weren't recorded.")
-            }
-            let loader = RecordingLoader(api: api, conversationId: conversationId)
-            self.loader = loader
-            let asset = AVURLAsset(url: URL(string: "omi-recording://note/\(conversationId).wav")!)
-            asset.resourceLoader.setDelegate(loader, queue: loader.queue)
-            let item = AVPlayerItem(asset: asset)
-            let player = AVPlayer(playerItem: item)
-            player.automaticallyWaitsToMinimizeStalling = true
-            self.player = player
-            try await waitUntilReady(item)
-            timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 4), queue: .main) { [weak self] time in
-                MainActor.assumeIsolated {
-                    guard let self else { return }
-                    self.current = min(max(time.seconds, 0), self.duration)
-                    if let p = self.player, p.timeControlStatus == .paused, self.isPlaying, self.current >= self.duration - 0.3 {
-                        self.isPlaying = false  // reached the end
-                    }
-                }
-            }
-            state = .ready
-        } catch is CancellationError {
-            state = .idle
-        } catch APIError.http(404, _) {
-            state = .unavailable("This conversation isn't on the server anymore.")
-        } catch {
-            teardown()
-            state = .failed("Couldn't load the recording (\(Self.describe(error))).")
-        }
-    }
-
-    /// Bounded: a player that never becomes ready is a failure with Retry, not a spinner forever.
-    private func waitUntilReady(_ item: AVPlayerItem) async throws {
-        let deadline = ContinuousClock.now + Self.loadTimeout
-        while ContinuousClock.now < deadline {
+    func waitUntilReady() async throws {
+        while true {  // bounded and cancelled by the controller
             switch item.status {
             case .readyToPlay: return
             case .failed: throw item.error ?? URLError(.cannotDecodeContentData)
             default: try await Task.sleep(for: .milliseconds(150))
             }
         }
-        throw URLError(.timedOut)
     }
 
-    private func play() {
-        guard let player else { return }
-        NotificationCenter.default.post(name: .omiAudioWillPlay, object: self)
+    func play() {
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio)
         try? AVAudioSession.sharedInstance().setActive(true)
-        if current >= duration - 0.3 { seek(to: 0) }
         player.play()
-        isPlaying = true
+        playing = true
+        watch()
     }
 
     func pause() {
-        player?.pause()
-        isPlaying = false
+        player.pause()
+        playing = false
+        watchdog?.cancel()
     }
 
     func seek(to seconds: Double) {
-        guard let player else { return }
-        let to = min(max(seconds, 0), duration)
-        current = to
-        player.seek(to: CMTime(seconds: to, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        player.seek(to: CMTime(seconds: seconds, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
     }
 
-    func skip(by seconds: Double) { seek(to: current + seconds) }
-
-    func stop() {
-        pause()
-        teardown()
-        if state == .ready || state == .loading { state = .idle }
-        current = 0
-    }
-
-    private func teardown() {
-        if let timeObserver { player?.removeTimeObserver(timeObserver) }
+    func teardown() {
+        playing = false
+        watchdog?.cancel()
+        if let timeObserver { player.removeTimeObserver(timeObserver) }
         timeObserver = nil
-        player?.replaceCurrentItem(with: nil)
-        player = nil
-        loader = nil
+        observers.forEach(NotificationCenter.default.removeObserver)
+        observers = []
+        player.replaceCurrentItem(with: nil)
+        loader.onError = nil
+        loader.cancelAll()
     }
 
-    static func unavailableMessage(_ reason: String?) -> String {
-        switch reason {
-        case "expired": return "This recording's audio has expired on the server, so it can't be played."
-        case "no_audio": return "No audio was kept for this conversation."
-        case "too_long": return "This recording is too long to play here (over 4 hours)."
-        case "in_progress": return "Still recording; you can listen once it ends."
-        default: return "This recording can't be played."
+    /// While it should be playing: a failed item, or waiting for data longer than the limit, is a failure.
+    private func watch() {
+        watchdog?.cancel()
+        watchdog = Task { [weak self] in
+            var waiting: ContinuousClock.Instant?
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(500))
+                guard let self, self.playing else { return }
+                if self.item.status == .failed {
+                    self.fail(self.item.error.map { "\($0.localizedDescription)" } ?? "the player failed")
+                    return
+                }
+                if self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate {
+                    let since = waiting ?? ContinuousClock.now
+                    waiting = since
+                    if ContinuousClock.now - since > Self.stallLimit {
+                        self.fail("no audio arrived for \(Self.stallLimit.components.seconds) s")
+                        return
+                    }
+                } else {
+                    waiting = nil
+                }
+            }
         }
     }
 
-    static func describe(_ error: Error) -> String {
-        if let e = error as? URLError, e.code == .timedOut { return "timed out" }
-        return "\(error)"
+    private func fail(_ reason: String) {
+        onFailure?(reason)
     }
 }
 
@@ -298,6 +252,8 @@ final class RecordingLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked
     private let conversationId: String
     private var tasks: [ObjectIdentifier: Task<Void, Never>] = [:]
     private static let piece = 256 * 1024
+    /// A range that failed while the player needed it (not a cancelled one).
+    var onError: ((String) -> Void)?
 
     init(api: APIClient, conversationId: String) {
         self.api = api
@@ -331,7 +287,10 @@ final class RecordingLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked
                 }
                 if !Task.isCancelled { box.request.finishLoading() }
             } catch {
-                if !Task.isCancelled { box.request.finishLoading(with: error) }
+                if !Task.isCancelled {
+                    box.request.finishLoading(with: error)
+                    if !(error is CancellationError) { self?.onError?("\(error)") }
+                }
             }
             if let owner = self { owner.queue.async { owner.tasks[key] = nil } }
         }
@@ -340,6 +299,14 @@ final class RecordingLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked
 
     func resourceLoader(_ resourceLoader: AVAssetResourceLoader, didCancel request: AVAssetResourceLoadingRequest) {
         tasks.removeValue(forKey: ObjectIdentifier(request))?.cancel()
+    }
+
+    /// The note was left: no range keeps loading for it.
+    func cancelAll() {
+        queue.async { [self] in
+            tasks.values.forEach { $0.cancel() }
+            tasks = [:]
+        }
     }
 }
 
