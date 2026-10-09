@@ -202,6 +202,7 @@ public final class AppModel {
         }
         serverStatus = status
         serverStatusAt = Date()
+        rememberValueNotesScope(config)
         let epoch = cacheEpoch
         guard data == dataEpoch else { return }  // a vault change just reset everything
         async let issuesTask: [ServerIssue]? = status.supportsIssues ? try? api.issues() : []

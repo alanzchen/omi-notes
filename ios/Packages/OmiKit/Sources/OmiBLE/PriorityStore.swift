@@ -23,10 +23,30 @@ public final class PriorityStore: @unchecked Sendable {
     private let url: URL
     private let lock = NSLock()
     private var entries: [Entry]
+    /// The one scope (server address, pairing generation, vault) whose server last confirmed it
+    /// supports value notes, so saved notes of exactly that scope can still be marked offline.
+    private let capabilityURL: URL
+    private var capableScope: String?
 
     public init(url: URL) {
         self.url = url
         entries = JSONFile.load([Entry].self, from: url) ?? []
+        capabilityURL = url.deletingLastPathComponent().appendingPathComponent("app-value-notes-scope.json")
+        capableScope = JSONFile.load(String.self, from: capabilityURL)
+    }
+
+    /// What the live server just said for this scope (nil scope: nothing known any more).
+    public func remember(scope: String?, supportsValueNotes: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        let next = supportsValueNotes ? scope : nil
+        guard next != capableScope else { return }
+        capableScope = next
+        if let next { try? JSONFile.save(next, to: capabilityURL) } else { try? FileManager.default.removeItem(at: capabilityURL) }
+    }
+
+    public func confirmedCapable(scope: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return capableScope == scope
     }
 
     public func entries(server: String) -> [Entry] {

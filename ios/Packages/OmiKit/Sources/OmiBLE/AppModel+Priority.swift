@@ -6,12 +6,32 @@ import OmiProtocol
 /// "PUT /v1/conversations/{id}/priority"). Shown at once (optimistic), saved on the phone until the
 /// server confirms, retried on refreshes, and never undone by an older request.
 extension AppModel {
-    public var supportsValueNotes: Bool { serverStatus?.supportsValueNotes == true && retryServerKey != nil }
+    /// Online: what the server says. Offline: only when the saved notes are of exactly the scope
+    /// (server address, pairing, vault) whose server last confirmed it; re-pairing or another vault
+    /// is a different scope.
+    public var supportsValueNotes: Bool {
+        if let status = serverStatus { return status.supportsValueNotes && retryServerKey != nil }
+        guard let scope = cacheScope(engine.settings.serverConfig()) else { return false }
+        return priorityStore.confirmedCapable(scope: scope.folder)
+    }
+
+    /// The pending-choice key: the live server's, else the saved notes' scope (offline).
+    var priorityKey: String? {
+        if let key = retryServerKey { return key }
+        guard serverStatus == nil, let scope = cacheScope(engine.settings.serverConfig()) else { return nil }
+        return "\(scope.serverURL)|\(scope.vaultId)"
+    }
+
+    /// After a server answer: remember (or forget) its capability for this exact scope.
+    func rememberValueNotesScope(_ config: UploadConfig) {
+        let scope = cacheScope(config)
+        priorityStore.remember(scope: scope?.folder, supportsValueNotes: serverStatus?.supportsValueNotes == true && scope != nil)
+    }
 
     /// The choice to show: an unconfirmed one first, else the server's. `pending`: not confirmed yet.
     public func priority(of conversation: ConversationSummary) -> (state: String, pending: Bool) {
         _ = priorityRevision  // observed: a new choice redraws
-        if let key = retryServerKey, let entry = priorityStore.pending(conversation.id, server: key) {
+        if let key = priorityKey, let entry = priorityStore.pending(conversation.id, server: key) {
             return (entry.state, true)
         }
         let id = conversation.id
@@ -21,7 +41,7 @@ extension AppModel {
 
     public func setPriority(_ conversationId: String, _ state: String) async {
         let config = engine.settings.serverConfig()
-        guard let endpoint = config.endpoint, let key = retryServerKey else { return }
+        guard let endpoint = config.endpoint, let key = priorityKey, supportsValueNotes else { return }
         let entry: PriorityStore.Entry
         do {
             entry = try priorityStore.choose(conversationId, state: state, server: key)
@@ -37,7 +57,7 @@ extension AppModel {
 
     /// On every refresh: send what's still unconfirmed for this server (only the latest per conversation).
     func settlePriorities(api: APIClient, data: Int) async {
-        guard supportsValueNotes, let key = retryServerKey else { return }
+        guard supportsValueNotes, let key = priorityKey else { return }
         for entry in priorityStore.entries(server: key) where data == dataEpoch {
             await sendPriority(entry, api: api, data: data)
         }

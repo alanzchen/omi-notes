@@ -102,6 +102,32 @@ final class PriorityServerStub: URLProtocol, @unchecked Sendable {
         #expect(m.recent.first?.value?.user?.state == "important")
     }
 
+    @Test func offlineMarkingNeedsTheSameConfirmedScopeAndNothingCrossesARePair() async throws {
+        let (m, root) = try model()
+        await m.refreshServer()                                      // saves the list for this scope…
+        let scope = NoteCache.Scope(serverURL: "https://mac.ts.net", generation: 1, vaultId: "vault-a")
+        if m.noteCache.lastScope == nil {                            // …except on a Mac host, which refuses
+            try JSONEncoder().encode(scope).write(to: root.appendingPathComponent("cache/scope.json"))  // file protection
+        }
+        #expect(m.noteCache.lastScope == scope)
+        PriorityServerStub.offline = true
+        // relaunched offline: the same server, pairing and vault said it supports value notes
+        let (offline, _) = try model(root: root)
+        await offline.refreshServer()
+        #expect(offline.serverStatus == nil && offline.supportsValueNotes, "a saved note can be marked offline")
+        await offline.setPriority("c1", "less_useful")
+        #expect(offline.priority(of: c1) == ("less_useful", true))
+        // re-paired (a new generation) while offline: neither the capability nor the choice carries over
+        try offline.engine.settings.setServer(url: URL(string: "https://mac.ts.net")!, token: "tok2")
+        #expect(!offline.supportsValueNotes && offline.priorityKey == nil)
+        // back online with the original pairing: the pending choice is sent and settles
+        PriorityServerStub.offline = false
+        let (back, _) = try model(root: root)
+        await back.refreshServer()
+        #expect(PriorityServerStub.puts.last?["state"] as? String == "less_useful")
+        #expect(back.priority(of: c1) == ("less_useful", false))
+    }
+
     @Test func retriesAreBoundedAndThenSaySo() async throws {
         let (m, _) = try model()
         await m.refreshServer()

@@ -334,8 +334,9 @@ struct SavedConversationsView: View {
                     ConversationDetailView(model: model, summary: d.entry)
                         .onAppear { model.openSaved(d) }
                 } label: {
-                    ConversationRow(conversation: d.entry)
+                    ConversationRow(conversation: d.entry, priority: model.priorityState(of: d.entry))
                 }
+                .modifier(PriorityActions(model: model, conversation: d.entry))
             }
         }
         .navigationTitle("Saved on this phone")
