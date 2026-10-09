@@ -56,9 +56,7 @@ struct ServerView: View {
             TimelineView(.periodic(from: .now, by: 30)) { context in
                 VStack(alignment: .leading, spacing: 8) {
                     let server = model.health(now: context.date).steps.first { $0.area == .server }!
-                    StepRow(step: server) { fix in
-                        if fix != .openServer { onFix(fix) }  // already here
-                    }
+                    StepRow(step: server, onFix: onFix, hiding: .openServer)  // already on the Server page
                     if let at = model.serverStatusAt {
                         Text("Last answered \(SystemHealth.relative(at, context.date))").font(.caption).foregroundStyle(.secondary)
                     }
@@ -75,9 +73,9 @@ struct ServerView: View {
             Section {
                 ForEach(model.issues) { issue in IssueRow(model: model, issue: issue) }
             } header: {
-                Text("Needs attention")
+                Text("Couldn't be finished on the server")
             } footer: {
-                Text("Commands run in Terminal on the computer that runs your server.")
+                Text("The server keeps the audio. What the server's operator can do is under Diagnostics.")
             }
         }
     }
@@ -191,10 +189,8 @@ struct IssueRow: View {
             Label(issue.message, systemImage: issue.needsAction ? "exclamationmark.triangle.fill" : "clock.badge.exclamationmark")
                 .foregroundStyle(issue.needsAction ? .red : .orange).font(.subheadline.weight(.medium))
             if let detail = issue.detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
-            if let step = issue.nextStep {
-                Text(LocalizedStringKey(step)).font(.caption).textSelection(.enabled)
-            }
-            if issue.code == "conversation_failed", let id = issue.conversationId, model.canRetry {
+            if let step = issue.phoneStep { Text(step).font(.caption).foregroundStyle(.secondary) }
+            if issue.code == "conversation_failed", let id = issue.conversationId, model.canRetry, issue.canRetryFromPhone {
                 RetryControl(model: model, conversationId: id)
             }
             if issue.code == "chunks_failed", model.canRetry {
@@ -278,7 +274,7 @@ struct RetryControl: View {
             if let op, !op.isFinished {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.small)
-                    Text(op.message ?? op.state).font(.caption).foregroundStyle(.secondary)
+                    Text(op.displayMessage).font(.caption).foregroundStyle(.secondary)
                 }
             } else {
                 Button(sending ? "Retrying…" : "Retry") {
@@ -289,7 +285,7 @@ struct RetryControl: View {
                     }
                 }
                 .buttonStyle(.bordered).controlSize(.small).disabled(sending)
-                if let op, op.isFinished { Text(op.message ?? op.state).font(.caption).foregroundStyle(op.state == "done" ? .green : .orange) }
+                if let op, op.isFinished { Text(op.displayMessage).font(.caption).foregroundStyle(op.state == "done" ? .green : .orange) }
             }
             if let msg = model.retryMessages[conversationId] { Text(msg).font(.caption).foregroundStyle(.secondary) }
         }

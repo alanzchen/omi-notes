@@ -58,23 +58,19 @@ struct HomeView: View {
 
     // MARK: Needs you
 
-    private var serverProblems: [ServerIssue] { model.issues.filter(\.needsAction) }
+    // Server processing failures are not listed here: the health card and the Server tab show them,
+    // and this section is for what the phone's owner can act on.
+
     private var newVoices: Int { model.speakers.suggestions.count }
 
     @ViewBuilder private var needsYouSection: some View {
-        if !s.attention.isEmpty || !serverProblems.isEmpty || newVoices > 0 {
+        if !s.attention.isEmpty || newVoices > 0 {
             Section("Needs you") {
                 ForEach(s.attention, id: \.self) { msg in
                     Label(msg, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.subheadline)
                 }
                 if !s.attention.isEmpty {
                     Button("Dismiss phone messages") { model.engine.clearAttention() }.font(.subheadline)
-                }
-                if !serverProblems.isEmpty {
-                    Button { onFix(.openServer) } label: {
-                        Label(serverProblems.count == 1 ? serverProblems[0].message : "\(serverProblems.count) problems on the server",
-                              systemImage: "server.rack")
-                    }
                 }
                 if newVoices > 0 {
                     Button(action: openPeople) {

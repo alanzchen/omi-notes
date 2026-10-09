@@ -26,7 +26,24 @@ extension AppModel {
             return
         }
         retryMessages[conversationId] = nil
-        await send(entry, api: APIClient(endpoint: endpoint, session: session), config: config, data: dataEpoch)
+        let api = APIClient(endpoint: endpoint, session: session)
+        let data = dataEpoch
+        await send(entry, api: api, config: config, data: data)
+        await followUp(entry, api: api, config: config, data: data)
+    }
+
+    /// Right after a tap: read the operation a few times (status reads only, never a new request),
+    /// so a quick result shows now instead of at the next minute's refresh; then refresh once.
+    func followUp(_ entry: RetryStore.Entry, api: APIClient, config: UploadConfig, data: Int) async {
+        func current() -> Bool { isCurrent(config) && data == dataEpoch }
+        for _ in 0..<6 {
+            guard let op = retries[entry.conversationId], !op.isFinished else { break }
+            try? await Task.sleep(for: retryFollowUpInterval)
+            guard current(), let fresh = try? await api.operation(op.id), current() else { return }
+            retryStore.record(fresh, for: entry.requestId)
+            retries[entry.conversationId] = fresh
+        }
+        if current(), retries[entry.conversationId]?.isFinished == true { await refreshServer() }
     }
 
     /// `data`: the data epoch the request belongs to; an answer after a server or vault change is dropped.

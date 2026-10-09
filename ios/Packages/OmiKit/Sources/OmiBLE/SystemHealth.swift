@@ -175,7 +175,8 @@ public struct SystemHealth: Equatable, Sendable {
         let conflicts = q?.notesConflicted ?? 0
         if failed + conflicts > 0 {
             let n = failed + conflicts
-            return step(.needsAction, "\(n) item\(n == 1 ? " needs" : "s need") your attention", "See Server for what happened and what to do.", .openServer)
+            return step(.needsAction, "\(n) item\(n == 1 ? "" : "s") couldn't be finished on the server",
+                        "The server keeps the audio. See Server for what happened.", .openServer)
         }
         if let retrying = q?.conversationsRetrying, retrying > 0 {
             let a = status.activity

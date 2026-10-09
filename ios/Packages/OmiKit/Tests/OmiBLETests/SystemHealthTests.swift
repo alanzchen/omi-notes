@@ -81,9 +81,10 @@ import Testing
 
     @Test func failedChunksAndConflictsNeedAction() throws {
         let chunks = health(streaming(), reachable(), try status(["chunks_failed": 2]))
-        #expect(chunks.level == .needsAction && chunks.headline == "2 items need your attention")
+        #expect(chunks.level == .needsAction && chunks.headline == "2 items couldn't be finished on the server")
+        #expect(chunks.detail == "The server keeps the audio. See Server for what happened.")
         let conflict = health(streaming(), reachable(), try status(["notes_conflicted": 1]))
-        #expect(conflict.headline == "1 item needs your attention")
+        #expect(conflict.headline == "1 item couldn't be finished on the server")
     }
 
     @Test func olderServersFallBackToTheLegacyFailedSum() throws {

@@ -113,6 +113,8 @@ struct HealthCard: View {
 struct StepRow: View {
     let step: SystemHealth.Step
     var onFix: (SystemHealth.Fix) -> Void
+    /// A fix not to offer here (e.g. "Open Server" on the Server page itself).
+    var hiding: SystemHealth.Fix?
     @Environment(\.dynamicTypeSize) private var typeSize
     @ScaledMetric private var iconWidth: CGFloat = 22
 
@@ -124,7 +126,7 @@ struct StepRow: View {
                 Text(step.area.title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 Text(step.title).font(.subheadline)
                 if let detail = step.detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
-                if let fix = step.fix, step.level >= .delayed {
+                if let fix = step.fix, fix != hiding, step.level >= .delayed {
                     Button(fix.title) { onFix(fix) }.buttonStyle(.bordered).controlSize(.small).padding(.top, 2)
                 }
             }

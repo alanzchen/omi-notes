@@ -106,6 +106,17 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         #expect(Set(sentRequestIds()).count == 1)
     }
 
+    @Test func aQuickResultShowsWithoutWaitingForTheNextRefresh() async throws {
+        let (m, _) = try model()
+        m.retryFollowUpInterval = .milliseconds(10)
+        await m.refreshServer()
+        AppServerStub.routes["/v1/conversations/conv-1/retry"] = [(202, Self.opJSON("op-1", "queued"))]
+        AppServerStub.routes["/v1/operations/op-1"] = [(200, Self.opJSON("op-1", "running")), (200, Self.opJSON("op-1", "failed"))]
+        await m.retry(conversationId: "conv-1")
+        #expect(m.retries["conv-1"]?.state == "failed" && m.retries["conv-1"]?.displayMessage != "Queued on the server")
+        #expect(sentRequestIds().count == 1)  // status reads only: never a second retry
+    }
+
     @Test func aRefusalSettlesTheRequest() async throws {
         let (m, root) = try model()
         await m.refreshServer()

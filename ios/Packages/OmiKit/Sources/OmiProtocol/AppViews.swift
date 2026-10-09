@@ -180,12 +180,22 @@ public struct ServerIssue: Decodable, Equatable, Sendable, Identifiable, Hashabl
     public var conversationId: String?
     public var startedAt: String?
     public var title: String?
+    /// The server operator's step, with this deployment's commands (shown under Diagnostics).
+    public var serverStep: String?
+    /// False when a retry from the phone can't help until the server changes; missing means true.
+    public var retryable: Bool?
 
     public var id: String { "\(code):\(conversationId ?? "")" }
     public var needsAction: Bool { severity != "delayed" }
+    public var canRetryFromPhone: Bool { retryable != false }
+    /// Plain guidance for the main screens; an older server's command-bearing step is left to Diagnostics.
+    public var phoneStep: String? { nextStep.flatMap { $0.contains("`") ? nil : $0 } }
+    /// What the server's operator does (Diagnostics).
+    public var technicalStep: String? { serverStep ?? nextStep.flatMap { $0.contains("`") ? $0 : nil } }
 
     enum CodingKeys: String, CodingKey {
-        case code, severity, message, detail, count, title
+        case code, severity, message, detail, count, title, retryable
+        case serverStep = "server_step"
         case nextStep = "next_step"
         case conversationId = "conversation_id"
         case startedAt = "started_at"
@@ -209,6 +219,15 @@ public struct RetryOperation: Codable, Equatable, Sendable, Identifiable {
     public var message: String?
 
     public var isFinished: Bool { ["done", "failed", "superseded"].contains(state) }
+
+    /// Worded from the state (an older server said "Waiting for the server to start" for queued work).
+    public var displayMessage: String {
+        switch state {
+        case "accepted", "queued": return "Queued on the server"
+        case "running": return "Retrying now"
+        default: return message ?? state
+        }
+    }
 
     enum CodingKeys: String, CodingKey {
         case id, kind, stage, state, message

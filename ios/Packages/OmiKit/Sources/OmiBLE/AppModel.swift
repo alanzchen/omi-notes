@@ -52,6 +52,8 @@ public final class AppModel {
     public internal(set) var retries: [String: RetryOperation] = [:]
     /// A short outcome to show next to a retry button (by conversation id; "chunks" for audio files).
     public internal(set) var retryMessages: [String: String] = [:]
+    /// Pause between the few status checks right after a Retry tap (shortened in tests).
+    var retryFollowUpInterval: Duration = .seconds(2)
     let retryStore: RetryStore
     /// Opt-in alerts for problems this phone observes (Settings).
     public let problemAlerts = ProblemAlerts()

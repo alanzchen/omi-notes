@@ -17,6 +17,24 @@ struct DiagnosticsView: View {
             LiveRecordingSection(snapshot: s)
             PendantSyncSection(snapshot: s)
             UploadsSection(model: model, showQuarantined: true)
+            if !model.issues.isEmpty {
+                Section {
+                    ForEach(model.issues) { issue in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(issue.message).font(.subheadline)
+                            if let id = issue.conversationId { Text("Conversation \(id)").font(.caption.monospaced()).foregroundStyle(.secondary) }
+                            if let step = issue.technicalStep {
+                                Text(LocalizedStringKey(step)).font(.caption).textSelection(.enabled)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                } header: {
+                    Text("Server processing")
+                } footer: {
+                    Text("For whoever runs the server: commands run in Terminal on that computer.")
+                }
+            }
             Section {
                 NavigationLink("Recent log") { LogView(model: model) }
             } footer: {
