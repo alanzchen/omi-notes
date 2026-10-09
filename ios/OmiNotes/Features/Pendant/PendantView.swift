@@ -38,9 +38,12 @@ struct PendantView: View {
                     HeroRow(step: p.headline, onFix: onFix)
                     ForEach(p.also) { step in HeroRow(step: step, onFix: onFix, compact: true) }
                     if p.headline.area == .pendant, p.connectionTitle == "Not connected" { WhyNotConnected() }
+                    #if DEBUG
                     if synthetic {
                         Label("Synthetic preview (debug build)", systemImage: "testtube.2").font(.footnote).foregroundStyle(.orange)
-                    } else if model.snapshot.simulated {
+                    }
+                    #endif
+                    if !synthetic, model.snapshot.simulated {
                         Label("Simulated pendant", systemImage: "testtube.2").font(.footnote).foregroundStyle(.orange)
                     }
                 }
