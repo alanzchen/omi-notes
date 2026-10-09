@@ -37,7 +37,8 @@ log = logging.getLogger(__name__)
 # 2: conversation records may carry app-retry state (`retry`, `retry_outcome`) and `_omi/operations/`
 # exists. A vault is only raised to 2 when the first retry is accepted, so an older backend refuses
 # it rather than rewriting records without that state.
-FORMAT = 2
+# 3: conversation records may carry `resolution` (kept from the phone with the speaker unknown).
+FORMAT = 3
 OMI = "_omi"
 LEASE_RENEW_SECONDS = 5 * 60
 LEASE_STALE_SECONDS = 15 * 60

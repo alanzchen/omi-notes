@@ -40,7 +40,8 @@ operational index. Copy the folder anywhere, point a backend at it, and it rebui
 ```
 
 `VAULT.json` `format` is 1 until the first app retry raises it to 2 (records may then carry retry
-state); an older backend refuses a format-2 vault instead of rewriting records without it.
+state), and the first keep from the phone raises it to 3 (records may carry `resolution`); an older
+backend refuses a newer vault instead of rewriting records without that state.
 
 No lock files, temp files, logs, or caches that aren't referenced results live in the vault.
 
@@ -132,6 +133,12 @@ reused for another conversation is `409`. Reprocess, resummarize and `retry-fail
 conversation with a pending retry alone (checked in the same statement that queues them), and a
 retry isn't accepted while other processing of the conversation is queued. A provider call repeats
 only if the process dies between its response and the cache write.
+
+A keep (`POST /v1/conversations/{id}/keep`, `kind: "keep"`, only for a `speakers_unknown` failure)
+is the same operation; step 2 also commits `resolution: {kind: "kept_speaker_unknown", op,
+resolved_at, failure: {stage, kind, id}}`, which stays in the record for good. With it, the worker
+writes the cached unseparated text as a transcript with speaker `unknown` (no labels or voiceprints)
+and renders a transcript-only note without a summary; a rebuild reproduces the same note.
 
 ## Retention
 

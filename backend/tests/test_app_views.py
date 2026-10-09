@@ -333,13 +333,14 @@ def test_phone_guidance_is_plain_and_server_commands_are_separate(client, worker
     assert issue["retryable"] is True
 
 
-def test_no_speaker_failures_say_a_retry_from_the_phone_cannot_help(client, worker):
+def test_no_speaker_failures_offer_keep_instead_of_a_futile_retry(client, worker):
     row = finished(client, worker)
     worker.db.execute("UPDATE conversations SET status='failed', failed_stage='transcribing', error_kind='speakers_unknown', "
                       "note_path=NULL, error='x' WHERE id=?", (row["id"],))  # fmt: skip
     (issue,) = problems(client)
     assert issue["code"] == "conversation_failed" and issue["retryable"] is False
-    assert "kept" in issue["message"] and "`" not in issue["next_step"] and "nothing to do on this phone" in issue["next_step"]
+    assert issue["can_keep"] is True and "kept" in issue["message"] and "short" not in issue["message"]
+    assert "`" not in issue["next_step"] and "speaker unknown" in issue["next_step"]
 
 
 def test_a_queued_retry_does_not_claim_the_server_is_down():

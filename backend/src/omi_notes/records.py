@@ -10,7 +10,10 @@ Blocks (docs/vault.md):
 - `failure`: why it failed permanently;
 - `retry`: an app retry accepted and not yet finished (`{op, stage}`), and `retry_outcome`: how the
   last finished one ended (`{op, status, failure_kind, finished_at}`), written in the same commit as
-  that outcome — so a rebuild tells a finished retry from a pending one (docs/vault.md, "Operations").
+  that outcome — so a rebuild tells a finished retry from a pending one (docs/vault.md, "Operations");
+- `resolution`: the owner kept a `speakers_unknown` result from the phone (`{kind, op, resolved_at,
+  failure}`, the failure it resolved): processed again, it becomes a transcript-only note with the
+  speaker unknown. Kept for good, so the original condition stays visible.
 
 Open conversations have no record: they are recomputed. The index row is derived from the record
 (`row_from_record`) and the record from the row (`record_from_row`), so the rebuild and the running
@@ -122,6 +125,8 @@ def record_from_row(row, known_through: dict[str, int]) -> dict:
         record["retry"] = {"op": row["retry_op"], "stage": _get(row, "retry_stage")}
     if _get(row, "retry_outcome"):
         record["retry_outcome"] = json.loads(row["retry_outcome"])
+    if _get(row, "resolution"):
+        record["resolution"] = json.loads(row["resolution"])
     if row["note_path"]:
         render = {key: _out(_get(row, col), kind) for key, spec in RENDER_COLUMNS.items() if spec for col, kind in [spec]}
         render["kind"] = (json.loads(row["index_json"]) if row["index_json"] else {}).get("kind")
@@ -156,6 +161,8 @@ def row_from_record(record: dict) -> tuple[dict, dict[str, int]]:
     values["retry_stage"] = retry.get("stage") if retry else None
     outcome = record.get("retry_outcome")
     values["retry_outcome"] = json.dumps(outcome, sort_keys=True) if isinstance(outcome, dict) else None
+    resolution = record.get("resolution")
+    values["resolution"] = json.dumps(resolution, sort_keys=True) if isinstance(resolution, dict) else None
     if retry and not failure:
         # consumed but unfinished: run the retried stage again (its cached results are reused)
         status = "summarizing" if retry.get("stage") == "summarizing" else "closed"

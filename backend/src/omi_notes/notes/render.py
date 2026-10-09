@@ -206,7 +206,7 @@ def render_note(d: NoteData, my_notes: str | None = None) -> str:
     speakers = len({s["speaker"] for s in d.segments})
     out += [
         f"**When:** {start_local:%a %d %b %Y, %H:%M}–{end_local:%H:%M} · "
-        f"**Duration:** {_duration_text(d.end - d.start)} · **Speakers:** {speakers}",
+        f"**Duration:** {_duration_text(d.end - d.start)} · **Speakers:** {'unknown' if d.speakers_unknown else speakers}",
         "",
     ]
 
@@ -236,7 +236,7 @@ def render_note(d: NoteData, my_notes: str | None = None) -> str:
     if d.speakers_unknown:
         out += [
             "> [!warning] Local speaker separation found no distinct speaker in this audio, so the speaker is "
-            "unknown.",
+            "unknown. The text is the automated transcription and hasn't been checked.",
             "",
         ]
     elif not d.speaker_labels_consistent:

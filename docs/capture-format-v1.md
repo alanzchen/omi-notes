@@ -159,7 +159,7 @@ No auth. `200 {"ok": true}`.
                "backing_off": 0, "oldest_waiting_ended_at": "…", "oldest_pending_chunk_received_at": null,
                "stt": {"last_ok_at": "…", "last_error_at": null, "last_error_kind": null}, "llm": null},
   "vault_id": "…",
-  "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "search", "stats"]
+  "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "search", "stats"]
 }
 ```
 
@@ -328,7 +328,8 @@ notes directory.
 `state` is the display chip, chosen by precedence from the row; the raw `status` stays alongside.
 Codes: `listening` (open; the message says what it is waiting for), `processing`, `retrying` (an
 automatic retry is scheduled), `ready`, `transcript_only` (summary failed or summaries are turned
-off: the message says which), `failed` (no note), `discarded`. Messages are chosen by the server from
+off: the message says which), `kept_speaker_unknown` (kept from the phone as a transcript with the
+speaker unknown; see `resolution`), `failed` (no note), `discarded`. Messages are chosen by the server from
 the failure kind, never copied from a provider error. `issues` lists problems that coexist with
 readable content: `reprocess_failed` (an earlier note is still shown), `note_conflict` (edited
 outside My Notes; the server stopped updating it), `render_retrying`. `provisional`, `late_audio`
@@ -337,7 +338,8 @@ no current summary is readable); `speaker_names` are the people assigned to this
 speakers.
 
 `speakers_ready` is true once a closed conversation has a persisted transcript, even while
-summarization is pending or has failed. The phone offers speaker details only when it is true;
+summarization is pending or has failed (false for a kept `speakers_unknown` transcript: no speaker
+was separated, so there is nothing to review). The phone offers speaker details only when it is true;
 the speakers endpoint remains unavailable before transcription. This additive field may be absent
 on older servers; the phone then offers details only for `done` or `discarded` rows with a note path.
 Every field after `title` except `note_path`, `late_audio` and `provisional` is additive: older
@@ -370,11 +372,18 @@ included (with nothing to show yet). The body is the list entry plus:
 ```
 
 - `summary_state`: `ready`, `pending`, `disabled` (summaries turned off), `failed` (then
-  `summary_error` is a sanitized sentence), `not_applicable` (discarded before summarizing),
+  `summary_error` is a sanitized sentence), `not_applicable` (discarded before summarizing, or kept
+  without a summary),
   `updating`, `unavailable` (the referenced file is missing or unreadable).
 - `transcript_state`: `ready`, `pending`, `updating`, `unavailable`. Segments come 500 at a time;
   `next_from` is the `segments_from` of the next page (null on the last).
-- Speaker names are shown only when the stored assignments were made for this transcript.
+- Speaker names are shown only when the stored assignments were made for this transcript. A
+  segment whose speaker nobody separated has speaker `unknown`.
+- `resolution` (additive; null otherwise): how the owner resolved the conversation from the phone,
+  kept with the condition it resolved, so the history stays visible after the failure is gone:
+  `{"kind": "kept_speaker_unknown", "resolved_at": "…", "message": "…", "original": {"code":
+  "speakers_unknown", "stage": "transcribing", "message": "…"}}`. `speech_s` (detected speech) and
+  `duration_s` (start to end) are separate figures.
 - `note_state`: `none` (no note yet), `matches` (the saved Markdown is what the server wrote, apart
   from My Notes), `differs` (edited elsewhere: the phone shows this generated view with a banner),
   `missing`. `my_notes` is the text of the note's My Notes block; `my_notes_unreadable` is true when
@@ -388,7 +397,7 @@ What needs attention, most urgent first, bounded and sanitized:
 {"issues": [{"code": "conversation_failed", "severity": "action", "message": "The summary service rejected the server's credentials.",
              "next_step": "This needs a fix on the server. Once it's fixed, Retry here processes it again.",
              "server_step": "Fix the provider's key, account or settings on the server, then retry on the server with `omi-notes retry-failed`.",
-             "retryable": true, "conversation_id": "…", "started_at": "…", "title": null}]}
+             "retryable": true, "can_keep": false, "conversation_id": "…", "started_at": "…", "title": null}]}
 ```
 
 Codes: `read_only` (with `detail`), `worker_stopped`, `chunks_failed` (with `count`),
@@ -397,8 +406,10 @@ do something) or `delayed` (the server retries on its own). `next_step` is plain
 phone (no commands): whoever holds the phone may not run the server. `server_step` is the server
 operator's step; its commands name this deployment's `omi-notes` and environment file (the phone
 shows it under Diagnostics). `retryable` (conversation issues) is false when a retry from the phone
-can't help until something changes on the server (for example `speakers_unknown`). Both fields are
-optional for older servers: a missing `retryable` means true.
+can't help until something changes on the server (for example `speakers_unknown`). `can_keep` is
+true for a `speakers_unknown` failure with no operation pending: the phone offers
+`POST /v1/conversations/{id}/keep`. These fields are optional for older servers: a missing
+`retryable` means true, a missing `can_keep` false.
 
 ### `POST /v1/conversations/{id}/retry`
 
@@ -418,6 +429,16 @@ the retry is durable in the vault (docs/vault.md, "Operations"):
 meanwhile), `done`, `failed` (it failed again; see the conversation), `stopped` (the note was frozen),
 `superseded` (other processing replaced it). `409 busy` is not an answer: keep the request id and
 send it again later. The failed stage is redone with cached results reused.
+
+### `POST /v1/conversations/{id}/keep`
+
+For a `speakers_unknown` failure (words were transcribed, local speaker separation found no
+speaker): the owner keeps it as a transcript with the speaker unknown. Same body, answers and
+`409`s as a retry, plus `not_keepable` for any other failure (provider, worker and I/O failures
+stay failures to fix). The operation has `kind: "keep"`; once `done` the conversation is `done` with
+a transcript-only note (cached text reused, no summary, no speaker labels or voiceprints), it leaves
+`/v1/issues` and the failed counts, and its detail carries `resolution`. Nothing is deleted. If the
+attempt fails for another reason, that failure is listed as usual. The decision is permanent.
 
 ### `GET /v1/operations/{id}`
 

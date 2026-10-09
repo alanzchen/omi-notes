@@ -181,7 +181,7 @@ def create_app(
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes
-            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "search", "stats"],
+            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "search", "stats"],
             "vault_id": vault.vault_id,
         }
 
@@ -270,6 +270,19 @@ def create_app(
         pipeline = app.state.speakers.pipeline
         status_code, op = await run_in_threadpool(
             operations.accept, pipeline, conv_id, body.get("request_id"), read_only=read_only_reason(db)
+        )
+        return JSONResponse({"operation": op}, status_code=status_code)
+
+    @app.post("/v1/conversations/{conv_id}/keep")
+    async def keep(conv_id: str, request: Request) -> JSONResponse:
+        """Keep a `speakers_unknown` conversation as a transcript with the speaker unknown (a durable
+        operation like a retry; docs/vault.md, "Operations")."""
+        body = await read_json(request)
+        if not isinstance(body, dict):
+            raise ApiError(422, "invalid_body", "expected a JSON object")
+        pipeline = app.state.speakers.pipeline
+        status_code, op = await run_in_threadpool(
+            operations.accept, pipeline, conv_id, body.get("request_id"), read_only=read_only_reason(db), kind="keep"
         )
         return JSONResponse({"operation": op}, status_code=status_code)
 

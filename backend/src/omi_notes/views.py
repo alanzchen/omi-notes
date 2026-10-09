@@ -44,8 +44,8 @@ def failure_message(kind: str | None, stage: str | None) -> str:
         "notes": "The note's My Notes section is ambiguous, so the server won't overwrite it.",
         "io": "The server couldn't write the note file.",
         "move": "The server couldn't move the note file.",
-        "speakers_unknown": "The server got a few words from a very short sound but found no speaker in it, so no note "
-                            "was made. The audio and its text are kept.",
+        "speakers_unknown": "Words were transcribed, but local speaker separation found no distinct speaker, so no note "
+                            "was made. The audio and the automated text are kept on the server.",
     }.get(kind or "", f"The {service} failed.")
 
 
@@ -72,7 +72,8 @@ def server_step(kind: str | None, stage: str | None, *, retrying: bool) -> str:
     if kind == "notes":
         return "Fix the My Notes markers in the note by hand, " + retry
     if kind == "speakers_unknown":
-        return "Nothing is lost. Retry after the speaker-separation models are updated, " + retry
+        return ("Nothing is lost. The phone can keep it as a transcript with the speaker unknown; if speaker "
+                "separation on the server changes, " + retry)
     if kind in ("io", "move"):
         return "Check the vault folder's disk space and permissions, " + retry
     return "See _status.md in your vault for details, " + retry
@@ -83,7 +84,7 @@ def next_step(kind: str | None, stage: str | None, *, retrying: bool) -> str:
     if retrying:
         return "The server retries on its own; nothing to do on this phone."
     if kind == "speakers_unknown":
-        return "Retrying won't help until the server's speaker separation changes; nothing to do on this phone."
+        return "You can keep it as a transcript with the speaker unknown. A retry would give the same result."
     if kind == "notes":
         return "The note's My Notes section needs fixing on the server before it can be updated."
     return "This needs a fix on the server. Once it's fixed, Retry here processes it again."
@@ -92,6 +93,33 @@ def next_step(kind: str | None, stage: str | None, *, retrying: bool) -> str:
 def retryable(kind: str | None) -> bool:
     """Whether a retry from the phone can help without a change on the server first."""
     return kind != "speakers_unknown"
+
+
+def keepable(kind: str | None) -> bool:
+    """Whether the phone can keep it as is (`POST /v1/conversations/{id}/keep`)."""
+    return kind == "speakers_unknown"
+
+
+def resolution(row: sqlite3.Row) -> dict | None:
+    """How the owner resolved this conversation from the phone, with the condition it resolved."""
+    try:
+        res = json.loads(row["resolution"]) if row["resolution"] else None
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(res, dict) or res.get("kind") != "kept_speaker_unknown":
+        return None
+    failure = res.get("failure") if isinstance(res.get("failure"), dict) else {}
+    at = res.get("resolved_at")
+    return {"kind": res["kind"], "resolved_at": iso_utc_epoch(at) if isinstance(at, (int, float)) else None,
+            "message": "Kept from the phone as a transcript with the speaker unknown.",
+            "original": {"code": failure.get("kind"), "stage": failure.get("stage"),
+                         "message": failure_message(failure.get("kind"), failure.get("stage"))}}  # fmt: skip
+
+
+def _kept(row: sqlite3.Row) -> bool:
+    """Kept with the speaker unknown, and the current note is that transcript (not a later one
+    whose speakers were separated after all)."""
+    return row["status"] == "done" and resolution(row) is not None and bool(_index(row).get("speakers_unknown"))
 
 
 # -- conversation state ---------------------------------------------------------------------------
@@ -122,6 +150,8 @@ def state(row: sqlite3.Row) -> dict:
         if row["note_path"]:
             return {"code": "ready", "message": "Note ready"}  # an earlier note survives a failed reprocess
         return {"code": "failed", "message": failure_message(row["error_kind"], row["failed_stage"])}
+    if _kept(row):
+        return {"code": "kept_speaker_unknown", "message": "Kept as a transcript; the speaker is unknown"}
     if row["llm_status"] == "none":
         return {"code": "transcript_only", "message": "Transcript ready; summaries are turned off"}
     return {"code": "ready", "message": "Note ready"}
@@ -163,6 +193,8 @@ def summary(conv_dir: Path, row: sqlite3.Row) -> tuple[ConversationNotes | None,
     """(notes, availability): ready | pending | disabled | failed | not_applicable | updating | unavailable."""
     if row["llm_status"] == "none":
         return None, "disabled"
+    if _kept(row):
+        return None, "not_applicable"  # kept without a summary on purpose
     if not row["llm_ref"]:
         if row["status"] == "failed" and row["failed_stage"] == "summarizing":
             return None, "failed"
@@ -250,7 +282,8 @@ def summary_row(pipeline, row: sqlite3.Row) -> dict:
         "note_path": row["note_path"],
         "late_audio": bool(row["late_audio"]),
         "provisional": bool(row["provisional"]),
-        "speakers_ready": row["status"] != "open" and row["transcript_sha"] is not None,
+        # nothing to review when no speaker was separated
+        "speakers_ready": row["status"] != "open" and row["transcript_sha"] is not None and not _kept(row),
     }
 
 
@@ -284,6 +317,7 @@ def detail(pipeline, row: sqlite3.Row, *, segments_from: int = 0) -> dict:
         "my_notes": note["my_notes"],
         "my_notes_unreadable": note["my_notes_unreadable"],
         "discard_reason": idx.get("discard_reason") if row["status"] == "discarded" else None,
+        "resolution": resolution(row),
         "transcript_sha": row["transcript_sha"],
         "speakers_revision": row["speakers_revision"],
         "revision": row["revision"],
@@ -364,9 +398,10 @@ def server_issues(db, *, read_only: str | None, worker: bool, limit: int = ISSUE
                     "next_step": "This needs a fix on the server. Once it's fixed, they can be tried again.",
                     "server_step": f"See _status.md in your vault, then retry on the server with {command('retry-failed')}."})  # fmt: skip
 
-    def conv(r, code: str, severity: str, message: str, step: str, server: str, can_retry: bool = True) -> dict:
+    def conv(r, code: str, severity: str, message: str, step: str, server: str, can_retry: bool = True,
+             can_keep: bool = False) -> dict:  # fmt: skip
         return {"code": code, "severity": severity, "message": message, "next_step": step, "server_step": server,
-                "retryable": can_retry,
+                "retryable": can_retry, "can_keep": can_keep,
                 "conversation_id": r["id"], "started_at": iso_utc_epoch(r["start"]),
                 "title": r["title"] if r["note_path"] else None}  # fmt: skip
 
@@ -376,7 +411,8 @@ def server_issues(db, *, read_only: str | None, worker: bool, limit: int = ISSUE
         else:
             message = failure_message(r["error_kind"], r["failed_stage"])
         out.append(conv(r, "conversation_failed", "action", message, next_step(r["error_kind"], r["failed_stage"], retrying=False),
-                        server_step(r["error_kind"], r["failed_stage"], retrying=False), retryable(r["error_kind"])))  # fmt: skip
+                        server_step(r["error_kind"], r["failed_stage"], retrying=False), retryable(r["error_kind"]),
+                        keepable(r["error_kind"]) and not r["retry_op"]))  # fmt: skip
     for r in db.query(f"SELECT * FROM conversations WHERE edited=1 AND frozen=0 AND note_path IS NOT NULL AND {LISTED} "
                       "ORDER BY start DESC LIMIT ?", (limit,)):  # fmt: skip
         out.append(conv(r, "note_conflict", "action", "The note was changed outside My Notes; the server stopped updating it.",

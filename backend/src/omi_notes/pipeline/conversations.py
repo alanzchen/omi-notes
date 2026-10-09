@@ -87,6 +87,8 @@ _PROMPT_IN_NAME = re.compile(r"-p(\d+)-[0-9a-f]{16}\.json$")
 
 STATUS_INTERVAL = 60.0  # `_status.md` and stubs are rewritten at most once a minute
 EDITED_RETRY = 600.0
+# why a kept `speakers_unknown` conversation has no summary (shown in its note)
+KEPT_REASON = "kept from the phone without speaker separation"
 
 
 class CacheMiss(RuntimeError):
@@ -509,7 +511,10 @@ class ConversationPipeline:
         else:
             speakers = self._speakers(conv_id, cached["response"], audio, audio_sha)
         segments = merge_same_speaker(segments_from_deepgram(speakers.response, audio.timemap))
-        if unlabeled and any(s["text"].strip() for s in segments):
+        if unlabeled:
+            # one window with no speaker: say so rather than number a made-up "Speaker 1"
+            segments = merge_same_speaker([s | {"speaker": "unknown"} for s in segments])
+        if unlabeled and any(s["text"].strip() for s in segments) and not _kept(row):
             raise ProviderError("words were transcribed, but local speaker separation found no speakers; "
                                 "no note is made so no speaker is invented (the audio and its text are kept)",
                                 terminal=True, kind="speakers_unknown")  # fmt: skip
@@ -536,8 +541,9 @@ class ConversationPipeline:
             "timemap": [[m.out_start, m.wall_start, m.duration] for m in audio.timemap],
         }
         atomic_write_bytes(self.conv_dir(conv_id) / "transcript.json", json.dumps(transcript, indent=1).encode())
-        self.identify(conv_id, audio, audio_sha, clips, sha256_hex(canonical_json(segments).encode()),
-                      {seg["speaker"] for seg in segments}, consistent=speakers.consistent)  # fmt: skip
+        if not unlabeled:  # no labels or voiceprints for a speaker nobody separated
+            self.identify(conv_id, audio, audio_sha, clips, sha256_hex(canonical_json(segments).encode()),
+                          {seg["speaker"] for seg in segments}, consistent=speakers.consistent)  # fmt: skip
         self._set(conv_id, status="summarizing", audio_sha=audio_sha, stt_ref=name, language=language,
                   transcript_sha=sha256_hex(canonical_json(segments).encode()), attempts=0, error=None,
                   error_kind=None, next_attempt_at=None, updated_at=now, skip_stt=None)  # fmt: skip
@@ -797,7 +803,11 @@ class ConversationPipeline:
         discard_reason = None
         # Re-renders (cache_only) reproduce what the note was made from, whatever the settings now.
         no_summary = row["llm_status"] == "none" if cache_only else self.settings.llm_provider == "none"
-        if verdict == "discard":
+        if _kept(row) and transcript.get("speaker_source") == "unlabeled":
+            # the owner chose to keep it as it is: no discard, and no summary of text nobody can attribute
+            kind = "transcript_only"
+            summary_error = KEPT_REASON
+        elif verdict == "discard":
             kind = "discarded"
             discard_reason = RULE_REASONS.get(rule, rule)
         elif summary_error is not None or no_summary:
@@ -876,6 +886,8 @@ class ConversationPipeline:
             "stt_seconds": transcript.get("submitted_seconds", 0),
             "discard_reason": discard_reason,
             "relevance": [verdict, rule],
+            # only when true, so the records of every other note stay byte-identical
+            **({"speakers_unknown": True} if data.speakers_unknown else {}),
         }
         llm_status = "ok" if llm_cached else ("none" if snap.get("llm_none") else ("failed" if summary_error else None))
         self._commit(
@@ -1343,7 +1355,18 @@ def _outcome(row, status: str, failure_kind: str | None) -> dict:
     if not row["retry_op"]:
         return {}
     outcome = {"op": row["retry_op"], "status": status, "failure_kind": failure_kind, "finished_at": time.time()}
+    if _kept(row).get("op") == row["retry_op"]:
+        outcome["kind"] = "keep"
     return {"retry_outcome": json.dumps(outcome, sort_keys=True), "retry_op": None, "retry_stage": None}
+
+
+def _kept(row) -> dict:
+    """The owner's "keep with the speaker unknown" decision (`resolution` in conversation.json), or {}."""
+    try:
+        resolution = json.loads(row["resolution"]) if row["resolution"] else None
+    except (json.JSONDecodeError, IndexError, KeyError):
+        return {}
+    return resolution if isinstance(resolution, dict) and resolution.get("kind") == "kept_speaker_unknown" else {}
 
 
 def _load_llm_cache(path: Path) -> dict:

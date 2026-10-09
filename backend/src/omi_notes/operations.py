@@ -1,4 +1,4 @@
-"""App retries as durable operations (docs/vault.md, "Operations").
+"""App retries and keeps as durable operations (docs/vault.md, "Operations").
 
 A retry the phone asked for is a file, `_omi/operations/<request_id>.json`, written (and fsync'd)
 before anything is queued: `{format, id, kind: "retry", conversation_id, stage, failure_kind,
@@ -14,6 +14,11 @@ it was accepted for (`failure_id`); anything else supersedes it. A malformed ope
 reported, never overwritten; a missing one whose outcome is recorded is written again from it.
 Nothing here deletes, and a provider call can repeat only if the process dies between the response
 and its cache write.
+
+A keep (`kind: "keep"`, `POST /v1/conversations/{id}/keep`) is the same operation for a
+`speakers_unknown` failure, plus the owner's decision: `resolution` is committed with `retry`, so the
+attempt it queues makes a transcript-only note with the speaker unknown (cached text, no provider
+call) instead of failing again. The vault is raised to format 3 first.
 """
 
 from __future__ import annotations
@@ -33,6 +38,8 @@ from .views import LISTED
 log = logging.getLogger(__name__)
 
 FORMAT = 1
+KINDS = ("retry", "keep")
+KEPT = "kept_speaker_unknown"
 TERMINAL = ("done", "failed", "stopped", "superseded")
 REQUIRED = ("id", "kind", "conversation_id", "state")
 STATES = ("accepted", *TERMINAL)
@@ -67,7 +74,7 @@ def read(vault: Vault, op_id: str) -> dict | None:
     except (OSError, ValueError) as exc:
         raise OperationCorrupt(500, "operation_unreadable", f"operation {op_id} is unreadable: {exc}") from exc
     if (not isinstance(op, dict) or any(not isinstance(op.get(k), str) for k in REQUIRED) or op["id"] != op_id
-            or not isinstance(op.get("format"), int) or not 1 <= op["format"] <= FORMAT or op["kind"] != "retry"
+            or not isinstance(op.get("format"), int) or not 1 <= op["format"] <= FORMAT or op["kind"] not in KINDS
             or op["state"] not in STATES or (op["state"] == "accepted" and not _valid_accepted(op))):  # fmt: skip
         raise OperationCorrupt(500, "operation_unreadable", f"operation {op_id} is not a valid operation file")
     return op
@@ -103,9 +110,9 @@ def _state(outcome: dict) -> str:
 # -- accepting --------------------------------------------------------------------------------------
 
 
-def accept(pipeline, conv_id: str, request_id: str, *, read_only: str | None) -> tuple[int, dict]:
-    """`POST /v1/conversations/{id}/retry`: 202 with the new operation, or 200 for a repeated
-    request id once its acceptance is complete (a crash may have interrupted it)."""
+def accept(pipeline, conv_id: str, request_id: str, *, read_only: str | None, kind: str = "retry") -> tuple[int, dict]:
+    """`POST /v1/conversations/{id}/retry` (or `/keep`): 202 with the new operation, or 200 for a
+    repeated request id once its acceptance is complete (a crash may have interrupted it)."""
     if not isinstance(request_id, str) or not UUID_RE.match(request_id):
         raise ApiError(422, "invalid_body", "request_id must be a lowercase UUID")
     if read_only:
@@ -114,7 +121,7 @@ def accept(pipeline, conv_id: str, request_id: str, *, read_only: str | None) ->
     with lock(vault):
         existing = read(vault, request_id)
         if existing is not None:
-            if existing.get("kind") != "retry" or existing.get("conversation_id") != conv_id:
+            if existing.get("kind") != kind or existing.get("conversation_id") != conv_id:
                 raise ApiError(409, "request_conflict", "this request id belongs to another operation")
             if not _repair(pipeline, existing):
                 # accepted, but its queueing isn't committed yet: not an answer to settle on
@@ -134,11 +141,14 @@ def accept(pipeline, conv_id: str, request_id: str, *, read_only: str | None) ->
         try:
             row = _row(db, conv_id)
             _check_retryable(row)
+            if kind == "keep" and row["error_kind"] != "speakers_unknown":
+                raise ApiError(409, "not_keepable", "only a conversation whose speakers couldn't be separated can be kept "
+                               "this way")  # fmt: skip
             previous = _outcome(row)
             if previous:
                 _close(vault, previous, conv_id)  # its receipt is final before a new attempt replaces it
-            vault.raise_format(2)
-            op = {"format": FORMAT, "id": request_id, "kind": "retry", "conversation_id": conv_id,
+            vault.raise_format(3 if kind == "keep" else 2)
+            op = {"format": FORMAT, "id": request_id, "kind": kind, "conversation_id": conv_id,
                   "stage": row["failed_stage"] or "transcribing", "failure_kind": row["error_kind"],
                   "failure_id": row["failure_id"], "record_sha": row["record_sha"], "requested_at": time.time(),
                   "state": "accepted"}  # fmt: skip
@@ -167,7 +177,13 @@ def _check_retryable(row) -> None:
 def _enqueue(pipeline, row, op: dict) -> None:
     """Record the retry in conversation.json (then the index), then wake the worker. The counter is
     only a wake-up: which attempt is the retry's is decided by `retry` / `retry_outcome`."""
-    pipeline._commit(row["id"], retry_op=op["id"], retry_stage=op["stage"])
+    keep = {}
+    if op["kind"] == "keep":
+        # the owner's decision, with the failure it resolves (it stays visible after the note exists)
+        keep["resolution"] = json.dumps({"kind": KEPT, "op": op["id"], "resolved_at": op["requested_at"],
+                                         "failure": {"stage": row["failed_stage"], "kind": row["error_kind"],
+                                                     "id": row["failure_id"]}}, sort_keys=True)  # fmt: skip
+    pipeline._commit(row["id"], retry_op=op["id"], retry_stage=op["stage"], **keep)
     pipeline.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1 WHERE id=?", (row["id"],))
 
 
@@ -197,7 +213,8 @@ def _close(vault: Vault, outcome: dict, conv_id: str | None) -> None:
     if op is None:
         # the receipt is missing (lost from the vault) but its outcome is recorded: write it again
         log.warning("operation %s had no file; writing its receipt from the recorded outcome", outcome["op"])
-        op = {"format": FORMAT, "id": outcome["op"], "kind": "retry", "conversation_id": conv_id, "reconstructed": True}
+        op = {"format": FORMAT, "id": outcome["op"], "kind": outcome.get("kind", "retry"), "conversation_id": conv_id,
+              "reconstructed": True}  # fmt: skip
     op.update(state=_state(outcome), outcome=outcome.get("status"),
               outcome_failure_kind=outcome.get("failure_kind"), finished_at=outcome.get("finished_at"))  # fmt: skip
     _write(vault, op)
@@ -322,7 +339,7 @@ def view(pipeline, op_id: str) -> dict:
         "state": state,
         "requested_at": iso_utc_epoch(op["requested_at"]) if op.get("requested_at") else None,
         "finished_at": iso_utc_epoch(finished_at) if finished_at else None,
-        "message": _MESSAGES.get(state, state),
+        "message": (_KEEP_MESSAGES.get(state) if op.get("kind") == "keep" else None) or _MESSAGES.get(state, state),
     }
 
 
@@ -336,4 +353,10 @@ _MESSAGES = {
     "failed": "The retry failed again",
     "stopped": "Stopped: the note is frozen on the server",
     "superseded": "Replaced by later processing",
+}
+
+_KEEP_MESSAGES = {
+    "accepted": "Keeping it",
+    "done": "Kept as a transcript; the speaker is unknown",
+    "failed": "Couldn't keep it: processing failed for another reason",
 }
