@@ -141,6 +141,8 @@ import OmiProtocol
         // Button + heartbeat event examples.
         let button = EventBody(deviceId: Self.deviceId, at: "2026-09-26T19:32:06.000Z", payload: .button(ButtonData(code: 2)), captureId: Self.liveCaptureId, offsetUs: 877_000)
         try Self.prettyJSON(button).write(to: out.appendingPathComponent("event_button.json"))
+        let star = EventBody(deviceId: Self.deviceId, at: "2026-09-26T19:32:06.000Z", payload: .button(ButtonData(code: Int(ButtonEvent.starCode))), captureId: Self.liveCaptureId, offsetUs: 877_000)
+        try Self.prettyJSON(star).write(to: out.appendingPathComponent("event_button_star.json"))
         let hb = EventBody(deviceId: Self.deviceId, at: "2026-09-26T19:32:06.000Z", payload: .heartbeat(HeartbeatData(
             battery: 83, charging: false, firmwareRevision: "3.0.21", modelNumber: "Omi CV 1", rtcValid: true, offlineUnread: 0,
             outboxChunks: 1, outboxBytes: Int64(liveBody.count), appState: "background",
@@ -268,6 +270,7 @@ import OmiProtocol
         ## Events
 
         - `event_button.json` — double tap (`code` 2) with `capture_id` + `offset_us`.
+        - `event_button_star.json` — a double tap set to star (`code` 3), same placement.
         - `event_heartbeat.json` — heartbeat with a coverage watermark through the end of the (rotated)
           chunk 0 of the live sample.
         - `event_voice_enrollment_start.json` / `event_voice_enrollment_end.json` — one enrollment window

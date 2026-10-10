@@ -60,6 +60,11 @@ public struct EngineSnapshot: Equatable, Sendable {
     public var attention: [String] = []
     public var serverConfigured = false
     public var lastButton: String?
+    /// This phone's choices for the pendant (`SettingsStore`).
+    public var recordingPaused = false
+    public var autoCollect = true
+    public var buttonActionsEnabled = true
+    public var doubleTapAction = DoubleTapAction.endConversation
     public var recoveredCaptures = 0
     public var quarantined: [String] = []
     /// Voice enrollment window currently open on the live capture, if any.
@@ -461,6 +466,59 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         }
     }
 
+    /// Pause or resume recording from this phone (kept across launches). Paused, the pendant drops
+    /// its audio while connected to this phone; it records to its own storage if the link drops.
+    public func setRecordingPaused(_ paused: Bool) {
+        queue.async { self.setRecordingPausedNow(paused, from: "the app") }
+    }
+
+    private func setRecordingPausedNow(_ paused: Bool, from source: String) {
+        guard paused != settings.recordingPaused else { return }
+        settings.recordingPaused = paused
+        log(.info, "engine", "recording \(paused ? "paused" : "resumed") from \(source)")
+        if let s = session {
+            if paused { withBackgroundTask("pause") { s.setAudioPaused(true) } } else { s.setAudioPaused(false) }
+            // felt on the pendant: one long buzz for paused, a short one for recording again
+            if s.info.canVibrate { s.vibrate(paused ? .long : .short) { _ in } }
+        }
+        scheduleReconcile()
+        scheduleSnapshot()
+    }
+
+    /// Collect the pendant's stored audio on every connection, or only when asked.
+    public func setAutoCollect(_ on: Bool) {
+        queue.async {
+            self.settings.autoCollectPendantAudio = on
+            self.session?.autoCollect = on
+            if on { self.session?.collectOfflineAudio() }
+            self.scheduleSnapshot()
+        }
+    }
+
+    public func setButtonActions(_ on: Bool) {
+        queue.async { self.settings.buttonActionsEnabled = on; self.scheduleSnapshot() }
+    }
+
+    public func setDoubleTapAction(_ action: DoubleTapAction) {
+        queue.async { self.settings.doubleTapAction = action; self.scheduleSnapshot() }
+    }
+
+    /// Collect the audio stored on the pendant now.
+    public func collectPendantAudioNow() {
+        queue.async {
+            self.session?.collectOfflineAudio()
+            self.scheduleSnapshot()
+        }
+    }
+
+    /// Reads what the pendant supports again (after its features couldn't be read).
+    public func retryPendantControls() {
+        queue.async {
+            self.session?.retryControls()
+            self.scheduleSnapshot()
+        }
+    }
+
     /// Find my pendant: three long vibrations (as the Omi app does), stopping at the first failure.
     public func findPendant(completion: @escaping @Sendable (Error?) -> Void) {
         queue.async {
@@ -650,6 +708,8 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         let id = s.deviceId
         s.onCodecLearned = { memory.remember(codec: $0.rawValue, for: id) }
         s.onAudioNotification = { [weak self] in self?.noteAudio() }
+        s.startPaused(settings.recordingPaused)
+        s.autoCollect = settings.autoCollectPendantAudio
         session = s
         refusal = nil
         pendingDisconnectReason = nil
@@ -755,29 +815,40 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         scheduleSnapshot()
     }
 
-    public func session(_ session: DeviceSession, didReceiveButton received: ButtonEvent) {
-        var event = received
-        if event.uploadCode != nil {
-            guard settings.buttonActionsEnabled else {
-                log(.info, "engine", "button \(event) ignored: button actions are off on this phone")
-                return
-            }
-            if event == .doubleTap, settings.doubleTapAction == .bookmark { event = .singleTap }
-        }
-        guard let code = event.uploadCode else {
+    public func session(_ session: DeviceSession, didReceiveButton event: ButtonEvent) {
+        guard var code = event.uploadCode else {
             log(.debug, "engine", "button event \(event) ignored")
             return
+        }
+        guard settings.buttonActionsEnabled else {
+            log(.info, "engine", "button \(event) ignored: button actions are off on this phone")
+            return
+        }
+        // What this phone does with a double tap (single tap always bookmarks).
+        var split = event == .doubleTap
+        var what = code == 1 ? "Bookmark" : "End conversation"
+        if event == .doubleTap {
+            switch settings.doubleTapAction {
+            case .endConversation: break
+            case .bookmark: code = 1; split = false; what = "Bookmark"
+            case .starConversation: code = Int(ButtonEvent.starCode); split = false; what = "Star conversation"
+            case .pauseRecording:
+                let pausing = !settings.recordingPaused
+                setRecordingPausedNow(pausing, from: "double tap")
+                lastButton = "\(pausing ? "Paused" : "Resumed") at \(DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium))"
+                return
+            }
         }
         do {
             try events.button(code: code, deviceId: session.deviceId, captureId: recorder.captureId, offsetUs: recorder.nowOffsetUs())
         } catch {
             log(.error, "engine", "button event write failed: \(error)")
         }
-        if event == .doubleTap {
+        if split {
             withBackgroundTask("double-tap") { recorder.rotateNow(reason: .doubleTap) }
         }
-        lastButton = "\(code == 1 ? "Bookmark" : "End conversation") at \(DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium))"
-        log(.info, "engine", "button \(code == 1 ? "single tap (bookmark)" : "double tap (split)")")
+        lastButton = "\(what) at \(DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium))"
+        log(.info, "engine", "button: \(what.lowercased())")
         scheduleReconcile()
     }
 
@@ -1015,6 +1086,10 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         s.attention = attention + uploader.status.attention
         s.serverConfigured = settings.endpoint != nil
         s.lastButton = lastButton
+        s.recordingPaused = settings.recordingPaused
+        s.autoCollect = settings.autoCollectPendantAudio
+        s.buttonActionsEnabled = settings.buttonActionsEnabled
+        s.doubleTapAction = settings.doubleTapAction
         s.recoveredCaptures = recoveredCaptures
         s.quarantined = quarantined
         s.activeEnrollmentId = activeEnrollment?.id

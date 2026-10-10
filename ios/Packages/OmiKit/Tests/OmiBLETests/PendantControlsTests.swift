@@ -41,6 +41,24 @@ import OmiProtocol
         #expect(!h.transport.calls.contains { $0.hasPrefix("write ledDimRatio") || $0.hasPrefix("write haptic") })
     }
 
+    @Test func unreadableFeaturesAreUnknownNotUnsupportedAndCanBeReadAgain() throws {
+        let h = SessionHarness(values: Self.cv1())
+        h.transport.failReads = [.features]
+        h.connectFully()
+        let info = h.session.info
+        #expect(!info.controlsKnown && info.controlsUnreadable, "a failed read is unknown, not evidence of no hardware")
+        #expect(info.settingsSupported.isEmpty && info.settings.isEmpty)
+        let r = Box<Result<Int, Error>>()
+        h.session.change(.ledBrightness, to: 10) { r.value = $0 }
+        if case .failure(let e)? = r.value { #expect((e as? PendantControlError) == .capabilityUnknown) } else { Issue.record("no failure") }
+        #expect(!h.transport.calls.contains { $0.hasPrefix("write ledDimRatio") }, "nothing is written until support is known")
+
+        h.transport.failReads = []
+        h.session.retryControls()
+        #expect(h.session.info.controlsKnown && !h.session.info.controlsUnreadable)
+        #expect(h.session.info.settings == [.ledBrightness: 50, .micGain: 6] && h.session.info.canVibrate)
+    }
+
     @Test func aChangeIsWrittenThenReadBackAndAFailureKeepsWhatThePendantHas() throws {
         let h = SessionHarness(values: Self.cv1())
         h.connectFully()
@@ -149,5 +167,20 @@ import OmiProtocol
         settings.doubleTapAction = .bookmark
         engine.simulateButton(code: 2)
         #expect(await waitFor(2) { buttonCodes() == [1] })
+        settings.doubleTapAction = .starConversation
+        engine.simulateButton(code: 2)
+        #expect(await waitFor(2) { buttonCodes() == [1, 3] }, "a star is its own event, with no split")
+
+        // double tap set to pause: recording pauses (felt as one long buzz), and the next resumes it
+        engine.queue.sync { engine.simulated?.failControlWrites = false }
+        settings.doubleTapAction = .pauseRecording
+        engine.simulateButton(code: 2)
+        #expect(await waitFor(2) { engine.snapshotNow().device?.audioPaused == true && settings.recordingPaused })
+        #expect(await waitFor(2) { engine.snapshotNow().live == nil || engine.snapshotNow().device?.audioPaused == true })
+        #expect(await waitFor(2) { engine.queue.sync { engine.simulated?.vibrations.last } == HapticPulse.long.rawValue })
+        engine.simulateButton(code: 2)
+        #expect(await waitFor(2) { engine.snapshotNow().device?.audioPaused == false && !settings.recordingPaused })
+        #expect(await waitFor(2) { engine.queue.sync { engine.simulated?.vibrations.last } == HapticPulse.short.rawValue })
+        #expect(buttonCodes() == [1, 3], "pausing uploads no button event")
     }
 }

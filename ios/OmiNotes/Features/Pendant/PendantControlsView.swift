@@ -15,6 +15,13 @@ struct PendantControlsSection: View {
             if s.connection != .streaming || s.device == nil {
                 Label("Connect the pendant to change its light or microphone level, or to find it.", systemImage: "antenna.radiowaves.left.and.right.slash")
                     .font(.subheadline).foregroundStyle(.secondary)
+            } else if let d = s.device, d.controlsUnreadable {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Couldn't read which settings this pendant supports, so none can be changed yet.", systemImage: "questionmark.circle")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                    Button("Try again") { model.engine.retryPendantControls() }
+                }
+                .padding(.vertical, 2)
             } else if let d = s.device, !d.controlsKnown {
                 HStack(spacing: 10) {
                     ProgressView()
@@ -207,27 +214,93 @@ private struct StatusLine: View {
     }
 }
 
+/// Pausing recording and collecting the pendant's stored audio: this phone's choices, with what
+/// they mean for recording said before they are made.
+struct PendantRecordingSection: View {
+    let model: AppModel
+    @State private var confirmPause = false
+    @State private var confirmManual = false
+
+    var body: some View {
+        let s = model.snapshot
+        Section {
+            if s.recordingPaused {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Recording is paused from this phone.", systemImage: "pause.circle.fill").foregroundStyle(.orange)
+                    Text(s.connection == .streaming
+                         ? "While connected, the pendant records nothing. If it disconnects, it records to its own storage as usual."
+                         : "When it reconnects it won't record until you resume. While away it records to its own storage as usual.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Button("Resume recording") { model.engine.setRecordingPaused(false) }
+                        .buttonStyle(.borderedProminent).padding(.top, 2)
+                }
+                .padding(.vertical, 2)
+            } else {
+                Button("Pause recording…") { confirmPause = true }
+            }
+            Toggle("Collect pendant audio automatically", isOn: Binding(get: { s.autoCollect }, set: { on in
+                if on { model.engine.setAutoCollect(true) } else { confirmManual = true }
+            }))
+            if !s.autoCollect, s.connection == .streaming, let d = s.device, d.offlineHeld {
+                LabeledContent("Waiting on the pendant") {
+                    Text(d.offlineUnread.map { "\($0) records" } ?? "Unknown").foregroundStyle(.secondary)
+                }
+                Button("Collect now") { model.engine.collectPendantAudioNow() }
+            }
+        } header: {
+            Text("Recording")
+        } footer: {
+            Text(s.autoCollect
+                 ? "Audio the pendant recorded while away from this phone is collected each time it connects."
+                 : "The pendant keeps what it recorded away from this phone until you collect it. When its storage is full the oldest audio is overwritten.")
+        }
+        .confirmationDialog("Pause recording?", isPresented: $confirmPause, titleVisibility: .visible) {
+            Button("Pause", role: .destructive) { model.engine.setRecordingPaused(true) }
+        } message: {
+            Text("While the pendant is connected to this phone it records nothing, live or to its own storage, until you resume here (or with a double tap set to pause). If it disconnects, it records to its own storage as usual.")
+        }
+        .confirmationDialog("Collect pendant audio only when asked?", isPresented: $confirmManual, titleVisibility: .visible) {
+            Button("Only when I ask", role: .destructive) { model.engine.setAutoCollect(false) }
+        } message: {
+            Text("What the pendant records away from this phone stays on it until you tap Collect now. Its storage is a ring: when it fills, the oldest audio is overwritten and lost. Notes for that time appear only after collecting, and conversations around a reconnect may be finished without it.")
+        }
+    }
+}
+
 /// What this phone does with the pendant's button (kept on the phone, like the Omi app's).
 struct PendantButtonSection: View {
     let model: AppModel
-    @State private var enabled = true
-    @State private var doubleTap = DoubleTapAction.endConversation
 
     var body: some View {
+        let s = model.snapshot
+        let starSupported = model.serverStatus?.supportsPendantStar == true
+        let options = DoubleTapAction.allCases.filter { $0 != .starConversation || starSupported || s.doubleTapAction == .starConversation }
         Section {
-            Toggle("Button actions", isOn: Binding(get: { enabled }, set: { enabled = $0; model.engine.settings.buttonActionsEnabled = $0 }))
-            Picker("Double tap", selection: Binding(get: { doubleTap }, set: { doubleTap = $0; model.engine.settings.doubleTapAction = $0 })) {
-                ForEach(DoubleTapAction.allCases, id: \.self) { Text($0.title).tag($0) }
+            Toggle("Button actions", isOn: Binding(get: { s.buttonActionsEnabled }, set: { model.engine.setButtonActions($0) }))
+            Picker("Double tap", selection: Binding(get: { s.doubleTapAction }, set: { model.engine.setDoubleTapAction($0) })) {
+                ForEach(options, id: \.self) { Text($0.title).tag($0) }
             }
-            .disabled(!enabled)
+            .disabled(!s.buttonActionsEnabled)
         } header: {
             Text("Pendant button")
         } footer: {
-            Text(enabled ? "A single tap bookmarks the moment. Kept on this phone." : "Taps on the pendant are ignored. Kept on this phone.")
+            Text(footer(s, starSupported: starSupported))
         }
-        .onAppear {
-            enabled = model.engine.settings.buttonActionsEnabled
-            doubleTap = model.engine.settings.doubleTapAction
+    }
+
+    private func footer(_ s: EngineSnapshot, starSupported: Bool) -> String {
+        guard s.buttonActionsEnabled else { return "Taps on the pendant are ignored. Kept on this phone." }
+        var text = "A single tap bookmarks the moment. "
+        switch s.doubleTapAction {
+        case .endConversation: text += "A double tap ends the conversation."
+        case .bookmark: text += "A double tap bookmarks too."
+        case .pauseRecording: text += "A double tap pauses recording (one long buzz) or resumes it (one short buzz)."
+        case .starConversation:
+            text += starSupported
+                ? "A double tap stars the conversation it's in, once it's finished; a second one in the same conversation un-stars it."
+                : "Your server doesn't support stars yet: taps are kept and applied if it is updated within 7 days."
         }
+        if !starSupported, s.doubleTapAction != .starConversation { text += " Starring needs a server update." }
+        return text + " Kept on this phone."
     }
 }

@@ -97,6 +97,8 @@ public final class SettingsStore: @unchecked Sendable {
         static let onboarded = "omi.onboarded"
         static let buttonActionsOff = "omi.buttonActionsOff"
         static let doubleTapAction = "omi.doubleTapAction"
+        static let recordingPaused = "omi.recordingPaused"
+        static let autoCollectOff = "omi.autoCollectOff"
     }
 
     public init(defaults: UserDefaults = .standard, tokens: TokenStore = KeychainTokenStore()) {
@@ -201,6 +203,18 @@ public final class SettingsStore: @unchecked Sendable {
         set { defaults.set(!newValue, forKey: Key.buttonActionsOff) }
     }
 
+    /// Recording paused from this phone (kept across launches, like the Omi app's mute).
+    public var recordingPaused: Bool {
+        get { defaults.bool(forKey: Key.recordingPaused) }
+        set { defaults.set(newValue, forKey: Key.recordingPaused) }
+    }
+
+    /// Collect the audio stored on the pendant on every connection (on by default).
+    public var autoCollectPendantAudio: Bool {
+        get { !defaults.bool(forKey: Key.autoCollectOff) }
+        set { defaults.set(!newValue, forKey: Key.autoCollectOff) }
+    }
+
     public var doubleTapAction: DoubleTapAction {
         get { defaults.string(forKey: Key.doubleTapAction).flatMap(DoubleTapAction.init(rawValue:)) ?? .endConversation }
         set { defaults.set(newValue.rawValue, forKey: Key.doubleTapAction) }
@@ -211,12 +225,18 @@ public final class SettingsStore: @unchecked Sendable {
 public enum DoubleTapAction: String, CaseIterable, Sendable {
     /// End the current conversation now (the default).
     case endConversation
+    /// Pause recording, or resume it (the Omi app's "mute/unmute").
+    case pauseRecording
+    /// Star the conversation this moment belongs to (needs a server that supports it).
+    case starConversation
     /// Bookmark this moment, like a single tap; the conversation continues.
     case bookmark
 
     public var title: String {
         switch self {
         case .endConversation: return "End conversation"
+        case .pauseRecording: return "Pause / resume recording"
+        case .starConversation: return "Star conversation"
         case .bookmark: return "Bookmark"
         }
     }

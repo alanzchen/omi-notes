@@ -46,7 +46,8 @@ first "keep unknown" of a voice raises it to 4 (`speakers.json` label states may
 that state.
 
 `<conversation dir>/priority.json` `{format, state: important|less_useful|auto, set_at, revision,
-request_id, requests}` is the owner's explicit choice for a conversation (`PUT …/priority`): read on
+request_id, requests, source: app|pendant, event_id?}` is the owner's explicit choice (made in the app,
+or a star from the pendant's double tap, applied from its button event) for a conversation (`PUT …/priority`): read on
 demand, never derived, never overwritten by a re-summary, untouched by rebuilds and re-renders. It
 changes nothing else (note, path, keep/discard, statistics). Older backends ignore the file.
 

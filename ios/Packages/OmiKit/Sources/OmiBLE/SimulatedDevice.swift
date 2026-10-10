@@ -219,6 +219,12 @@ public final class SimulatedDevice: DeviceTransport, @unchecked Sendable {
             guard let self, self.connected else { return }
             self.delegate?.transport(self, didUpdateNotificationStateFor: c, enabled: enabled, error: nil)
             if c == .audioData, enabled, !self.streaming { self.startStreaming() }
+            if c == .audioData, !enabled, self.streaming {
+                // connected but not subscribed: the firmware drops its audio (transport.c pusher())
+                self.streaming = false
+                self.timer?.cancel()
+                self.timer = nil
+            }
             if c == .storageControl { self.storageNotify = enabled }
         }
     }

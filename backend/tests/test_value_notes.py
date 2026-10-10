@@ -111,7 +111,7 @@ def test_the_owners_choice_is_durable_deduplicated_and_later_wins(client, worker
     t = datetime(2026, 10, 10, 9, 0, tzinfo=UTC)
     rid = str(uuid.uuid4())
     first = choose(client, row["id"], "less_useful", at=t, request_id=rid).json()
-    assert first == {"state": "less_useful", "revision": 1, "set_at": "2026-10-10T09:00:00.000Z", "applied": True}
+    assert first == {"state": "less_useful", "revision": 1, "set_at": "2026-10-10T09:00:00.000Z", "source": "app", "applied": True}
     assert choose(client, row["id"], "less_useful", at=t, request_id=rid).json()["revision"] == 1  # a repeat
     newer = choose(client, row["id"], "important", at=t + timedelta(minutes=5)).json()
     assert newer["state"] == "important" and newer["revision"] == 2
@@ -134,7 +134,7 @@ def test_the_owners_choice_is_durable_deduplicated_and_later_wins(client, worker
     for i in range(3):
         worker.tick(T0 + 10000 + i)
     assert get(client, f"/v1/conversations/{row['id']}")["value"]["user"] == {
-        "state": "important", "revision": 2, "set_at": "2026-10-10T09:05:00.000Z"}
+        "state": "important", "revision": 2, "set_at": "2026-10-10T09:05:00.000Z", "source": "app"}
     # restore automatic, later than every earlier choice
     back = choose(client, row["id"], "auto", at=t + timedelta(minutes=10)).json()
     assert back["state"] == "auto" and back["revision"] == 3

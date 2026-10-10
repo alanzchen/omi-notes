@@ -105,7 +105,9 @@ public struct PendantSummary: Equatable, Sendable {
         // low battery). Both needing action: the pendant leads (pairing or Bluetooth comes first).
         let lead = phone.level > pendant.level || (phone.level == .delayed && pendant.level == .delayed) ? phone : pendant
         let other = lead.area == .pendant ? phone : pendant
-        let headline = lead.level == .normal && s.connection == .streaming
+        let headline = s.recordingPaused && s.connection == .streaming
+            ? SystemHealth.Step(area: .pendant, level: .delayed, title: "Recording paused", detail: "Paused from this phone", fix: .resumeRecording)
+            : lead.level == .normal && s.connection == .streaming
             ? SystemHealth.Step(area: .pendant, level: .normal, title: "Connected and recording", detail: nil, fix: nil)
             : lead
 
@@ -123,9 +125,8 @@ public struct PendantSummary: Equatable, Sendable {
             also.append(low)
         }
 
-        let rows = [pendantRow(s, pendant: pendant), phoneRow(s, server: server, now: now), storageRow(s),
-                    s.rememberedDeviceId == nil ? nil : Row(kind: .gestures, title: "Tap once to bookmark",
-                                                            detail: "Double-tap to end the conversation")].compactMap { $0 }
+        let rows = [pausedRow(s), pendantRow(s, pendant: pendant), phoneRow(s, server: server, now: now), storageRow(s),
+                    gesturesRow(s)].compactMap { $0 }
         return PendantSummary(
             rows: rows, name: s.rememberedDeviceName ?? "Omi", connected: s.connection == .streaming, connectionTitle: connectionTitle(s),
             stateLine: stateLine(s, now: now), storage: storage(s), paired: s.rememberedDeviceId != nil, battery: charge,
@@ -185,7 +186,36 @@ public struct PendantSummary: Equatable, Sendable {
                    s.upload.lastSuccessAt.map { "Last upload \(SystemHealth.relative($0, now))" } ?? "No upload yet")
     }
 
+    /// Paused from this phone (kept across launches): said even while disconnected.
+    static func pausedRow(_ s: EngineSnapshot) -> Row? {
+        guard s.recordingPaused, s.rememberedDeviceId != nil else { return nil }
+        return Row(kind: .pendant, title: "Recording paused",
+                   detail: s.connection == .streaming ? "The pendant isn't recording while connected" : "Applies when it reconnects",
+                   attention: true, fix: .resumeRecording)
+    }
+
+    /// What the button does, as set on this phone.
+    static func gesturesRow(_ s: EngineSnapshot) -> Row? {
+        guard s.rememberedDeviceId != nil else { return nil }
+        guard s.buttonActionsEnabled else { return Row(kind: .gestures, title: "Button actions are off", detail: "Taps on the pendant are ignored") }
+        let double: String
+        switch s.doubleTapAction {
+        case .endConversation: double = "Double-tap to end the conversation"
+        case .pauseRecording: double = "Double-tap to pause or resume recording"
+        case .starConversation: double = "Double-tap to star the conversation"
+        case .bookmark: double = "Double-tap also bookmarks"
+        }
+        return Row(kind: .gestures, title: "Tap once to bookmark", detail: double)
+    }
+
     static func storageRow(_ s: EngineSnapshot) -> Row? {
+        if s.connection == .streaming, s.device?.offlineHeld == true {
+            let n = s.device?.offlineUnread ?? 0
+            return n == 0
+                ? Row(kind: .storage, title: "No offline audio on the pendant", detail: "Automatic collection is off")
+                : Row(kind: .storage, title: "\(n) records waiting on the pendant", detail: "Automatic collection is off",
+                      attention: true, fix: .collectPendantAudio)
+        }
         switch storage(s) {
         case .collecting(let received, let total)?:
             return Row(kind: .storage, title: "Collecting audio from the pendant", detail: "\(received) of \(total) records",
@@ -203,6 +233,7 @@ public struct PendantSummary: Equatable, Sendable {
     static func stateLine(_ s: EngineSnapshot, now: Date) -> String {
         switch s.connection {
         case .streaming:
+            if s.device?.audioPaused == true { return "Connected · recording paused" }
             if s.device?.noAudioYet != true, let at = s.live?.lastNotificationAt {
                 let ago = SystemHealth.relative(at, now)
                 return now.timeIntervalSince(at) <= recentAudio ? "Recording · audio received \(ago)" : "Connected · last audio \(ago)"

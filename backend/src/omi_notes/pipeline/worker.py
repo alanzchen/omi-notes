@@ -22,7 +22,7 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
-from .. import __version__, operations, search
+from .. import __version__, operations, priority, search
 from ..audio.timeline import RING_RECORD_SECONDS, CaptureTimeline, ChunkDecode
 from ..audio.vad import MIN_SPEECH, VadChoice, VadStream, make_vad
 from ..db import Database
@@ -34,6 +34,7 @@ from ..rebuild import advance_processed
 from ..records import record_from_row, write_record
 from ..settings import Settings
 from ..speakers import enroll
+from ..views import LISTED
 from ..util import uuid7_for
 from ..vault import LEASE_RENEW_SECONDS, LeaseError, Vault
 from . import segmenter as seg
@@ -57,6 +58,7 @@ CHUNKS_PER_TICK = 200
 TIMELINE_CACHE = 32
 RETENTION_INTERVAL = 3600.0
 LATE_EVENT_HORIZON = 7 * 86400
+STAR_CODE = 3  # button event code: star the conversation this moment belongs to (capture-format-v1.md)
 
 
 class Worker:
@@ -453,7 +455,7 @@ class Worker:
     def apply_late_events(self, now: float) -> None:
         """Bookmarks and double taps that land in an already finished note annotate it (it is
         re-rendered, never reopened)."""
-        for ev in self.db.query("SELECT * FROM event_times WHERE type='button' AND code IN (1, 2) AND applied=0"):
+        for ev in self.db.query("SELECT * FROM event_times WHERE type='button' AND code IN (1, 2, 3) AND applied=0"):
             try:
                 self._apply_late_event(ev, now)
             except Exception:
@@ -461,6 +463,9 @@ class Worker:
 
     def _apply_late_event(self, ev, now: float) -> None:
         t = ev["t"]
+        if ev["code"] == STAR_CODE:
+            self._apply_star(ev, now)
+            return
         if ev["code"] == 1:
             owner = bookmark_owner(self.db, ev["device_id"], t)
             conv = self.db.one("SELECT * FROM conversations WHERE id=?", (owner,)) if owner else None
@@ -481,6 +486,33 @@ class Worker:
             self.db.execute("UPDATE events SET applied=1 WHERE event_id=?", (ev["event_id"],))
         elif now - t > LATE_EVENT_HORIZON:
             self.db.execute("UPDATE events SET applied=1 WHERE event_id=?", (ev["event_id"],))
+
+    def _apply_star(self, ev, now: float) -> None:
+        """A double tap set to "star": the conversation that moment belongs to (as for a bookmark)
+        becomes important once it is finished. Each star toggles it, as in the Omi app (a second
+        double tap in the same conversation un-stars it), so the state follows the number of stars
+        up to this one. Written like the owner's choice: later wins, the event is its request id."""
+        t = ev["t"]
+        owner = bookmark_owner(self.db, ev["device_id"], t)
+        conv = self.db.one("SELECT * FROM conversations WHERE id=?", (owner,)) if owner else None
+        if conv is None or conv["status"] == "open":
+            if now - t > LATE_EVENT_HORIZON:
+                self.db.execute("UPDATE events SET applied=1 WHERE event_id=?", (ev["event_id"],))
+            return  # not finished yet (or nothing within reach yet): wait
+        stars = [
+            s for s in self.db.query(
+                "SELECT event_id, t FROM event_times WHERE type='button' AND code=? AND device_id=? AND t BETWEEN ? AND ?",
+                (STAR_CODE, ev["device_id"], conv["start"] - BOOKMARK_REACH, conv["end"] + BOOKMARK_REACH),
+            )
+            if bookmark_owner(self.db, ev["device_id"], s["t"]) == conv["id"]
+        ]  # fmt: skip
+        stars.sort(key=lambda s: (s["t"], s["event_id"]))
+        nth = next(i for i, s in enumerate(stars) if s["event_id"] == ev["event_id"]) + 1
+        state = "important" if nth % 2 else "auto"
+        if self.db.one(f"SELECT 1 FROM conversations WHERE id=? AND {LISTED}", (conv["id"],)):
+            priority.from_pendant(self.pipeline, conv["id"], state, set_at=float(ev["at"]), event_id=ev["event_id"])
+            log.info("pendant star: conversation %s -> %s", conv["id"], state)
+        self.db.execute("UPDATE events SET applied=1 WHERE event_id=?", (ev["event_id"],))
 
     # -- segmentation ----------------------------------------------------------------------------
 

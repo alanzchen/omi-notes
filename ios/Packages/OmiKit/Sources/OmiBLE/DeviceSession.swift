@@ -85,6 +85,13 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
         public var canVibrate = false
         /// Whether `settingsSupported`/`canVibrate` are known yet (after the features read).
         public var controlsKnown = false
+        /// Recording paused from this phone: audio is not subscribed, so the pendant drops it.
+        public var audioPaused = false
+        /// Collecting audio stored on the pendant waits for the user (automatic collection is off).
+        public var offlineHeld = false
+        /// The features characteristic exists but couldn't be read: what the pendant supports is
+        /// unknown (not "unsupported"), and nothing is written until it is known.
+        public var controlsUnreadable = false
     }
 
     public struct LiveStats: Equatable, Sendable {
@@ -139,6 +146,9 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
     private var subscribeAttempts = 0
     private var subscribeDeadline: UInt64?
     private var reconnectRequested = false
+    /// Set before `start()` from the phone's settings.
+    public private(set) var audioPaused = false
+    public var autoCollect = true
     private var capturedOnce = false
     private var firmwareReadFailed = false
     private var featuresReadFailed = false
@@ -171,6 +181,12 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
     }
 
     public var deviceId: String { transport.identifier.uuidString.lowercased() }
+
+    /// The phone's pause setting, before `start()`.
+    public func startPaused(_ paused: Bool) {
+        audioPaused = paused
+        info.audioPaused = paused
+    }
 
     public func start() {
         info.mtu = transport.maximumWriteValueLength
@@ -280,8 +296,10 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
         detectionRetryAt = nil
         log(.info, "ble", "re-reading device information for offline-storage detection (\(detectionRetries)/\(Self.maxDetectionRetries))")
         if firmwareReadFailed { enqueue(.read(.firmwareRevision) { [weak self] data, error in self?.storeString(.firmwareRevision, data, error) }) }
+        let refreshControls = featuresReadFailed && info.controlsUnreadable
         if featuresReadFailed { enqueue(.read(.features) { [weak self] data, error in self?.storeFeatures(data, error) }) }
         enqueue(.barrier { [weak self] in self?.evaluateOfflineSupport() })
+        if refreshControls { enqueue(.barrier { [weak self] in self?.readSettings() }) }
     }
 
     /// Every connect must end in a sealed ring sync when the device supports it (the server's
@@ -310,7 +328,7 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
     public func transport(_ t: DeviceTransport, didDiscover characteristics: Set<OmiCharacteristic>, complete: Bool) {
         guard phase != .ended else { return }
         available = characteristics
-        if characteristics.contains(.audioData), !audioSubscribeRequested {
+        if characteristics.contains(.audioData), !audioSubscribeRequested, !audioPaused {
             // Routing rule: connected-but-unsubscribed drops audio, so this comes before anything else.
             audioSubscribeRequested = true
             phase = .subscribing
@@ -409,6 +427,11 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
 
     private func handleAudioSubscription(enabled: Bool, error: Error?) {
         if case .refused = phase { return }
+        if audioPaused {
+            // Paused by the user: notifications off is what was asked for; nothing is restored.
+            if !enabled { endAudioCoverage(reason: .userStopped) }
+            return
+        }
         guard enabled else {
             // Not notifying (turned off, or a failed subscribe): the firmware drops audio while
             // unsubscribed, so coverage ends now, error or not. Seal the capture, then restore the
@@ -435,11 +458,11 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
         startConfigurationIfReady()
     }
 
-    private func endAudioCoverage() {
+    private func endAudioCoverage(reason: SealReason = .bleDisconnected) {
         audioSubscribed = false
         guard recorder.isActive else { return }
-        log(.warning, "ble", "audio notifications are off; sealing capture \(recorder.captureId ?? "?")")
-        recorder.finish(reason: .bleDisconnected)
+        log(reason == .userStopped ? .info : .warning, "ble", "audio notifications are off; sealing capture \(recorder.captureId ?? "?")")
+        recorder.finish(reason: reason)
         delegate?.sessionDidChange(self)
     }
 
@@ -487,7 +510,7 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
     // MARK: Configuration
 
     private func startConfigurationIfReady() {
-        guard discoveryComplete, audioSubscribed, !configureStarted else { return }
+        guard discoveryComplete, audioSubscribed || audioPaused, !configureStarted else { return }
         configureStarted = true
         phase = .configuring
         if available.contains(.timeSyncWrite) {
@@ -552,17 +575,90 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
         enqueue(.barrier { [weak self] in self?.readSettings() })
     }
 
+    // MARK: Pausing recording
+
+    /// Pause (or resume) recording from this phone. Paused, the audio notifications are turned off,
+    /// so the pendant itself drops its audio while connected (device-protocol.md "Routing"); the
+    /// capture so far is sealed `user_stopped`. Anything still received is journaled as usual.
+    /// If the link drops while paused, the pendant records to its own storage as always.
+    public func setAudioPaused(_ paused: Bool) {
+        guard phase != .ended, paused != audioPaused else { return }
+        audioPaused = paused
+        info.audioPaused = paused
+        if paused {
+            audioSubscribeRequested = false
+            subscribeDeadline = nil
+            if discoveryComplete || audioSubscribed {
+                gattLog.append("notify audioData false")
+                transport.setNotify(false, for: .audioData)
+            }
+            endAudioCoverage(reason: .userStopped)
+            log(.info, "ble", "recording paused from the phone")
+        } else if available.contains(.audioData) {
+            audioSubscribeRequested = true
+            subscribeAttempts = 0
+            if phase == .discovering { phase = .subscribing }
+            requestAudioSubscription()
+            log(.info, "ble", "recording resumed")
+        }
+        delegate?.sessionDidChange(self)
+    }
+
+    // MARK: Collecting audio stored on the pendant
+
+    /// Starts collecting the audio stored on the pendant now (when automatic collection is off,
+    /// or to collect again). Does nothing until offline storage support is known.
+    public func collectOfflineAudio() {
+        guard phase == .streaming, let ctx = ringContext else { return }
+        switch ring.state {
+        case .idle, .complete, .failed, .interrupted:
+            info.offlineHeld = false
+            ringRetries = 0
+            ring.start(ctx)
+            delegate?.sessionDidChange(self)
+        default:
+            break
+        }
+    }
+
+    /// How much is waiting on the pendant, without collecting it (a status read writes nothing).
+    private func readStoredAmount() {
+        guard hasStorage else { return }
+        enqueue(.read(.storageStatus) { [weak self] data, _ in
+            guard let self, let data, case .ring(let s) = RingProtocol.parseStatus(data) else { return }
+            self.info.rtcValid = s.rtcValid
+            self.info.offlineUnread = Int(s.unreadRecords)
+            self.delegate?.sessionDidChange(self)
+        })
+    }
+
     // MARK: Pendant settings
 
     /// Supported only when the characteristic exists and the features say so; unreadable features
     /// leave every control unavailable rather than guessing.
     private func evaluateControls() {
+        if available.contains(.features), info.features == nil {
+            info.settingsSupported = []
+            info.canVibrate = false
+            info.controlsKnown = false
+            info.controlsUnreadable = true
+            return
+        }
+        // No features characteristic at all (older firmware): nothing is advertised.
         let features = info.features ?? DeviceFeatures(rawValue: 0)
+        info.controlsUnreadable = false
         info.settingsSupported = Set(PendantSetting.allCases.filter {
             available.contains($0.characteristic) && $0.isAdvertised(by: features)
         })
         info.canVibrate = available.contains(.haptic) && features.haptic
         info.controlsKnown = true
+    }
+
+    /// Reads the features again (after they couldn't be read), then the settings they advertise.
+    public func retryControls() {
+        guard phase == .streaming, available.contains(.features) else { return }
+        enqueue(.read(.features) { [weak self] data, error in self?.storeFeatures(data, error) })
+        enqueue(.barrier { [weak self] in self?.readSettings() })
     }
 
     private func readSettings() {
@@ -581,7 +677,7 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
     /// a failed write the value is read again, so the shown value stays what the pendant has.
     public func change(_ setting: PendantSetting, to value: Int, done: @escaping (Result<Int, Error>) -> Void) {
         guard phase == .streaming, info.settingsSupported.contains(setting) else {
-            done(.failure(phase == .streaming ? PendantControlError.unsupported : PendantControlError.notConnected))
+            done(.failure(controlError))
             return
         }
         let c = setting.characteristic
@@ -604,10 +700,15 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
         })
     }
 
+    private var controlError: PendantControlError {
+        if phase != .streaming { return .notConnected }
+        return info.controlsKnown ? .unsupported : .capabilityUnknown
+    }
+
     /// One vibration. Done when the pendant has accepted the write.
     public func vibrate(_ pulse: HapticPulse, done: @escaping (Error?) -> Void) {
         guard phase == .streaming, info.canVibrate else {
-            done(phase == .streaming ? PendantControlError.unsupported : PendantControlError.notConnected)
+            done(controlError)
             return
         }
         enqueue(.write(pulse.payload, .haptic) { done($0) })
@@ -674,7 +775,13 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
             hasFeaturesCharacteristic: available.contains(.features), features: info.features,
             reconnectedAt: connectedAt)
         ringContext = ctx
-        ring.start(ctx)
+        if autoCollect {
+            ring.start(ctx)
+        } else {
+            info.offlineHeld = true
+            log(.info, "ring", "automatic collection is off; the pendant's stored audio waits")
+            readStoredAmount()
+        }
         delegate?.sessionDidChange(self)
     }
 
@@ -742,12 +849,13 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
 }
 
 public enum PendantControlError: Error, LocalizedError, Equatable {
-    case notConnected, unsupported, unconfirmed
+    case notConnected, unsupported, unconfirmed, capabilityUnknown
     public var errorDescription: String? {
         switch self {
         case .notConnected: return "the pendant isn't connected"
         case .unsupported: return "this pendant doesn't support it"
         case .unconfirmed: return "the pendant didn't confirm the new value"
+        case .capabilityUnknown: return "it isn't known yet what this pendant supports"
         }
     }
 }

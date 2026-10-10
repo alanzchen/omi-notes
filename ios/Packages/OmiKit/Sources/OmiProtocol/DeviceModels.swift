@@ -99,6 +99,10 @@ public enum ButtonEvent: Equatable, Sendable {
         }
     }
 
+    /// Uploaded code for "star the conversation this moment belongs to" (a double tap set to star;
+    /// capture-format-v1.md). Never sent by the pendant itself.
+    public static let starCode: Int32 = 3
+
     /// Code uploaded in a `button` event, or nil if the event is not forwarded.
     public var uploadCode: Int? {
         switch self {

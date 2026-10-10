@@ -358,6 +358,8 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
     /// Value assessments, highlights and the owner's priority choice.
     public var supportsValueNotes: Bool { features?.contains("value_notes") == true }
     public var supportsSearch: Bool { features?.contains("search") == true }
+    /// Button code 3: a double tap stars the conversation it belongs to.
+    public var supportsPendantStar: Bool { features?.contains("pendant_star") == true }
     public var supportsStats: Bool { features?.contains("stats") == true }
 }
 
@@ -460,15 +462,19 @@ public struct ConversationValue: Codable, Equatable, Hashable, Sendable {
         public var state: String
         public var revision: Int?
         public var setAt: String?
+        /// Where the choice was made: `app`, or `pendant` (a star from a double tap). Nil from
+        /// servers before it existed.
+        public var source: String?
 
-        public init(state: String, revision: Int? = nil, setAt: String? = nil) {
+        public init(state: String, revision: Int? = nil, setAt: String? = nil, source: String? = nil) {
             self.state = state
             self.revision = revision
             self.setAt = setAt
+            self.source = source
         }
 
         enum CodingKeys: String, CodingKey {
-            case state, revision
+            case state, revision, source
             case setAt = "set_at"
         }
     }

@@ -181,7 +181,7 @@ def create_app(
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes
-            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats"],
+            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star"],
             "vault_id": vault.vault_id,
         }
 

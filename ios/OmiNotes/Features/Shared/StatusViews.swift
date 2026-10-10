@@ -64,6 +64,8 @@ extension SystemHealth.Fix {
         case .retryUploads: return "Retry now"
         case .openServer: return "Open Server"
         case .openDiagnostics: return "Show details"
+        case .resumeRecording: return "Resume"
+        case .collectPendantAudio: return "Collect"
         }
     }
 }

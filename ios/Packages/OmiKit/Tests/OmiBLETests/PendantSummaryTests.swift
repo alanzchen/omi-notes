@@ -39,6 +39,22 @@ import Testing
         PendantSummary.evaluate(snapshot: s, server: reach, status: st, statusAt: st == nil ? nil : now.addingTimeInterval(-age), now: now)
     }
 
+    @Test func thePhonesChoicesAreSaidWithAWayBack() throws {
+        var s = streaming()
+        s.recordingPaused = true
+        s.device?.audioPaused = true
+        s.device?.offlineHeld = true
+        s.device?.offlineUnread = 3
+        s.doubleTapAction = .starConversation
+        let p = summary(s, reachable, try status())
+        #expect(p.stateLine == "Connected · recording paused" && p.headline.title == "Recording paused")
+        #expect(p.rows.contains { $0.title == "Recording paused" && $0.fix == .resumeRecording })
+        #expect(p.rows.contains { $0.title == "3 records waiting on the pendant" && $0.fix == .collectPendantAudio })
+        #expect(p.rows.contains { $0.detail == "Double-tap to star the conversation" })
+        s.buttonActionsEnabled = false
+        #expect(summary(s, reachable, try status()).rows.contains { $0.title == "Button actions are off" })
+    }
+
     @Test func normalShowsBatteryAndObservedFactsOnly() throws {
         let p = summary(streaming(), reachable, try status(pending: 1))
         #expect(p.connected && p.connectionTitle == "Connected · recording")

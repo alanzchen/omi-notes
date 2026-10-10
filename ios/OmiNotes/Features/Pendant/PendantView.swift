@@ -366,6 +366,7 @@ struct ManagePendantView: View {
     var body: some View {
         List {
             PendantControlsSection(model: model, controls: controls)
+            PendantRecordingSection(model: model)
             PendantButtonSection(model: model)
             PendantDeviceSection(snapshot: model.snapshot)
             DeviceSettingsSection(model: model)

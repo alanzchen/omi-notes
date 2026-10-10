@@ -31,6 +31,7 @@ public struct SystemHealth: Equatable, Sendable {
     /// What the step's button does (the view maps these to navigation).
     public enum Fix: Equatable, Sendable {
         case pairDevice, reconnectDevice, openBluetoothSettings, retryUploads, openServer, openDiagnostics
+        case resumeRecording, collectPendantAudio
     }
 
     public struct Step: Equatable, Sendable, Identifiable {

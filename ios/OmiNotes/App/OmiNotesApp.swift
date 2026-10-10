@@ -99,6 +99,8 @@ struct RootView: View {
         case .openDiagnostics:
             serverPath = NavigationPath([ServerView.Page.diagnostics])
             tab = .server
+        case .resumeRecording: model.engine.setRecordingPaused(false)
+        case .collectPendantAudio: model.engine.collectPendantAudioNow()
         }
     }
 }

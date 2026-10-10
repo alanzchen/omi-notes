@@ -157,7 +157,8 @@ struct WorthRevisitingSection: View {
 
     private func meta(_ c: ConversationSummary, important: Bool) -> String {
         let when = c.startedDate.map { "\(Fmt.day($0)), \(Fmt.time($0))" } ?? ""
-        return [when, important ? "Marked important" : nil].compactMap { $0 }.joined(separator: " · ")
+        let mark = c.value?.user?.source == "pendant" ? "Starred from the pendant" : "Marked important"
+        return [when, important ? mark : nil].compactMap { $0 }.joined(separator: " · ")
     }
 }
 

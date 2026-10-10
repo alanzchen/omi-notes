@@ -159,14 +159,15 @@ No auth. `200 {"ok": true}`.
                "backing_off": 0, "oldest_waiting_ended_at": "…", "oldest_pending_chunk_received_at": null,
                "stt": {"last_ok_at": "…", "last_error_at": null, "last_error_kind": null}, "llm": null},
   "vault_id": "…",
-  "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats"]
+  "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star"]
 }
 ```
 
 `features` lists optional capabilities (absent on older servers). The phone starts a voice
 enrollment only when it contains `voice_enrollment`: a server that doesn't know the enrollment
 events would transcribe the reading as a conversation. `conversation_detail` and `issues` announce
-the app views below.
+the app views below. `pendant_star` announces button code 3 (below); the phone offers "star
+conversation" for a double tap only when it is listed, because older servers store code 3 but ignore it.
 
 The response is cheap and calls no provider: `ready` means *configured*, not that inference works.
 `worker.present` means a process holds the vault's worker lock (the pipeline, or a maintenance
@@ -263,7 +264,7 @@ Small JSON side events, uploaded through the same durable outbox:
 
 | `type` | `data` |
 |---|---|
-| `button` | `{"code": 1}` single tap = bookmark (rendered in the note); `{"code": 2}` double tap = end the current conversation now |
+| `button` | `{"code": 1}` single tap = bookmark (rendered in the note); `{"code": 2}` double tap = end the current conversation now; `{"code": 3}` double tap set to "star" = star the conversation this moment belongs to (no split; servers with `pendant_star`) |
 | `voice_enrollment_start` | `{"enrollment_id": "<uuid>"}` with top-level `capture_id` + `offset_us` (window start on the live capture). The phone holds that capture's chunks from here until this event is acknowledged. |
 | `voice_enrollment_end` | `{"enrollment_id": "<uuid>", "end_offset_us": 55000000, "outcome": "completed" \| "cancelled" \| "interrupted"}` with top-level `capture_id` + `offset_us` (= the end). Held by the phone until the start is acknowledged. Speech inside the window is never transcribed; only `completed` windows are judged for enrollment (`docs/speaker-learning.md`). |
 | `heartbeat` | `{"battery": 83, "charging": false, "firmware_revision": "3.0.21", "model_number": "Omi CV 1", "rtc_valid": true, "offline_unread": 0, "outbox_chunks": 3, "outbox_bytes": 812345, "app_state": "background", "coverage": {"capture_id": "…", "through_offset_us": 734000000, "through_chunk_sequence": 11}}` (all optional) |
@@ -275,6 +276,13 @@ flag). Heartbeats feed `_status.md`.
 capture) so the server places them on the capture timeline; a split is applied only once the
 capture's audio up to that offset has been processed. An event that lands inside an
 already-finalized conversation is annotated, never used to reopen it.
+
+A star (code 3) belongs to the conversation a bookmark at that moment would (the one containing it,
+else the nearest within 60 s) and is applied once that conversation is finished: it sets the
+owner's priority (`priority.json`) to `important`, with `set_at` = the event's `at`, `source:
+"pendant"`, its `event_id` and the request id `pendant:<event_id>`, under the same later-wins rule as
+the app's choice. Each star toggles: the n-th star in one conversation means `important` when n is
+odd, `auto` when even (the Omi app's star/unstar). Applying it is idempotent across index rebuilds.
 
 **Coverage watermark.** `heartbeat.data.coverage` says: the phone was connected and subscribed for
 live capture `capture_id` from its start through `through_offset_us`, and every notification
@@ -469,7 +477,8 @@ Every list and search entry carries `value`; the detail adds `value_reasons` and
 ### `PUT /v1/conversations/{id}/priority`
 
 Body `{"state": "important" | "less_useful" | "auto", "request_id": "…", "set_at": "<ISO time of the
-owner's choice>"}` → `{"state", "revision", "set_at", "applied"}`. A repeated `request_id` answers
+owner's choice>"}` → `{"state", "revision", "set_at", "source", "applied"}` (`source`: `app`, or
+`pendant` for a star from a double tap; absent for choices stored before it existed). A repeated `request_id` answers
 the current state; a choice older than the stored one (`set_at`) is not applied (`applied: false`)
 and the newer stands. Stored in the vault (`<conversation dir>/priority.json`). `404` unknown,
 `409` still recording, `422` bad body, `503` read-only.
