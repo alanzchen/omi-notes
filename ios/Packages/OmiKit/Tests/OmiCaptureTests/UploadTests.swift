@@ -75,9 +75,20 @@ final class FakeUploadTransport: UploadTransport, @unchecked Sendable {
     private var nextId = 1
 
     var active: [Task] { tasks.filter { !$0.done } }
+    /// Set to list tasks as the system's background session does: a finished task stays listed
+    /// (completed) until it is `unlisted`, and the listing goes through the production filter.
+    var systemListing: UploadTaskOwnership?
+    var unlisted: Set<Int> = []
+    var now = Date()
 
     func activeTaskIdentifiers(_ completion: @escaping @Sendable (Set<String>) -> Void) {
-        let snapshot = Set(active.map(\.description))
+        var snapshot = Set(active.map(\.description))
+        if var o = systemListing {
+            let listed = tasks.filter { !unlisted.contains($0.id) }
+                .map { UploadTaskOwnership.Listed(id: $0.id, description: $0.description, completed: $0.done) }
+            snapshot = o.owners(listed, now: now)
+            systemListing = o
+        }
         if asyncEnumeration { pendingEnumerations.append((snapshot, completion)) } else { completion(snapshot) }
     }
 
@@ -155,6 +166,7 @@ final class UploaderHarness: @unchecked Sendable {
 
     func complete(task: FakeUploadTransport.Task, status: Int?, body: String? = nil, error: Error? = nil) {
         task.done = true
+        transport.systemListing?.delivered(task.id)
         sync { uploader.handleCompletion(identifier: task.description, statusCode: status, body: body.map { Data($0.utf8) }, error: error) }
     }
 

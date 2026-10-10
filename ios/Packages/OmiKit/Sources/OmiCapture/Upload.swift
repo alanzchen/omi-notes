@@ -138,7 +138,8 @@ public final class UploadStateStore: @unchecked Sendable {
 
 public protocol UploadTransport: AnyObject {
     /// Descriptions (`taskDescription`) of upload tasks the system still holds, including tasks
-    /// whose cancellation has not completed yet. The completion may run on any queue.
+    /// whose cancellation has not completed yet and finished tasks whose completion has not been
+    /// delivered yet. The completion may run on any queue.
     func activeTaskIdentifiers(_ completion: @escaping @Sendable (Set<String>) -> Void)
     func startUpload(_ request: URLRequest, fromFile: URL, identifier: String, earliestBeginDate: Date?)
     /// Asynchronous: cancelled tasks later complete with `URLError.cancelled`.
@@ -522,6 +523,55 @@ public final class BackgroundEventsLatch: @unchecked Sendable {
 
 // MARK: - Background URLSession transport
 
+/// Which of the tasks a session lists still own their file.
+///
+/// A background session relaunched for a task that finished while the app wasn't running lists
+/// that task as `.completed` before delivering its completion (observed with a real session on the
+/// iOS Simulator). Until the completion arrives the file is still that task's: treating it as free
+/// made a relaunch PUT a chunk the server had already stored. Once delivered the task owns nothing
+/// (a retry is never held back by a stale listing), and a finished task that is never delivered
+/// stops owning its file after `grace`, so it can't block a retry either.
+public struct UploadTaskOwnership: Sendable {
+    public struct Listed: Sendable {
+        public var id: Int
+        public var description: String?
+        public var completed: Bool
+        public init(id: Int, description: String?, completed: Bool) {
+            self.id = id
+            self.description = description
+            self.completed = completed
+        }
+    }
+
+    /// How long a finished task that is never delivered keeps its file.
+    public var grace: TimeInterval = 120
+
+    private var deliveredIds: Set<Int> = []
+    private var finishedSince: [Int: Date] = [:]
+
+    public init() {}
+
+    /// The task's completion has been handed to the app.
+    public mutating func delivered(_ id: Int) { deliveredIds.insert(id) }
+
+    public mutating func owners(_ listed: [Listed], now: Date) -> Set<String> {
+        let ids = Set(listed.map(\.id))
+        deliveredIds.formIntersection(ids)  // forgotten once the session stops listing them
+        finishedSince = finishedSince.filter { ids.contains($0.key) }
+        var owners: Set<String> = []
+        for task in listed {
+            guard let description = task.description, !deliveredIds.contains(task.id) else { continue }
+            if task.completed {
+                let since = finishedSince[task.id] ?? now
+                finishedSince[task.id] = since
+                if now.timeIntervalSince(since) > grace { continue }
+            }
+            owners.insert(description)
+        }
+        return owners
+    }
+}
+
 /// Real transport: one background `URLSession` (survives suspension and relaunches the app for
 /// completions). Delegate callbacks are delivered on the engine queue.
 public final class BackgroundSessionTransport: NSObject, UploadTransport, URLSessionDataDelegate, @unchecked Sendable {
@@ -530,6 +580,8 @@ public final class BackgroundSessionTransport: NSObject, UploadTransport, URLSes
     private var session: URLSession!
     private let delegateQueue: OperationQueue
     private var bodies: [Int: Data] = [:]
+    private let ownershipLock = NSLock()
+    private var ownership = UploadTaskOwnership()
     public var onCompletion: ((String, Int?, Data?, Error?) -> Void)?
     public let eventsLatch = BackgroundEventsLatch()
 
@@ -548,8 +600,11 @@ public final class BackgroundSessionTransport: NSObject, UploadTransport, URLSes
     }
 
     public func activeTaskIdentifiers(_ completion: @escaping @Sendable (Set<String>) -> Void) {
-        session.getAllTasks { tasks in
-            let ids = Set(tasks.filter { $0.state != .completed }.compactMap(\.taskDescription))
+        session.getAllTasks { [self] tasks in
+            let listed = tasks.map { UploadTaskOwnership.Listed(id: $0.taskIdentifier, description: $0.taskDescription, completed: $0.state == .completed) }
+            ownershipLock.lock()
+            let ids = ownership.owners(listed, now: Date())
+            ownershipLock.unlock()
             completion(ids)
         }
     }
@@ -580,6 +635,9 @@ public final class BackgroundSessionTransport: NSObject, UploadTransport, URLSes
     public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         let body = bodies.removeValue(forKey: task.taskIdentifier)
         let status = (task.response as? HTTPURLResponse)?.statusCode
+        ownershipLock.lock()
+        ownership.delivered(task.taskIdentifier)
+        ownershipLock.unlock()
         guard let id = task.taskDescription else { return }
         onCompletion?(id, status, body, error)
     }
