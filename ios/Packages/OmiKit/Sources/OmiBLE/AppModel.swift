@@ -94,6 +94,8 @@ public final class AppModel {
     public static let pageSize = 20
     /// Injectable for tests (no network).
     public var session: URLSession = APIClient.defaultSession
+    /// How firmware metadata and packages are fetched (a local feed in simulator automation).
+    public var firmwareFetch: FirmwareModel.Fetch = FirmwareModel.urlSessionFetch
 
     public init(engine: OmiEngine, noteCache: NoteCache = .appDefault()) {
         self.engine = engine

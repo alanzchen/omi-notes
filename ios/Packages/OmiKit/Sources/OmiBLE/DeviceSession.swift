@@ -21,6 +21,12 @@ public protocol DeviceTransport: AnyObject {
     /// Write with response.
     func write(_ data: Data, to characteristic: OmiCharacteristic)
     func setNotify(_ enabled: Bool, for characteristic: OmiCharacteristic)
+    /// Write without response (SMP accepts nothing else). False when it can't be sent right now.
+    func writeWithoutResponse(_ data: Data, to characteristic: OmiCharacteristic) -> Bool
+}
+
+extension DeviceTransport {
+    public func writeWithoutResponse(_ data: Data, to characteristic: OmiCharacteristic) -> Bool { false }
 }
 
 public protocol DeviceTransportDelegate: AnyObject {
@@ -83,6 +89,8 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
         public var settingsSupported: Set<PendantSetting> = []
         /// The vibration motor is present and advertised.
         public var canVibrate = false
+        /// The pendant offers MCUmgr firmware updates over Bluetooth (its SMP service was found).
+        public var canUpdateFirmware = false
         /// Whether `settingsSupported`/`canVibrate` are known yet (after the features read).
         public var controlsKnown = false
         /// Recording paused from this phone: audio is not subscribed, so the pendant drops it.
@@ -367,6 +375,8 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
         case .storageControl:
             ring.handleNotification(value)
             delegate?.sessionDidChange(self)
+        case .smp:
+            onSMP?(value)
         default:
             break
         }
@@ -575,6 +585,23 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
         enqueue(.barrier { [weak self] in self?.readSettings() })
     }
 
+    // MARK: Firmware update transport (MCUmgr SMP)
+
+    /// SMP responses (notifications, possibly a message in several parts).
+    public var onSMP: ((Data) -> Void)?
+    public var canUpdateFirmware: Bool { available.contains(.smp) }
+
+    public func enableSMP(done: @escaping (Error?) -> Void) {
+        guard phase == .streaming, available.contains(.smp) else { done(PendantControlError.unsupported); return }
+        enqueue(.notify(.smp, true) { done($0) })
+    }
+
+    /// Sends one SMP message (it must fit one write). False when it couldn't be sent now.
+    public func sendSMP(_ data: Data) -> Bool {
+        guard phase == .streaming, available.contains(.smp) else { return false }
+        return transport.writeWithoutResponse(data, to: .smp)
+    }
+
     // MARK: Pausing recording
 
     /// Pause (or resume) recording from this phone. Paused, the audio notifications are turned off,
@@ -637,6 +664,7 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
     /// Supported only when the characteristic exists and the features say so; unreadable features
     /// leave every control unavailable rather than guessing.
     private func evaluateControls() {
+        info.canUpdateFirmware = available.contains(.smp)
         if available.contains(.features), info.features == nil {
             info.settingsSupported = []
             info.canVibrate = false

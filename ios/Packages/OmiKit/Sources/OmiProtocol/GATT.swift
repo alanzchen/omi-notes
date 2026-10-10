@@ -39,6 +39,11 @@ public enum OmiUUID {
     public static let hapticService = "cab1ab95-2ea5-4f4d-bb56-874b72cfc984"
     public static let haptic = "cab1ab96-2ea5-4f4d-bb56-874b72cfc984"
 
+    /// MCUmgr SMP (firmware updates): Zephyr's standard SMP Bluetooth service, enabled on CV1 by
+    /// `CONFIG_NCS_SAMPLE_MCUMGR_BT_OTA_DFU=y`. The UUIDs are Zephyr's (`smp_bt.c`), not in the Omi repo.
+    public static let smpService = "8d53dc1d-1db7-4cd3-868b-8a527460aa84"
+    public static let smp = "da2e7828-fbce-4e01-ae9e-261174997c48"
+
     public static let storageService = "30295780-4301-eabd-2904-2849adfeae43"
     public static let storageControl = "30295781-4301-eabd-2904-2849adfeae43"
     public static let storageStatus = "30295782-4301-eabd-2904-2849adfeae43"
@@ -55,6 +60,7 @@ public enum OmiCharacteristic: String, CaseIterable, Sendable, Hashable {
     case charging
     case ledDimRatio, micGain
     case haptic
+    case smp
     case storageControl, storageStatus
 
     public var serviceUUID: String {
@@ -68,6 +74,7 @@ public enum OmiCharacteristic: String, CaseIterable, Sendable, Hashable {
         case .button: return OmiUUID.buttonService
         case .charging, .ledDimRatio, .micGain: return OmiUUID.settingsService
         case .haptic: return OmiUUID.hapticService
+        case .smp: return OmiUUID.smpService
         case .storageControl, .storageStatus: return OmiUUID.storageService
         }
     }
@@ -90,6 +97,7 @@ public enum OmiCharacteristic: String, CaseIterable, Sendable, Hashable {
         case .ledDimRatio: return OmiUUID.ledDimRatio
         case .micGain: return OmiUUID.micGain
         case .haptic: return OmiUUID.haptic
+        case .smp: return OmiUUID.smp
         case .storageControl: return OmiUUID.storageControl
         case .storageStatus: return OmiUUID.storageStatus
         }
@@ -99,7 +107,7 @@ public enum OmiCharacteristic: String, CaseIterable, Sendable, Hashable {
     public static let serviceUUIDs: [String] = [
         OmiUUID.audioService, OmiUUID.timeSyncService, OmiUUID.deviceInfoService, OmiUUID.featuresService,
         OmiUUID.batteryService, OmiUUID.buttonService, OmiUUID.settingsService, OmiUUID.storageService,
-        OmiUUID.hapticService,
+        OmiUUID.hapticService, OmiUUID.smpService,
     ]
 
     /// Lookup by (service, characteristic), both lowercase. 16-bit SIG UUIDs are 4 hex chars.

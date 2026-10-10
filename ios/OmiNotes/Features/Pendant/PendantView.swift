@@ -357,10 +357,12 @@ private struct LinkRow: View {
 struct ManagePendantView: View {
     let model: AppModel
     @State private var controls: PendantControlsModel
+    @State private var firmware: FirmwareModel
 
     init(model: AppModel) {
         self.model = model
         _controls = State(initialValue: PendantControlsModel(engine: model.engine))
+        _firmware = State(initialValue: FirmwareModel(engine: model.engine, fetch: model.firmwareFetch))
     }
 
     var body: some View {
@@ -368,6 +370,7 @@ struct ManagePendantView: View {
             PendantControlsSection(model: model, controls: controls)
             PendantRecordingSection(model: model)
             PendantButtonSection(model: model)
+            PendantFirmwareSection(model: model, firmware: firmware)
             PendantDeviceSection(snapshot: model.snapshot)
             DeviceSettingsSection(model: model)
             Section {

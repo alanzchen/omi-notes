@@ -54,6 +54,25 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             engine.setSimulatedMode(UserDefaults.standard.bool(forKey: "OmiNotesDebugSimulatedDevice"))
         }
         engine.setSimulatedControlsFail(UserDefaults.standard.bool(forKey: "OmiNotesDebugPendantControlsFail"))
+        // `-OmiNotesDebugPendantFeaturesUnreadable YES`: the simulated pendant's features can't be read.
+        // `-OmiNotesDebugSimulatedFirmwareAfterUpdate 3.0.22`: what it reports after an update's restart.
+        // `-OmiNotesDebugFirmwareFeed <dir>`: Omi's firmware answers and packages come from local files
+        // (latest.json / stable.json, the package by its file name; a missing file is a 404).
+        let featuresUnreadable = UserDefaults.standard.bool(forKey: "OmiNotesDebugPendantFeaturesUnreadable")
+        let afterUpdate = UserDefaults.standard.string(forKey: "OmiNotesDebugSimulatedFirmwareAfterUpdate")
+        engine.configureSimulatedPendant { sim in
+            sim.failFeaturesRead = featuresUnreadable
+            if let afterUpdate { sim.firmwareAfterUpdate = afterUpdate }
+        }
+        if let feed = UserDefaults.standard.string(forKey: "OmiNotesDebugFirmwareFeed") {
+            let dir = URL(fileURLWithPath: feed)
+            model.firmwareFetch = { url in
+                let name = url.path.hasSuffix("/latest") ? "latest.json" : url.path.hasSuffix("/stable") ? "stable.json" : url.lastPathComponent
+                guard let data = try? Data(contentsOf: dir.appendingPathComponent(name)) else { return (Data(), 404) }
+                try await Task.sleep(for: .milliseconds(600))
+                return (data, 200)
+            }
+        }
         // `-OmiNotesDebugOpenURL omi-notes://configure?…` exercises the URL-scheme sheet without the system prompt.
         if let raw = UserDefaults.standard.string(forKey: "OmiNotesDebugOpenURL"), let link = URL(string: raw) {
             model.handleOpenURL(link)

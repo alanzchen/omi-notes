@@ -60,6 +60,7 @@ public struct EngineSnapshot: Equatable, Sendable {
     public var attention: [String] = []
     public var serverConfigured = false
     public var lastButton: String?
+    public var firmware = FirmwareUpdateState.idle
     /// This phone's choices for the pendant (`SettingsStore`).
     public var recordingPaused = false
     public var autoCollect = true
@@ -448,6 +449,84 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
 
     public func runRetentionNow() { queue.async { self.runRetention() } }
 
+    // MARK: Firmware update
+
+    private(set) var firmwareUpdater: FirmwareUpdater?
+    private(set) var firmwareState = FirmwareUpdateState.idle
+    static let firmwareMinimumBattery = 15
+    static let firmwareRestartWait: TimeInterval = 180
+
+    /// Why a firmware update can't start now, or nil when it can (the Omi app's preconditions:
+    /// `firmware_mixin.dart` `kFirmwareUpdateMinBattery = 15` unless charging).
+    func firmwareBlocker() -> String? {
+        Self.firmwareBlocker(device: session?.phase == .streaming ? session?.info : nil, firmware: firmwareState, ring: ring.state)
+    }
+
+    /// The same rules from a snapshot (for the screen).
+    public static func firmwareBlocker(_ s: EngineSnapshot) -> String? {
+        firmwareBlocker(device: s.connection == .streaming ? s.device : nil, firmware: s.firmware, ring: s.offline)
+    }
+
+    static func firmwareBlocker(device: DeviceSession.Info?, firmware: FirmwareUpdateState, ring: RingSyncState) -> String? {
+        guard let d = device else { return "Connect the pendant first." }
+        guard d.modelNumber == FirmwareRelease.cv1Model else { return "Only an Omi CV 1 can be updated here." }
+        guard d.canUpdateFirmware else { return "This pendant doesn't offer updates over Bluetooth." }
+        if firmware.isActive { return "An update is already running." }
+        let charging = d.charging == true
+        guard let battery = d.battery else { return charging ? nil : "The pendant's battery level isn't known yet." }
+        if battery < firmwareMinimumBattery, !charging { return "Charge the pendant to at least \(firmwareMinimumBattery)% first." }
+        switch ring {
+        case .idle, .complete, .failed, .interrupted, .unsupported: break
+        default: return "Wait until collecting audio from the pendant has finished."
+        }
+        return nil
+    }
+
+    public func firmwareUpdateBlocker() -> String? { queue.sync { firmwareBlocker() } }
+
+    /// Installs a checked package on the connected pendant: recording stops for the update, the
+    /// images are uploaded and, only if the pendant reports them, installed by a restart. The result
+    /// is confirmed by the version the pendant reports when it comes back.
+    public func installFirmware(_ package: FirmwarePackage, version: String) {
+        queue.async {
+            if let why = self.firmwareBlocker() {
+                self.setFirmwareState(.failed(why))
+                return
+            }
+            let s = self.session!
+            log(.info, "firmware", "installing \(version) on \(s.info.firmwareRevision ?? "?")")
+            s.setAudioPaused(true)  // not the user's pause: the pendant records nothing during the update
+            let updater = FirmwareUpdater(package: package, target: version, session: s, queue: self.queue)
+            updater.onState = { [weak engine = self] st in engine?.firmwareStateChanged(st) }
+            self.firmwareUpdater = updater
+            updater.start()
+        }
+    }
+
+    private func firmwareStateChanged(_ st: FirmwareUpdateState) {
+        setFirmwareState(st)
+        switch st {
+        case .restarting:
+            queue.asyncAfter(deadline: .now() + Self.firmwareRestartWait) { [weak self] in self?.firmwareUpdater?.timedOutWaitingForRestart() }
+        case .done, .failed:
+            // Recording comes back as the user had it (a fresh connection already applied it).
+            if let s = session, firmwareUpdater?.session === s, !settings.recordingPaused { s.setAudioPaused(false) }
+            firmwareUpdater = nil
+        default:
+            break
+        }
+    }
+
+    private func setFirmwareState(_ st: FirmwareUpdateState) {
+        firmwareState = st
+        scheduleSnapshot()
+    }
+
+    /// Back to idle after a finished update was seen.
+    public func clearFirmwareResult() {
+        queue.async { if !self.firmwareState.isActive { self.setFirmwareState(.idle) } }
+    }
+
     // MARK: Pendant controls
 
     /// Changes one of the pendant's settings on the current connection. The result (on main) is
@@ -476,6 +555,10 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         guard paused != settings.recordingPaused else { return }
         settings.recordingPaused = paused
         log(.info, "engine", "recording \(paused ? "paused" : "resumed") from \(source)")
+        if firmwareState.isActive {  // the update holds audio off; the choice applies afterwards
+            scheduleSnapshot()
+            return
+        }
         if let s = session {
             if paused { withBackgroundTask("pause") { s.setAudioPaused(true) } } else { s.setAudioPaused(false) }
             // felt on the pendant: one long buzz for paused, a short one for recording again
@@ -533,6 +616,15 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     static let findPulseGap: TimeInterval = 0.75
 
     private var simulatedControlsFail = false
+    private var simulatedSetup: [@Sendable (SimulatedDevice) -> Void] = []
+
+    /// Sets up the simulated pendant (tests, simulator screenshots); applied now and when created.
+    public func configureSimulatedPendant(_ setup: @escaping @Sendable (SimulatedDevice) -> Void) {
+        queue.async {
+            self.simulatedSetup.append(setup)
+            if let s = self.simulated { setup(s) }
+        }
+    }
 
     /// The simulated pendant rejects settings and vibration writes (simulator screenshots of the
     /// error state; it never affects a real pendant).
@@ -724,6 +816,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         finishEnrollment(outcome: .interrupted)
         let r = pendingDisconnectReason ?? reason
         pendingDisconnectReason = nil
+        if let updater = firmwareUpdater, updater.session === s { updater.linkDropped() }
         session = nil
         withBackgroundTask("seal") { s.end(reason: r) }
         refreshOutboxStats()
@@ -747,8 +840,19 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             let trace = config.simulatedTrace ?? SimulatedTrace.synthetic()
             simulated = SimulatedDevice(queue: queue, clock: config.clock, trace: trace)
             simulated?.failControlWrites = simulatedControlsFail
+            simulated?.onRestart = { [weak self] in self?.simulatedRestart() }
+            simulated?.onLinkLost = { [weak self] in self?.simulatedRestart() }
+            for f in simulatedSetup { simulated.map(f) }
         }
         connectSimulated(after: 0.5)
+    }
+
+    /// The simulated pendant restarted (a firmware update's reset): the link drops, then it returns.
+    private func simulatedRestart() {
+        guard let sim = simulated else { return }
+        sim.linkDown()
+        endSession(reason: .bleDisconnected)
+        connectSimulated(after: 1.5)
     }
 
     private func connectSimulated(after delay: TimeInterval) {
@@ -811,6 +915,9 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
 
     public func sessionDidBecomeReady(_ session: DeviceSession) {
         if settings.rememberedDeviceName == nil { settings.rememberedDeviceName = session.info.name }
+        if let updater = firmwareUpdater, updater.session !== session {
+            updater.reconnected(reporting: session.info.firmwareRevision)  // back after the update's restart
+        }
         writeHeartbeat(reason: "connect")
         scheduleSnapshot()
     }
@@ -1086,6 +1193,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         s.attention = attention + uploader.status.attention
         s.serverConfigured = settings.endpoint != nil
         s.lastButton = lastButton
+        s.firmware = firmwareState
         s.recordingPaused = settings.recordingPaused
         s.autoCollect = settings.autoCollectPendantAudio
         s.buttonActionsEnabled = settings.buttonActionsEnabled

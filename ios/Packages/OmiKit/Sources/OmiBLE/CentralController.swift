@@ -545,6 +545,13 @@ final class CBDeviceTransport: NSObject, DeviceTransport, CBPeripheralDelegate {
         whenPoweredOn { [weak self] in self?.peripheral.writeValue(data, for: ch, type: .withResponse) }
     }
 
+    func writeWithoutResponse(_ data: Data, to c: OmiCharacteristic) -> Bool {
+        guard let ch = characteristics[c], peripheral.state == .connected, peripheral.canSendWriteWithoutResponse,
+              data.count <= peripheral.maximumWriteValueLength(for: .withoutResponse) else { return false }
+        peripheral.writeValue(data, for: ch, type: .withoutResponse)
+        return true
+    }
+
     func setNotify(_ enabled: Bool, for c: OmiCharacteristic) {
         guard let ch = characteristics[c] else {
             delegate?.transport(self, didUpdateNotificationStateFor: c, enabled: false, error: SessionError.disconnected)

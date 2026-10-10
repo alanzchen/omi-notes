@@ -133,6 +133,23 @@ public final class SimulatedDevice: DeviceTransport, @unchecked Sendable {
     public private(set) var vibrations: [UInt8] = []
     /// Debug: settings and vibration writes fail, as a pendant that rejects them would.
     public var failControlWrites = false
+    /// Debug: the features read fails (what it supports is then unknown).
+    public var failFeaturesRead = false
+
+    // Firmware update (MCUmgr SMP), as the firmware's image manager answers.
+    /// What the device reports after restarting with an installed update.
+    public var firmwareAfterUpdate: String?
+    /// Debug: refuse uploads (MCUmgr error 3).
+    public var refuseFirmwareUpload = false
+    /// Debug: the link drops in the middle of the next upload (out of range).
+    public var dropLinkDuringUpload = false
+    /// The pendant restarted (an update's reset): the engine drops the link and reconnects.
+    public var onRestart: (() -> Void)?
+    /// The link was lost (out of range): the engine drops it and reconnects.
+    public var onLinkLost: (() -> Void)?
+    public private(set) var uploaded: [Int: Data] = [:]
+    public private(set) var markedForInstall: Set<Data> = []
+    private var smpAssembler = SMPAssembler()
     private var ring: [UInt64: Data] = [:]
     private var readSeq: UInt64 = 1000
     private var writeSeq: UInt64 = 1000
@@ -188,6 +205,10 @@ public final class SimulatedDevice: DeviceTransport, @unchecked Sendable {
     public func read(_ c: OmiCharacteristic) {
         after(0.02) { [weak self] in
             guard let self, self.connected else { return }
+            if c == .features, self.failFeaturesRead {
+                self.delegate?.transport(self, didUpdateValue: nil, for: c, error: SimulatedControlError.rejected)
+                return
+            }
             self.delegate?.transport(self, didUpdateValue: self.value(for: c), for: c, error: nil)
         }
     }
@@ -212,6 +233,72 @@ public final class SimulatedDevice: DeviceTransport, @unchecked Sendable {
             self.delegate?.transport(self, didWriteTo: c, error: nil)
             if c == .storageControl { self.handleStorageCommand(data) }
         }
+    }
+
+    public func writeWithoutResponse(_ data: Data, to c: OmiCharacteristic) -> Bool {
+        guard connected, c == .smp, data.count <= maximumWriteValueLength else { return false }
+        guard let request = smpAssembler.append(data) else { return true }
+        after(0.005) { [weak self] in self?.answerSMP(request) }
+        return true
+    }
+
+    private func answerSMP(_ r: SMPMessage) {
+        guard connected else { return }
+        var body: [(String, CBOR)] = [("rc", .uint(0))]
+        switch (r.group, r.id, r.op) {
+        case (SMPMessage.imageGroup, SMPMessage.imageUpload, .write):
+            let image = r.body["image"]?.int ?? currentUploadImage
+            let off = r.body["off"]?.int ?? -1
+            if dropLinkDuringUpload, off > 0 {
+                dropLinkDuringUpload = false
+                onLinkLost?()
+                return
+            }
+            if refuseFirmwareUpload {
+                body = [("rc", .uint(3))]
+            } else {
+                if off == 0 { currentUploadImage = image; uploaded[image] = Data() }
+                if off == uploaded[currentUploadImage]?.count, let chunk = r.body["data"]?.data { uploaded[currentUploadImage]?.append(chunk) }
+                body.append(("off", .uint(UInt64(uploaded[currentUploadImage]?.count ?? 0))))
+            }
+        case (SMPMessage.imageGroup, SMPMessage.imageState, .read):
+            let slots: [CBOR] = uploaded.sorted { $0.key < $1.key }.compactMap { image, bytes in
+                guard let img = try? MCUbootImage(bytes) else { return nil }
+                return .map([("image", .uint(UInt64(image))), ("slot", .uint(1)), ("hash", .bytes(img.hash)),
+                             ("pending", .bool(markedForInstall.contains(img.hash)))])
+            }
+            body = [("images", .array(slots))]
+        case (SMPMessage.imageGroup, SMPMessage.imageState, .write):
+            if let hash = r.body["hash"]?.data, uploaded.values.contains(where: { (try? MCUbootImage($0))?.hash == hash }) {
+                markedForInstall.insert(hash)
+            } else {
+                body = [("rc", .uint(3))]
+            }
+        case (SMPMessage.osGroup, SMPMessage.osReset, .write):
+            after(0.3) { [weak self] in self?.restartAfterReset() }
+        default:
+            body = [("rc", .uint(8))]
+        }
+        let op: SMPMessage.Op = r.op == .read ? .readResponse : .writeResponse
+        let answer = SMPMessage(op: op, group: r.group, id: r.id, sequence: r.sequence, body: .map(body)).encoded()
+        var rest = answer[...]
+        while !rest.isEmpty {  // notifications of at most one packet each
+            let part = rest.prefix(maximumWriteValueLength)
+            rest = rest.dropFirst(part.count)
+            delegate?.transport(self, didUpdateValue: Data(part), for: .smp, error: nil)
+        }
+    }
+
+    private var currentUploadImage = 0
+
+    private func restartAfterReset() {
+        if !markedForInstall.isEmpty, markedForInstall.count == uploaded.count, let version = firmwareAfterUpdate {
+            firmwareRevision = version
+        }
+        uploaded = [:]
+        markedForInstall = []
+        smpAssembler.reset()
+        onRestart?()
     }
 
     public func setNotify(_ enabled: Bool, for c: OmiCharacteristic) {

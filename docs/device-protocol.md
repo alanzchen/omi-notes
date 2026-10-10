@@ -26,6 +26,7 @@ No characteristic requires pairing/bonding (Omi never bonds). Custom characteris
 | LED brightness | `O(0010)` | `O(0011)` | no | read + write, u8 0–100 (see "Pendant settings") |
 | Microphone gain | `O(0010)` | `O(0012)` | no | read + write, u8 level 0–8 |
 | Vibration | `cab1ab95-2ea5-4f4d-bb56-874b72cfc984` | `cab1ab96-2ea5-4f4d-bb56-874b72cfc984` | no | write u8 1/2/3 |
+| Firmware update (SMP) | `8d53dc1d-1db7-4cd3-868b-8a527460aa84` | `da2e7828-fbce-4e01-ae9e-261174997c48` | no | write without response + notify (see "Firmware update") |
 | Storage | `30295780-4301-eabd-2904-2849adfeae43` | `30295781-…` control/data (write + notify), `30295782-…` status (read) | no | offline ring sync |
 
 Sources: `app/lib/services/devices/models.dart`, `app/lib/services/devices/connectors/omi_connection.dart`,
@@ -74,6 +75,48 @@ From `omi/firmware/omi/src/lib/core/transport.c` (settings handlers, `features_r
   (`app/lib/services/devices/connectors/device_connection.dart` `playFindDevicePattern`).
 - The app reads these after the connection is ready (never ahead of offline sync) and confirms
   every write by reading it back.
+
+## Pausing recording and collecting stored audio (phone choices)
+
+- **Pause** (the Omi app's double-tap "mute"): the app turns `O(0001)` notifications off. Per the
+  routing rule above the firmware then drops its audio while connected (nothing reaches BLE or the
+  SD ring); if the link drops, it records to its ring as usual. The live capture is sealed
+  `user_stopped`; anything still received is journaled. Kept across launches until resumed.
+- **Manual collection**: offline sync is not started on connect; the 16-byte status is read (a read
+  writes nothing) to show what is waiting. The ring overwrites its oldest batches when full
+  (`src/sd_card.c`, `overwritten_end_seq` / `dropped_packets`), so audio left there can be lost.
+
+## Firmware update (CV1)
+
+Source facts (reference tree, firmware 3.0.21):
+- MCUmgr SMP over BLE is enabled: `omi.conf` `CONFIG_NCS_SAMPLE_MCUMGR_BT_OTA_DFU=y`. MCUboot,
+  overwrite-only, downgrade prevention, two updatable images (application core, network core):
+  `sysbuild.conf` (`SB_CONFIG_MCUBOOT_MODE_OVERWRITE_ONLY`, `MCUBOOT_UPDATEABLE_IMAGES=2`,
+  `MCUBOOT_NRF53_MULTI_IMAGE_UPDATE`), `sysbuild/mcuboot.conf` (`CONFIG_MCUBOOT_DOWNGRADE_PREVENTION`).
+  Secondary slots 0xF0000 and 0x40000 in external flash (`boards/omi/pm_static.yml`). Signing key
+  RSA-2048 (`SB_CONFIG_BOOT_SIGNATURE_KEY_FILE`).
+- The SMP service/characteristic UUIDs (`8d53dc1d-1db7-4cd3-868b-8a527460aa84` /
+  `da2e7828-fbce-4e01-ae9e-261174997c48`, write without response + notify) are Zephyr's standard
+  ones (`smp_bt.c`); they are not written in the Omi repo.
+- Release metadata: the Omi backend's `GET /v2/firmware/latest?device_model=…&firmware_revision=…`
+  (404 when nothing newer) and `/v2/firmware/stable?device_model=…`, no account required
+  (`backend/routers/firmware.py`); the Omi app calls them in `app/lib/backend/http/api/device.dart`.
+  `is_legacy_secure_dfu: false` for CV1 (`.github/workflows/firmware_release.yml`). The Omi app
+  requires ≥ 15 % battery unless charging (`firmware_mixin.dart` `kFirmwareUpdateMinBattery`).
+
+Checked against the published artifacts (3.0.17–3.0.21, read 2026-10-10): the OTA zip holds
+`manifest.json` with image 0 `omi.signed.bin` (board `omi`) and image 1 `ipc_radio.bin` (board
+`omi/nrf5340/cpunet`); both are MCUboot images with a SHA-256 TLV and the same key hash
+(`fc5701dc…cfa9994`); the MCUboot header version is `0.0.0+0`, so the DIS firmware string is the only
+version. The backend answered 3.0.21 for 3.0.20, 404 for 3.0.21, and 3.0.21 as stable.
+
+What the app does: only the official package for exactly the offered version
+(`github.com/BasedHardware/omi/releases/download/Omi_CV1_v<version>/`), checked on the phone (zip
+CRCs, manifest board/SoC/indexes, sizes against the slots, MCUboot SHA-256, CV1 key hash); audio off
+for the update; upload both images in single-write SMP requests; read the image state and require
+both hashes; confirm both; reset; finished only when the reconnected pendant reports the version.
+**Not verified on a real pendant:** the SMP exchange, confirm/reset behaviour of the multi-image
+update, and whether downgrade prevention (equal `0.0.0+0` versions) allows reinstalling a release.
 
 ## Codec ids (`O(0002)` first byte)
 

@@ -304,3 +304,100 @@ struct PendantButtonSection: View {
         return text + " Kept on this phone."
     }
 }
+
+/// The pendant's firmware: what it runs, whether Omi has published a newer release, installing it
+/// (or reinstalling the latest stable one), and how the update is going. Finished means the pendant
+/// restarted and reports the new version.
+struct PendantFirmwareSection: View {
+    let model: AppModel
+    let firmware: FirmwareModel
+    @State private var confirm: FirmwareRelease?
+
+    var body: some View {
+        let s = model.snapshot
+        let current = s.connection == .streaming ? s.device?.firmwareRevision : nil
+        Section {
+            LabeledContent("Firmware", value: current ?? "—")
+            if s.firmware != .idle {
+                progress(s.firmware)
+            } else if firmware.prepare != .idle {
+                preparing(firmware.prepare)
+            } else {
+                offer(s, current: current)
+            }
+        } header: {
+            Text("Firmware")
+        } footer: {
+            Text("Releases come from Omi. Only the official package for that version is installed, after it's checked on this iPhone.")
+        }
+        .confirmationDialog(confirm.map { "Install firmware \($0.version)?" } ?? "", isPresented: Binding(get: { confirm != nil }, set: { if !$0 { confirm = nil } }),
+                            titleVisibility: .visible, presenting: confirm) { release in
+            Button("Install \(release.version)", role: .destructive) {
+                Task { await firmware.install(release, current: current) }
+            }
+        } message: { release in
+            Text("The pendant stops recording during the update (a few minutes), then restarts to install it. It can't go back to \(current ?? "the current version") by itself. Keep this app open and the pendant near your iPhone, with at least 15% battery or charging.\(release.changelog.isEmpty ? "" : "\n\nWhat's new: \(release.changelog.joined(separator: "; ")).")")
+        }
+    }
+
+    @ViewBuilder private func offer(_ s: EngineSnapshot, current: String?) -> some View {
+        let blocker = OmiEngine.firmwareBlocker(s)
+        switch firmware.check {
+        case .idle:
+            Button("Check for update") { Task { await firmware.checkForUpdate(s.device) } }
+                .disabled(current == nil)
+        case .checking:
+            HStack(spacing: 10) { ProgressView(); Text("Checking with Omi…").foregroundStyle(.secondary) }
+        case .upToDate(let v):
+            Label("Up to date: \(v) is the latest published firmware.", systemImage: "checkmark.seal").foregroundStyle(.secondary)
+            Button("Check again") { Task { await firmware.checkForUpdate(s.device) } }
+        case .available(let r):
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Version \(r.version) is available").font(.body.weight(.semibold))
+                if !r.changelog.isEmpty { Text(r.changelog.joined(separator: " · ")).font(.footnote).foregroundStyle(.secondary) }
+            }
+            Button("Install \(r.version)…") { confirm = r }.disabled(blocker != nil)
+            if let blocker { Text(blocker).font(.footnote).foregroundStyle(.secondary) }
+        case .failed(let why):
+            Text(why).font(.footnote).foregroundStyle(.red)
+            Button("Try again") { Task { await firmware.checkForUpdate(s.device) } }.disabled(current == nil)
+        }
+        if let stable = firmware.stable, let current, stable.version != current {
+            Button("Reinstall the latest stable firmware (\(stable.version))…", role: .destructive) { confirm = stable }
+                .disabled(blocker != nil)
+        }
+    }
+
+    @ViewBuilder private func preparing(_ p: FirmwareModel.Prepare) -> some View {
+        switch p {
+        case .idle: EmptyView()
+        case .downloading: HStack(spacing: 10) { ProgressView(); Text("Downloading the update…").foregroundStyle(.secondary) }
+        case .checkingPackage: HStack(spacing: 10) { ProgressView(); Text("Checking the package…").foregroundStyle(.secondary) }
+        case .failed(let why):
+            Text(why).font(.footnote).foregroundStyle(.red)
+            Button("OK") { firmware.dismissResult() }
+        }
+    }
+
+    @ViewBuilder private func progress(_ st: FirmwareUpdateState) -> some View {
+        switch st {
+        case .idle: EmptyView()
+        case .preparing: HStack(spacing: 10) { ProgressView(); Text("Starting the update…").foregroundStyle(.secondary) }
+        case .uploading(let sent, let total):
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Sending the update to the pendant · \(total > 0 ? Int(100 * Double(sent) / Double(total)) : 0)%")
+                ProgressView(value: Double(sent), total: Double(max(total, 1)))
+                Text("Keep this app open and the pendant near your iPhone. It isn't recording during the update.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+        case .confirming: HStack(spacing: 10) { ProgressView(); Text("Checking what the pendant received…").foregroundStyle(.secondary) }
+        case .restarting(let v): HStack(spacing: 10) { ProgressView(); Text("The pendant is restarting to install \(v)…").foregroundStyle(.secondary) }
+        case .done(let v):
+            Label("Updated: the pendant now reports firmware \(v).", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+            Button("OK") { firmware.dismissResult() }
+        case .failed(let why):
+            Text("The update didn't complete: \(why).").font(.footnote).foregroundStyle(.red)
+            Button("OK") { firmware.dismissResult() }
+        }
+    }
+}

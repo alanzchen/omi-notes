@@ -233,6 +233,7 @@ public struct PendantSummary: Equatable, Sendable {
     static func stateLine(_ s: EngineSnapshot, now: Date) -> String {
         switch s.connection {
         case .streaming:
+            if s.firmware.isActive { return "Updating firmware · not recording" }
             if s.device?.audioPaused == true { return "Connected · recording paused" }
             if s.device?.noAudioYet != true, let at = s.live?.lastNotificationAt {
                 let ago = SystemHealth.relative(at, now)
