@@ -39,6 +39,48 @@ import OmiProtocol
         #expect(retry.count == 2 && (retry.last?.earliest ?? .distantPast) > h.now, "retried, after the backoff")
     }
 
+    /// The coordinator's acceptance gate for 0.1.0 (15): once the listing stops counting a task that
+    /// was never delivered, the uploader must let go of the file too (at its next reconcile).
+    @Test func expiredUndeliveredOwnershipActuallyRetriesInUploader() throws {
+        let h = UploaderHarness()
+        h.transport.systemListing = UploadTaskOwnership()
+        let a = try h.writeChunk(seq: 0)
+        h.reconcile()
+        let task = try #require(h.task(for: a.name))
+        task.done = true
+        relaunch(h)
+        h.reconcile()
+        #expect(h.started.filter { $0.name == a.name }.count == 1)
+        #expect(h.uploader.status.inFlight == 1)
+        h.transport.now = h.transport.now.addingTimeInterval(121)
+        h.now = h.now.addingTimeInterval(121)
+        h.reconcile()
+        #expect(h.started.filter { $0.name == a.name }.count == 2, "expired undelivered ownership must release Uploader.started and retry without a user tap or another relaunch")
+
+        // the old task's 201 arrives after all: it acknowledges, and the retry's answer is ignored
+        h.complete(task: task, status: 201)
+        #expect(h.t.outbox.pendingItem(named: a.name) == nil)
+        let retry = try #require(h.transport.active.last { $0.name == a.name })
+        h.complete(task: retry, status: 200)
+        #expect(h.started.filter { $0.name == a.name }.count == 2 && h.uploader.status.inFlight == 0)
+    }
+
+    /// A task this uploader just started may be missing from a listing taken before it began; it is
+    /// still never started twice.
+    @Test func aTaskStartedHereIsNotRestartedByAListingThatDoesNotShowItYet() throws {
+        let h = UploaderHarness()
+        h.transport.systemListing = UploadTaskOwnership()
+        let a = try h.writeChunk(seq: 0)
+        h.reconcile()
+        let task = try #require(h.task(for: a.name))
+        h.transport.unlisted.insert(task.id)    // not visible to getAllTasks yet
+        h.transport.now += 3600
+        h.reconcile()
+        #expect(h.started.filter { $0.name == a.name }.count == 1 && h.uploader.status.inFlight == 1)
+        h.complete(task: task, status: nil, error: URLError(.networkConnectionLost))  // its response was lost
+        #expect(h.started.filter { $0.name == a.name }.count == 2, "a lost response still retries")
+    }
+
     @Test func listedTasksOwnTheirFileUntilDeliveredOrForAtMostTheGrace() {
         var o = UploadTaskOwnership()
         let t0 = Date(timeIntervalSince1970: 1_000)

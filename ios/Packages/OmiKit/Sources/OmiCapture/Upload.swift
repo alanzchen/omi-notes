@@ -214,7 +214,12 @@ public final class Uploader: @unchecked Sendable {
     public var onStatusChange: (() -> Void)?
 
     public private(set) var status = UploaderStatus()
+    /// Files with a task in flight: those this uploader started (until their completion arrives,
+    /// since a new task may not be listed yet) plus those the system's listing says it owns.
     private var started: Set<String> = []
+    /// The ones this uploader started. Files adopted from the listing are owned only while it still
+    /// lists them, so a task the transport stops counting (never delivered) can't hold its file.
+    private var launched: Set<String> = []
     private var startedKey: String?
     private var reconcileInProgress = false
     private var reconcileAgain = false
@@ -271,6 +276,7 @@ public final class Uploader: @unchecked Sendable {
         let currentKey = key(for: cfg)
         if startedKey != currentKey {
             started.removeAll()
+            launched.removeAll()
             startedKey = currentKey
         }
         let pending = outbox.pending()
@@ -283,7 +289,8 @@ public final class Uploader: @unchecked Sendable {
             activeNames.insert(name)
         }
         if !obsolete.isEmpty { transport.cancel(identifiers: obsolete) }
-        started = started.intersection(pendingNames).union(activeNames.intersection(pendingNames))
+        launched.formIntersection(pendingNames)
+        started = launched.union(activeNames.intersection(pendingNames))
         var inFlight = started.count
         var held = 0
         // Small side events first (timely), then chunks, then seals.
@@ -319,6 +326,7 @@ public final class Uploader: @unchecked Sendable {
         let begin = rec.nextAttemptAt.flatMap { $0 > now() ? $0 : nil }
         transport.startUpload(req, fromFile: item.url, identifier: UploadTaskID.make(key: key, name: item.name), earliestBeginDate: begin)
         started.insert(item.name)
+        launched.insert(item.name)
         return true
     }
 
@@ -334,6 +342,7 @@ public final class Uploader: @unchecked Sendable {
             return
         }
         started.remove(name)
+        launched.remove(name)
         if let e = error as? URLError, e.code == .cancelled {
             status.inFlight = started.count
             onStatusChange?()
@@ -409,6 +418,7 @@ public final class Uploader: @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(queue))
         transport.cancelAll()
         started.removeAll()
+        launched.removeAll()
         status.pausedReason = nil
         status.attention.removeAll()
         reconcile()
@@ -423,6 +433,7 @@ public final class Uploader: @unchecked Sendable {
         status.pausedReason = nil
         transport.cancelAll()
         started.removeAll()
+        launched.removeAll()
         reconcile()
     }
 
