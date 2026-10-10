@@ -115,7 +115,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     private var events: EventWriter!
     private var backgroundTransport: BackgroundSessionTransport?
     private var central: CentralController?
-    private var simulated: SimulatedDevice?
+    private(set) var simulated: SimulatedDevice?
     public private(set) var session: DeviceSession?
     private weak var background: BackgroundTaskProviding?
 
@@ -443,6 +443,66 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
 
     public func runRetentionNow() { queue.async { self.runRetention() } }
 
+    // MARK: Pendant controls
+
+    /// Changes one of the pendant's settings on the current connection. The result (on main) is
+    /// the value the pendant reports after the write, or why it couldn't be changed.
+    public func changePendantSetting(_ setting: PendantSetting, to value: Int,
+                                     completion: @escaping @Sendable (Result<Int, Error>) -> Void) {
+        queue.async {
+            guard let session = self.session else {
+                DispatchQueue.main.async { completion(.failure(PendantControlError.notConnected)) }
+                return
+            }
+            session.change(setting, to: value) { result in
+                self.scheduleSnapshot()
+                DispatchQueue.main.async { completion(result) }
+            }
+        }
+    }
+
+    /// Find my pendant: three long vibrations (as the Omi app does), stopping at the first failure.
+    public func findPendant(completion: @escaping @Sendable (Error?) -> Void) {
+        queue.async {
+            guard let session = self.session else {
+                DispatchQueue.main.async { completion(PendantControlError.notConnected) }
+                return
+            }
+            self.vibrate(session, remaining: 3, completion: completion)
+        }
+    }
+
+    static let findPulseGap: TimeInterval = 0.75
+
+    private var simulatedControlsFail = false
+
+    /// The simulated pendant rejects settings and vibration writes (simulator screenshots of the
+    /// error state; it never affects a real pendant).
+    public func setSimulatedControlsFail(_ fail: Bool) {
+        queue.async {
+            self.simulatedControlsFail = fail
+            self.simulated?.failControlWrites = fail
+        }
+    }
+
+    private func vibrate(_ session: DeviceSession, remaining: Int, completion: @escaping @Sendable (Error?) -> Void) {
+        session.vibrate(.long) { error in
+            if let error {
+                DispatchQueue.main.async { completion(error) }
+            } else if remaining <= 1 {
+                DispatchQueue.main.async { completion(nil) }
+            } else {
+                self.queue.asyncAfter(deadline: .now() + Self.findPulseGap) {
+                    guard self.session === session else {
+                        DispatchQueue.main.async { completion(PendantControlError.notConnected) }
+                        return
+                    }
+                    self.vibrate(session, remaining: remaining - 1, completion: completion)
+                }
+            }
+        }
+    }
+
     // MARK: Voice enrollment (docs/speaker-learning.md, "Enrollment")
 
     public enum EnrollmentError: Error, LocalizedError, Equatable {
@@ -626,6 +686,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         if simulated == nil {
             let trace = config.simulatedTrace ?? SimulatedTrace.synthetic()
             simulated = SimulatedDevice(queue: queue, clock: config.clock, trace: trace)
+            simulated?.failControlWrites = simulatedControlsFail
         }
         connectSimulated(after: 0.5)
     }
@@ -694,7 +755,15 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         scheduleSnapshot()
     }
 
-    public func session(_ session: DeviceSession, didReceiveButton event: ButtonEvent) {
+    public func session(_ session: DeviceSession, didReceiveButton received: ButtonEvent) {
+        var event = received
+        if event.uploadCode != nil {
+            guard settings.buttonActionsEnabled else {
+                log(.info, "engine", "button \(event) ignored: button actions are off on this phone")
+                return
+            }
+            if event == .doubleTap, settings.doubleTapAction == .bookmark { event = .singleTap }
+        }
         guard let code = event.uploadCode else {
             log(.debug, "engine", "button event \(event) ignored")
             return

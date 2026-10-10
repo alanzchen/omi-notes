@@ -23,6 +23,9 @@ No characteristic requires pairing/bonding (Omi never bonds). Custom characteris
 | Time sync | `O(0030)` | `O(0031)` write / `O(0032)` read | no | write **exactly 4 bytes**, Unix seconds u32 LE, on every connect |
 | Button | `23ba7924-0000-1000-7450-346eac492e92` | `23ba7925-0000-1000-7450-346eac492e92` | no | notify, 8 bytes: i32 LE event + 4 zero bytes |
 | Charging | `O(0010)` | `O(0013)` | no | read + notify, u8 0/1 |
+| LED brightness | `O(0010)` | `O(0011)` | no | read + write, u8 0–100 (see "Pendant settings") |
+| Microphone gain | `O(0010)` | `O(0012)` | no | read + write, u8 level 0–8 |
+| Vibration | `cab1ab95-2ea5-4f4d-bb56-874b72cfc984` | `cab1ab96-2ea5-4f4d-bb56-874b72cfc984` | no | write u8 1/2/3 |
 | Storage | `30295780-4301-eabd-2904-2849adfeae43` | `30295781-…` control/data (write + notify), `30295782-…` status (read) | no | offline ring sync |
 
 Sources: `app/lib/services/devices/models.dart`, `app/lib/services/devices/connectors/omi_connection.dart`,
@@ -48,6 +51,29 @@ now, `5` release → ignored. A ≥ 3 s long press powers the device off and sen
 - **Scanning**: advertises name `"Omi"` + service `O(0000)`. OmiGlass reuses `O(0000)` — exclude names
   containing `glass`. DevKit 2's advertising payload may not include the UUID, so the foreground pairing
   scan uses `withServices: nil` and matches on service UUID **or** name ∈ {`Omi`, `Omi DevKit 2`, `Friend`}.
+
+## Pendant settings
+
+From `omi/firmware/omi/src/lib/core/transport.c` (settings handlers, `features_read_handler`),
+`src/settings.c`, `src/mic.c` (`mic_set_gain`), `src/led.c` and `src/haptic.c`; the reference tree's
+`omi.conf` sets `CONFIG_BT_DIS_FW_REV_STR="3.0.21"`, the firmware of the production CV1.
+
+- **Advertised in features:** bit 5 haptic (`CONFIG_OMI_ENABLE_HAPTIC=y` on CV1), bit 7 LED dimming and
+  bit 8 mic gain (always set). The app offers a control only when its characteristic is discovered
+  **and** its bit is set; unreadable features mean no controls.
+- **LED brightness `O(0011)`:** one byte, capped at 100; the LED PWM duty is `period × ratio / 100`, so
+  0 turns the LED off. Default 50.
+- **Mic gain `O(0012)`:** one byte, capped at 8, applied immediately. Levels: 0 mute, 1 −20 dB,
+  2 −10 dB, 3 0 dB, 4 +6 dB, 5 +10 dB, 6 +20 dB (default), 7 +30 dB, 8 +40 dB. Level 0 records silence.
+- Both are saved with `settings_save_one` and loaded at boot, so they persist across reconnects and
+  restarts. **A write succeeds even when the flash save fails** (the handler returns `len`), and a
+  read returns the in-memory value; so a readback confirms the active value, not that it survives a
+  reboot. Any other write length is rejected (`BT_ATT_ERR_INVALID_ATTRIBUTE_LEN`).
+- **Vibration:** writing 1, 2 or 3 vibrates for 100, 300 or 500 ms; other values are ignored. The
+  Omi app's Find Device plays level 3 three times, 750 ms apart
+  (`app/lib/services/devices/connectors/device_connection.dart` `playFindDevicePattern`).
+- The app reads these after the connection is ready (never ahead of offline sync) and confirms
+  every write by reading it back.
 
 ## Codec ids (`O(0002)` first byte)
 

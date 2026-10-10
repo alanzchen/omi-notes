@@ -31,7 +31,13 @@ public enum OmiUUID {
     public static let button = "23ba7925-0000-1000-7450-346eac492e92"
 
     public static let settingsService = omi("0010")
+    public static let ledDimRatio = omi("0011")
+    public static let micGain = omi("0012")
     public static let charging = omi("0013")
+
+    /// The vibration motor (`omi/firmware/omi/src/haptic.c`).
+    public static let hapticService = "cab1ab95-2ea5-4f4d-bb56-874b72cfc984"
+    public static let haptic = "cab1ab96-2ea5-4f4d-bb56-874b72cfc984"
 
     public static let storageService = "30295780-4301-eabd-2904-2849adfeae43"
     public static let storageControl = "30295781-4301-eabd-2904-2849adfeae43"
@@ -47,6 +53,8 @@ public enum OmiCharacteristic: String, CaseIterable, Sendable, Hashable {
     case timeSyncWrite, timeSyncRead
     case button
     case charging
+    case ledDimRatio, micGain
+    case haptic
     case storageControl, storageStatus
 
     public var serviceUUID: String {
@@ -58,7 +66,8 @@ public enum OmiCharacteristic: String, CaseIterable, Sendable, Hashable {
         case .features: return OmiUUID.featuresService
         case .timeSyncWrite, .timeSyncRead: return OmiUUID.timeSyncService
         case .button: return OmiUUID.buttonService
-        case .charging: return OmiUUID.settingsService
+        case .charging, .ledDimRatio, .micGain: return OmiUUID.settingsService
+        case .haptic: return OmiUUID.hapticService
         case .storageControl, .storageStatus: return OmiUUID.storageService
         }
     }
@@ -78,6 +87,9 @@ public enum OmiCharacteristic: String, CaseIterable, Sendable, Hashable {
         case .timeSyncRead: return OmiUUID.timeSyncRead
         case .button: return OmiUUID.button
         case .charging: return OmiUUID.charging
+        case .ledDimRatio: return OmiUUID.ledDimRatio
+        case .micGain: return OmiUUID.micGain
+        case .haptic: return OmiUUID.haptic
         case .storageControl: return OmiUUID.storageControl
         case .storageStatus: return OmiUUID.storageStatus
         }
@@ -87,6 +99,7 @@ public enum OmiCharacteristic: String, CaseIterable, Sendable, Hashable {
     public static let serviceUUIDs: [String] = [
         OmiUUID.audioService, OmiUUID.timeSyncService, OmiUUID.deviceInfoService, OmiUUID.featuresService,
         OmiUUID.batteryService, OmiUUID.buttonService, OmiUUID.settingsService, OmiUUID.storageService,
+        OmiUUID.hapticService,
     ]
 
     /// Lookup by (service, characteristic), both lowercase. 16-bit SIG UUIDs are 4 hex chars.

@@ -353,14 +353,27 @@ private struct LinkRow: View {
     }
 }
 
-/// Pendant details and actions, kept off the main screen. Forget keeps its confirmation.
+/// Pendant details, its settings and actions, kept off the main screen. Forget keeps its confirmation.
 struct ManagePendantView: View {
     let model: AppModel
+    @State private var controls: PendantControlsModel
+
+    init(model: AppModel) {
+        self.model = model
+        _controls = State(initialValue: PendantControlsModel(engine: model.engine))
+    }
 
     var body: some View {
         List {
+            PendantControlsSection(model: model, controls: controls)
+            PendantButtonSection(model: model)
             PendantDeviceSection(snapshot: model.snapshot)
             DeviceSettingsSection(model: model)
+            Section {
+                Link(destination: URL(string: "https://www.omi.me/pages/charging-omi")!) {
+                    Label("Charging help", systemImage: "bolt.badge.questionmark")
+                }
+            }
         }
         .navigationTitle("Manage pendant")
     }

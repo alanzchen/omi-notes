@@ -76,6 +76,15 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
         public var offlineSupport: OfflineStorageSupport = .unknown
         public var offlineUnread: Int?
         public var noAudioYet = false
+        /// The pendant's settings as last read from it on this connection (nil: not read, or
+        /// the read failed). Never a value the app merely asked for.
+        public var settings: [PendantSetting: Int] = [:]
+        /// Settings this pendant supports (characteristic present and advertised in features).
+        public var settingsSupported: Set<PendantSetting> = []
+        /// The vibration motor is present and advertised.
+        public var canVibrate = false
+        /// Whether `settingsSupported`/`canVibrate` are known yet (after the features read).
+        public var controlsKnown = false
     }
 
     public struct LiveStats: Equatable, Sendable {
@@ -539,6 +548,69 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
             enqueueNotify(.charging)
         }
         enqueue(.barrier { [weak self] in self?.becomeReady() })
+        // After ready (so offline sync isn't held up): what the pendant's own settings are now.
+        enqueue(.barrier { [weak self] in self?.readSettings() })
+    }
+
+    // MARK: Pendant settings
+
+    /// Supported only when the characteristic exists and the features say so; unreadable features
+    /// leave every control unavailable rather than guessing.
+    private func evaluateControls() {
+        let features = info.features ?? DeviceFeatures(rawValue: 0)
+        info.settingsSupported = Set(PendantSetting.allCases.filter {
+            available.contains($0.characteristic) && $0.isAdvertised(by: features)
+        })
+        info.canVibrate = available.contains(.haptic) && features.haptic
+        info.controlsKnown = true
+    }
+
+    private func readSettings() {
+        evaluateControls()
+        for setting in PendantSetting.allCases where info.settingsSupported.contains(setting) {
+            enqueue(.read(setting.characteristic) { [weak self] data, _ in
+                guard let self else { return }
+                self.info.settings[setting] = setting.decode(data)
+                self.delegate?.sessionDidChange(self)
+            })
+        }
+        delegate?.sessionDidChange(self)
+    }
+
+    /// Writes a setting, then reads it back: success carries the value the pendant reports. After
+    /// a failed write the value is read again, so the shown value stays what the pendant has.
+    public func change(_ setting: PendantSetting, to value: Int, done: @escaping (Result<Int, Error>) -> Void) {
+        guard phase == .streaming, info.settingsSupported.contains(setting) else {
+            done(.failure(phase == .streaming ? PendantControlError.unsupported : PendantControlError.notConnected))
+            return
+        }
+        let c = setting.characteristic
+        enqueue(.write(setting.encode(value), c) { [weak self] writeError in
+            guard let self else { return }
+            self.enqueue(.read(c) { [weak self] data, readError in
+                guard let self else { return }
+                let reported = readError == nil ? setting.decode(data) : nil
+                self.info.settings[setting] = reported
+                self.delegate?.sessionDidChange(self)
+                if let writeError {
+                    done(.failure(writeError))
+                } else if let reported {
+                    log(.info, "ble", "\(setting.rawValue) set to \(reported)")
+                    done(.success(reported))
+                } else {
+                    done(.failure(readError ?? PendantControlError.unconfirmed))
+                }
+            })
+        })
+    }
+
+    /// One vibration. Done when the pendant has accepted the write.
+    public func vibrate(_ pulse: HapticPulse, done: @escaping (Error?) -> Void) {
+        guard phase == .streaming, info.canVibrate else {
+            done(phase == .streaming ? PendantControlError.unsupported : PendantControlError.notConnected)
+            return
+        }
+        enqueue(.write(pulse.payload, .haptic) { done($0) })
     }
 
     private func storeString(_ c: OmiCharacteristic, _ data: Data?, _ error: Error?) {
@@ -665,6 +737,17 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
         case .write(let d, let c, _): return "write \(c.rawValue) [\(d.map { String(format: "%02x", $0) }.joined())]"
         case .notify(let c, let on, _): return "notify \(c.rawValue) \(on)"
         case .barrier: return "barrier"
+        }
+    }
+}
+
+public enum PendantControlError: Error, LocalizedError, Equatable {
+    case notConnected, unsupported, unconfirmed
+    public var errorDescription: String? {
+        switch self {
+        case .notConnected: return "the pendant isn't connected"
+        case .unsupported: return "this pendant doesn't support it"
+        case .unconfirmed: return "the pendant didn't confirm the new value"
         }
     }
 }

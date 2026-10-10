@@ -103,6 +103,9 @@ struct PendantDeviceSection: View {
             Section("Pendant") {
                 LabeledContent("Model", value: d.modelNumber ?? "—")
                 LabeledContent("Firmware", value: d.firmwareRevision ?? "—")
+                if let hw = d.hardwareRevision { LabeledContent("Hardware", value: hw) }
+                if let maker = d.manufacturer { LabeledContent("Manufacturer", value: maker) }
+                if let serial = d.serialNumber { LabeledContent("Serial number", value: serial) }
                 LabeledContent("Battery", value: d.battery.map { "\($0)%\(d.charging == true ? " · charging" : "")" } ?? "—")
                 LabeledContent("Audio format", value: d.codec.map { "\($0.label) (\($0.rawValue))" } ?? "reading…")
                 LabeledContent("Clock") {

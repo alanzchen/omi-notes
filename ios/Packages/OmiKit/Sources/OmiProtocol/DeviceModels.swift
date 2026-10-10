@@ -122,7 +122,10 @@ public struct DeviceFeatures: Equatable, Sendable {
         rawValue = UInt32(b[0]) | UInt32(b[1]) << 8 | UInt32(b[2]) << 16 | UInt32(b[3]) << 24
     }
 
+    public var haptic: Bool { rawValue & (1 << 5) != 0 }
     public var offlineStorage: Bool { rawValue & (1 << 6) != 0 }
+    public var ledDimming: Bool { rawValue & (1 << 7) != 0 }
+    public var micGain: Bool { rawValue & (1 << 8) != 0 }
 }
 
 // MARK: - Firmware version

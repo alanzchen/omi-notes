@@ -95,6 +95,8 @@ public final class SettingsStore: @unchecked Sendable {
         static let userDisconnected = "omi.userDisconnected"
         static let simulated = "omi.simulatedDevice"
         static let onboarded = "omi.onboarded"
+        static let buttonActionsOff = "omi.buttonActionsOff"
+        static let doubleTapAction = "omi.doubleTapAction"
     }
 
     public init(defaults: UserDefaults = .standard, tokens: TokenStore = KeychainTokenStore()) {
@@ -190,6 +192,33 @@ public final class SettingsStore: @unchecked Sendable {
     public var onboarded: Bool {
         get { defaults.bool(forKey: Key.onboarded) }
         set { defaults.set(newValue, forKey: Key.onboarded) }
+    }
+
+    /// Whether this phone acts on the pendant's button (on by default). Kept on the phone: the
+    /// pendant always sends its button events.
+    public var buttonActionsEnabled: Bool {
+        get { !defaults.bool(forKey: Key.buttonActionsOff) }
+        set { defaults.set(!newValue, forKey: Key.buttonActionsOff) }
+    }
+
+    public var doubleTapAction: DoubleTapAction {
+        get { defaults.string(forKey: Key.doubleTapAction).flatMap(DoubleTapAction.init(rawValue:)) ?? .endConversation }
+        set { defaults.set(newValue.rawValue, forKey: Key.doubleTapAction) }
+    }
+}
+
+/// What a double tap on the pendant does (this phone's choice).
+public enum DoubleTapAction: String, CaseIterable, Sendable {
+    /// End the current conversation now (the default).
+    case endConversation
+    /// Bookmark this moment, like a single tap; the conversation continues.
+    case bookmark
+
+    public var title: String {
+        switch self {
+        case .endConversation: return "End conversation"
+        case .bookmark: return "Bookmark"
+        }
     }
 }
 

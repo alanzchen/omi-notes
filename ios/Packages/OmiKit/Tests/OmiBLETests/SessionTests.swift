@@ -41,13 +41,27 @@ final class FakeDeviceTransport: DeviceTransport {
         if let cached = cachedCharacteristics { delegate?.transport(self, didDiscover: cached, complete: true) }
     }
 
+    /// Reads that fail although the pendant has a value.
+    var failReads: Set<OmiCharacteristic> = []
+
     func read(_ c: OmiCharacteristic) {
         calls.append("read \(c.rawValue)")
-        delegate?.transport(self, didUpdateValue: values[c], for: c, error: values[c] == nil ? SessionError.timeout : nil)
+        let value = failReads.contains(c) ? nil : values[c]
+        delegate?.transport(self, didUpdateValue: value, for: c, error: value == nil ? SessionError.timeout : nil)
     }
+
+    /// Writes that fail (a pendant rejecting or not answering them).
+    var writeErrors: [OmiCharacteristic: Error] = [:]
+    /// Writes that are never answered (the op stays outstanding).
+    var unanswered: Set<OmiCharacteristic> = []
 
     func write(_ data: Data, to c: OmiCharacteristic) {
         calls.append("write \(c.rawValue) \(data.map { String(format: "%02x", $0) }.joined())")
+        if unanswered.contains(c) { return }
+        if let e = writeErrors[c] { delegate?.transport(self, didWriteTo: c, error: e); return }
+        // The pendant keeps its settings (flash), as the firmware does: one byte, capped.
+        if c == .ledDimRatio, let b = data.first { values[c] = Data([min(b, 100)]) }
+        if c == .micGain, let b = data.first { values[c] = Data([min(b, 8)]) }
         delegate?.transport(self, didWriteTo: c, error: nil)
     }
 
@@ -155,7 +169,10 @@ struct SessionHarness {
         // Ring detection starts with a status read, after configuration; then INFO (unread 0 here).
         let statusIndex = try #require(calls.firstIndex(of: "read storageStatus"))
         #expect(statusIndex > calls.firstIndex(of: "read audioCodec")!)
-        #expect(calls.last == "write storageControl 10")
+        let info = try #require(calls.lastIndex(of: "write storageControl 10"))
+        #expect(info > statusIndex)
+        // the pendant's settings are read only after that, never ahead of offline sync
+        #expect(calls.suffix(from: info + 1) == ["read ledDimRatio", "read micGain"])
     }
 
     @Test func unsupportedCodecRefusesToRecord() {

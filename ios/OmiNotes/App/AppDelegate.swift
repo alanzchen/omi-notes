@@ -47,6 +47,13 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
                 model.debugUseServerFixture(status: st, issues: list.issues)
             }
         }
+        // `-OmiNotesDebugSimulatedDevice YES|NO` turns the simulated pendant on or off, and
+        // `-OmiNotesDebugPendantControlsFail YES` makes it reject settings writes (screenshots of the
+        // pendant's settings and their error state).
+        if UserDefaults.standard.object(forKey: "OmiNotesDebugSimulatedDevice") != nil {
+            engine.setSimulatedMode(UserDefaults.standard.bool(forKey: "OmiNotesDebugSimulatedDevice"))
+        }
+        engine.setSimulatedControlsFail(UserDefaults.standard.bool(forKey: "OmiNotesDebugPendantControlsFail"))
         // `-OmiNotesDebugOpenURL omi-notes://configure?…` exercises the URL-scheme sheet without the system prompt.
         if let raw = UserDefaults.standard.string(forKey: "OmiNotesDebugOpenURL"), let link = URL(string: raw) {
             model.handleOpenURL(link)

@@ -126,6 +126,13 @@ public final class SimulatedDevice: DeviceTransport, @unchecked Sendable {
     private var playbackStartMono: UInt64 = 0
     private var nextIndex = 0
     private var deviceTimeOffset: TimeInterval = 0
+    /// The pendant's settings (in flash: they survive reconnects), as the CV1 firmware keeps them.
+    public var ledBrightness = PendantSetting.ledBrightness.firmwareDefault
+    public var micGain = PendantSetting.micGain.firmwareDefault
+    /// Vibrations played (`HapticPulse` raw values).
+    public private(set) var vibrations: [UInt8] = []
+    /// Debug: settings and vibration writes fail, as a pendant that rejects them would.
+    public var failControlWrites = false
     private var ring: [UInt64: Data] = [:]
     private var readSeq: UInt64 = 1000
     private var writeSeq: UInt64 = 1000
@@ -192,6 +199,16 @@ public final class SimulatedDevice: DeviceTransport, @unchecked Sendable {
                 let secs = data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
                 self.deviceTimeOffset = TimeInterval(UInt32(littleEndian: secs)) - self.clock.wallNow().timeIntervalSince1970
             }
+            if [.ledDimRatio, .micGain, .haptic].contains(c) {
+                if self.failControlWrites {
+                    self.delegate?.transport(self, didWriteTo: c, error: SimulatedControlError.rejected)
+                    return
+                }
+                // As the firmware: one byte, capped (transport.c), haptic levels 1–3 (haptic.c).
+                if c == .ledDimRatio, data.count == 1 { self.ledBrightness = min(Int(data[0]), 100) }
+                if c == .micGain, data.count == 1 { self.micGain = min(Int(data[0]), 8) }
+                if c == .haptic, let level = data.first { self.vibrations.append(level) }
+            }
             self.delegate?.transport(self, didWriteTo: c, error: nil)
             if c == .storageControl { self.handleStorageCommand(data) }
         }
@@ -218,6 +235,8 @@ public final class SimulatedDevice: DeviceTransport, @unchecked Sendable {
         case .manufacturerName: return Data("Based Hardware (simulated)".utf8)
         case .features: return withUnsafeBytes(of: UInt32(0x1EC).littleEndian) { Data($0) }
         case .charging: return Data([0])
+        case .ledDimRatio: return Data([UInt8(ledBrightness)])
+        case .micGain: return Data([UInt8(micGain)])
         case .timeSyncRead:
             let t = UInt32(clamping: Int64(clock.wallNow().timeIntervalSince1970 + deviceTimeOffset))
             return withUnsafeBytes(of: t.littleEndian) { Data($0) }
@@ -344,4 +363,9 @@ public final class SimulatedDevice: DeviceTransport, @unchecked Sendable {
     private func after(_ seconds: Double, _ body: @escaping @Sendable () -> Void) {
         queue.asyncAfter(deadline: .now() + seconds, execute: body)
     }
+}
+
+enum SimulatedControlError: Error, LocalizedError {
+    case rejected
+    var errorDescription: String? { "the simulated pendant rejected the write" }
 }
