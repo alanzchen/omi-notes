@@ -72,7 +72,7 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         WKApplication: true
         WKCompanionAppBundleIdentifier: $(OMI_APP_BUNDLE_ID)
-        WKBackgroundModes: [audio]
+        UIBackgroundModes: [audio]
         NSMicrophoneUsageDescription: Omi Notes records on your Apple Watch only while you have started a recording, and sends it to your iPhone for your notes.
     settings:
       base:
