@@ -75,6 +75,29 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
                 return (data, 200)
             }
         }
+        // `-OmiNotesDebugWatchDrop YES`: ingest Watch outbox files copied into Documents/WatchDrop
+        // through the same calls WatchConnectivity uses (simulator automation where WatchConnectivity
+        // file transfer doesn't work).
+        if UserDefaults.standard.bool(forKey: "OmiNotesDebugWatchDrop") {
+            let drop = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("WatchDrop")
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: drop.path)) ?? []
+            var acks: [String] = []
+            for name in names.sorted() where name.hasSuffix(".json") {
+                let manifest = try? Data(contentsOf: drop.appendingPathComponent(name))
+                let base = String(name.dropLast(5))
+                let audio = drop.appendingPathComponent("\(base).m4a")
+                do {
+                    if FileManager.default.fileExists(atPath: audio.path) {
+                        acks.append(try engine.acceptWatchSegment(file: audio, manifest: manifest))
+                    } else {
+                        acks.append(try engine.acceptWatchEnd(manifest))
+                    }
+                } catch {
+                    OmiLog.shared.log(.warning, "watch", "drop \(name) not accepted: \(error.localizedDescription)")
+                }
+            }
+            OmiLog.shared.log(.info, "watch", "drop acknowledged \(acks.count): \(acks.joined(separator: ","))")
+        }
         // `-OmiNotesDebugOpenURL omi-notes://configure?…` exercises the URL-scheme sheet without the system prompt.
         if let raw = UserDefaults.standard.string(forKey: "OmiNotesDebugOpenURL"), let link = URL(string: raw) {
             model.handleOpenURL(link)

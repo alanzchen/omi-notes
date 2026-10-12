@@ -26,8 +26,9 @@ final class WatchSync: NSObject, WCSessionDelegate {
 
     func refreshCounts() {
         let segments = outbox.segments(), ends = outbox.ends()
-        held = segments.filter { $0.segment.binding != binding }.count + ends.filter { $0.binding != binding }.count
-        pending = segments.count + ends.count - held
+        // audio parts only (a recording's end marker isn't audio, but is sent the same way)
+        held = segments.filter { $0.segment.binding != binding }.count
+        pending = segments.count - held + (segments.isEmpty ? ends.filter { $0.binding == binding }.count : 0)
     }
 
     /// After a failed transfer, wait before sending again (5 s, doubling to 5 min): a failing link
