@@ -31,8 +31,10 @@ struct RecordView: View {
             }
         case .interrupted(let why):
             Text(why).font(.footnote).foregroundStyle(.orange).multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
         case .failed(let why):
             Text(why).font(.footnote).foregroundStyle(.red).multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

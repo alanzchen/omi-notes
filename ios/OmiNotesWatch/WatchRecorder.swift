@@ -77,6 +77,7 @@ final class WatchRecorder: NSObject, AVAudioRecorderDelegate {
         watchLog.info("start requested (active: \(self.current != nil), bound: \(self.sync.binding != nil))")
         guard current == nil else { return }
         guard let binding = sync.binding else {
+            sync.pump()  // asks the iPhone if it is reachable
             state = .failed("Open Omi Notes on your iPhone once, then try again.")
             return
         }
@@ -313,6 +314,6 @@ final class WatchRecorder: NSObject, AVAudioRecorderDelegate {
                                                reason: .appRecovered))
         current = nil
         persist()
-        state = .interrupted("The last recording was cut short when the app closed. It was kept.")
+        state = .interrupted("The app closed during a recording. What was recorded is kept.")
     }
 }

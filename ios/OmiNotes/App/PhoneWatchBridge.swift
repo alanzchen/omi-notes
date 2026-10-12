@@ -20,7 +20,9 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
 
     private func announce(_ session: WCSession) {
         guard session.activationState == .activated else { return }
-        try? session.updateApplicationContext([WatchWire.binding: engine.settings.phoneInstallId])
+        // a changing field, so the context is always transmitted (an unchanged one may not reach a
+        // freshly installed Watch app)
+        try? session.updateApplicationContext([WatchWire.binding: engine.settings.phoneInstallId, "at": Date().timeIntervalSince1970])
     }
 
     private func acknowledge(_ ids: [String], _ session: WCSession) {
@@ -42,6 +44,12 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
     }
 
     func sessionWatchStateDidChange(_ session: WCSession) { announce(session) }
+
+    /// The Watch asks who its iPhone is (it has no binding yet).
+    func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
+        replyHandler([WatchWire.binding: engine.settings.phoneInstallId])
+        announce(session)
+    }
 
     func session(_ session: WCSession, didReceive file: WCSessionFile) {
         OmiLog.shared.log(.info, "watch", "received a file from the Watch (\(file.metadata?[WatchWire.kind] as? String ?? "?"))")

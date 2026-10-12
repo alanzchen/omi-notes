@@ -52,7 +52,8 @@ final class WatchSync: NSObject, WCSessionDelegate {
     /// Hands everything waiting (for this iPhone) to WatchConnectivity, skipping what is in flight.
     func pump() {
         refreshCounts()
-        guard activated, let binding else { return }
+        guard activated else { return }
+        guard let binding else { askForBinding(); return }
         if let at = retryAt, at > Date() {
             if !retryScheduled {
                 retryScheduled = true
@@ -88,6 +89,16 @@ final class WatchSync: NSObject, WCSessionDelegate {
             binding = m[WatchWire.binding] as? String
             acks = m[WatchWire.acks] as? [String] ?? []
         }
+    }
+
+    /// No binding yet (fresh install): ask the iPhone directly when it is reachable.
+    private func askForBinding() {
+        let session = WCSession.default
+        guard session.activationState == .activated, session.isReachable else { return }
+        session.sendMessage(["hello": 1], replyHandler: { reply in
+            let r = Received(reply)
+            Task { @MainActor in self.handle(r) }
+        }, errorHandler: nil)
     }
 
     /// Looks again later for items whose acknowledgement is overdue.
