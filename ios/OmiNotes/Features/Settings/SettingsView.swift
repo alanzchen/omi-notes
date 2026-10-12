@@ -19,7 +19,7 @@ struct SettingsView: View {
             }
             .font(.subheadline)
             Section("Privacy") {
-                Text("Audio goes from the pendant to this phone, then to your own server. This app sends it nowhere else. Your server decides which services receive your audio and transcripts; see Server → Configuration.")
+                Text("Audio goes from the pendant (and your Apple Watch, when you record on it) to this phone, then to your own server. This app sends it nowhere else. Your server decides which services receive your audio and transcripts; see Server → Configuration.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             AlertsSection(model: model)
@@ -221,7 +221,7 @@ struct WatchStatusSection: View {
                 if let at = snapshot.watchLastReceivedAt {
                     LabeledContent("Last received", value: at.formatted(date: .omitted, time: .shortened))
                 }
-                LabeledContent("Received since launch", value: "\(snapshot.watchReceived) part\(snapshot.watchReceived == 1 ? "" : "s")")
+                LabeledContent("Received", value: "\(snapshot.watchReceived) part\(snapshot.watchReceived == 1 ? "" : "s")")
                 if snapshot.watchPending > 0 {
                     LabeledContent("Being prepared for upload", value: "\(snapshot.watchPending)")
                 }

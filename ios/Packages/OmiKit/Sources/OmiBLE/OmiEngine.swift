@@ -1237,8 +1237,9 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         s.lastButton = lastButton
         s.firmware = firmwareState
         s.watchPending = watchInbox.pendingCount
-        s.watchLastReceivedAt = watchLastReceivedAt
-        s.watchReceived = watchReceived
+        let received = watchInbox.receivedSummary()
+        s.watchReceived = received.count + s.watchPending
+        s.watchLastReceivedAt = [watchLastReceivedAt, received.last].compactMap { $0 }.max()
         s.recordingPaused = settings.recordingPaused
         s.autoCollect = settings.autoCollectPendantAudio
         s.buttonActionsEnabled = settings.buttonActionsEnabled

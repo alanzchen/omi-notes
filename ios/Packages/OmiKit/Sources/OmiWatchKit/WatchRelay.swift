@@ -284,4 +284,12 @@ public final class PhoneWatchInbox: @unchecked Sendable {
     private func isDone(_ id: String) -> Bool { FileManager.default.fileExists(atPath: doneDir.appendingPathComponent(id).path) }
 
     public var pendingCount: Int { pending().count }
+
+    /// Segments received and handed on so far (kept as small markers), and when the latest was.
+    public func receivedSummary() -> (count: Int, last: Date?) {
+        lock.lock(); defer { lock.unlock() }
+        let names = Files.names(doneDir, suffix: "").filter { !$0.hasSuffix("-end") }
+        let dates = names.compactMap { (try? FileManager.default.attributesOfItem(atPath: doneDir.appendingPathComponent($0).path))?[.modificationDate] as? Date }
+        return (names.count, dates.max())
+    }
 }
