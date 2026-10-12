@@ -8,6 +8,7 @@ import UIKit
 /// background for a Bluetooth event or a finished upload.
 final class AppDelegate: NSObject, UIApplicationDelegate {
     private(set) var model: AppModel!
+    private var watchBridge: PhoneWatchBridge?
     private var backgroundTasks: UIKitBackgroundTasks!
     private let alerts = LocalAlerts()
 
@@ -23,6 +24,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             simulatedTrace: trace)
         let engine = OmiEngine(config: config, settings: SettingsStore(), background: backgroundTasks)
         model = AppModel(engine: engine)
+        watchBridge = PhoneWatchBridge(engine: engine)
         model.problemAlerts.sink = alerts
         #if DEBUG
         // Simulator automation only (debug builds): `-OmiNotesDebugServerURL <url> -OmiNotesDebugToken <token>`.

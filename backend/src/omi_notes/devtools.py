@@ -160,14 +160,15 @@ def live_envelopes(
 
 
 def pcm_envelopes(
-    pcm: np.ndarray, *, capture_id: str, device_id: str, started_at: datetime, chunk_seconds: float = 60.0
+    pcm: np.ndarray, *, capture_id: str, device_id: str, started_at: datetime, chunk_seconds: float = 60.0,
+    source: str = "wav_replay",
 ) -> list[bytes]:
     step = int(chunk_seconds * SAMPLE_RATE)
     envelopes = []
     for c, i in enumerate(range(0, max(len(pcm), 1), step)):
         part = pcm[i : i + step].astype("<i2")
         header = base_header(
-            capture_id=capture_id, seq=c, device_id=device_id, source="wav_replay", payload_format="pcm16le_v1",
+            capture_id=capture_id, seq=c, device_id=device_id, source=source, payload_format="pcm16le_v1",
             codec_id=0, started_at=started_at, start_us=i * 1_000_000 // SAMPLE_RATE,
             end_us=(i + len(part)) * 1_000_000 // SAMPLE_RATE, record_count=len(part),
         )  # fmt: skip

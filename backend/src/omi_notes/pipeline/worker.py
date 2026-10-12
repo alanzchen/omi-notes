@@ -622,7 +622,7 @@ class Worker:
 
     def _live_spans(self, device: str, lo: float, hi: float) -> list[seg.Span]:
         """Spans of live/replay captures near [lo, hi], using monotonic seal ends."""
-        live_like = "device_id=? AND source IN ('live_ble','wav_replay') AND capture_started_at IS NOT NULL"
+        live_like = "device_id=? AND source IN ('live_ble','wav_replay','watch_mic') AND capture_started_at IS NOT NULL"
         captures = self.db.query(
             f"""SELECT * FROM capture_times WHERE {live_like} AND capture_started_at <= ?
                 AND (seal_json IS NULL OR seal_end >= ?) ORDER BY capture_started_at""",
@@ -655,8 +655,8 @@ class Worker:
         device that cannot record offline has known losses there; everything else waits for a
         processed offline-storage sync."""
         sources = {r["source"] for r in self.db.query("SELECT DISTINCT source FROM captures WHERE device_id=?", (device,))}
-        if sources == {"wav_replay"}:
-            return "none"
+        if sources <= {"wav_replay", "watch_mic"}:
+            return "none"  # a recording the phone relays whole: nothing outside it to wait for
         live = self.db.one(
             "SELECT offline_storage FROM captures WHERE device_id=? AND source='live_ble' AND capture_started_at IS NOT NULL "
             "ORDER BY capture_started_at DESC LIMIT 1",
@@ -666,7 +666,7 @@ class Worker:
 
     def _live_open(self, device: str) -> bool:
         latest = self.db.one(
-            """SELECT seal_json FROM captures WHERE device_id=? AND source IN ('live_ble','wav_replay')
+            """SELECT seal_json FROM captures WHERE device_id=? AND source IN ('live_ble','wav_replay','watch_mic')
                AND capture_started_at IS NOT NULL ORDER BY capture_started_at DESC LIMIT 1""",
             (device,),
         )

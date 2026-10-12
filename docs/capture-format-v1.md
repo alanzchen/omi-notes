@@ -67,7 +67,7 @@ The total body must be exactly `12 + header_len + payload_bytes` bytes. Max body
 | `model_number` | string \| null | Device Information `2A24` |
 | `firmware_revision` | string \| null | `2A26` |
 | `hardware_revision` | string \| null | `2A27` |
-| `source` | string | `live_ble` \| `device_ring` \| `wav_replay` |
+| `source` | string | `live_ble` \| `device_ring` \| `wav_replay` \| `watch_mic` |
 | `payload_format` | string | `ble_notifications_v1` \| `ring_records_v1` \| `pcm16le_v1` |
 | `codec_id` | int | `20` Opus 10 ms (DevKit), `21` Opus 20 ms FS320 (CV1). `pcm16le_v1` uses `0`. PCM ids 0/1 over BLE are **not supported** in v1 (no current firmware emits them). |
 | `sample_rate` | int | `16000` |
@@ -123,10 +123,27 @@ sequence for the device (the firmware can resend records past its last checkpoin
 server dedupes on `(device_id, ring_sequence)` (comparing bytes, so a firmware reflash that
 restarts sequences is not mistaken for a duplicate).
 
-### Payload `pcm16le_v1` (source `wav_replay`, developer tooling)
+### Payload `pcm16le_v1` (sources `wav_replay`, developer tooling, and `watch_mic`)
 
 Raw signed 16-bit little-endian mono PCM at 16 kHz. `record_count` = number of samples,
 `payload_bytes = 2 × record_count`. The audio starts at `chunk_start_offset_us`.
+
+### Apple Watch (`watch_mic`)
+
+The Watch app records one capture per user-started recording, in 60 s segments. The phone receives
+each segment over WatchConnectivity, stores and verifies it, converts it to 16 kHz PCM and uploads it
+as chunk `chunk_sequence` = segment index of capture `capture_id` = the Watch's recording id, with
+`device_id` = the Watch's stable id and offsets from the Watch's monotonic clock. The seal
+(`user_stopped`, or `app_recovered` after the Watch app was stopped) follows the last segment. Like
+`wav_replay`, nothing outside a Watch capture is awaited.
+
+The same event can be recorded by the Watch and the pendant. A conversation recorded only by the
+Watch waits (≤ 30 min after it ends) for the other devices' overlapping conversations to finish,
+then their loudness over time is correlated (0.1 s steps, ±15 s of clock skew). Correlation ≥ 0.6
+with the pendant covering ≥ 80 % of the Watch's audio: the Watch conversation is an *alternate
+recording*, finalized as discarded with that reason (no second note; its audio is kept like any
+other). Otherwise both are kept (`partial`, `uncertain`, `distinct`). The decision and its evidence
+are in `<conversation dir>/source.json` (written before use; delete it and reprocess to undo).
 
 ## HTTP API
 

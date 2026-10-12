@@ -99,6 +99,7 @@ public final class SettingsStore: @unchecked Sendable {
         static let doubleTapAction = "omi.doubleTapAction"
         static let recordingPaused = "omi.recordingPaused"
         static let autoCollectOff = "omi.autoCollectOff"
+        static let installId = "omi.phoneInstallId"
     }
 
     public init(defaults: UserDefaults = .standard, tokens: TokenStore = KeychainTokenStore()) {
@@ -207,6 +208,15 @@ public final class SettingsStore: @unchecked Sendable {
     public var recordingPaused: Bool {
         get { defaults.bool(forKey: Key.recordingPaused) }
         set { defaults.set(newValue, forKey: Key.recordingPaused) }
+    }
+
+    /// This phone install's stable id: Apple Watch recordings are bound to it, so a Watch paired
+    /// with another iPhone never sends them there.
+    public var phoneInstallId: String {
+        if let id = defaults.string(forKey: Key.installId) { return id }
+        let id = UUID().uuidString.lowercased()
+        defaults.set(id, forKey: Key.installId)
+        return id
     }
 
     /// Collect the audio stored on the pendant on every connection (on by default).

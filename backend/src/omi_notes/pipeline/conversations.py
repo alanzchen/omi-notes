@@ -64,6 +64,7 @@ from . import prompt
 from .relevance import deterministic_relevance
 from .segmenter import RingCapture, ring_resolved_until
 from .speakers import SpeakerResult, resolve_speakers
+from . import sources
 from .transcript import ConversationAudio, assemble, detected_language, merge_same_speaker, segments_from_deepgram
 from .turn_transcription import CACHE_FORMAT as WINDOW_CACHE_FORMAT
 from .turn_transcription import transcribe_windows
@@ -72,8 +73,8 @@ log = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 6
 CLAIM_TTL = 3600.0
-SOURCE_PRIORITY = {"live_ble": 0, "wav_replay": 1, "device_ring": 2}
-SOURCE_LABEL = {"live_ble": "live", "wav_replay": "replay", "device_ring": "offline"}
+SOURCE_PRIORITY = {"live_ble": 0, "wav_replay": 1, "watch_mic": 1, "device_ring": 2}
+SOURCE_LABEL = {"live_ble": "live", "wav_replay": "replay", "watch_mic": "Apple Watch", "device_ring": "offline"}
 RULE_REASONS = {
     "empty_transcript": "no speech was transcribed",
     "filler_only": "only filler words",
@@ -320,6 +321,12 @@ class ConversationPipeline:
             self._commit(conv_id, status="done", needs_render=0, next_attempt_at=None, **_outcome(row, "frozen", None))
             operations.finished(self, row["retry_op"])
             return
+        if row["status"] == "closed" and sources.watch_only(self.db, row) and sources.read(self, conv_id) is None:
+            # the same conversation may also be on the pendant: decide once both are finished
+            if not sources.ready(self, row, now):
+                self._set(conv_id, next_attempt_at=now + 60)
+                return
+            sources.decide(self, row, now)
         stage = "transcribing" if row["status"] in ("closed", "transcribing") else "summarizing"
         try:
             if stage == "transcribing":
@@ -803,7 +810,12 @@ class ConversationPipeline:
         discard_reason = None
         # Re-renders (cache_only) reproduce what the note was made from, whatever the settings now.
         no_summary = row["llm_status"] == "none" if cache_only else self.settings.llm_provider == "none"
-        if _kept(row) and transcript.get("speaker_source") == "unlabeled":
+        source = sources.read(self, conv_id) if sources.watch_only(self.db, row) else None
+        alternate = sources.alternate_reason(self, source) if source else None
+        if alternate:
+            kind = "discarded"  # listed with its reason, no note of its own; its audio stays
+            discard_reason = alternate
+        elif _kept(row) and transcript.get("speaker_source") == "unlabeled":
             # the owner chose to keep it as it is: no discard, and no summary of text nobody can attribute
             kind = "transcript_only"
             summary_error = KEPT_REASON

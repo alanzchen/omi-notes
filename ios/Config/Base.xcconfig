@@ -3,7 +3,8 @@
 // Copy Local.xcconfig.example to Local.xcconfig and edit it.
 
 PRODUCT_NAME = OmiNotes
-PRODUCT_BUNDLE_IDENTIFIER = dev.omi-notes.app
+OMI_APP_BUNDLE_ID = dev.omi-notes.app
+PRODUCT_BUNDLE_IDENTIFIER = $(OMI_APP_BUNDLE_ID)
 MARKETING_VERSION = 0.1.0
 CURRENT_PROJECT_VERSION = 1
 CODE_SIGN_STYLE = Automatic

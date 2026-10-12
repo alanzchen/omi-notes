@@ -87,7 +87,7 @@ class SealBody(BaseModel):
     ended_at: IsoTime
     end_offset_us: Count | None = None
     device_id: Annotated[StrictStr, Field(min_length=1, max_length=128)]
-    source: Literal["live_ble", "device_ring", "wav_replay"]
+    source: Literal["live_ble", "device_ring", "wav_replay", "watch_mic"]
     ring: RingSealInfo | None = None
 
 

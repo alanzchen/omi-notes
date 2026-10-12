@@ -1,6 +1,7 @@
 import Foundation
 import OmiCapture
 import OmiProtocol
+import OmiWatchKit
 
 /// `UIApplication.beginBackgroundTask` abstraction (UIKit lives in the app target).
 public protocol BackgroundTaskProviding: AnyObject, Sendable {
@@ -61,6 +62,10 @@ public struct EngineSnapshot: Equatable, Sendable {
     public var serverConfigured = false
     public var lastButton: String?
     public var firmware = FirmwareUpdateState.idle
+    /// Apple Watch recordings: segments received but not yet queued for upload, and the last receipt.
+    public var watchPending = 0
+    public var watchLastReceivedAt: Date?
+    public var watchReceived = 0
     /// This phone's choices for the pendant (`SettingsStore`).
     public var recordingPaused = false
     public var autoCollect = true
@@ -212,6 +217,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             outbox: outbox, state: UploadStateStore(url: dirs.state.appendingPathComponent("upload-state.json")),
             transport: transport, queue: queue, config: { settings.serverConfig() })
         uploader.gate = CompositeUploadGate([ledger, enrollmentGate])
+        _ = watchInbox  // created now: WatchConnectivity may call in from its own queue
         uploader.enabled = false  // until recovery completes
         uploader.onStatusChange = { [weak self] in self?.scheduleSnapshot() }
         backgroundTransport?.onCompletion = { [weak self] id, status, body, error in
@@ -257,6 +263,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         ledger.prune()
         recoveryComplete = true
         uploader.enabled = true
+        processWatch()
 
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + config.tickInterval, repeating: config.tickInterval, leeway: .milliseconds(100))
@@ -448,6 +455,41 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     }
 
     public func runRetentionNow() { queue.async { self.runRetention() } }
+
+    // MARK: Apple Watch relay
+
+    public private(set) lazy var watchInbox = PhoneWatchInbox(root: config.dirs.root.appendingPathComponent("watch", isDirectory: true),
+                                                             binding: settings.phoneInstallId)
+    private lazy var watchProcessor = WatchRelayProcessor(inbox: watchInbox, outbox: outbox, appVersion: config.appVersion,
+                                                          timezone: config.timezone)
+    private var watchLastReceivedAt: Date?
+    private var watchReceived = 0
+
+    /// Stores a segment the Watch sent (from WatchConnectivity's temporary file, before its callback
+    /// returns). Returns the id to acknowledge to the Watch only once it is durable and verified.
+    public func acceptWatchSegment(file: URL, manifest: Data?) throws -> String {
+        guard let segment = WatchWire.decode(WatchSegment.self, manifest) else { throw WatchRelayError.damaged("manifest") }
+        try watchInbox.accept(file: file, segment: segment)
+        queue.async {
+            self.watchLastReceivedAt = Date()
+            self.watchReceived += 1
+            self.processWatch()
+        }
+        return segment.id
+    }
+
+    public func acceptWatchEnd(_ data: Data?) throws -> String {
+        guard let end = WatchWire.decode(WatchRecordingEnd.self, data) else { throw WatchRelayError.damaged("end") }
+        try watchInbox.accept(end: end)
+        queue.async { self.processWatch() }
+        return end.id
+    }
+
+    func processWatch() {
+        guard recoveryComplete else { return }
+        if watchProcessor.process() > 0 { scheduleReconcile() }
+        scheduleSnapshot()
+    }
 
     // MARK: Firmware update
 
@@ -1053,7 +1095,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         if session?.phase == .streaming, now &- lastHeartbeatMono >= Self.heartbeatInterval {
             writeHeartbeat(reason: "periodic")
         }
-        if tickCount % 30 == 0 { checkStorage() }
+        if tickCount % 30 == 0 { checkStorage(); processWatch() }
         if tickCount % 5 == 0 { refreshOutboxStats() }
         if tickCount % 3600 == 0 { runRetention() }
         if session != nil || tickCount % 5 == 0 { scheduleSnapshot() }
@@ -1194,6 +1236,9 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         s.serverConfigured = settings.endpoint != nil
         s.lastButton = lastButton
         s.firmware = firmwareState
+        s.watchPending = watchInbox.pendingCount
+        s.watchLastReceivedAt = watchLastReceivedAt
+        s.watchReceived = watchReceived
         s.recordingPaused = settings.recordingPaused
         s.autoCollect = settings.autoCollectPendantAudio
         s.buttonActionsEnabled = settings.buttonActionsEnabled

@@ -19,13 +19,14 @@ RING_RECORD_SIZE = 444
 OPUS_CODECS = {20: 160, 21: 320}  # codec id -> samples per frame at 16 kHz
 FLAG_SESSION_START = 0x01
 
-Source = Literal["live_ble", "device_ring", "wav_replay"]
+Source = Literal["live_ble", "device_ring", "wav_replay", "watch_mic"]
 PayloadFormat = Literal["ble_notifications_v1", "ring_records_v1", "pcm16le_v1"]
 
 _SOURCE_FORMAT = {
     "live_ble": "ble_notifications_v1",
     "device_ring": "ring_records_v1",
     "wav_replay": "pcm16le_v1",
+    "watch_mic": "pcm16le_v1",
 }
 
 

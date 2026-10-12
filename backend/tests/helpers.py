@@ -30,14 +30,16 @@ def iso(epoch: float) -> str:
     return iso_utc(datetime.fromtimestamp(epoch, UTC))
 
 
-def replay(client, pcm: np.ndarray, start: datetime = STARTED, chunk_seconds: float = 60.0) -> str:
-    """Developer PCM replay: time outside the capture needs no evidence, so conversations close fast."""
+def replay(client, pcm: np.ndarray, start: datetime = STARTED, chunk_seconds: float = 60.0, *,
+           source: str = "wav_replay", device: str = DEVICE) -> str:
+    """Developer PCM replay (or an Apple Watch recording relayed by the phone, `watch_mic`): time
+    outside the capture needs no evidence, so conversations close fast."""
     capture = str(uuid.uuid4())
-    envs = pcm_envelopes(pcm, capture_id=capture, device_id=DEVICE, started_at=start, chunk_seconds=chunk_seconds)
+    envs = pcm_envelopes(pcm, capture_id=capture, device_id=device, started_at=start, chunk_seconds=chunk_seconds, source=source)
     upload_all(client, capture, envs)
     end_us = parse_envelope(envs[-1]).header.chunk_end_offset_us
-    seal = {"last_chunk_sequence": len(envs) - 1, "reason": "replay_complete", "ended_at": iso_utc(start),
-            "end_offset_us": end_us, "device_id": DEVICE, "source": "wav_replay"}  # fmt: skip
+    seal = {"last_chunk_sequence": len(envs) - 1, "reason": "replay_complete" if source == "wav_replay" else "user_stopped",
+            "ended_at": iso_utc(start), "end_offset_us": end_us, "device_id": device, "source": source}  # fmt: skip
     assert client.put(f"/v1/captures/{capture}/seal", json=seal, headers=AUTH).status_code == 200
     return capture
 

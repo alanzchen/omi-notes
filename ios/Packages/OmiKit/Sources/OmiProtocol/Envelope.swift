@@ -6,6 +6,8 @@ public enum CaptureSource: String, Codable, Sendable {
     case liveBLE = "live_ble"
     case deviceRing = "device_ring"
     case wavReplay = "wav_replay"
+    /// An Apple Watch recording relayed by the phone (16 kHz PCM, capture-format-v1.md "Apple Watch").
+    case watchMic = "watch_mic"
 }
 
 public enum PayloadFormat: String, Codable, Sendable {
