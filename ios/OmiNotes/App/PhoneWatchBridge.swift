@@ -34,6 +34,7 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
 
     func session(_ session: WCSession, activationDidCompleteWith state: WCSessionActivationState, error: Error?) {
         OmiLog.shared.log(.info, "watch", "WatchConnectivity \(state.rawValue) paired \(session.isPaired) installed \(session.isWatchAppInstalled)\(error.map { " error \($0.localizedDescription)" } ?? "")")
+        engine.acceptWatchReport(session.receivedApplicationContext[WatchWire.report] as? Data)
         announce(session)
     }
 
@@ -44,6 +45,11 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
     }
 
     func sessionWatchStateDidChange(_ session: WCSession) { announce(session) }
+
+    /// The Watch's latest status report.
+    func session(_ session: WCSession, didReceiveApplicationContext context: [String: Any]) {
+        engine.acceptWatchReport(context[WatchWire.report] as? Data)
+    }
 
     /// The Watch asks who its iPhone is (it has no binding yet).
     func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {

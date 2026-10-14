@@ -29,6 +29,28 @@ final class WatchSync: NSObject, WCSessionDelegate {
         // audio parts only (a recording's end marker isn't audio, but is sent the same way)
         held = segments.filter { $0.segment.binding != binding }.count
         pending = segments.count - held + (segments.isEmpty ? ends.filter { $0.binding == binding }.count : 0)
+        sendReport()
+    }
+
+    /// What the recorder is doing, for the iPhone's Devices screen.
+    var recorderState: (state: WatchReport.State, since: Date?) = (.idle, nil) {
+        didSet { sendReport() }
+    }
+    private var lastReport: WatchReport?
+
+    /// Tells the iPhone (application context: only the latest counts) what this Watch is doing, with
+    /// the time it said so. Sent when something changes, or at most every 5 min while it doesn't.
+    private func sendReport() {
+        guard activated, binding != nil, WCSession.default.activationState == .activated else { return }
+        let now = Date()
+        let r = WatchReport(state: recorderState.state, since: recorderState.since, waitingParts: pending, at: now)
+        if let l = lastReport, l.state == r.state, l.since == r.since, l.waitingParts == r.waitingParts, now.timeIntervalSince(l.at) < 300 { return }
+        do {
+            try WCSession.default.updateApplicationContext([WatchWire.report: WatchWire.encode(r)])
+            lastReport = r
+        } catch {
+            watchLog.error("status report not sent: \(error.localizedDescription)")
+        }
     }
 
     /// After a failed transfer, wait before sending again (5 s, doubling to 5 min): a failing link

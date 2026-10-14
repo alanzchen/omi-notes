@@ -24,7 +24,7 @@ struct OmiNotesApp: App {
 }
 
 struct RootView: View {
-    enum Tab: String { case home, pendant, people, server }
+    enum Tab: String { case home, devices, people, server }
     /// What the Settings sheet opens on.
     enum SettingsPage: String, Identifiable { case main, pairing; var id: String { rawValue } }
 
@@ -46,9 +46,9 @@ struct RootView: View {
             }
             .tabItem { Label("Home", systemImage: "waveform") }
             .tag(Tab.home)
-            NavigationStack { PendantView(model: model, onFix: fix) }
-                .tabItem { Label("Pendant", systemImage: "wave.3.right.circle") }
-                .tag(Tab.pendant)
+            NavigationStack { DevicesView(model: model, onFix: fix) }
+                .tabItem { Label("Devices", systemImage: "wave.3.right.circle") }
+                .tag(Tab.devices)
             NavigationStack { PeopleView(model: model) }
                 .tabItem { Label("People", systemImage: "person.2") }
                 .tag(Tab.people)
@@ -68,7 +68,7 @@ struct RootView: View {
             NavigationStack {
                 Group {
                     switch page {
-                    case .main: SettingsView(model: model)
+                    case .main: SettingsView(model: model, onFix: { f in settings = nil; fix(f) })
                     case .pairing: PairingView(model: model, onPaired: { settings = nil })
                     }
                 }
@@ -106,12 +106,13 @@ struct RootView: View {
 }
 
 extension RootView {
-    /// Simulator automation only (debug builds): `-OmiNotesDebugTab home|pendant|people|server|settings|pairing|diagnostics|debug`
+    /// Simulator automation only (debug builds): `-OmiNotesDebugTab home|devices|people|server|settings|pairing|diagnostics|debug`
     /// opens that screen at launch (there is no way to tap in a headless simulator).
     static var initialTab: Tab {
         #if DEBUG
         let raw = UserDefaults.standard.string(forKey: "OmiNotesDebugTab")
         if raw == "diagnostics" || raw == "debug" { return .server }
+        if raw == "pendant" { return .devices }  // the tab's earlier name
         if let raw, let tab = Tab(rawValue: raw) { return tab }
         #endif
         return .home

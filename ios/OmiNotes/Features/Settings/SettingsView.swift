@@ -5,10 +5,18 @@ import SwiftUI
 /// App and pendant settings (the server connection lives in the Server tab).
 struct SettingsView: View {
     let model: AppModel
+    var onFix: (SystemHealth.Fix) -> Void = { _ in }
     var body: some View {
         Form {
-            DeviceSettingsSection(model: model)
-            WatchStatusSection(model: model)
+            // the same pages as the Devices tab (each device's settings live there, once)
+            Section("Devices") {
+                NavigationLink { DevicePageView(page: .pendant, model: model, onFix: onFix) } label: {
+                    Label("Pendant", systemImage: "circle.circle")
+                }
+                NavigationLink { DevicePageView(page: .watch, model: model, onFix: onFix) } label: {
+                    Label("Apple Watch", systemImage: "applewatch")
+                }
+            }
             Section {
                 Label("Leave Omi Notes running in the background. Force-quitting it stops the pendant from reconnecting until you open the app again.",
                       systemImage: "moon.zzz")
@@ -208,27 +216,4 @@ struct DeviceSettingsSection: View {
     }
 }
 
-/// Apple Watch recordings arriving through this iPhone (the Watch app records; this phone uploads).
-struct WatchStatusSection: View {
-    let model: AppModel
-
-    var body: some View {
-        let s = model.snapshot
-        Section {
-            NavigationLink { WatchSetupView(model: model) } label: {
-                LabeledContent {
-                    if let at = s.watchLastReceivedAt {
-                        Text("Received \(at.formatted(.relative(presentation: .named)))")
-                    } else {
-                        Text("Set up")
-                    }
-                } label: {
-                    Label("Apple Watch", systemImage: "applewatch")
-                }
-            }
-        } footer: {
-            Text("Record on your Watch all day; it sends what it hears here.")
-        }
-    }
-}
 

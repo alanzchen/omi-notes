@@ -30,7 +30,15 @@ final class WatchRecorder: NSObject {
         return 60
     }
 
-    private(set) var state: State = .idle
+    private(set) var state: State = .idle {
+        didSet {
+            switch state {
+            case .recording(let since): sync.recorderState = (.recording, since)
+            case .interrupted, .failed: sync.recorderState = current.map { (.paused, $0.startedAt) } ?? (.idle, nil)
+            case .idle: sync.recorderState = (.idle, nil)
+            }
+        }
+    }
     let outbox: WatchOutbox
     let sync: WatchSync
     private let defaults = UserDefaults.standard

@@ -70,6 +70,8 @@ public struct EngineSnapshot: Equatable, Sendable {
     /// server last acknowledged one (sent files are kept for a while, so this can lapse).
     public var watchWaitingUpload = 0
     public var watchLastUploadedAt: Date?
+    /// The Watch app's latest report about itself (as of its own timestamp).
+    public var watchReport: WatchReport?
     /// This phone's choices for the pendant (`SettingsStore`).
     public var recordingPaused = false
     public var autoCollect = true
@@ -488,6 +490,13 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         try watchInbox.accept(end: end)
         queue.async { self.processWatch() }
         return end.id
+    }
+
+    /// The Watch app's application context (its latest status report).
+    public func acceptWatchReport(_ data: Data?) {
+        guard let report = WatchWire.decode(WatchReport.self, data) else { return }
+        watchInbox.saveReport(report)
+        queue.async { self.scheduleSnapshot() }
     }
 
     func processWatch() {
@@ -1252,6 +1261,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         s.watchLastReceivedAt = [watchLastReceivedAt, received.last].compactMap { $0 }.max()
         s.watchWaitingUpload = watchUploads.waiting
         s.watchLastUploadedAt = watchUploads.lastAt
+        s.watchReport = watchInbox.latestReport
         s.recordingPaused = settings.recordingPaused
         s.autoCollect = settings.autoCollectPendantAudio
         s.buttonActionsEnabled = settings.buttonActionsEnabled

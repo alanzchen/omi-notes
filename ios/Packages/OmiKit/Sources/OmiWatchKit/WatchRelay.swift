@@ -62,10 +62,29 @@ public struct WatchRecordingEnd: Codable, Equatable, Sendable {
     }
 }
 
+/// What the Watch app last said about itself (sent as its application context: only the latest
+/// counts). A statement as of `at`, not proof of what it is doing now.
+public struct WatchReport: Codable, Equatable, Sendable {
+    public enum State: String, Codable, Sendable { case recording, paused, idle }
+    public var state: State
+    /// When the current recording started (recording or paused).
+    public var since: Date?
+    /// Audio parts on the Watch the phone hasn't acknowledged yet.
+    public var waitingParts: Int
+    public var at: Date
+
+    public init(state: State, since: Date?, waitingParts: Int, at: Date) {
+        self.state = state
+        self.since = since
+        self.waitingParts = waitingParts
+        self.at = at
+    }
+}
+
 /// WatchConnectivity payload keys (property-list values only).
 public enum WatchWire {
     public static let kind = "kind", manifest = "manifest", acks = "acks", rejects = "rejects", binding = "binding"
-    public static let segment = "segment", end = "end"
+    public static let segment = "segment", end = "end", report = "report"
 
     public static func encode<T: Encodable>(_ v: T) -> Data {
         let e = JSONEncoder()
@@ -289,6 +308,19 @@ public final class PhoneWatchInbox: @unchecked Sendable {
     private func isDone(_ id: String) -> Bool { FileManager.default.fileExists(atPath: doneDir.appendingPathComponent(id).path) }
 
     public var pendingCount: Int { pending().count }
+
+    /// Keeps the Watch's latest report (newer than the stored one only).
+    public func saveReport(_ report: WatchReport) {
+        lock.lock(); defer { lock.unlock() }
+        let url = root.appendingPathComponent("report.json")
+        if let old = WatchWire.decode(WatchReport.self, try? Data(contentsOf: url)), old.at >= report.at { return }
+        try? Files.durableWrite(WatchWire.encode(report), to: url)
+    }
+
+    public var latestReport: WatchReport? {
+        lock.lock(); defer { lock.unlock() }
+        return WatchWire.decode(WatchReport.self, try? Data(contentsOf: root.appendingPathComponent("report.json")))
+    }
 
     /// The Watch recordings this phone has queued audio of (one upload capture each).
     public func recordingIds() -> Set<String> {
