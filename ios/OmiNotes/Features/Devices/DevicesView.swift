@@ -134,6 +134,7 @@ private struct DeviceCardShell<Art: View>: View {
     let state: String
     let stateColor: Color?
     let detail: String?
+    var detailColor: Color = Pendant.secondary
     @ViewBuilder var art: () -> Art
     var action: () -> Void
 
@@ -145,9 +146,10 @@ private struct DeviceCardShell<Art: View>: View {
                     Text(name).font(.headline)
                     HStack(spacing: 6) {
                         if let stateColor { Circle().fill(stateColor).frame(width: 7, height: 7) }
-                        Text(state).font(.subheadline)
+                        Text(state).font(.subheadline).fixedSize(horizontal: false, vertical: true)
                     }
-                    if let detail { Text(detail).font(.footnote).foregroundStyle(Pendant.secondary).lineLimit(2) }
+                    // never cut off: the end of the line ("reported 2 hours ago") is what matters
+                    if let detail { Text(detail).font(.footnote).foregroundStyle(detailColor).fixedSize(horizontal: false, vertical: true) }
                 }
                 Spacer(minLength: 0)
                 Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(Pendant.chevron)
@@ -169,7 +171,8 @@ private struct PendantCardView: View {
     var body: some View {
         Card {
             DeviceCardShell(name: summary.name, state: state, stateColor: summary.connected ? Pendant.indicatorOn : nil,
-                            detail: battery, art: { MiniPendant(on: summary.connected) }, action: open)
+                            detail: battery, detailColor: lowBattery ? Pendant.lowText : Pendant.secondary,
+                            art: { MiniPendant(on: summary.connected) }, action: open)
             // a problem shows here, on its device; everything else is on the pendant's page
             if let issue = summary.rows.first(where: \.attention) {
                 Divider().padding(.leading, 86)
@@ -177,7 +180,7 @@ private struct PendantCardView: View {
                     Image(systemName: "exclamationmark").font(.system(size: 11, weight: .bold))
                         .foregroundStyle(Pendant.warnForeground).frame(width: 22, height: 22)
                         .background(Pendant.warnBackground, in: .rect(cornerRadius: 7))
-                    Text(issue.title).font(.footnote.weight(.semibold)).lineLimit(2)
+                    Text(issue.title).font(.footnote.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 0)
                     if let fix = issue.fix {
                         Button { onFix(fix) } label: {
@@ -196,6 +199,11 @@ private struct PendantCardView: View {
     private var state: String {
         // the state line before its "·" detail: "Recording", "Not connected", "Connected"
         summary.stateLine.components(separatedBy: " · ").first ?? summary.stateLine
+    }
+
+    private var lowBattery: Bool {
+        if case .level(_, false, true) = summary.battery { return true }
+        return false
     }
 
     private var battery: String? {
