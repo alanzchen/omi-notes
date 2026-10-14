@@ -40,6 +40,10 @@ struct DevicesView: View {
                         case .watch: WatchCardView(summary: watch.summary) { page = .watch }
                         }
                     }
+                    if layout.cards.isEmpty {
+                        Text("Record with an Omi pendant, your Apple Watch, or both. Their audio comes to this iPhone and becomes notes on your server.")
+                            .font(.subheadline).foregroundStyle(Pendant.secondary).padding(.horizontal, 4).padding(.bottom, 2)
+                    }
                     if !layout.setup.isEmpty {
                         Card {
                             ForEach(Array(layout.setup.enumerated()), id: \.element) { index, device in

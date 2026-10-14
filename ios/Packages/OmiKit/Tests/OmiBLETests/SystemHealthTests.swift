@@ -153,8 +153,18 @@ import Testing
         var s = EngineSnapshot()
         s.serverConfigured = false
         let h = health(s, .notConfigured, nil)
-        #expect(h.level == .needsAction && h.headline == "No pendant paired")
+        #expect(h.level == .needsAction && h.headline == "No recording device set up")
+        #expect(step(h, .pendant).detail?.contains("Apple Watch") == true, "either device starts recording")
         #expect(step(h, .server).fix == .openServer)
+    }
+
+    @Test func aWatchUserWithoutAPendantIsNotToldToPairOne() {
+        var s = streaming()
+        s.connection = .noDevice
+        s.watchLastReceivedAt = Date(timeIntervalSince1970: 1_790_000_000)
+        let h = health(s, reachable(), nil)
+        #expect(step(h, .pendant).level == .normal && step(h, .pendant).fix == nil, "\(step(h, .pendant))")
+        #expect(h.headline != "No recording device set up" && h.level != .needsAction)
     }
 }
 

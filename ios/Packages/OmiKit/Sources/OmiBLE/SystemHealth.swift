@@ -81,7 +81,11 @@ public struct SystemHealth: Equatable, Sendable {
         }
         switch s.connection {
         case .noDevice:
-            return step(.needsAction, "No pendant paired", "Pair your Omi to start recording.", .pairDevice)
+            // the Apple Watch records too: without a pendant, that's a choice, not a problem
+            if s.watchReport != nil || s.watchLastReceivedAt != nil {
+                return step(.normal, "Recording with Apple Watch", "No pendant paired. You can add one in Devices.")
+            }
+            return step(.needsAction, "No recording device set up", "Pair an Omi pendant, or set up Apple Watch in Devices.", .pairDevice)
         case .bluetoothUnavailable(let why):
             return step(.needsAction, "Bluetooth is \(why)", "Turn Bluetooth on and allow Omi Notes to use it.", .openBluetoothSettings)
         case .refused(let why):
