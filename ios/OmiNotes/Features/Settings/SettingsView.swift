@@ -8,7 +8,7 @@ struct SettingsView: View {
     var body: some View {
         Form {
             DeviceSettingsSection(model: model)
-            WatchStatusSection(snapshot: model.snapshot)
+            WatchStatusSection(model: model)
             Section {
                 Label("Leave Omi Notes running in the background. Force-quitting it stops the pendant from reconnecting until you open the app again.",
                       systemImage: "moon.zzz")
@@ -210,26 +210,24 @@ struct DeviceSettingsSection: View {
 
 /// Apple Watch recordings arriving through this iPhone (the Watch app records; this phone uploads).
 struct WatchStatusSection: View {
-    let snapshot: EngineSnapshot
+    let model: AppModel
 
     var body: some View {
+        let s = model.snapshot
         Section {
-            if snapshot.watchReceived == 0 && snapshot.watchPending == 0 && snapshot.watchLastReceivedAt == nil {
-                Text("Open Omi Notes on your Apple Watch and tap the microphone to record. Recordings come here and upload like the pendant's.")
-                    .font(.footnote).foregroundStyle(.secondary)
-            } else {
-                if let at = snapshot.watchLastReceivedAt {
-                    LabeledContent("Last received", value: at.formatted(date: .omitted, time: .shortened))
-                }
-                LabeledContent("Received", value: "\(snapshot.watchReceived) part\(snapshot.watchReceived == 1 ? "" : "s")")
-                if snapshot.watchPending > 0 {
-                    LabeledContent("Being prepared for upload", value: "\(snapshot.watchPending)")
+            NavigationLink { WatchSetupView(model: model) } label: {
+                LabeledContent {
+                    if let at = s.watchLastReceivedAt {
+                        Text("Received \(at.formatted(.relative(presentation: .named)))")
+                    } else {
+                        Text("Set up")
+                    }
+                } label: {
+                    Label("Apple Watch", systemImage: "applewatch")
                 }
             }
-        } header: {
-            Text("Apple Watch")
         } footer: {
-            Text("The Watch keeps each part until this iPhone has saved it. If the pendant recorded the same conversation, you get one note and the Watch audio is kept as an alternate recording.")
+            Text("Record on your Watch all day; it sends what it hears here.")
         }
     }
 }

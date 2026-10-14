@@ -5,12 +5,14 @@ speech on the two devices stays two notes. Synthetic audio; fake providers."""
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import timedelta
 
 import numpy as np
 
-from omi_notes.devtools import synth_speech_like
+from omi_notes.devtools import pcm_envelopes, synth_speech_like
 
+from .conftest import put_chunk, upload_all
 from .helpers import STARTED, T0, convs, live, note_text, replay, silence
 
 WATCH = "watch-0f3a9c2e"
@@ -90,3 +92,21 @@ def test_a_watch_recording_longer_than_the_pendants_keeps_its_note(client, worke
     _, (watch,) = by_device(worker)
     d = decision(worker, watch)
     assert d["decision"] in ("partial", "uncertain", "distinct") and watch["note_path"], d
+
+
+def test_a_watch_recording_still_going_gets_notes_without_stop(client, worker, settings):
+    """All-day recording: the wearer never taps Stop (no seal), yet each conversation becomes a note
+    once the parts after it have arrived."""
+    capture = str(uuid.uuid4())
+    pcm = np.concatenate([silence(1), talk(30, 3), silence(269), talk(30, 5), silence(270)])  # 10 one-minute parts
+    envs = pcm_envelopes(pcm, capture_id=capture, device_id=WATCH, started_at=STARTED, chunk_seconds=60.0, source="watch_mic")
+    upload_all(client, capture, envs[:5])
+    run(worker, T0 + 900)
+    (first,) = convs(worker)
+    assert first["status"] == "done" and first["note_path"], "a note before Stop"
+    for seq in range(5, len(envs)):  # the next five minutes, still not stopped
+        assert put_chunk(client, capture, seq, envs[seq]).status_code == 201
+    run(worker, T0 + 1500)
+    rows = convs(worker)
+    assert len(rows) == 2 and all(r["status"] == "done" and r["note_path"] for r in rows), rows
+    assert worker.pipeline.db.one("SELECT seal_json FROM captures WHERE capture_id=?", (capture,))["seal_json"] is None

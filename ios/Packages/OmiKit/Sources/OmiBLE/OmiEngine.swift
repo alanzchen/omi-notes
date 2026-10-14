@@ -66,6 +66,10 @@ public struct EngineSnapshot: Equatable, Sendable {
     public var watchPending = 0
     public var watchLastReceivedAt: Date?
     public var watchReceived = 0
+    /// Of those, the parts queued for the server but not yet acknowledged by it, and when the
+    /// server last acknowledged one (sent files are kept for a while, so this can lapse).
+    public var watchWaitingUpload = 0
+    public var watchLastUploadedAt: Date?
     /// This phone's choices for the pendant (`SettingsStore`).
     public var recordingPaused = false
     public var autoCollect = true
@@ -464,6 +468,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
                                                           timezone: config.timezone)
     private var watchLastReceivedAt: Date?
     private var watchReceived = 0
+    private var watchUploads: (waiting: Int, lastAt: Date?) = (0, nil)
 
     /// Stores a segment the Watch sent (from WatchConnectivity's temporary file, before its callback
     /// returns). Returns the id to acknowledge to the Watch only once it is durable and verified.
@@ -1177,6 +1182,11 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
 
     private func refreshOutboxStats() {
         outboxStats = outbox.stats()
+        let watchIds = watchInbox.recordingIds()
+        if !watchIds.isEmpty {
+            func watch(_ item: OutboxItem) -> Bool { item.kind.isChunk && item.kind.captureId.map(watchIds.contains) == true }
+            watchUploads = (outbox.pending().filter(watch).count, outbox.sent().filter(watch).map(\.modified).max())
+        }
         quarantined = outbox.quarantined().map { item in
             "\(item.name): \(outbox.quarantineReason(item.name) ?? "kept")"
         }
@@ -1240,6 +1250,8 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         let received = watchInbox.receivedSummary()
         s.watchReceived = received.count + s.watchPending
         s.watchLastReceivedAt = [watchLastReceivedAt, received.last].compactMap { $0 }.max()
+        s.watchWaitingUpload = watchUploads.waiting
+        s.watchLastUploadedAt = watchUploads.lastAt
         s.recordingPaused = settings.recordingPaused
         s.autoCollect = settings.autoCollectPendantAudio
         s.buttonActionsEnabled = settings.buttonActionsEnabled

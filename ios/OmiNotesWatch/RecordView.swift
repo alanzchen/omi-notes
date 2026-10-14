@@ -29,6 +29,8 @@ struct RecordView: View {
                 }
                 .accessibilityElement(children: .combine)
             }
+            Text("Keeps going with your wrist down until you stop it.").font(.caption2).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
         case .interrupted(let why):
             Text(why).font(.footnote).foregroundStyle(.orange).multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
@@ -67,8 +69,11 @@ struct RecordView: View {
                 Text("Open Omi Notes on your iPhone to connect.")
             } else if sync.pending > 0 {
                 Text("\(sync.pending) part\(sync.pending == 1 ? "" : "s") waiting for iPhone")
-            } else {
+            } else if sync.lastAckAt != nil || recorder.isActive {
                 Label("All sent to iPhone", systemImage: "checkmark")
+            }
+            if let at = sync.lastAckAt {
+                Text("iPhone last confirmed \(at.formatted(date: .omitted, time: .shortened))")
             }
             if sync.held > 0 { Text("\(sync.held) kept for another iPhone").foregroundStyle(.orange) }
         }

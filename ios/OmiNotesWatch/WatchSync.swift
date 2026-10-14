@@ -10,7 +10,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
     private(set) var binding: String? = UserDefaults.standard.string(forKey: "omi.phoneBinding")
     private(set) var pending = 0
     private(set) var held = 0
-    private(set) var lastAckAt: Date?
+    private(set) var lastAckAt: Date? = UserDefaults.standard.object(forKey: "omi.lastAckAt") as? Date
     private(set) var activated = false
     let outbox: WatchOutbox
 
@@ -49,7 +49,11 @@ final class WatchSync: NSObject, WCSessionDelegate {
         sent[id] = (now, (sent[id]?.times ?? 0) + 1)
     }
 
-    /// Hands everything waiting (for this iPhone) to WatchConnectivity, skipping what is in flight.
+    /// Files handed to WatchConnectivity at once, at most: after a day away from the iPhone, the
+    /// backlog goes over a few at a time, oldest first, instead of queueing every file at once.
+    static let maxInFlight = 4
+
+    /// Hands what is waiting (for this iPhone) to WatchConnectivity, skipping what is in flight.
     func pump() {
         refreshCounts()
         guard activated else { return }
@@ -69,7 +73,10 @@ final class WatchSync: NSObject, WCSessionDelegate {
         let inFlight = Set(session.outstandingFileTransfers.compactMap { $0.file.metadata?["id"] as? String })
             .union(session.outstandingUserInfoTransfers.compactMap { $0.userInfo["id"] as? String })
         let now = Date()
+        var room = Self.maxInFlight - session.outstandingFileTransfers.count
         for (segment, file) in outbox.segments() where segment.binding == binding && !inFlight.contains(segment.id) && due(segment.id, now: now) {
+            guard room > 0 else { break }
+            room -= 1
             watchLog.info("sending segment \(segment.id)")
             markSent(segment.id, now: now)
             session.transferFile(file, metadata: [WatchWire.kind: WatchWire.segment, "id": segment.id, WatchWire.manifest: WatchWire.encode(segment)])
@@ -123,6 +130,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
             outbox.acknowledge(r.acks)
             for id in r.acks { sent[id] = nil }
             lastAckAt = Date()
+            UserDefaults.standard.set(lastAckAt, forKey: "omi.lastAckAt")
         }
         pump()
     }

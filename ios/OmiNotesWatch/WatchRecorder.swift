@@ -6,12 +6,14 @@ import os
 
 let watchLog = Logger(subsystem: "dev.omi-notes.watch", category: "recording")
 
-/// Records what the wearer starts, in 60 s segments, into the Watch's outbox. It keeps recording
-/// with the wrist down or the screen off (background audio mode, user-started only); a call or Siri
-/// interrupts it, and it resumes when the system allows or when the wearer taps Resume.
+/// Records what the wearer starts, in 60 s segments, into the Watch's outbox, until they stop it.
+/// It keeps recording with the wrist down or the screen off (background audio mode, user-started
+/// only). Segments are cut inside the audio stream (`WatchCapture`), so there is no gap between
+/// them. A call or Siri interrupts it; it resumes when the system allows, otherwise the wearer taps
+/// Resume. A Watch that fills up pauses instead of deleting anything.
 @MainActor
 @Observable
-final class WatchRecorder: NSObject, AVAudioRecorderDelegate {
+final class WatchRecorder: NSObject {
     enum State: Equatable {
         case idle
         case recording(since: Date)
@@ -32,9 +34,10 @@ final class WatchRecorder: NSObject, AVAudioRecorderDelegate {
     let outbox: WatchOutbox
     let sync: WatchSync
     private let defaults = UserDefaults.standard
-    private var recorder: AVAudioRecorder?
-    private var rotation: Timer?
+    private var capture: WatchCapture?
     private var current: Active?
+    /// The recording just stopped (a segment finished right before Stop may still arrive).
+    private var lastClosed: Active?
 
     /// What is being recorded (kept so a terminated app can close it at the next launch).
     struct Active: Codable {
@@ -65,6 +68,9 @@ final class WatchRecorder: NSObject, AVAudioRecorderDelegate {
             let options = AVAudioSession.InterruptionOptions(rawValue: note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
             MainActor.assumeIsolated { self?.interrupted(type, resume: options.contains(.shouldResume)) }
         }
+        NotificationCenter.default.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.mediaServicesReset() }
+        }
         recoverAfterTermination()
     }
 
@@ -93,18 +99,25 @@ final class WatchRecorder: NSObject, AVAudioRecorderDelegate {
         }
     }
 
+    /// Activating the audio session can block: not on the main thread.
+    nonisolated private static func activateSession() async -> String? {
+        await Task.detached {
+            let session = AVAudioSession.sharedInstance()
+            do {
+                try session.setCategory(.record, mode: .default)
+                // notifications and alarms don't stop the recording (calls and Siri still do)
+                try? session.setPrefersNoInterruptionsFromSystemAlerts(true)
+                try session.setActive(true)
+                return nil
+            } catch {
+                return error.localizedDescription
+            }
+        }.value
+    }
+
     private func begin(binding: String) {
         Task {
-            // activating the audio session can block: not on the main thread
-            let failure: String? = await Task.detached {
-                do {
-                    try AVAudioSession.sharedInstance().setCategory(.record, mode: .default)
-                    try AVAudioSession.sharedInstance().setActive(true)
-                    return nil
-                } catch {
-                    return error.localizedDescription
-                }
-            }.value
+            let failure = await Self.activateSession()
             watchLog.info("audio session active: \(failure == nil)")
             if let failure { self.state = .failed("The microphone couldn't start: \(failure)"); return }
             self.beginRecording(binding: binding)
@@ -124,9 +137,12 @@ final class WatchRecorder: NSObject, AVAudioRecorderDelegate {
         finishSegment()
         active = current ?? active
         let end = ProcessInfo.processInfo.systemUptime
+        // every segment made so far, including any whose hand-over is still on its way here
+        let last = max(active.lastAddedIndex, active.index - 1)
         try? outbox.add(end: WatchRecordingEnd(recordingId: active.recordingId, deviceId: Self.deviceId, binding: active.binding,
-                                               lastIndex: active.lastAddedIndex, endOffsetUs: Int64((end - active.startUptime) * 1_000_000),
+                                               lastIndex: last, endOffsetUs: Int64((end - active.startUptime) * 1_000_000),
                                                endedAt: Date(), reason: .userStopped))
+        lastClosed = active
         current = nil
         persist()
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
@@ -135,110 +151,113 @@ final class WatchRecorder: NSObject, AVAudioRecorderDelegate {
         sync.pump()
     }
 
-    /// After an interruption the system didn't resume.
+    /// After an interruption (or a pause for storage) the system didn't end by itself.
     func resume() {
-        guard current != nil else { return }
-        do { try AVAudioSession.sharedInstance().setActive(true) } catch {
-            state = .interrupted("The microphone is still in use. Try again in a moment.")
-            return
+        guard current != nil, capture == nil else { return }
+        Task {
+            if let failure = await Self.activateSession() {
+                watchLog.error("resume failed: \(failure)")
+                self.state = .interrupted("The microphone is still in use. Try again in a moment.")
+                return
+            }
+            guard self.current != nil, self.capture == nil else { return }
+            self.startSegment()
         }
-        current?.index += 1
-        startSegment()
     }
 
     // MARK: Segments
 
-    private var segmentURL: URL? {
-        guard let a = current else { return nil }
-        return FileManager.default.temporaryDirectory.appendingPathComponent("\(a.recordingId)-\(a.index).m4a")
-    }
-
     #if DEBUG
-    /// Simulator automation only (`-OmiWatchDebugSyntheticAudio YES`): the simulator has no working
-    /// microphone here, so segments are synthesized speech-like audio; everything after the
-    /// microphone (segments, outbox, transfer, relay) is the real path.
+    /// Simulator automation only (`OmiWatchDebugSyntheticAudio YES`): see `WatchCapture.synthetic`.
     static var syntheticAudio: Bool { UserDefaults.standard.bool(forKey: "OmiWatchDebugSyntheticAudio") }
-    private var syntheticSeed = 1
     #endif
 
+    /// Starts a run of the microphone at the current segment index.
     private func startSegment() {
-        guard let url = segmentURL else { return }
+        guard let a = current else { return }
+        if let reason = storagePauseReason() { state = .interrupted(reason); return }
+        let recordingId = a.recordingId
+        let c = WatchCapture(
+            firstIndex: a.index, segmentSeconds: Self.segmentSeconds, recordingStartUptime: a.startUptime,
+            makeURL: { FileManager.default.temporaryDirectory.appendingPathComponent("\(recordingId)-\($0).m4a") },
+            finished: { [weak self] done in Task { @MainActor in self?.captured(done, recordingId: recordingId) } },
+            failed: { [weak self] why in Task { @MainActor in self?.captureFailed(why) } },
+            changed: { [weak self] in Task { @MainActor in self?.inputChanged() } })
         #if DEBUG
-        if Self.syntheticAudio {
-            current?.segmentStartUptime = ProcessInfo.processInfo.systemUptime
-            persist()
-            state = .recording(since: current?.startedAt ?? Date())
-            rotation?.invalidate()
-            rotation = Timer.scheduledTimer(withTimeInterval: Self.segmentSeconds, repeats: false) { [weak self] _ in
-                MainActor.assumeIsolated { self?.rotate() }
-            }
-            return
-        }
+        c.synthetic = Self.syntheticAudio
         #endif
-        let settings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 16_000, AVNumberOfChannelsKey: 1,
-                                       AVEncoderBitRateKey: 32_000]
         do {
-            let r = try AVAudioRecorder(url: url, settings: settings)
-            r.delegate = self
-            guard r.record() else { throw CocoaError(.fileWriteUnknown) }
-            recorder = r
+            try c.start()
+            capture = c
             current?.segmentStartUptime = ProcessInfo.processInfo.systemUptime
             persist()
-            state = .recording(since: current?.startedAt ?? Date())
-            rotation?.invalidate()
-            rotation = Timer.scheduledTimer(withTimeInterval: Self.segmentSeconds, repeats: false) { [weak self] _ in
-                MainActor.assumeIsolated { self?.rotate() }
-            }
-            if current?.index == 0 { WKInterfaceDevice.current().play(.start) }
+            state = .recording(since: a.startedAt)
+            if a.index == 0 { WKInterfaceDevice.current().play(.start) }
+            watchLog.info("capture started at segment \(a.index)")
         } catch {
-            state = .failed("Recording couldn't start: \(error.localizedDescription)")
+            watchLog.error("capture didn't start: \(error.localizedDescription)")
+            state = .interrupted("Paused: the microphone couldn't start (\(error.localizedDescription)). Tap Resume to try again.")
         }
     }
 
-    private func rotate() {
-        #if DEBUG
-        let synthetic = Self.syntheticAudio
-        #else
-        let synthetic = false
-        #endif
-        guard current != nil, recorder != nil || synthetic else { return }
+    /// A segment the capture finished (rotation, interruption or stop).
+    private func captured(_ done: WatchCapture.Finished, recordingId: String) {
+        // a rotation just before Stop can arrive after it: the recording is closed, the audio still kept
+        guard let a = current?.recordingId == recordingId ? current : lastClosed, a.recordingId == recordingId else { return }
+        add(file: done.url, active: a, index: done.index, start: done.start, seconds: done.seconds)
+        guard current?.recordingId == recordingId else { return }
+        current?.index = max(a.index, done.index + 1)
+        current?.segmentStartUptime = a.startUptime + done.start + done.seconds
+        persist()
+        if capture != nil, let reason = storagePauseReason() {
+            watchLog.error("pausing: \(reason)")
+            finishSegment()
+            state = .interrupted(reason)
+        }
+    }
+
+    /// The audio input was reconfigured (the engine stopped itself): keep what was recorded and
+    /// start a new run right away; if that isn't allowed, it shows as paused.
+    private func inputChanged() {
+        guard capture != nil else { return }
+        watchLog.info("audio input changed: restarting")
         finishSegment()
-        current?.index += 1
         startSegment()
     }
 
-    /// Closes the current file and hands it to the outbox with its timing and hash.
-    private func finishSegment() {
-        rotation?.invalidate()
-        rotation = nil
-        #if DEBUG
-        if Self.syntheticAudio, let a = current, let url = segmentURL {
-            let end = ProcessInfo.processInfo.systemUptime
-            syntheticSeed += 1
-            Self.writeSynthetic(seconds: end - a.segmentStartUptime, seed: syntheticSeed, to: url)
-            add(file: url, active: a, startUptime: a.segmentStartUptime, endUptime: end)
-            return
-        }
-        #endif
-        guard let r = recorder, let a = current else { return }
-        let url = r.url
-        r.stop()
-        recorder = nil
-        let end = ProcessInfo.processInfo.systemUptime
-        add(file: url, active: a, startUptime: a.segmentStartUptime, endUptime: end)
+    private func captureFailed(_ why: String) {
+        guard capture != nil else { return }
+        watchLog.error("capture failed: \(why)")
+        finishSegment()
+        state = .interrupted("Paused: \(why). Tap Resume to try again.")
     }
 
-    private func add(file url: URL, active a: Active, startUptime: TimeInterval, endUptime: TimeInterval) {
+    private func storagePauseReason() -> String? {
+        let free = (try? outbox.root.resourceValues(forKeys: [.volumeAvailableCapacityKey]))?.volumeAvailableCapacity
+        return WatchStorage.pauseReason(freeBytes: free.map(Int64.init), waitingBytes: outbox.waitingBytes)
+    }
+
+    /// Ends the current run and hands its open segment to the outbox.
+    private func finishSegment() {
+        guard let c = capture, let a = current else { return }
+        capture = nil
+        let last = c.stop()
+        if let last { add(file: last.url, active: a, index: last.index, start: last.start, seconds: last.seconds) }
+        current?.index = c.currentIndex
+        current?.segmentStartUptime = ProcessInfo.processInfo.systemUptime
+        persist()
+    }
+
+    private func add(file url: URL, active a: Active, index: Int, start: Double, seconds: Double) {
         guard let data = try? Data(contentsOf: url), !data.isEmpty else { return }
-        let segment = WatchSegment(recordingId: a.recordingId, index: a.index, deviceId: Self.deviceId, deviceName: WKInterfaceDevice.current().name,
+        let segment = WatchSegment(recordingId: a.recordingId, index: index, deviceId: Self.deviceId, deviceName: WKInterfaceDevice.current().name,
                                    binding: a.binding, recordingStartedAt: a.startedAt,
-                                   startOffsetUs: Int64((startUptime - a.startUptime) * 1_000_000),
-                                   endOffsetUs: Int64((endUptime - a.startUptime) * 1_000_000),
+                                   startOffsetUs: Int64(start * 1_000_000), endOffsetUs: Int64((start + seconds) * 1_000_000),
                                    bytes: data.count, sha256: WatchHash.sha256(data))
-        watchLog.info("segment \(segment.index) ready: \(segment.bytes) bytes")
+        watchLog.info("segment \(segment.index) ready: \(segment.bytes) bytes, \(seconds, format: .fixed(precision: 3)) s from \(start, format: .fixed(precision: 3)) s")
         do {
             try outbox.add(segmentFile: url, segment: segment)
-            current?.lastAddedIndex = a.index
+            if let c = current, c.recordingId == a.recordingId { current?.lastAddedIndex = max(c.lastAddedIndex, index) }
             persist()
             sync.pump()
         } catch {
@@ -246,34 +265,13 @@ final class WatchRecorder: NSObject, AVAudioRecorderDelegate {
         }
     }
 
-    #if DEBUG
-    private static func writeSynthetic(seconds: Double, seed: Int, to url: URL) {
-        let settings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 16_000, AVNumberOfChannelsKey: 1, AVEncoderBitRateKey: 32_000]
-        guard let file = try? AVAudioFile(forWriting: url, settings: settings),
-              let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(max(seconds, 0.1) * 16_000)) else { return }
-        buffer.frameLength = buffer.frameCapacity
-        var rng = UInt64(seed) &* 6364136223846793005 &+ 1442695040888963407
-        func next() -> Double { rng = rng &* 6364136223846793005 &+ 1442695040888963407; return Double(rng >> 11) / Double(1 << 53) }
-        var i = 0
-        let n = Int(buffer.frameLength)
-        while i < n {  // words and pauses of irregular length
-            let word = Int((0.2 + next()) * 16_000), pause = Int((0.15 + 0.75 * next()) * 16_000)
-            for k in 0..<min(word, n - i) {
-                let t = Double(i + k) / 16_000
-                buffer.floatChannelData![0][i + k] = Float(0.25 * sin(2 * .pi * (140 + 30 * sin(4.4 * t)) * t) * abs(sin(2 * .pi * 4 * t)))
-            }
-            i += word + pause
-        }
-        try? file.write(from: buffer)
-    }
-    #endif
-
     // MARK: Interruptions and termination
 
     private func interrupted(_ type: AVAudioSession.InterruptionType?, resume shouldResume: Bool) {
         guard current != nil else { return }
         switch type {
         case .began?:
+            guard capture != nil else { return }  // already paused
             finishSegment()
             state = .interrupted("Paused by another app or a call.")
         case .ended?:
@@ -283,8 +281,13 @@ final class WatchRecorder: NSObject, AVAudioRecorderDelegate {
         }
     }
 
-    nonisolated func audioRecorderEncodeErrorDidOccur(_ recorder: AVAudioRecorder, error: Error?) {
-        Task { @MainActor in self.state = .failed("Recording stopped: \(error?.localizedDescription ?? "encoder error")") }
+    /// The system's audio service restarted: the microphone is gone until set up again, which only
+    /// the wearer may ask for.
+    private func mediaServicesReset() {
+        guard current != nil else { return }
+        watchLog.error("media services were reset")
+        finishSegment()
+        state = .interrupted("Paused: the Watch's audio restarted. Tap Resume to continue.")
     }
 
     private func persist() {
@@ -294,15 +297,21 @@ final class WatchRecorder: NSObject, AVAudioRecorderDelegate {
     /// The app was terminated while recording: keep what was written and close the recording.
     private func recoverAfterTermination() {
         guard let data = defaults.data(forKey: "omi.activeRecording"), var a = try? JSONDecoder().decode(Active.self, from: data) else { return }
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(a.recordingId)-\(a.index).m4a")
         let sameBoot = abs(Date().addingTimeInterval(-ProcessInfo.processInfo.systemUptime).timeIntervalSince(a.bootTime)) < 5
-        if FileManager.default.fileExists(atPath: url.path) {
-            if sameBoot, let file = try? AVAudioFile(forReading: url), file.length > 0 {
+        // the open segment, and the next one if a rotation hadn't been recorded yet
+        var start = a.segmentStartUptime - a.startUptime, setAside = false
+        for index in a.index...(a.index + 1) {
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(a.recordingId)-\(index).m4a")
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            // after a segment set aside, a later one is set aside too (the phone seals only a recording without holes)
+            if !setAside, sameBoot, let file = try? AVAudioFile(forReading: url), file.length > 0 {
                 let seconds = Double(file.length) / file.processingFormat.sampleRate
-                add(file: url, active: a, startUptime: a.segmentStartUptime, endUptime: a.segmentStartUptime + seconds)
-                a.lastAddedIndex = a.index
+                add(file: url, active: a, index: index, start: start, seconds: seconds)
+                a.lastAddedIndex = index
+                start += seconds
             } else {
                 // unreadable (cut off mid-write) or its timing is lost: set aside, never deleted
+                setAside = true
                 let kept = outbox.root.appendingPathComponent("unrecovered", isDirectory: true)
                 try? FileManager.default.createDirectory(at: kept, withIntermediateDirectories: true)
                 try? FileManager.default.moveItem(at: url, to: kept.appendingPathComponent(url.lastPathComponent))

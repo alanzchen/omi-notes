@@ -189,6 +189,11 @@ public final class WatchOutbox: @unchecked Sendable {
     }
 
     public var pendingCount: Int { segments().count + ends().count }
+
+    /// Bytes of audio waiting for the phone.
+    public var waitingBytes: Int64 {
+        segments().reduce(0) { $0 + Int64($1.segment.bytes) }
+    }
 }
 
 // MARK: - Phone side
@@ -284,6 +289,12 @@ public final class PhoneWatchInbox: @unchecked Sendable {
     private func isDone(_ id: String) -> Bool { FileManager.default.fileExists(atPath: doneDir.appendingPathComponent(id).path) }
 
     public var pendingCount: Int { pending().count }
+
+    /// The Watch recordings this phone has queued audio of (one upload capture each).
+    public func recordingIds() -> Set<String> {
+        lock.lock(); defer { lock.unlock() }
+        return Set(Files.names(doneDir, suffix: "").compactMap { name in name.lastIndex(of: "-").map { String(name[..<$0]) } })
+    }
 
     /// Segments received and handed on so far (kept as small markers), and when the latest was.
     public func receivedSummary() -> (count: Int, last: Date?) {
