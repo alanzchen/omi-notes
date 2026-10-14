@@ -1,6 +1,7 @@
 import Foundation
 import OmiCapture
 import OmiProtocol
+import OmiWatchKit
 
 /// "Is it working?" in one sentence, expandable into pendant → phone → server → notes.
 ///
@@ -25,7 +26,7 @@ public struct SystemHealth: Equatable, Sendable {
     }
 
     public enum Area: String, Sendable, CaseIterable {
-        case pendant, phone, server, notes
+        case pendant, watch, phone, server, notes
     }
 
     /// What the step's button does (the view maps these to navigation).
@@ -57,14 +58,14 @@ public struct SystemHealth: Equatable, Sendable {
         snapshot s: EngineSnapshot, server: ServerReachability, status: ServerStatus?, statusAt: Date?, now: Date,
         issues: [ServerIssue] = []
     ) -> SystemHealth {
-        let steps = [pendant(s), phone(s, server: server),
+        let steps = [pendant(s)] + [watch(s, now: now)].compactMap { $0 } + [phone(s, server: server),
                      self.server(server, status: status, statusAt: statusAt, now: now, issues: issues),
                      notes(status, statusAt: statusAt, now: now)]
         let worst = steps.map(\.level).max() ?? .unknown
         let lead = steps.first { $0.level == worst }!
         switch worst {
         case .normal:
-            return SystemHealth(level: .normal, headline: "Connected; no reported problems", detail: steps[3].title, steps: steps)
+            return SystemHealth(level: .normal, headline: "Connected; no reported problems", detail: steps.last?.title, steps: steps)
         case .working:
             return SystemHealth(level: .working, headline: s.connection == .streaming ? "Recording; notes are catching up" : lead.title,
                                 detail: lead.title, steps: steps)
@@ -83,7 +84,7 @@ public struct SystemHealth: Equatable, Sendable {
         case .noDevice:
             // the Apple Watch records too: without a pendant, that's a choice, not a problem
             if s.watchReport != nil || s.watchLastReceivedAt != nil {
-                return step(.normal, "Recording with Apple Watch", "No pendant paired. You can add one in Devices.")
+                return step(.normal, "Using Apple Watch, no pendant", "Its state is in Devices. You can add a pendant there too.")
             }
             return step(.needsAction, "No recording device set up", "Pair an Omi pendant, or set up Apple Watch in Devices.", .pairDevice)
         case .bluetoothUnavailable(let why):
@@ -111,6 +112,16 @@ public struct SystemHealth: Equatable, Sendable {
             }
             let battery = d?.battery.map { "Battery \($0)%\(d?.charging == true ? ", charging" : "")" }
             return step(.normal, "Pendant connected", battery)
+        }
+    }
+
+    /// Only a fresh report from the Watch says anything about it now; otherwise no step.
+    static func watch(_ s: EngineSnapshot, now: Date) -> Step? {
+        guard let r = s.watchReport, now.timeIntervalSince(r.at) <= WatchSummary.fresh else { return nil }
+        switch r.state {
+        case .recording: return Step(area: .watch, level: .normal, title: "Apple Watch recording", detail: "Reported \(relative(r.at, now))")
+        case .paused: return Step(area: .watch, level: .needsAction, title: "Apple Watch recording is paused", detail: "Tap Resume on the Watch.")
+        case .idle: return Step(area: .watch, level: .normal, title: "Apple Watch not recording", detail: "Reported \(relative(r.at, now))")
         }
     }
 

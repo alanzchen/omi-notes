@@ -3,6 +3,7 @@ import Testing
 @testable import OmiBLE
 @testable import OmiCapture
 @testable import OmiProtocol
+import OmiWatchKit
 
 @Suite struct SystemHealthTests {
     let now = Date(timeIntervalSince1970: 1_790_000_000)
@@ -164,7 +165,20 @@ import Testing
         s.watchLastReceivedAt = Date(timeIntervalSince1970: 1_790_000_000)
         let h = health(s, reachable(), nil)
         #expect(step(h, .pendant).level == .normal && step(h, .pendant).fix == nil, "\(step(h, .pendant))")
+        #expect(!step(h, .pendant).title.contains("Recording"), "a receipt doesn't mean the Watch is recording now")
         #expect(h.headline != "No recording device set up" && h.level != .needsAction)
+    }
+
+    @Test func aFreshlyPausedWatchIsOnHomeAndAnOldReportIsNot() {
+        let now = Date()
+        var s = streaming()
+        s.watchReport = WatchReport(state: .paused, since: now.addingTimeInterval(-600), waitingParts: 0, at: now.addingTimeInterval(-30))
+        let h = SystemHealth.evaluate(snapshot: s, server: reachable(), status: nil, statusAt: nil, now: now)
+        let watch = h.steps.first { $0.area == .watch }
+        #expect(watch?.level == .needsAction && watch?.detail?.contains("Resume") == true && h.headline == watch?.title)
+        s.watchReport?.at = now.addingTimeInterval(-3600)
+        #expect(SystemHealth.evaluate(snapshot: s, server: reachable(), status: nil, statusAt: nil, now: now).steps.allSatisfy { $0.area != .watch },
+                "an hour-old report claims nothing about now")
     }
 }
 

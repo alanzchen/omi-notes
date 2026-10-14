@@ -39,6 +39,7 @@ extension SystemHealth.Area {
     var title: String {
         switch self {
         case .pendant: return "Pendant"
+        case .watch: return "Apple Watch"
         case .phone: return "Phone"
         case .server: return "Server"
         case .notes: return "Notes"
@@ -48,6 +49,7 @@ extension SystemHealth.Area {
     var symbol: String {
         switch self {
         case .pendant: return "waveform.circle"
+        case .watch: return "applewatch"
         case .phone: return "iphone"
         case .server: return "server.rack"
         case .notes: return "doc.text"

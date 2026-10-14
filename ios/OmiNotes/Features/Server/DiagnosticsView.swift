@@ -77,8 +77,18 @@ struct LogView: View {
             }
         }
         .navigationTitle("Recent log")
-        .toolbar { Button("Refresh") { model.refreshLogs() } }
+        .toolbar {
+            // for whoever helps troubleshoot (no token; capture ids and file names are included)
+            ShareLink(item: export, subject: Text("Omi Notes log"), preview: SharePreview("Omi Notes log"))
+            Button("Refresh") { model.refreshLogs() }
+        }
         .onAppear { model.refreshLogs() }
+    }
+
+    /// The lines shown (filter applied), oldest first, with full timestamps.
+    private var export: String {
+        let lines = model.logs.filter { filter.isEmpty || $0.message.localizedCaseInsensitiveContains(filter) || $0.category == filter }
+        return "Omi Notes \(SettingsView.version)\n" + lines.reversed().map { "\($0.date.ISO8601Format()) \($0.level.rawValue) \($0.category): \($0.message)" }.joined(separator: "\n")
     }
 
     private func color(_ l: LogLine.Level) -> Color {
