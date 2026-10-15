@@ -109,7 +109,7 @@ final class WatchRecorder: NSObject {
             watchLog.info("microphone permission: \(granted)")
             Task { @MainActor in
                 guard granted else {
-                    self.state = .failed("Microphone access is off. Allow it in Settings ▸ Privacy ▸ Microphone.")
+                    self.state = .failed("Microphone access is off. Allow it in Settings ▸ Privacy & Security ▸ Microphone.")
                     return
                 }
                 self.begin(binding: binding)
@@ -137,7 +137,11 @@ final class WatchRecorder: NSObject {
         Task {
             let failure = await Self.activateSession()
             watchLog.info("audio session active: \(failure == nil)")
-            if let failure { self.state = .failed("The microphone couldn't start: \(failure)"); return }
+            if let failure {
+                watchLog.error("audio session failed: \(failure)")
+                self.state = .failed("The microphone isn't available right now. Try again in a moment.")
+                return
+            }
             self.beginRecording(binding: binding)
         }
     }
@@ -219,7 +223,7 @@ final class WatchRecorder: NSObject {
             watchLog.info("capture started at segment \(a.index)")
         } catch {
             watchLog.error("capture didn't start: \(error.localizedDescription)")
-            state = .interrupted("Paused: the microphone couldn't start (\(error.localizedDescription)). Tap Resume to try again.")
+            state = .interrupted("Paused: the microphone isn't available. Tap Resume to try again.")
         }
     }
 
@@ -255,7 +259,7 @@ final class WatchRecorder: NSObject {
         guard capture != nil else { return }
         watchLog.error("capture failed: \(why)")
         finishSegment()
-        state = .interrupted("Paused: \(why). Tap Resume to try again.")
+        state = .interrupted("Paused: recording stopped unexpectedly. Tap Resume to try again.")
         perfSample("failed")
     }
 
@@ -290,7 +294,8 @@ final class WatchRecorder: NSObject {
             persist()
             sync.pump()
         } catch {
-            state = .failed("A recording segment couldn't be saved: \(error.localizedDescription)")
+            watchLog.error("segment not saved: \(error.localizedDescription)")
+            state = .failed("Part of the recording couldn't be saved. Check the Watch's storage, then start again.")
         }
     }
 

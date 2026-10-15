@@ -107,7 +107,8 @@ struct WatchDetailView: View {
         }
         .navigationTitle("Apple Watch")
         .navigationBarTitleDisplayMode(.inline)
-        .task {
+        // again once the server's status (and so its features) is known
+        .task(id: model.serverStatus?.supportsWatchPerformance) {
             #if DEBUG
             if let name = UserDefaults.standard.string(forKey: "OmiNotesDebugWatchState"), WatchSummary.debugFixture(name) != nil {
                 performance = Self.debugPerformance
@@ -152,7 +153,9 @@ struct WatchDetailView: View {
     @ViewBuilder private func places(_ f: Flow, _ now: Date) -> some View {
         place("applewatch", "On the Watch", f.report.map { r in
             let parts = r.waitingParts == 0 ? "Everything sent to this iPhone" : "\(r.waitingParts) part\(r.waitingParts == 1 ? "" : "s") not on this iPhone yet"
-            return "\(parts) · reported \(SystemHealth.relative(r.at, now))"
+            // waiting, and nothing has arrived for a while: what helps
+            let stuck = r.waitingParts > 0 && (f.lastReceivedAt.map { now.timeIntervalSince($0) > 15 * 60 } ?? true)
+            return "\(parts) · reported \(SystemHealth.relative(r.at, now))" + (stuck ? ". They move when both are nearby with Omi Notes open." : "")
         } ?? "Unknown until the Watch app reports")
         Divider().padding(.leading, 50)
         place("iphone", "On this iPhone", {

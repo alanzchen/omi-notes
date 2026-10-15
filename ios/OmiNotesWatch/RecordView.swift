@@ -6,14 +6,20 @@ struct RecordView: View {
     let sync: WatchSync
 
     var body: some View {
-        VStack(spacing: 10) {
-            status
-            Spacer(minLength: 0)
-            button
-            Spacer(minLength: 0)
-            syncLine
+        // fills the screen when it fits; scrolls (below the clock) when a message makes it taller
+        GeometryReader { g in
+            ScrollView {
+                VStack(spacing: 10) {
+                    status
+                    Spacer(minLength: 0)
+                    button
+                    Spacer(minLength: 0)
+                    syncLine
+                }
+                .frame(minHeight: g.size.height)
+                .padding(.horizontal, 6)
+            }
         }
-        .padding(.horizontal, 6)
         .navigationTitle("Omi Notes")
     }
 
@@ -69,6 +75,11 @@ struct RecordView: View {
                 Text("Open Omi Notes on your iPhone to connect.")
             } else if sync.pending > 0 {
                 Text("\(sync.pending) part\(sync.pending == 1 ? "" : "s") waiting for iPhone")
+                // nothing confirmed for a while: say what helps
+                if sync.lastAckAt.map({ Date().timeIntervalSince($0) > 15 * 60 }) ?? true {
+                    Text("Keep your iPhone nearby with Omi Notes open.").foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             } else if sync.lastAckAt != nil || recorder.isActive {
                 Label("All sent to iPhone", systemImage: "checkmark")
             }
