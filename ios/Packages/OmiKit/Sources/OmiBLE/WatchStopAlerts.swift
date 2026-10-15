@@ -34,6 +34,9 @@ public final class WatchStopAlerts: @unchecked Sendable {
     private let defaults: UserDefaults
     private let lock = NSLock()
     private static let stateKey = "omi.watchStopAlerts"
+    private static let reportKey = "omi.watchStopAlerts.recordingReports"
+    /// Reports without a device (older Watch apps) apply to every Watch.
+    static let anyDevice = "*"
 
     /// Per recording: its latest sample seen (time, event), and the stop sample already alerted.
     struct Recording: Codable, Equatable {
@@ -46,6 +49,18 @@ public final class WatchStopAlerts: @unchecked Sendable {
 
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+    }
+
+    /// Per Watch: the latest time its status report said it was recording. A stop from before then
+    /// is already over, whichever arrives first.
+    private var recordingReports: [String: Date] {
+        get { (defaults.dictionary(forKey: Self.reportKey) as? [String: Date]) ?? [:] }
+        set { defaults.set(newValue, forKey: Self.reportKey) }
+    }
+
+    private func recordingKnownAfter(_ at: Date, device: String) -> Bool {
+        let reports = recordingReports
+        return [device, Self.anyDevice].contains { (reports[$0] ?? .distantPast) > at }
     }
 
     private var recordings: [String: Recording] {
@@ -71,7 +86,7 @@ public final class WatchStopAlerts: @unchecked Sendable {
         for rid in touched.sorted() {
             guard var r = all[rid] else { continue }
             let newer = all.contains { $0.key != rid && $0.value.device == r.device && $0.value.at > r.at && Self.going.contains($0.value.event) }
-            if Self.unexpected.contains(r.event) && !newer {
+            if Self.unexpected.contains(r.event) && !newer && !recordingKnownAfter(r.at, device: r.device) {
                 guard r.alerted != r.sampleId, now.timeIntervalSince(r.at) < Self.maxAge else { continue }
                 r.alerted = r.sampleId
                 all[rid] = r
@@ -98,10 +113,14 @@ public final class WatchStopAlerts: @unchecked Sendable {
 
     /// The Watch's latest status report says it is recording (as of `at`): alerts about stops
     /// before then no longer describe now.
-    public func recording(asOf at: Date) -> [Decision] {
+    public func recording(asOf at: Date, deviceId: String? = nil) -> [Decision] {
         lock.lock(); defer { lock.unlock() }
+        let key = deviceId ?? Self.anyDevice
+        var reports = recordingReports
+        reports[key] = max(reports[key] ?? .distantPast, at)
+        recordingReports = reports
         var all = recordings, out: [Decision] = []
-        for (rid, r) in all where r.alerted != nil && r.at < at {
+        for (rid, r) in all where r.alerted != nil && r.at < at && (deviceId == nil || r.device == deviceId) {
             all[rid]?.alerted = nil
             out.append(.withdraw(identifier: Self.identifier(rid)))
         }

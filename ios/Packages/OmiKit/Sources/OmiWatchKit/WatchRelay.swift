@@ -73,12 +73,16 @@ public struct WatchReport: Codable, Equatable, Sendable {
     /// seconds (absent from older Watch apps).
     public var waitingParts: Int
     public var waitingSeconds: Int?
+    /// The Watch's device id (as in its chunks and samples); absent from older Watch apps.
+    public var deviceId: String?
     public var at: Date
     /// Counters since the Watch app launched (transfers, resends, capture buffer allocations…), to
     /// compare builds; absent from older Watch apps.
     public var stats: [String: Int]?
 
-    public init(state: State, since: Date?, waitingParts: Int, waitingSeconds: Int? = nil, at: Date, stats: [String: Int]? = nil) {
+    public init(state: State, since: Date?, waitingParts: Int, waitingSeconds: Int? = nil, at: Date, deviceId: String? = nil,
+                stats: [String: Int]? = nil) {
+        self.deviceId = deviceId
         self.state = state
         self.since = since
         self.waitingParts = waitingParts

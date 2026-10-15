@@ -57,6 +57,25 @@ import OmiProtocol
         #expect(a.recording(asOf: t0.addingTimeInterval(3 * 3600 + 120)) == [.withdraw(identifier: "omi.watch-stop.r3")])
     }
 
+    @Test func aRecordingReportThatArrivedFirstStopsAnOlderInterruptionFromAlerting() {
+        // the Watch said "recording" at T2; the interruption from T1 (before T2) arrives later, at T3
+        let defaults = UserDefaults(suiteName: "omi-stop-\(UUID().uuidString)")!
+        let t1 = 10.0, t2 = t0.addingTimeInterval(12 * 60), t3 = t0.addingTimeInterval(15 * 60)
+        let a = WatchStopAlerts(defaults: defaults)
+        #expect(a.recording(asOf: t2).isEmpty)
+        #expect(a.process(deviceId: "w", samples: [s("interrupted", t1)], now: t3).isEmpty, "known to be recording again since")
+        // the same after a relaunch (the report's time is remembered)
+        #expect(WatchStopAlerts(defaults: defaults).process(deviceId: "w", samples: [s("interrupted", t1, rec: "r2")], now: t3).isEmpty)
+        // an interruption after that report still alerts
+        #expect(scheduled(WatchStopAlerts(defaults: defaults).process(deviceId: "w", samples: [s("interrupted", 13, rec: "r3")], now: t3)).count == 1)
+        // a report from another Watch says nothing about this one
+        let b = alerts()
+        _ = b.recording(asOf: t2, deviceId: "other-watch")
+        #expect(scheduled(b.process(deviceId: "w", samples: [s("interrupted", t1)], now: t3)).count == 1)
+        _ = b.recording(asOf: t2, deviceId: "w")
+        #expect(b.process(deviceId: "w", samples: [s("interrupted", t1, rec: "r4")], now: t3).isEmpty)
+    }
+
     @Test func aClosedAppAlertsOnceAcrossARelaunch() {
         let defaults = UserDefaults(suiteName: "omi-stop-\(UUID().uuidString)")!
         let rec = s("recovered", 50)

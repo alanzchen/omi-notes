@@ -545,7 +545,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     public func acceptWatchReport(_ data: Data?) {
         guard let report = WatchWire.decode(WatchReport.self, data) else { return }
         watchInbox.saveReport(report)
-        if report.state == .recording { deliver(watchStopAlerts.recording(asOf: report.at)) }
+        if report.state == .recording { deliver(watchStopAlerts.recording(asOf: report.at, deviceId: report.deviceId)) }
         if let stats = report.stats, !stats.isEmpty {
             log(.info, "watch", "Watch \(report.state.rawValue), \(report.waitingParts) waiting: " + stats.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
         }
