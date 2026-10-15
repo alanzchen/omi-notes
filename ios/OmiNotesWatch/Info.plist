@@ -22,6 +22,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Omi Notes records on your Apple Watch only while you have started a recording, and sends it to your iPhone for your notes.</string>
+	<key>OmiSharedKeychainGroup</key>
+	<string>$(AppIdentifierPrefix)dev.omi-notes.shared</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>
