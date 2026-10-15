@@ -21,7 +21,7 @@ struct OmiNotesWatchApp: App {
 
     @ViewBuilder private var root: some View {
         #if DEBUG
-        if UserDefaults.standard.bool(forKey: "OmiWatchDebugComplicationGallery") {
+        if UserDefaults.standard.string(forKey: "OmiWatchDebugComplicationGallery") != nil {
             ComplicationGallery()
         } else {
             RecordView(recorder: recorder, sync: sync)

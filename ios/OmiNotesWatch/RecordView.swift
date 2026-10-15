@@ -11,86 +11,147 @@ struct RecordView: View {
         GeometryReader { g in
             ScrollView {
                 VStack(spacing: 10) {
-                    status
+                    hero
                     Spacer(minLength: 0)
-                    button
+                    primary
                     Spacer(minLength: 0)
-                    syncLine
+                    syncRow
                 }
                 .frame(minHeight: g.size.height)
-                .padding(.horizontal, 6)
+                .padding(.horizontal, 8)  // capsules clear the screen's rounded edge
+                details.padding(.top, 8).padding(.horizontal, 6)
             }
         }
         .navigationTitle("Omi Notes")
     }
 
-    @ViewBuilder private var status: some View {
+    // MARK: Status
+
+    private var mark: ComplicationDisplay.Main {
         switch recorder.state {
-        case .idle:
-            Label("Not recording", systemImage: "mic.slash").foregroundStyle(.secondary).font(.footnote)
-        case .recording(let since):
-            TimelineView(.periodic(from: since, by: 1)) { context in
-                HStack(spacing: 6) {
-                    Circle().fill(.red).frame(width: 8, height: 8)
-                    Text("Recording · \(elapsed(since, context.date))").font(.footnote.monospacedDigit())
-                }
-                .accessibilityElement(children: .combine)
-            }
-            Text("Keeps going with your wrist down until you stop it.").font(.caption2).foregroundStyle(.secondary)
-                .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
-        case .interrupted(let why):
-            Text(why).font(.footnote).foregroundStyle(.orange).multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-        case .failed(let why):
-            Text(why).font(.footnote).foregroundStyle(.red).multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
+        case .recording: return .recording
+        case .interrupted: return recorder.isActive ? .paused : .error
+        case .failed: return .error
+        case .idle: return .idle
         }
     }
 
-    @ViewBuilder private var button: some View {
+    @ViewBuilder private var hero: some View {
+        VStack(spacing: 4) {
+            HStack(spacing: 6) {
+                RecorderMark(main: mark, scale: 0.75).frame(height: 13)
+                Text(title).font(.system(size: 15, weight: .semibold, design: .rounded)).foregroundStyle(titleColor)
+            }
+            .accessibilityElement(children: .combine)
+            switch recorder.state {
+            case .recording(let since):
+                TimelineView(.periodic(from: since, by: 1)) { context in
+                    Text(elapsed(since, context.date)).font(.system(size: 40, weight: .medium, design: .rounded)).monospacedDigit()
+                        .minimumScaleFactor(0.7).lineLimit(1)
+                }
+                .accessibilityLabel("Recording time")
+            case .interrupted(let why), .failed(let why):
+                Text(Self.reason(why)).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            case .idle:
+                EmptyView()
+            }
+        }
+    }
+
+    private var title: String {
+        switch recorder.state {
+        case .recording: return "Recording"
+        case .interrupted: return recorder.isActive ? "Paused" : "Recording stopped"
+        case .failed: return "Can't record"
+        case .idle: return "Ready to record"
+        }
+    }
+
+    private var titleColor: Color {
+        switch mark {
+        case .recording: return Color(red: 1, green: 0.35, blue: 0.3)
+        case .paused: return .orange
+        case .error: return .yellow
+        default: return .secondary
+        }
+    }
+
+    /// The recorder's message without what the buttons already say.
+    static func reason(_ text: String) -> String {
+        var t = text
+        for prefix in ["Paused: ", "Paused. "] where t.hasPrefix(prefix) { t = String(t.dropFirst(prefix.count)) }
+        for suffix in [" Tap Resume to try again.", " Tap Resume to continue."] where t.hasSuffix(suffix) { t = String(t.dropLast(suffix.count)) }
+        if t == "Tap Resume to continue." || t.isEmpty { return "Tap Resume when you're ready." }
+        return t.prefix(1).uppercased() + t.dropFirst()
+    }
+
+    // MARK: Action
+
+    @ViewBuilder private var primary: some View {
         if recorder.isRecording {
             Button { recorder.stop() } label: {
-                Image(systemName: "stop.fill").font(.title2)
-                    .frame(width: 74, height: 74).background(Color.white.opacity(0.18), in: .circle)
+                Label("Stop", systemImage: "stop.fill").font(.system(size: 17, weight: .semibold, design: .rounded))
+                    .frame(maxWidth: .infinity).frame(height: 46)
+                    .background(Color.white.opacity(0.14), in: .capsule)
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Stop recording")
         } else if case .interrupted = recorder.state, recorder.isActive {
-            HStack(spacing: 14) {
-                Button("Resume") { recorder.resume() }.tint(.red)
-                Button("Stop") { recorder.stop() }
+            VStack(spacing: 6) {
+                Button { recorder.resume() } label: {
+                    Label("Resume", systemImage: "play.fill").font(.system(size: 17, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.black).frame(maxWidth: .infinity).frame(height: 46)
+                        .background(Color.orange, in: .capsule)
+                }
+                .buttonStyle(.plain)
+                Button("Stop recording") { recorder.stop() }.buttonStyle(.plain).font(.footnote).foregroundStyle(.secondary)
             }
         } else {
             Button { recorder.start() } label: {
-                Image(systemName: "mic.fill").font(.title2).foregroundStyle(.white)
-                    .frame(width: 74, height: 74).background(Color.red, in: .circle)
+                ZStack {
+                    Circle().strokeBorder(Color.white.opacity(0.85), lineWidth: 3).frame(width: 76, height: 76)
+                    Circle().fill(Color(red: 1, green: 0.23, blue: 0.19)).frame(width: 60, height: 60)
+                }
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Start recording")
         }
     }
 
-    private var syncLine: some View {
-        Group {
+    // MARK: Sync
+
+    @ViewBuilder private var syncRow: some View {
+        HStack(spacing: 5) {
             if sync.binding == nil {
-                Text("Open Omi Notes on your iPhone to connect.")
+                Image(systemName: "iphone.slash")
+                Text("Open Omi Notes on iPhone to connect")
             } else if sync.pending > 0 {
-                Text(sync.pendingSeconds > 0 ? "\(WaitingAudio.text(sync.pendingSeconds).capitalizedFirst) of audio waiting for iPhone"
+                Image(systemName: "iphone")
+                Text(sync.pendingSeconds > 0 ? "\(WaitingAudio.text(sync.pendingSeconds).capitalizedFirst) waiting for iPhone"
                                              : "Finishing sending to iPhone")
-                // nothing confirmed for a while: say what helps
-                if sync.lastAckAt.map({ Date().timeIntervalSince($0) > 15 * 60 }) ?? true {
-                    Text("Keep your iPhone nearby with Omi Notes open.").foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
             } else if sync.lastAckAt != nil || recorder.isActive {
-                Label("All sent to iPhone", systemImage: "checkmark")
+                Image(systemName: "checkmark")
+                Text("All audio on iPhone")
             }
-            if let at = sync.lastAckAt {
-                Text("iPhone last confirmed \(at.formatted(date: .omitted, time: .shortened))")
+        }
+        .font(.system(size: 13, weight: .medium, design: .rounded)).foregroundStyle(.secondary)
+        .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
+        .accessibilityElement(children: .combine)
+    }
+
+    /// Below the main view: what helps, and the details.
+    @ViewBuilder private var details: some View {
+        VStack(spacing: 4) {
+            if sync.pending > 0, sync.lastAckAt.map({ Date().timeIntervalSince($0) > 15 * 60 }) ?? true {
+                Text("Keep your iPhone nearby with Omi Notes open.").foregroundStyle(.orange)
             }
-            if sync.held > 0 { Text("\(sync.held) kept for another iPhone").foregroundStyle(.orange) }
+            if recorder.isRecording { Text("Keeps recording with your wrist down until you stop it.") }
+            if let at = sync.lastAckAt { Text("iPhone confirmed \(at.formatted(date: .omitted, time: .shortened))") }
+            if sync.held > 0 { Text("Some audio is kept for another iPhone.").foregroundStyle(.orange) }
         }
         .font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private func elapsed(_ since: Date, _ now: Date) -> String {
