@@ -1,3 +1,4 @@
+import OmiWatchKit
 import SwiftUI
 
 /// One screen: what is happening, one button, and what is still on the Watch.
@@ -74,7 +75,8 @@ struct RecordView: View {
             if sync.binding == nil {
                 Text("Open Omi Notes on your iPhone to connect.")
             } else if sync.pending > 0 {
-                Text("\(sync.pending) part\(sync.pending == 1 ? "" : "s") waiting for iPhone")
+                Text(sync.pendingSeconds > 0 ? "\(WaitingAudio.text(sync.pendingSeconds).capitalizedFirst) of audio waiting for iPhone"
+                                             : "Finishing sending to iPhone")
                 // nothing confirmed for a while: say what helps
                 if sync.lastAckAt.map({ Date().timeIntervalSince($0) > 15 * 60 }) ?? true {
                     Text("Keep your iPhone nearby with Omi Notes open.").foregroundStyle(.orange)
@@ -95,4 +97,9 @@ struct RecordView: View {
         let s = max(0, Int(now.timeIntervalSince(since)))
         return s >= 3600 ? String(format: "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60) : String(format: "%d:%02d", s / 60, s % 60)
     }
+}
+
+extension String {
+    /// "less than a minute" → "Less than a minute"
+    var capitalizedFirst: String { prefix(1).uppercased() + dropFirst() }
 }

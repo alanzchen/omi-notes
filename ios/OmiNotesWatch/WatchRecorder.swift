@@ -339,7 +339,8 @@ final class WatchRecorder: NSObject {
         telemetry.sample(event, state: state ?? shown, recordingId: recordingId ?? a?.recordingId, mono: mono,
                          counters: sync.counters.merging(captureCounters()) { a, _ in a },
                          gauges: sync.relayGauges, binding: sync.binding,
-                         seal: seal || event == "paused" || event == "failed" || event == "interrupted")
+                         // events the iPhone acts on (alerts and their recovery) go at once
+                         seal: seal || ["paused", "failed", "interrupted", "resumed", "start"].contains(event))
     }
 
     // MARK: Interruptions and termination

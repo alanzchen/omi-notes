@@ -9,6 +9,8 @@ import WatchConnectivity
 final class WatchSync: NSObject, WCSessionDelegate {
     private(set) var binding: String? = UserDefaults.standard.string(forKey: "omi.phoneBinding")
     private(set) var pending = 0
+    /// Recorded length (seconds) of the audio parts waiting for this iPhone, from their own offsets.
+    private(set) var pendingSeconds = 0
     private(set) var held = 0
     private(set) var lastAckAt: Date? = UserDefaults.standard.object(forKey: "omi.lastAckAt") as? Date
     private(set) var activated = false
@@ -34,13 +36,18 @@ final class WatchSync: NSObject, WCSessionDelegate {
         // audio parts only (a recording's end marker isn't audio, but is sent the same way)
         held = segments.filter { $0.segment.binding != binding }.count
         pending = segments.count - held + (segments.isEmpty ? ends.filter { $0.binding == binding }.count : 0)
+        pendingSeconds = WaitingAudio.seconds(segments.filter { $0.segment.binding == binding }.map(\.segment))
         sendReport()
-        complication.update(recorder: complicationRecorder, waitingParts: pending, bound: binding != nil)
+        complication.update(recorder: complicationRecorder, waitingParts: pending, waitingSeconds: pendingSeconds, bound: binding != nil)
     }
 
     /// The watch-face complication's view of the recorder (set by the recorder).
     var complicationRecorder: ComplicationSnapshot.Recorder = .idle {
-        didSet { if complicationRecorder != oldValue { complication.update(recorder: complicationRecorder, waitingParts: pending, bound: binding != nil) } }
+        didSet {
+            if complicationRecorder != oldValue {
+                complication.update(recorder: complicationRecorder, waitingParts: pending, waitingSeconds: pendingSeconds, bound: binding != nil)
+            }
+        }
     }
     private let complication = ComplicationPublisher()
 
@@ -55,7 +62,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
     private func sendReport() {
         guard activated, binding != nil, WCSession.default.activationState == .activated else { return }
         let now = Date()
-        let r = WatchReport(state: recorderState.state, since: recorderState.since, waitingParts: pending, at: now,
+        let r = WatchReport(state: recorderState.state, since: recorderState.since, waitingParts: pending, waitingSeconds: pendingSeconds, at: now,
                             stats: counters.merging(captureStats) { a, _ in a }.merging(["awaiting_ack": resend.awaitingAck]) { a, _ in a })
         if let l = lastReport, l.state == r.state, l.since == r.since, l.waitingParts == r.waitingParts, now.timeIntervalSince(l.at) < 300 { return }
         do {
@@ -94,7 +101,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
     /// Relay health for a performance sample (cheap: counts already in memory).
     var relayGauges: [String: Int] {
         let oldest = outbox.segments().first.map { Int(Date().timeIntervalSince($0.segment.recordingStartedAt)) } ?? 0
-        return ["outbox_parts": pending, "awaiting_ack": awaitingAck, "outstanding_files": activated ? WCSession.default.outstandingFileTransfers.count : -1,
+        return ["outbox_parts": pending, "waiting_s": pendingSeconds, "awaiting_ack": awaitingAck, "outstanding_files": activated ? WCSession.default.outstandingFileTransfers.count : -1,
                 "last_transfer_error": lastTransferError, "oldest_waiting_s": oldest]
     }
 

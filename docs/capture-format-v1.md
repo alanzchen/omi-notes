@@ -169,7 +169,8 @@ server (`features` contains `watch_performance`).
   within `launch_id`: `callbacks`, `buffer_allocations`, `boundary_copies`, `segments`,
   `captured_ms`, `append_ms` = elapsed time inside the capture path (not CPU use), `encoded_bytes`,
   `transfers`, `resends`, `acks`, `transfer_failures`, `perf_batches_sent`), `gauges`
-  (`outbox_parts`, `awaiting_ack`, `outstanding_files` (WatchConnectivity transfers in flight, −1
+  (`outbox_parts`, `waiting_s` (recorded seconds of those parts, from their own offsets),
+  `awaiting_ack`, `outstanding_files` (WatchConnectivity transfers in flight, −1
   before activation), `last_transfer_error` (the last failed transfer's error code, 0 if none since
   launch), `oldest_waiting_s`), `app`, `os`, `model` (hardware identifier).
 - **Bounds:** a batch closes at 12 samples, after 30 min, or at a recording event other than

@@ -503,7 +503,24 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         let body = EventBody(deviceId: batch.deviceId, at: at, payload: .watchPerf(batch.data))
         try outbox.write(try ContractJSON.encode(body), kind: .event(eventId: batch.id))
         queue.async { self.scheduleReconcile() }
+        if watchStopAlertsEnabled {
+            deliver(watchStopAlerts.process(deviceId: batch.deviceId, samples: batch.data.samples, now: Date()))
+        }
         return batch.id
+    }
+
+    /// iPhone notifications when a Watch recording stops unexpectedly (the user's alert opt-in).
+    public let watchStopAlerts = WatchStopAlerts()
+    public weak var watchStopSink: WatchStopAlertSink?
+    private var watchStopAlertsEnabled: Bool { UserDefaults.standard.bool(forKey: ProblemAlerts.enabledKey) }
+
+    private func deliver(_ decisions: [WatchStopAlerts.Decision]) {
+        for d in decisions {
+            switch d {
+            case .schedule(let a): watchStopSink?.schedule(a)
+            case .withdraw(let id): watchStopSink?.withdraw(identifier: id)
+            }
+        }
     }
 
     private var watchRefused = 0
@@ -528,6 +545,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     public func acceptWatchReport(_ data: Data?) {
         guard let report = WatchWire.decode(WatchReport.self, data) else { return }
         watchInbox.saveReport(report)
+        if report.state == .recording { deliver(watchStopAlerts.recording(asOf: report.at)) }
         if let stats = report.stats, !stats.isEmpty {
             log(.info, "watch", "Watch \(report.state.rawValue), \(report.waitingParts) waiting: " + stats.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
         }

@@ -10,6 +10,14 @@ struct DevicesView: View {
     let model: AppModel
     var onFix: (SystemHealth.Fix) -> Void
     @State private var page: DevicePage? = DevicesView.initialPage
+    /// The last request shown (so returning to the tab doesn't reopen the page).
+    @MainActor private static var shownRequests = 0
+
+    private func openRequestedWatchPage() {
+        guard model.watchPageRequests != Self.shownRequests else { return }
+        Self.shownRequests = model.watchPageRequests
+        page = .watch
+    }
 
     /// Simulator screenshots only (debug builds): `-OmiNotesDebugDevicePage pendant|watch` opens that page.
     static var initialPage: DevicePage? {
@@ -68,6 +76,9 @@ struct DevicesView: View {
         }
         .navigationTitle("Devices")
         .navigationBarTitleDisplayMode(.inline)
+        // a tapped Watch alert: cold launch (the view appears after the request) or warm
+        .onAppear(perform: openRequestedWatchPage)
+        .onChange(of: model.watchPageRequests) { openRequestedWatchPage() }
         .navigationDestination(item: $page) { page in
             DevicePageView(page: page, model: model, onFix: onFix)
         }

@@ -76,6 +76,12 @@ struct WatchDetailView: View {
                         note("The whole Watch's battery, other apps included. Charging time and gaps are left out.")
                     }
 
+                    if summary.configured {
+                        heading("Alerts")
+                        Card { WatchAlertToggle(model: model) }
+                        note("If a call, an error or the app closing stops a Watch recording you didn't stop. It reaches this iPhone only when the Watch can send it, so it may be late.")
+                    }
+
                     heading("Record all day")
                     Card {
                         step(1, "Install", "In the iPhone's Watch app, find Omi Notes under Available Apps and tap Install. It may already be there.")
@@ -152,7 +158,10 @@ struct WatchDetailView: View {
 
     @ViewBuilder private func places(_ f: Flow, _ now: Date) -> some View {
         place("applewatch", "On the Watch", f.report.map { r in
-            let parts = r.waitingParts == 0 ? "Everything sent to this iPhone" : "\(r.waitingParts) part\(r.waitingParts == 1 ? "" : "s") not on this iPhone yet"
+            // the recorded length (from the Watch's own parts), never a count of parts
+            let parts = r.waitingParts == 0 ? "Everything sent to this iPhone"
+                : (r.waitingSeconds ?? 0) > 0 ? "\(WaitingAudio.text(r.waitingSeconds!).capitalizedFirst) of audio not on this iPhone yet"
+                : "Some audio not on this iPhone yet"
             // waiting, and nothing has arrived for a while: what helps
             let stuck = r.waitingParts > 0 && (f.lastReceivedAt.map { now.timeIntervalSince($0) > 15 * 60 } ?? true)
             return "\(parts) · reported \(SystemHealth.relative(r.at, now))" + (stuck ? ". They move when both are nearby with Omi Notes open." : "")
@@ -160,16 +169,14 @@ struct WatchDetailView: View {
         Divider().padding(.leading, 50)
         place("iphone", "On this iPhone", {
             guard let at = f.lastReceivedAt else { return "Nothing received yet" }
-            var s = "\(f.receivedTotal) part\(f.receivedTotal == 1 ? "" : "s") received in all · last \(SystemHealth.relative(at, now))"
-            if f.preparing > 0 { s += " · \(f.preparing) being prepared" }
+            var s = "Last audio received \(SystemHealth.relative(at, now))"
+            if f.preparing > 0 { s += " · some being prepared for upload" }
             return s
         }())
         Divider().padding(.leading, 50)
         place("arrow.up", "Upload to your server", {
             if f.waitingUpload > 0 {
-                var s = "\(f.waitingUpload) Watch part\(f.waitingUpload == 1 ? "" : "s") waiting"
-                if f.othersWaiting > 50 { s += ", in turn after \(f.othersWaiting) other parts on this iPhone" }
-                return s
+                return f.othersWaiting > 50 ? "Watch audio waiting, in turn after other recordings on this iPhone" : "Watch audio waiting to upload"
             }
             if let at = f.lastUploadedAt { return "Nothing waiting · last uploaded \(SystemHealth.relative(at, now))" }
             return f.receivedTotal > 0 ? "Nothing waiting" : "Nothing to upload yet"
@@ -222,4 +229,36 @@ struct WatchDetailView: View {
         }
         .padding(.horizontal, 12).padding(.vertical, 11)
     }
+}
+
+/// The same opt-in as Settings ▸ Alerts, here where Watch recording is explained.
+private struct WatchAlertToggle: View {
+    let model: AppModel
+    @State private var on = false
+    @State private var message: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle("Alert me if Watch recording stops", isOn: Binding(get: { on }, set: { value in
+                Task {
+                    if value, !(await LocalAlerts.requestPermission()) {
+                        message = "Notifications are off for Omi Notes in the iPhone Settings app."
+                        on = false
+                        return
+                    }
+                    model.problemAlerts.enabled = value
+                    on = value
+                    message = nil
+                }
+            }))
+            .font(.subheadline.weight(.semibold))
+            if let message { Text(message).font(.footnote).foregroundStyle(Pendant.warnForeground) }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 10)
+        .onAppear { on = model.problemAlerts.enabled }
+    }
+}
+
+private extension String {
+    var capitalizedFirst: String { prefix(1).uppercased() + dropFirst() }
 }

@@ -11,8 +11,8 @@ final class ComplicationPublisher {
     private let store = ComplicationStore(accessGroup: ComplicationKind.accessGroup)
     private var last: ComplicationSnapshot?
 
-    func update(recorder: ComplicationSnapshot.Recorder, waitingParts: Int, bound: Bool) {
-        let next = ComplicationSnapshot(at: Date(), recorder: recorder, waitingParts: waitingParts, bound: bound)
+    func update(recorder: ComplicationSnapshot.Recorder, waitingParts: Int, waitingSeconds: Int, bound: Bool) {
+        let next = ComplicationSnapshot(at: Date(), recorder: recorder, waitingParts: waitingParts, waitingSeconds: waitingSeconds, bound: bound)
         guard ComplicationPublishPolicy.shouldWrite(last: last, next: next) else { return }
         last = next
         let status = store.save(next)

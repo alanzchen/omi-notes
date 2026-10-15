@@ -71,7 +71,7 @@ struct AlertsSection: View {
         } header: {
             Text("Alerts")
         } footer: {
-            Text("For problems this phone can see: recording stopped because storage is full, audio that couldn't be uploaded, or uploads paused. Alerts never include what was said, and go away once fixed. They may arrive late: iOS decides when the app runs in the background.")
+            Text("For problems this phone can see: recording stopped because storage is full, audio that couldn't be uploaded, uploads paused, or an Apple Watch recording stopped without you stopping it. Alerts never include what was said, and go away once fixed. They may arrive late: iOS decides when the app runs in the background.")
         }
         .onAppear { on = model.problemAlerts.enabled }
     }

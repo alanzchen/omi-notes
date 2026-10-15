@@ -68,6 +68,8 @@ public final class AppModel {
     let priorityStore: PriorityStore
     /// Opt-in alerts for problems this phone observes (Settings).
     public let problemAlerts = ProblemAlerts()
+    /// Incremented when something (a tapped Watch alert) asks to show Devices ▸ Apple Watch.
+    public var watchPageRequests = 0
     public let noteCache: NoteCache
     /// Bumped when the cache is cleared or the server changes: an answer that started before then
     /// is not saved (it would bring cleared notes back).

@@ -56,7 +56,11 @@ struct RootView: View {
                 .tabItem { Label("Server", systemImage: "server.rack") }
                 .tag(Tab.server)
         }
-        .onAppear { showOnboarding = model.needsOnboarding }
+        .onAppear {
+            showOnboarding = model.needsOnboarding
+            if model.watchPageRequests > 0 { tab = .devices }  // launched by tapping a Watch alert
+        }
+        .onChange(of: model.watchPageRequests) { tab = .devices }
         // One refresh loop for every tab: status, issues and the first page of conversations.
         .task {
             while !Task.isCancelled {

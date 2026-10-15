@@ -58,9 +58,9 @@ public struct WatchSummary: Equatable, Sendable {
     public static func debugFixture(_ name: String, now: Date = Date()) -> (summary: WatchSummary, report: WatchReport?, lastReceivedAt: Date?)? {
         let report: WatchReport?, received: Date?, installed: Bool
         switch name {
-        case "recording": (report, received, installed) = (WatchReport(state: .recording, since: now.addingTimeInterval(-3 * 3600), waitingParts: 2, at: now.addingTimeInterval(-60)), now.addingTimeInterval(-90), true)
+        case "recording": (report, received, installed) = (WatchReport(state: .recording, since: now.addingTimeInterval(-3 * 3600), waitingParts: 2, waitingSeconds: 95, at: now.addingTimeInterval(-60)), now.addingTimeInterval(-90), true)
         case "paused": (report, received, installed) = (WatchReport(state: .paused, since: now.addingTimeInterval(-3600), waitingParts: 0, at: now.addingTimeInterval(-120)), now.addingTimeInterval(-150), true)
-        case "stale": (report, received, installed) = (WatchReport(state: .recording, since: now.addingTimeInterval(-6 * 3600), waitingParts: 5, at: now.addingTimeInterval(-2 * 3600)), now.addingTimeInterval(-2 * 3600), true)
+        case "stale": (report, received, installed) = (WatchReport(state: .recording, since: now.addingTimeInterval(-6 * 3600), waitingParts: 5, waitingSeconds: 290, at: now.addingTimeInterval(-2 * 3600)), now.addingTimeInterval(-2 * 3600), true)
         case "received": (report, received, installed) = (nil, now.addingTimeInterval(-40 * 60), true)
         case "installed": (report, received, installed) = (nil, nil, true)
         case "none": (report, received, installed) = (nil, nil, false)

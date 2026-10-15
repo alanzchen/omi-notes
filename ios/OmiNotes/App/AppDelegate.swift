@@ -1,12 +1,14 @@
 import OmiBLE
 import OmiCapture
 import OmiProtocol
+import OmiWatchKit
 import UIKit
+import UserNotifications
 
 /// Creates the engine (and with it the `CBCentralManager` carrying the restore identifier)
 /// synchronously in `didFinishLaunching`, because iOS may relaunch the app straight into the
 /// background for a Bluetooth event or a finished upload.
-final class AppDelegate: NSObject, UIApplicationDelegate {
+final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     private(set) var model: AppModel!
     private var watchBridge: PhoneWatchBridge?
     private var backgroundTasks: UIKitBackgroundTasks!
@@ -26,6 +28,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         model = AppModel(engine: engine)
         watchBridge = PhoneWatchBridge(engine: engine)
         model.problemAlerts.sink = alerts
+        engine.watchStopSink = alerts
+        UNUserNotificationCenter.current().delegate = self
         #if DEBUG
         // Simulator automation only (debug builds): `-OmiNotesDebugServerURL <url> -OmiNotesDebugToken <token>`.
         if let raw = UserDefaults.standard.string(forKey: "OmiNotesDebugServerURL"),
@@ -101,6 +105,24 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             }
             OmiLog.shared.log(.info, "watch", "drop acknowledged \(acks.count): \(acks.joined(separator: ","))")
         }
+        // `-OmiNotesDebugWatchStopAlert YES`: a SYNTHETIC Watch batch (a recording interrupted 3 min
+        // ago, never resumed) through the same call WatchConnectivity uses, with alerts on.
+        // `-OmiNotesDebugWatchAlertTap YES`: what tapping a Watch stop alert does.
+        if UserDefaults.standard.bool(forKey: "OmiNotesDebugWatchStopAlert") {
+            model.problemAlerts.enabled = true
+            let now = Date(), rec = UUID().uuidString.lowercased(), batch = UUID().uuidString.lowercased()
+            func sample(_ event: String, _ ago: TimeInterval) -> WatchPerfSample {
+                WatchPerfSample(id: UUID().uuidString.lowercased(), at: ISO8601UTC.format(now.addingTimeInterval(-ago)), monoS: 300 - ago,
+                                bootId: "synthetic", launchId: "synthetic", recordingId: rec, event: event, state: "recording", battery: nil,
+                                batteryState: "unknown", counters: [:], gauges: [:], app: "synthetic", os: "synthetic", model: "synthetic")
+            }
+            let data = WatchWire.encode(WatchPerfBatch(id: batch, deviceId: "watch-synthetic-alert", binding: engine.settings.phoneInstallId,
+                                                       data: WatchPerfData(batchId: batch, samples: [sample("start", 300), sample("interrupted", 180)], droppedBatches: 0)))
+            _ = try? engine.acceptWatchPerf(data)
+        }
+        if UserDefaults.standard.bool(forKey: "OmiNotesDebugWatchAlertTap") {
+            model.watchPageRequests += 1
+        }
         // `-OmiNotesDebugOpenURL omi-notes://configure?…` exercises the URL-scheme sheet without the system prompt.
         if let raw = UserDefaults.standard.string(forKey: "OmiNotesDebugOpenURL"), let link = URL(string: raw) {
             model.handleOpenURL(link)
@@ -172,5 +194,25 @@ final class UIKitBackgroundTasks: BackgroundTaskProviding, @unchecked Sendable {
                 if let id, id != .invalid { app.endBackgroundTask(id) }
             }
         }
+    }
+
+}
+
+extension AppDelegate {
+    // MARK: Notifications
+
+    /// Shown while the app is open too (a Watch stop matters even then).
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                            withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .list, .sound])
+    }
+
+    /// A Watch stop alert opens Devices ▸ Apple Watch; nothing is started or stopped.
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                            withCompletionHandler completionHandler: @escaping () -> Void) {
+        let route = response.notification.request.content.userInfo["route"] as? String
+        completionHandler()
+        guard route == LocalAlerts.watchRoute else { return }
+        Task { @MainActor in self.model.watchPageRequests += 1 }
     }
 }

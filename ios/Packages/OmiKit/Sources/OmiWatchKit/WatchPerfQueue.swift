@@ -8,6 +8,13 @@ public struct WatchPerfBatch: Codable, Equatable, Sendable {
     public var deviceId: String
     public var binding: String
     public var data: WatchPerfData
+
+    public init(id: String, deviceId: String, binding: String, data: WatchPerfData) {
+        self.id = id
+        self.deviceId = deviceId
+        self.binding = binding
+        self.data = data
+    }
 }
 
 /// The Watch's telemetry, kept apart from audio: the open batch is saved after every sample (a

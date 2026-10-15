@@ -48,10 +48,10 @@ public struct ComplicationCircle: View {
 
     @ViewBuilder private var sync: some View {
         switch display.sync {
-        case .waiting(let n):
+        case .waiting(let seconds):
             HStack(spacing: 1) {
                 Image(systemName: "arrow.up")
-                Text(n > 99 ? "99+" : "\(n)").monospacedDigit()
+                if let seconds { Text(WaitingAudio.short(seconds)).monospacedDigit() }
             }
         case .onIPhone: Image(systemName: "checkmark")
         case .notConnected: Image(systemName: "iphone.slash")
