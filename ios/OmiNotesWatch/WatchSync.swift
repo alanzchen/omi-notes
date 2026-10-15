@@ -26,6 +26,8 @@ final class WatchSync: NSObject, WCSessionDelegate {
 
     func refreshCounts() {
         let segments = outbox.segments(), ends = outbox.ends()
+        let waiting = Set(segments.map(\.segment.id) + ends.map(\.id))
+        if resend.entries.keys.contains(where: { !waiting.contains($0) }) { resend.keep(only: waiting) }
         // audio parts only (a recording's end marker isn't audio, but is sent the same way)
         held = segments.filter { $0.segment.binding != binding }.count
         pending = segments.count - held + (segments.isEmpty ? ends.filter { $0.binding == binding }.count : 0)
@@ -43,7 +45,8 @@ final class WatchSync: NSObject, WCSessionDelegate {
     private func sendReport() {
         guard activated, binding != nil, WCSession.default.activationState == .activated else { return }
         let now = Date()
-        let r = WatchReport(state: recorderState.state, since: recorderState.since, waitingParts: pending, at: now)
+        let r = WatchReport(state: recorderState.state, since: recorderState.since, waitingParts: pending, at: now,
+                            stats: counters.merging(captureStats) { a, _ in a }.merging(["awaiting_ack": resend.awaitingAck]) { a, _ in a })
         if let l = lastReport, l.state == r.state, l.since == r.since, l.waitingParts == r.waitingParts, now.timeIntervalSince(l.at) < 300 { return }
         do {
             try WCSession.default.updateApplicationContext([WatchWire.report: WatchWire.encode(r)])
@@ -58,17 +61,24 @@ final class WatchSync: NSObject, WCSessionDelegate {
     private var retryAt: Date?
     private var failures = 0
     private var retryScheduled = false
-    /// When each item was last handed over, and how often: a delivered item is not sent again
-    /// until no acknowledgement has come for a while (1 min, doubling to 10 min).
-    private var sent: [String: (at: Date, times: Int)] = [:]
-
-    private func due(_ id: String, now: Date) -> Bool {
-        guard let s = sent[id] else { return true }
-        return now.timeIntervalSince(s.at) >= min(600, 60 * pow(2, Double(min(s.times - 1, 4))))
+    /// When an item goes again (`WatchResendPolicy`): a delivered one waits long for the iPhone's
+    /// acknowledgement instead of being resent every few minutes. Saved, so a restart doesn't
+    /// resend everything delivered at once.
+    private var resend: WatchResendPolicy = UserDefaults.standard.data(forKey: "omi.resendPolicy")
+        .flatMap { try? JSONDecoder().decode(WatchResendPolicy.self, from: $0) } ?? WatchResendPolicy() {
+        didSet { UserDefaults.standard.set(try? JSONEncoder().encode(resend), forKey: "omi.resendPolicy") }
     }
 
+    /// Since launch, to compare builds (sent with the status report; nothing is sent for them alone).
+    private var counters: [String: Int] = [:]
+    /// The recorder's capture counters, set by the recorder.
+    var captureStats: [String: Int] = [:]
+
+    private func count(_ key: String, _ n: Int = 1) { counters[key, default: 0] += n }
+
     private func markSent(_ id: String, now: Date) {
-        sent[id] = (now, (sent[id]?.times ?? 0) + 1)
+        count(resend.entries[id] == nil ? "transfers" : "resends")
+        resend.handedOver(id, now: now)
     }
 
     /// Files handed to WatchConnectivity at once, at most: after a day away from the iPhone, the
@@ -96,14 +106,14 @@ final class WatchSync: NSObject, WCSessionDelegate {
             .union(session.outstandingUserInfoTransfers.compactMap { $0.userInfo["id"] as? String })
         let now = Date()
         var room = Self.maxInFlight - session.outstandingFileTransfers.count
-        for (segment, file) in outbox.segments() where segment.binding == binding && !inFlight.contains(segment.id) && due(segment.id, now: now) {
+        for (segment, file) in outbox.segments() where segment.binding == binding && !inFlight.contains(segment.id) && resend.due(segment.id, now: now) {
             guard room > 0 else { break }
             room -= 1
             watchLog.info("sending segment \(segment.id)")
             markSent(segment.id, now: now)
             session.transferFile(file, metadata: [WatchWire.kind: WatchWire.segment, "id": segment.id, WatchWire.manifest: WatchWire.encode(segment)])
         }
-        for end in outbox.ends() where end.binding == binding && !inFlight.contains(end.id) && due(end.id, now: now) {
+        for end in outbox.ends() where end.binding == binding && !inFlight.contains(end.id) && resend.due(end.id, now: now) {
             markSent(end.id, now: now)
             session.transferUserInfo([WatchWire.kind: WatchWire.end, "id": end.id, WatchWire.manifest: WatchWire.encode(end)])
         }
@@ -150,7 +160,8 @@ final class WatchSync: NSObject, WCSessionDelegate {
         if !r.acks.isEmpty {
             watchLog.info("iPhone acknowledged \(r.acks.count) item(s)")
             outbox.acknowledge(r.acks)
-            for id in r.acks { sent[id] = nil }
+            resend.acknowledged(r.acks)
+            count("acks", r.acks.count)
             lastAckAt = Date()
             UserDefaults.standard.set(lastAckAt, forKey: "omi.lastAckAt")
         }
@@ -193,12 +204,25 @@ final class WatchSync: NSObject, WCSessionDelegate {
                 self.retryAt = Date().addingTimeInterval(min(300, 5 * pow(2, Double(min(self.failures - 1, 6)))))
                 watchLog.error("transfer failed: \(failed); retrying after \(self.failures) failure(s)")
                 // a failed item is due again after the backoff
-                if let transferId { self.sent[transferId] = nil }
+                if let transferId { self.resend.failed(transferId) }
+                self.count("transfer_failures")
             } else {
                 self.failures = 0
                 self.retryAt = nil
+                // delivered, not acknowledged: kept, and sent again only after a long wait
+                if let transferId { self.resend.delivered(transferId, now: Date()) }
             }
             self.pump()
+        }
+    }
+
+    /// A recording end (sent as user info) was delivered or failed, like a file.
+    nonisolated func session(_ session: WCSession, didFinish userInfoTransfer: WCSessionUserInfoTransfer, error: Error?) {
+        let id = userInfoTransfer.userInfo["id"] as? String
+        let failed = error != nil
+        Task { @MainActor in
+            guard let id else { return }
+            if failed { self.resend.failed(id); self.count("transfer_failures") } else { self.resend.delivered(id, now: Date()) }
         }
     }
 

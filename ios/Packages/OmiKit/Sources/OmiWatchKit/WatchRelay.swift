@@ -72,12 +72,16 @@ public struct WatchReport: Codable, Equatable, Sendable {
     /// Audio parts on the Watch the phone hasn't acknowledged yet.
     public var waitingParts: Int
     public var at: Date
+    /// Counters since the Watch app launched (transfers, resends, capture buffer allocations…), to
+    /// compare builds; absent from older Watch apps.
+    public var stats: [String: Int]?
 
-    public init(state: State, since: Date?, waitingParts: Int, at: Date) {
+    public init(state: State, since: Date?, waitingParts: Int, at: Date, stats: [String: Int]? = nil) {
         self.state = state
         self.since = since
         self.waitingParts = waitingParts
         self.at = at
+        self.stats = stats
     }
 }
 

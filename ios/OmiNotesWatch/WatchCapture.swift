@@ -6,35 +6,19 @@ import OmiWatchKit
 /// stream (`SegmentClock`): the microphone never stops between segments, so no audio falls between
 /// two of them. One instance per run; an interruption ends the run and a new one starts after it.
 ///
-/// The input tap is called on an audio thread; everything it touches is behind `lock`.
+/// Conversion and file writing are `SegmentWriter` (buffers reused across callbacks). The input
+/// tap is called on an audio thread; everything it touches is behind `lock`.
 final class WatchCapture: @unchecked Sendable {
-    struct Finished: Sendable {
-        var url: URL
-        var index: Int
-        /// Seconds from the recording's start (Watch uptime) to the segment's first sample, and its length.
-        var start: Double
-        var seconds: Double
-    }
+    typealias Finished = SegmentWriter.Finished
 
-    static let rate = 16_000.0
     private let engine = AVAudioEngine()
     private let lock = NSLock()
-    private let makeURL: @Sendable (Int) -> URL
+    private let writer: SegmentWriter
     private let finished: @Sendable (Finished) -> Void
     private let failed: @Sendable (String) -> Void
     private let changed: @Sendable () -> Void
     private var observer: (any NSObjectProtocol)?
     private let recordingStartUptime: TimeInterval
-    private var clock: SegmentClock
-    private var index: Int
-    private var file: AVAudioFile?
-    private var converter: AVAudioConverter?
-    private var output: AVAudioFormat?
-    /// Seconds from the recording's start to this run's first sample; frames of the run so far, and
-    /// at which of them the open segment began.
-    private var runStart: Double?
-    private var runFrames: Int64 = 0
-    private var segmentStartFrame: Int64 = 0
     private var stopped = false
     #if DEBUG
     /// Simulator automation only (`OmiWatchDebugSyntheticAudio`): the simulator has no microphone
@@ -48,17 +32,18 @@ final class WatchCapture: @unchecked Sendable {
     init(firstIndex: Int, segmentSeconds: TimeInterval, recordingStartUptime: TimeInterval,
          makeURL: @escaping @Sendable (Int) -> URL, finished: @escaping @Sendable (Finished) -> Void,
          failed: @escaping @Sendable (String) -> Void, changed: @escaping @Sendable () -> Void) {
-        index = firstIndex
-        clock = SegmentClock(framesPerSegment: Int(segmentSeconds * Self.rate))
+        writer = SegmentWriter(firstIndex: firstIndex, segmentSeconds: segmentSeconds, makeURL: makeURL)
         self.recordingStartUptime = recordingStartUptime
-        self.makeURL = makeURL
         self.finished = finished
         self.failed = failed
         self.changed = changed
     }
 
     /// The index of the segment being written (the next to be finished).
-    var currentIndex: Int { lock.lock(); defer { lock.unlock() }; return index }
+    var currentIndex: Int { lock.lock(); defer { lock.unlock() }; return writer.index }
+
+    /// What the writer has done so far (allocations, boundary copies), for the Watch's report.
+    var stats: SegmentWriter.Stats { lock.lock(); defer { lock.unlock() }; return writer.stats }
 
     func start() throws {
         #if DEBUG
@@ -66,13 +51,9 @@ final class WatchCapture: @unchecked Sendable {
         #endif
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0,
-              let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Self.rate, channels: 1, interleaved: false),
-              let converter = AVAudioConverter(from: format, to: target) else {
+        guard format.sampleRate > 0, format.channelCount > 0, AVAudioConverter(from: format, to: writer.output) != nil else {
             throw CocoaError(.featureUnsupported, userInfo: [NSLocalizedDescriptionKey: "no microphone input is available"])
         }
-        self.converter = converter
-        output = target
         input.installTap(onBus: 0, bufferSize: 4_096, format: format) { [weak self] buffer, _ in
             self?.consume(buffer)
         }
@@ -97,76 +78,23 @@ final class WatchCapture: @unchecked Sendable {
         engine.stop()
         lock.lock(); defer { lock.unlock() }
         stopped = true
-        return closeSegment()
+        return writer.close()
     }
 
+    /// Synchronous: the buffer is used only until this returns.
     private func consume(_ buffer: AVAudioPCMBuffer) {
         lock.lock(); defer { lock.unlock() }
-        guard !stopped, let converter, let output else { return }
-        if runStart == nil {
-            // the first buffer ended about now
-            runStart = ProcessInfo.processInfo.systemUptime - recordingStartUptime - Double(buffer.frameLength) / buffer.format.sampleRate
-        }
-        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * Self.rate / buffer.format.sampleRate) + 64
-        guard let converted = AVAudioPCMBuffer(pcmFormat: output, frameCapacity: capacity) else { return }
-        nonisolated(unsafe) var fed = false
-        nonisolated(unsafe) let input = buffer
-        var error: NSError?
-        let status = converter.convert(to: converted, error: &error) { _, inputStatus in
-            if fed { inputStatus.pointee = .noDataNow; return nil }
-            fed = true
-            inputStatus.pointee = .haveData
-            return input
-        }
-        guard status != .error else {
-            failed("audio conversion failed (\(error?.localizedDescription ?? "unknown error"))")
-            return
-        }
-        var offset = 0
-        for run in clock.split(Int(converted.frameLength)) {
-            write(converted, from: offset, count: run.frames)
-            offset += run.frames
-            runFrames += Int64(run.frames)
-            if run.closesSegment, let done = closeSegment() { finished(done) }
-        }
-    }
-
-    private func write(_ buffer: AVAudioPCMBuffer, from offset: Int, count: Int) {
-        guard count > 0, let output else { return }
+        guard !stopped else { return }
         do {
-            if file == nil {
-                let settings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: Self.rate, AVNumberOfChannelsKey: 1,
-                                               AVEncoderBitRateKey: 32_000]
-                file = try AVAudioFile(forWriting: makeURL(index), settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
-                segmentStartFrame = runFrames
-            }
-            guard let part = AVAudioPCMBuffer(pcmFormat: output, frameCapacity: AVAudioFrameCount(count)) else { return }
-            part.frameLength = AVAudioFrameCount(count)
-            part.floatChannelData![0].update(from: buffer.floatChannelData![0] + offset, count: count)
-            try file?.write(from: part)
+            for done in try writer.append(buffer, endedAt: ProcessInfo.processInfo.systemUptime - recordingStartUptime) { finished(done) }
         } catch {
             failed("a recording segment couldn't be written (\(error.localizedDescription))")
         }
     }
 
-    /// Closes the open file (which finalizes it). Called with `lock` held.
-    private func closeSegment() -> Finished? {
-        guard let f = file else { return nil }
-        let url = f.url
-        if #available(watchOS 11.0, *) { f.close() }
-        file = nil
-        let frames = runFrames - segmentStartFrame
-        let done = Finished(url: url, index: index, start: (runStart ?? 0) + Double(segmentStartFrame) / Self.rate,
-                            seconds: Double(frames) / Self.rate)
-        index += 1
-        return frames > 0 ? done : nil
-    }
-
     #if DEBUG
     private func startFeed() {
         let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
-        output = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Self.rate, channels: 1, interleaved: false)
-        converter = output.flatMap { AVAudioConverter(from: format, to: $0) }
         feedStart = ProcessInfo.processInfo.systemUptime
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "dev.omi-notes.watch.synthetic-mic"))
         timer.schedule(deadline: .now() + 0.1, repeating: 0.1)

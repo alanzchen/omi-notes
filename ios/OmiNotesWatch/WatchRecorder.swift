@@ -213,6 +213,10 @@ final class WatchRecorder: NSObject {
         // a rotation just before Stop can arrive after it: the recording is closed, the audio still kept
         guard let a = current?.recordingId == recordingId ? current : lastClosed, a.recordingId == recordingId else { return }
         add(file: done.url, active: a, index: done.index, start: done.start, seconds: done.seconds)
+        if let s = capture?.stats {
+            sync.captureStats = ["callbacks": s.callbacks, "buffer_allocations": s.bufferAllocations, "boundary_copies": s.boundaryCopies,
+                                 "segments": s.segments]
+        }
         guard current?.recordingId == recordingId else { return }
         current?.index = max(a.index, done.index + 1)
         current?.segmentStartUptime = a.startUptime + done.start + done.seconds
