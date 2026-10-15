@@ -5,7 +5,7 @@ as `watch_perf` events (stored like any event: vault first, then the index). Thi
 them back and summarizes one recording at a time, claiming no more than the samples show:
 
 - An interval between two consecutive samples counts as *measured* only if both are from the same
-  boot (same `boot_at` within a few seconds, uptime increasing), at most `GAP` apart, recording, on
+  boot (same `boot_id`) with monotonic offsets (`mono_s`, increasing), at most `GAP` apart, recording, on
   battery (not charging/full) and with known levels. Anything else is a gap, charging or unknown
   time, reported separately and never bridged.
 - The rate (percentage points per hour) is the whole-Watch battery change over measured intervals,
@@ -15,7 +15,7 @@ them back and summarizes one recording at a time, claiming no more than the samp
   resets them) and never go negative. Callback counts are not hardware wakes; `append_ms` is
   elapsed time inside the capture path, not CPU use.
 - Samples may arrive late, out of order or twice: they are de-duplicated by id and ordered by the
-  Watch's own clock and uptime. A recording with no `stopped`/`recovered` sample is incomplete.
+  Watch's own clock and monotonic offset. The Watch never sends its boot time: `boot_id` is random. A recording with no `stopped`/`recovered` sample is incomplete.
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ EVENT_TYPE = "watch_perf"
 GAP = 15 * 60
 MIN_MEASURED = 45 * 60
 COARSE_PP = 3.0
-BOOT_SLACK = 5.0
 GAUGES = ("outbox_parts", "awaiting_ack")
 
 
@@ -54,11 +53,12 @@ def load(db, since: float) -> tuple[list[dict], dict[str, int]]:
         for s in data.get("samples") or []:
             if not isinstance(s, dict) or not isinstance(s.get("id"), str) or s["id"] in seen:
                 continue
-            at, boot = _epoch(s.get("at")), _epoch(s.get("boot_at"))
-            if at is None or boot is None or not isinstance(s.get("uptime_s"), (int, float)):
+            at, mono = _epoch(s.get("at")), s.get("mono_s")
+            if at is None or not isinstance(s.get("boot_id"), str):
                 continue
             seen.add(s["id"])
-            out.append({**s, "device_id": row["device_id"], "_at": at, "_boot": boot})
+            ok = isinstance(mono, (int, float)) and not isinstance(mono, bool)
+            out.append({**s, "device_id": row["device_id"], "_at": at, "_mono": float(mono) if ok else None})
     return out, dropped
 
 
@@ -77,14 +77,16 @@ def summarize(samples: list[dict]) -> list[dict]:
 
 
 def _session(recording_id: str, rows: list[dict]) -> dict:
-    rows = sorted(rows, key=lambda s: (s["_at"], s["uptime_s"]))
+    rows = sorted(rows, key=lambda s: (s["_at"], s["_mono"] if s["_mono"] is not None else -1))
     measured = charging = unknown = paused = drop = 0.0
     gaps: list[dict] = []
     for a, b in zip(rows, rows[1:]):
-        same_boot = abs(a["_boot"] - b["_boot"]) <= BOOT_SLACK and b["uptime_s"] >= a["uptime_s"]
-        dt = b["uptime_s"] - a["uptime_s"] if same_boot else None
+        same_boot = (a["boot_id"] == b["boot_id"] and a["_mono"] is not None and b["_mono"] is not None
+                     and b["_mono"] >= a["_mono"])  # fmt: skip
+        dt = b["_mono"] - a["_mono"] if same_boot else None
         if dt is None or dt > GAP:
-            gaps.append({"from": a["at"], "to": b["at"], "reason": "restart_or_clock_change" if dt is None else "no_samples"})
+            reason = ("restart" if a["boot_id"] != b["boot_id"] else "no_monotonic_time") if dt is None else "no_samples"
+            gaps.append({"from": a["at"], "to": b["at"], "reason": reason})
             continue
         if a.get("battery_state") in ("charging", "full") or b.get("battery_state") in ("charging", "full"):
             charging += dt
@@ -136,7 +138,7 @@ def _deltas(rows: list[dict]) -> dict[str, int]:
     for s in rows:
         by_launch.setdefault(str(s.get("launch_id")), []).append(s)
     for launch in by_launch.values():
-        launch.sort(key=lambda s: s["uptime_s"])
+        launch.sort(key=lambda s: s["_at"])
         first: dict[str, int] = {}
         last: dict[str, int] = {}
         for s in launch:  # each counter's first and last observed value (a sample may lack one)

@@ -32,12 +32,26 @@ final class WatchTelemetry {
         return "\(info?["CFBundleShortVersionString"] as? String ?? "?") (\(info?["CFBundleVersion"] as? String ?? "?"))"
     }
 
+    /// A random id for this boot, kept until the Watch reboots: lets the server tell a reboot from
+    /// continuous time without receiving the boot time (which never leaves the Watch).
+    static var bootId: String {
+        let uptime = ProcessInfo.processInfo.systemUptime
+        let boot = Date().timeIntervalSince1970 - uptime
+        let d = UserDefaults.standard
+        if let id = d.string(forKey: "omi.bootId"), abs(d.double(forKey: "omi.bootRef") - boot) < 5 { return id }
+        let id = UUID().uuidString.lowercased()
+        d.set(id, forKey: "omi.bootId")
+        d.set(boot, forKey: "omi.bootRef")
+        return id
+    }
+
     func monitorBattery(_ on: Bool) {
         WKInterfaceDevice.current().isBatteryMonitoringEnabled = on
     }
 
     /// `periodic` samples are skipped until `interval` has passed since the last sample.
-    func sample(_ event: String, state: String, recordingId: String?, counters: [String: Int], gauges: [String: Int],
+    /// `mono`: seconds since the recording started (monotonic), nil if it started before a reboot.
+    func sample(_ event: String, state: String, recordingId: String?, mono: TimeInterval?, counters: [String: Int], gauges: [String: Int],
                 binding: String?, seal: Bool = false) {
         let now = Date(), uptime = ProcessInfo.processInfo.systemUptime
         if event == "periodic", let last = lastSampleUptime, uptime - last < Self.interval { return }
@@ -53,8 +67,8 @@ final class WatchTelemetry {
         default: batteryState = "unknown"
         }
         let s = WatchPerfSample(
-            id: UUID().uuidString.lowercased(), at: ISO8601UTC.format(now), uptimeS: (uptime * 1000).rounded() / 1000,
-            bootAt: ISO8601UTC.format(now.addingTimeInterval(-uptime)), launchId: launchId, recordingId: recordingId, event: event,
+            id: UUID().uuidString.lowercased(), at: ISO8601UTC.format(now), monoS: mono.map { ($0 * 1000).rounded() / 1000 },
+            bootId: Self.bootId, launchId: launchId, recordingId: recordingId, event: event,
             state: state, battery: level >= 0 && level <= 1 ? (Double(level) * 1000).rounded() / 1000 : nil, batteryState: batteryState,
             counters: counters, gauges: gauges, app: Self.appVersion, os: device.systemVersion, model: Self.hardwareModel)
         queue.append(s, deviceId: WatchRecorder.deviceId, binding: binding, seal: seal)

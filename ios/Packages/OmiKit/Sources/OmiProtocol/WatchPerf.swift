@@ -10,10 +10,11 @@ public struct WatchPerfSample: Codable, Equatable, Sendable {
     public var id: String
     /// Watch wall clock, ISO-8601 UTC.
     public var at: String
-    /// Watch monotonic uptime in seconds (resets at reboot).
-    public var uptimeS: Double
-    /// `at - uptime_s`: identifies the boot (a reboot or a clock change moves it).
-    public var bootAt: String
+    /// Monotonic seconds since the recording started (like audio chunk offsets); absent when the
+    /// recording began before a reboot.
+    public var monoS: Double?
+    /// Random id of the Watch's current boot (a new one after a reboot); not the boot time.
+    public var bootId: String
     public var launchId: String
     public var recordingId: String?
     /// `start`, `periodic`, `interrupted`, `resumed`, `paused`, `failed`, `stopped`, `recovered`.
@@ -31,13 +32,13 @@ public struct WatchPerfSample: Codable, Equatable, Sendable {
     public var os: String
     public var model: String
 
-    public init(id: String, at: String, uptimeS: Double, bootAt: String, launchId: String, recordingId: String?, event: String,
+    public init(id: String, at: String, monoS: Double?, bootId: String, launchId: String, recordingId: String?, event: String,
                 state: String, battery: Double?, batteryState: String, counters: [String: Int], gauges: [String: Int],
                 app: String, os: String, model: String) {
         self.id = id
         self.at = at
-        self.uptimeS = uptimeS
-        self.bootAt = bootAt
+        self.monoS = monoS
+        self.bootId = bootId
         self.launchId = launchId
         self.recordingId = recordingId
         self.event = event
@@ -53,7 +54,7 @@ public struct WatchPerfSample: Codable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, at, event, state, battery, counters, gauges, app, os, model
-        case uptimeS = "uptime_s", bootAt = "boot_at", launchId = "launch_id", recordingId = "recording_id"
+        case monoS = "mono_s", bootId = "boot_id", launchId = "launch_id", recordingId = "recording_id"
         case batteryState = "battery_state"
     }
 }

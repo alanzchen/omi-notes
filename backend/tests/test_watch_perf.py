@@ -21,10 +21,11 @@ def iso(t: float) -> str:
 
 
 def sample(minute: float, battery, *, event="periodic", state="recording", battery_state="unplugged", launch="l1",
-           boot=T0 - 3600, counters=None, rec=REC) -> dict:  # fmt: skip
+           boot="boot-1", mono=True, counters=None, rec=REC) -> dict:  # fmt: skip
     t = T0 + minute * 60
-    return {"id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{rec}-{launch}-{minute}-{event}")), "at": iso(t), "uptime_s": t - boot,
-            "boot_at": iso(boot), "launch_id": launch, "recording_id": rec, "event": event, "state": state,
+    return {"id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{rec}-{launch}-{minute}-{event}")), "at": iso(t),
+            **({"mono_s": minute * 60.0} if mono else {}), "boot_id": boot, "launch_id": launch, "recording_id": rec,
+            "event": event, "state": state,
             **({"battery": battery} if battery is not None else {}), "battery_state": battery_state,
             "counters": counters or {}, "gauges": {"outbox_parts": 1, "awaiting_ack": 0},
             "app": "0.1.0 (24)", "os": "11.0", "model": "SyntheticWatch1,1"}  # fmt: skip
@@ -75,13 +76,15 @@ def test_late_out_of_order_and_duplicated_samples_count_once(client):
 def test_a_relaunch_never_gives_negative_deltas_and_a_reboot_is_a_gap(client):
     s = [sample(0, 0.70, counters={"callbacks": 100}), sample(5, 0.69, counters={"callbacks": 5000})]
     s += [sample(10, 0.68, launch="l2", counters={"callbacks": 10}), sample(15, 0.67, launch="l2", counters={"callbacks": 3010})]
-    # rebooted: a new boot time; the uptime restarts, so this interval is not measured
-    s += [sample(20, 0.66, launch="l3", boot=T0 + 19 * 60, counters={"callbacks": 0}), sample(25, 0.65, launch="l3", boot=T0 + 19 * 60)]
+    # rebooted: a new boot id and no monotonic offset (the recording began before the reboot), so
+    # nothing after it is measured
+    s += [sample(20, 0.66, launch="l3", boot="boot-2", mono=False, counters={"callbacks": 0}),
+          sample(25, 0.65, launch="l3", boot="boot-2", mono=False)]
     put(client, s)
     (row,) = summary(client)["sessions"]
     assert row["counters"]["callbacks"] == 4900 + 3000 and row["launches"] == 3
-    assert row["gaps"] == 1 and row["gap_list"][0]["reason"] == "restart_or_clock_change"
-    assert row["measured_s"] == 20 * 60 and row["rate_pp_per_hour"] is None and row["rate_quality"] == "insufficient"
+    assert [g["reason"] for g in row["gap_list"]] == ["restart", "no_monotonic_time"]
+    assert row["measured_s"] == 15 * 60 and row["rate_pp_per_hour"] is None and row["rate_quality"] == "insufficient"
 
 
 def test_a_long_silence_between_samples_is_a_gap_not_measured_time(client):

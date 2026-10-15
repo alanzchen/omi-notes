@@ -159,8 +159,10 @@ server (`features` contains `watch_performance`).
   (the app found a recording cut off by termination) and, while recording, `periodic` at most every
   5 min when a part finishes (no timer or wake of its own). Battery monitoring is on only while a
   recording is active.
-- **Sample:** `id` (UUID), `at` (Watch clock), `uptime_s` and `boot_at` (= `at - uptime_s`; a
-  reboot or clock change moves it), `launch_id` (one per app launch), `recording_id`, `event`,
+- **Sample:** `id` (UUID), `at` (Watch clock), `mono_s` (monotonic seconds since the recording
+  started, like chunk offsets; absent when it started before a reboot), `boot_id` (random, new
+  after a reboot: the boot time itself never leaves the Watch), `launch_id` (one per app launch),
+  `recording_id`, `event`,
   `state` (`recording`, `paused`, `idle`), `battery` (0–1, **absent when unknown**, never 0 for
   unknown), `battery_state` (`unplugged`, `charging`, `full`, `unknown`), `counters` (cumulative
   within `launch_id`: `callbacks`, `buffer_allocations`, `boundary_copies`, `segments`,
@@ -176,7 +178,7 @@ server (`features` contains `watch_performance`).
 
 Per-recording summaries computed from stored samples (newest first, `days` 1–90), with
 `dropped_batches` per device. An interval between consecutive samples is *measured* only if both
-are from the same boot (`boot_at` within 5 s, uptime increasing), at most 15 min apart, recording,
+are from the same boot (`boot_id`) with increasing `mono_s`, at most 15 min apart, recording,
 on battery and with known levels; otherwise it counts as a gap, charging, not-recording or
 unknown time, never bridged. `rate_pp_per_hour` (whole-Watch percentage points per hour over
 measured time) is given only with ≥ 45 min measured; `rate_quality` is `ok`, `coarse` (change

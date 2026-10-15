@@ -163,8 +163,8 @@ import OmiProtocol
         // Apple Watch performance telemetry: one batch, SYNTHETIC values (docs/capture-format-v1.md, "Watch performance").
         let perfBatch = "5ee0a000-0000-4000-8000-0000000000b1", rec = "5ee0a000-0000-4000-8000-00000000c0de"
         func perfSample(_ n: Int, _ event: String, _ battery: Double?, _ state: String) -> WatchPerfSample {
-            WatchPerfSample(id: "5ee0a000-0000-4000-8000-00000000000\(n)", at: "2026-10-15T09:\(String(format: "%02d", n * 5)):00.000Z", uptimeS: 3600 + Double(n * 300),
-                            bootAt: "2026-10-15T08:00:00.000Z", launchId: "5ee0a000-0000-4000-8000-0000000000a1", recordingId: rec,
+            WatchPerfSample(id: "5ee0a000-0000-4000-8000-00000000000\(n)", at: "2026-10-15T09:\(String(format: "%02d", n * 5)):00.000Z", monoS: Double(n * 300),
+                            bootId: "5ee0a000-0000-4000-8000-0000000000b0", launchId: "5ee0a000-0000-4000-8000-0000000000a1", recordingId: rec,
                             event: event, state: state, battery: battery, batteryState: battery == nil ? "unknown" : "unplugged",
                             counters: ["callbacks": n * 3500, "transfers": n * 5, "resends": 0, "acks": n * 5], gauges: ["outbox_parts": 1, "awaiting_ack": 0],
                             app: "0.1.0 (24)", os: "11.0", model: "Watch7,1")

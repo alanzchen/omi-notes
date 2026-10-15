@@ -157,7 +157,7 @@ final class WatchRecorder: NSObject {
                                                lastIndex: last, endOffsetUs: Int64((end - active.startUptime) * 1_000_000),
                                                endedAt: Date(), reason: .userStopped))
         lastClosed = active
-        perfSample("stopped", recordingId: active.recordingId, state: "idle", seal: true)
+        perfSample("stopped", recordingId: active.recordingId, state: "idle", seal: true, active: active)
         telemetry.monitorBattery(false)
         current = nil
         persist()
@@ -303,14 +303,19 @@ final class WatchRecorder: NSObject {
     }
 
     /// One sample now (periodic ones at most every 5 min); `state` defaults to what the recorder shows.
-    private func perfSample(_ event: String, recordingId: String? = nil, state: String? = nil, seal: Bool = false) {
+    /// `active`: the recording (defaults to the current one), for its monotonic start.
+    private func perfSample(_ event: String, recordingId: String? = nil, state: String? = nil, seal: Bool = false, active: Active? = nil) {
+        let a = active ?? current
+        let now = ProcessInfo.processInfo.systemUptime
+        let sameBoot = a.map { abs(Date().addingTimeInterval(-now).timeIntervalSince($0.bootTime)) < 5 } ?? false
+        let mono = sameBoot ? a.map { now - $0.startUptime } : nil
         let shown: String
         switch self.state {
         case .recording: shown = "recording"
         case .interrupted, .failed: shown = current == nil ? "idle" : "paused"
         case .idle: shown = "idle"
         }
-        telemetry.sample(event, state: state ?? shown, recordingId: recordingId ?? current?.recordingId,
+        telemetry.sample(event, state: state ?? shown, recordingId: recordingId ?? a?.recordingId, mono: mono,
                          counters: sync.counters.merging(captureCounters()) { a, _ in a },
                          gauges: ["outbox_parts": sync.pending, "awaiting_ack": sync.awaitingAck], binding: sync.binding,
                          seal: seal || event == "paused" || event == "failed" || event == "interrupted")
@@ -374,7 +379,7 @@ final class WatchRecorder: NSObject {
         try? outbox.add(end: WatchRecordingEnd(recordingId: a.recordingId, deviceId: Self.deviceId, binding: a.binding, lastIndex: last,
                                                endOffsetUs: Int64((a.segmentStartUptime - a.startUptime) * 1_000_000), endedAt: Date(),
                                                reason: .appRecovered))
-        perfSample("recovered", recordingId: a.recordingId, state: "idle", seal: true)
+        perfSample("recovered", recordingId: a.recordingId, state: "idle", seal: true, active: a)
         current = nil
         persist()
         state = .interrupted("The app closed during a recording. What was recorded is kept.")

@@ -10,7 +10,7 @@ import OmiProtocol
 @Suite(.serialized) struct WatchTelemetryTests {
     func sample(_ n: Int, battery: Double? = 0.8, event: String = "periodic") -> WatchPerfSample {
         WatchPerfSample(id: UUID().uuidString.lowercased(), at: ISO8601UTC.format(Date(timeIntervalSince1970: 1_791_000_000 + Double(n) * 300)),
-                        uptimeS: Double(n) * 300, bootAt: "2026-10-15T08:00:00.000Z", launchId: "launch", recordingId: "rec", event: event,
+                        monoS: Double(n) * 300, bootId: "boot", launchId: "launch", recordingId: "rec", event: event,
                         state: "recording", battery: battery, batteryState: battery == nil ? "unknown" : "unplugged",
                         counters: ["callbacks": n], gauges: [:], app: "t", os: "t", model: "t")
     }
