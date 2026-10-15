@@ -37,6 +37,12 @@ final class WatchRecorder: NSObject {
             case .interrupted, .failed: sync.recorderState = current.map { (.paused, $0.startedAt) } ?? (.idle, nil)
             case .idle: sync.recorderState = (.idle, nil)
             }
+            switch state {
+            case .recording: sync.complicationRecorder = .recording
+            case .interrupted: sync.complicationRecorder = current == nil ? .idle : .paused
+            case .failed: sync.complicationRecorder = .failed
+            case .idle: sync.complicationRecorder = .idle
+            }
         }
     }
     let outbox: WatchOutbox

@@ -1,0 +1,35 @@
+# XcodeGen spec with the Apple Watch complication (WidgetKit extension embedded in the Watch app).
+#   cd ios && xcodegen generate --spec project.complication.yml
+# Release signing needs an App Store profile for $(OMI_APP_BUNDLE_ID).watchkitapp.complication,
+# passed as OMI_COMPLICATION_PROFILE. Included arrays (the Watch app's dependencies) are appended.
+include:
+  - project.yml
+targets:
+  OmiNotesWatch:
+    dependencies:
+      - target: OmiNotesComplication
+  OmiNotesComplication:
+    type: app-extension
+    platform: watchOS
+    deploymentTarget: "10.0"
+    configFiles:
+      Debug: Config/Base.xcconfig
+      Release: Config/Base.xcconfig
+    sources:
+      - path: OmiNotesComplication
+    dependencies:
+      - package: OmiKit
+        product: OmiWatchKit
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(OMI_APP_BUNDLE_ID).watchkitapp.complication
+        PRODUCT_NAME: OmiNotesComplication
+        INFOPLIST_FILE: OmiNotesComplication/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: OmiNotesComplication/OmiNotesComplication.entitlements
+        SWIFT_VERSION: "6.0"
+        SKIP_INSTALL: YES
+        APPLICATION_EXTENSION_API_ONLY: YES
+        PROVISIONING_PROFILE_SPECIFIER: $(OMI_COMPLICATION_PROFILE)

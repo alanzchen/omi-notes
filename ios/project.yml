@@ -74,8 +74,11 @@ targets:
         WKCompanionAppBundleIdentifier: $(OMI_APP_BUNDLE_ID)
         UIBackgroundModes: [audio]
         NSMicrophoneUsageDescription: Omi Notes records on your Apple Watch only while you have started a recording, and sends it to your iPhone for your notes.
+        # shared with the complication extension (keychain group in both apps' entitlements)
+        OmiSharedKeychainGroup: $(AppIdentifierPrefix)dev.omi-notes.shared
     settings:
       base:
+        CODE_SIGN_ENTITLEMENTS: OmiNotesWatch/OmiNotesWatch.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: $(OMI_APP_BUNDLE_ID).watchkitapp
         PRODUCT_NAME: OmiNotesWatch
         SWIFT_VERSION: "6.0"

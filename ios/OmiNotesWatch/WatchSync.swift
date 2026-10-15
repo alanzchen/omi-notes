@@ -35,7 +35,14 @@ final class WatchSync: NSObject, WCSessionDelegate {
         held = segments.filter { $0.segment.binding != binding }.count
         pending = segments.count - held + (segments.isEmpty ? ends.filter { $0.binding == binding }.count : 0)
         sendReport()
+        complication.update(recorder: complicationRecorder, waitingParts: pending, bound: binding != nil)
     }
+
+    /// The watch-face complication's view of the recorder (set by the recorder).
+    var complicationRecorder: ComplicationSnapshot.Recorder = .idle {
+        didSet { if complicationRecorder != oldValue { complication.update(recorder: complicationRecorder, waitingParts: pending, bound: binding != nil) } }
+    }
+    private let complication = ComplicationPublisher()
 
     /// What the recorder is doing, for the iPhone's Devices screen.
     var recorderState: (state: WatchReport.State, since: Date?) = (.idle, nil) {

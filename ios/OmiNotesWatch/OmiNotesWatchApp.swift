@@ -19,9 +19,27 @@ struct OmiNotesWatchApp: App {
         _recorder = State(initialValue: WatchRecorder(outbox: outbox, sync: sync, telemetry: WatchTelemetry(queue: perf)))
     }
 
+    @ViewBuilder private var root: some View {
+        #if DEBUG
+        if UserDefaults.standard.bool(forKey: "OmiWatchDebugComplicationGallery") {
+            ComplicationGallery()
+        } else {
+            RecordView(recorder: recorder, sync: sync)
+        }
+        #else
+        RecordView(recorder: recorder, sync: sync)
+        #endif
+    }
+
     var body: some Scene {
         WindowGroup {
-            RecordView(recorder: recorder, sync: sync)
+            root
+                // from the complication: the status screen is the app's only screen; nothing is
+                // started or stopped by opening it
+                .onOpenURL { url in
+                    watchLog.info("opened from \(url.absoluteString)")
+                    sync.pump()
+                }
                 .task {
                     #if DEBUG
                     // Simulator automation only: `-OmiWatchDebugAutoStart YES` presses Start, as a tap would.
