@@ -120,6 +120,15 @@ extension AppModel {
         }
     }
 
+    /// The server's Apple Watch recording summaries, newest first (nil when it doesn't keep them or
+    /// can't be reached).
+    public func watchPerformance() async -> WatchPerformance? {
+        let config = engine.settings.serverConfig()
+        guard let endpoint = config.endpoint, serverStatus?.supportsWatchPerformance == true else { return nil }
+        let result = try? await APIClient(endpoint: endpoint, session: session).watchPerformance()
+        return isCurrent(config) ? result : nil
+    }
+
     /// The server's last 7 days (nil when it doesn't report them).
     public func weekStats() async -> ServerStats? {
         let config = engine.settings.serverConfig()

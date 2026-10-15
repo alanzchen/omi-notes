@@ -67,10 +67,14 @@ final class WatchRecorder: NSObject {
         return id
     }
 
-    init(outbox: WatchOutbox, sync: WatchSync) {
+    let telemetry: WatchTelemetry
+
+    init(outbox: WatchOutbox, sync: WatchSync, telemetry: WatchTelemetry) {
         self.outbox = outbox
         self.sync = sync
+        self.telemetry = telemetry
         super.init()
+        if let binding = sync.binding { telemetry.queue.seal(deviceId: Self.deviceId, binding: binding) }  // a previous launch's samples
         NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
             let type = (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt).flatMap(AVAudioSession.InterruptionType.init)
             let options = AVAudioSession.InterruptionOptions(rawValue: note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
@@ -137,7 +141,9 @@ final class WatchRecorder: NSObject {
         let now = ProcessInfo.processInfo.systemUptime
         current = Active(recordingId: UUID().uuidString.lowercased(), binding: binding, startedAt: Date(), startUptime: now,
                          bootTime: Date().addingTimeInterval(-now), index: 0, segmentStartUptime: now, lastAddedIndex: -1)
+        telemetry.monitorBattery(true)
         startSegment()
+        perfSample("start")
     }
 
     func stop() {
@@ -151,6 +157,8 @@ final class WatchRecorder: NSObject {
                                                lastIndex: last, endOffsetUs: Int64((end - active.startUptime) * 1_000_000),
                                                endedAt: Date(), reason: .userStopped))
         lastClosed = active
+        perfSample("stopped", recordingId: active.recordingId, state: "idle", seal: true)
+        telemetry.monitorBattery(false)
         current = nil
         persist()
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
@@ -170,6 +178,7 @@ final class WatchRecorder: NSObject {
             }
             guard self.current != nil, self.capture == nil else { return }
             self.startSegment()
+            self.perfSample("resumed")
         }
     }
 
@@ -213,18 +222,17 @@ final class WatchRecorder: NSObject {
         // a rotation just before Stop can arrive after it: the recording is closed, the audio still kept
         guard let a = current?.recordingId == recordingId ? current : lastClosed, a.recordingId == recordingId else { return }
         add(file: done.url, active: a, index: done.index, start: done.start, seconds: done.seconds)
-        if let s = capture?.stats {
-            sync.captureStats = ["callbacks": s.callbacks, "buffer_allocations": s.bufferAllocations, "boundary_copies": s.boundaryCopies,
-                                 "segments": s.segments]
-        }
+        sync.captureStats = captureCounters()
         guard current?.recordingId == recordingId else { return }
         current?.index = max(a.index, done.index + 1)
         current?.segmentStartUptime = a.startUptime + done.start + done.seconds
         persist()
+        perfSample("periodic")
         if capture != nil, let reason = storagePauseReason() {
             watchLog.error("pausing: \(reason)")
             finishSegment()
             state = .interrupted(reason)
+            perfSample("paused")
         }
     }
 
@@ -242,6 +250,7 @@ final class WatchRecorder: NSObject {
         watchLog.error("capture failed: \(why)")
         finishSegment()
         state = .interrupted("Paused: \(why). Tap Resume to try again.")
+        perfSample("failed")
     }
 
     private func storagePauseReason() -> String? {
@@ -254,6 +263,7 @@ final class WatchRecorder: NSObject {
         guard let c = capture, let a = current else { return }
         capture = nil
         let last = c.stop()
+        captureTotals.add(c.stats)
         if let last { add(file: last.url, active: a, index: last.index, start: last.start, seconds: last.seconds) }
         current?.index = c.currentIndex
         current?.segmentStartUptime = ProcessInfo.processInfo.systemUptime
@@ -267,6 +277,7 @@ final class WatchRecorder: NSObject {
                                    startOffsetUs: Int64(start * 1_000_000), endOffsetUs: Int64((start + seconds) * 1_000_000),
                                    bytes: data.count, sha256: WatchHash.sha256(data))
         watchLog.info("segment \(segment.index) ready: \(segment.bytes) bytes, \(seconds, format: .fixed(precision: 3)) s from \(start, format: .fixed(precision: 3)) s")
+        encodedBytes += data.count
         do {
             try outbox.add(segmentFile: url, segment: segment)
             if let c = current, c.recordingId == a.recordingId { current?.lastAddedIndex = max(c.lastAddedIndex, index) }
@@ -277,6 +288,34 @@ final class WatchRecorder: NSObject {
         }
     }
 
+    // MARK: Performance samples
+
+    /// Capture work so far in this app launch (finished runs plus the running one).
+    private var captureTotals = SegmentWriter.Stats()
+    private var encodedBytes = 0
+
+    private func captureCounters() -> [String: Int] {
+        var s = captureTotals
+        if let c = capture?.stats { s.add(c) }
+        return ["callbacks": s.callbacks, "buffer_allocations": s.bufferAllocations, "boundary_copies": s.boundaryCopies,
+                "segments": s.segments, "captured_ms": Int(s.frames / 16), "append_ms": Int(s.appendMicros / 1_000),
+                "encoded_bytes": encodedBytes]
+    }
+
+    /// One sample now (periodic ones at most every 5 min); `state` defaults to what the recorder shows.
+    private func perfSample(_ event: String, recordingId: String? = nil, state: String? = nil, seal: Bool = false) {
+        let shown: String
+        switch self.state {
+        case .recording: shown = "recording"
+        case .interrupted, .failed: shown = current == nil ? "idle" : "paused"
+        case .idle: shown = "idle"
+        }
+        telemetry.sample(event, state: state ?? shown, recordingId: recordingId ?? current?.recordingId,
+                         counters: sync.counters.merging(captureCounters()) { a, _ in a },
+                         gauges: ["outbox_parts": sync.pending, "awaiting_ack": sync.awaitingAck], binding: sync.binding,
+                         seal: seal || event == "paused" || event == "failed" || event == "interrupted")
+    }
+
     // MARK: Interruptions and termination
 
     private func interrupted(_ type: AVAudioSession.InterruptionType?, resume shouldResume: Bool) {
@@ -285,6 +324,7 @@ final class WatchRecorder: NSObject {
         case .began?:
             guard capture != nil else { return }  // already paused
             finishSegment()
+            perfSample("interrupted")
             state = .interrupted("Paused by another app or a call.")
         case .ended?:
             if shouldResume { resume() } else { state = .interrupted("Paused. Tap Resume to continue.") }
@@ -299,6 +339,7 @@ final class WatchRecorder: NSObject {
         guard current != nil else { return }
         watchLog.error("media services were reset")
         finishSegment()
+        perfSample("interrupted")
         state = .interrupted("Paused: the Watch's audio restarted. Tap Resume to continue.")
     }
 
@@ -333,6 +374,7 @@ final class WatchRecorder: NSObject {
         try? outbox.add(end: WatchRecordingEnd(recordingId: a.recordingId, deviceId: Self.deviceId, binding: a.binding, lastIndex: last,
                                                endOffsetUs: Int64((a.segmentStartUptime - a.startUptime) * 1_000_000), endedAt: Date(),
                                                reason: .appRecovered))
+        perfSample("recovered", recordingId: a.recordingId, state: "idle", seal: true)
         current = nil
         persist()
         state = .interrupted("The app closed during a recording. What was recorded is kept.")

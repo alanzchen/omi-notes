@@ -17,7 +17,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.requests import ClientDisconnect
 
-from . import PROTOCOL_VERSION, __version__, operations, priority, recording, search, views
+from . import PROTOCOL_VERSION, __version__, operations, priority, recording, search, views, watch_perf
 from .envelope import MAX_BODY_BYTES
 from .ingest import ApiError, Ingest, capture_status
 from .lock import api_lock
@@ -181,7 +181,7 @@ def create_app(
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes
-            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star"],
+            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star", "watch_performance"],
             "vault_id": vault.vault_id,
         }
 
@@ -211,6 +211,13 @@ def create_app(
         raw = await read_json(request)
         status_code, payload = await run_in_threadpool(ingest.put_event, event_id, raw)
         return JSONResponse(payload, status_code=status_code)
+
+    @app.get("/v1/watch/performance")
+    def watch_performance(days: int = 14) -> dict:
+        """Per-recording Apple Watch battery and work summaries (capture-format-v1.md, "Watch performance")."""
+        days = max(1, min(days, 90))
+        samples, dropped = watch_perf.load(db, time.time() - days * 86400)
+        return {"schema": 1, "days": days, "sessions": watch_perf.summarize(samples), "dropped_batches": dropped}
 
     @app.get("/v1/conversations/recent")
     def recent(limit: int = 20, before: str | None = None) -> dict:

@@ -18,7 +18,7 @@ let package = Package(
         // CoreBluetooth, per-connection sequence, simulated device, app engine.
         .target(name: "OmiBLE", dependencies: ["OmiProtocol", "OmiCapture", "OmiWatchKit"]),
         // Apple Watch recordings relayed through the phone: shared by the Watch and iPhone apps.
-        .target(name: "OmiWatchKit"),
+        .target(name: "OmiWatchKit", dependencies: ["OmiProtocol"]),
 
         .testTarget(name: "OmiProtocolTests", dependencies: ["OmiProtocol"]),
         .testTarget(

@@ -12,9 +12,11 @@ struct OmiNotesWatchApp: App {
     init() {
         let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("watch-outbox", isDirectory: true)
         let outbox = WatchOutbox(root: root)
-        let sync = WatchSync(outbox: outbox)
+        // telemetry is kept apart from audio (its own folder and bound)
+        let perf = WatchPerfQueue(root: root.deletingLastPathComponent().appendingPathComponent("watch-telemetry", isDirectory: true))
+        let sync = WatchSync(outbox: outbox, perf: perf)
         _sync = State(initialValue: sync)
-        _recorder = State(initialValue: WatchRecorder(outbox: outbox, sync: sync))
+        _recorder = State(initialValue: WatchRecorder(outbox: outbox, sync: sync, telemetry: WatchTelemetry(queue: perf)))
     }
 
     var body: some Scene {

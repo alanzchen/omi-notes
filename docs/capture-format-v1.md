@@ -145,6 +145,48 @@ recording*, finalized as discarded with that reason (no second note; its audio i
 other). Otherwise both are kept (`partial`, `uncertain`, `distinct`). The decision and its evidence
 are in `<conversation dir>/source.json` (written before use; delete it and reprocess to undo).
 
+### Watch performance (`watch_perf` events)
+
+While a recording is active the Watch takes small samples of its battery and its own work, keeps
+them in a bounded queue of its own (never mixed with audio, and never making room by touching
+audio), and sends them to the phone in batches with the same acknowledgement rules as audio: the
+phone acknowledges a batch only after writing it to its upload outbox as a `watch_perf` event whose
+`event_id` is the batch id (the same bytes on every resend), and the server stores events
+idempotently. Old servers accept the event type unchanged; only the summary below needs a newer
+server (`features` contains `watch_performance`).
+
+- **When:** at `start`, `interrupted`, `resumed`, `paused`, `failed`, `stopped`, `recovered`
+  (the app found a recording cut off by termination) and, while recording, `periodic` at most every
+  5 min when a part finishes (no timer or wake of its own). Battery monitoring is on only while a
+  recording is active.
+- **Sample:** `id` (UUID), `at` (Watch clock), `uptime_s` and `boot_at` (= `at - uptime_s`; a
+  reboot or clock change moves it), `launch_id` (one per app launch), `recording_id`, `event`,
+  `state` (`recording`, `paused`, `idle`), `battery` (0–1, **absent when unknown**, never 0 for
+  unknown), `battery_state` (`unplugged`, `charging`, `full`, `unknown`), `counters` (cumulative
+  within `launch_id`: `callbacks`, `buffer_allocations`, `boundary_copies`, `segments`,
+  `captured_ms`, `append_ms` = elapsed time inside the capture path (not CPU use), `encoded_bytes`,
+  `transfers`, `resends`, `acks`, `transfer_failures`, `perf_batches_sent`), `gauges`
+  (`outbox_parts`, `awaiting_ack`), `app`, `os`, `model` (hardware identifier).
+- **Bounds:** a batch closes at 12 samples, after 30 min, or at a recording event other than
+  `periodic`/`start`/`resumed`; at most 200 batches wait on the Watch. Beyond that the oldest are
+  discarded and the next batch reports the count in `dropped_batches`.
+- Callback counts are not hardware wake-ups, and the battery is the whole Watch's.
+
+### `GET /v1/watch/performance?days=14`
+
+Per-recording summaries computed from stored samples (newest first, `days` 1–90), with
+`dropped_batches` per device. An interval between consecutive samples is *measured* only if both
+are from the same boot (`boot_at` within 5 s, uptime increasing), at most 15 min apart, recording,
+on battery and with known levels; otherwise it counts as a gap, charging, not-recording or
+unknown time, never bridged. `rate_pp_per_hour` (whole-Watch percentage points per hour over
+measured time) is given only with ≥ 45 min measured; `rate_quality` is `ok`, `coarse` (change
+< 3 points) or `insufficient`. `counters` are growth within each app launch, summed (never
+negative); `complete` is false until a `stopped` or `recovered` sample arrives. Fields:
+`recording_id`, `device_id`, `started_at`, `last_at`, `complete`, `samples`,
+`samples_battery_unknown`, `battery_start`, `battery_end`, `measured_s`, `battery_drop_pp`,
+`rate_pp_per_hour`, `rate_quality`, `charging_s`, `battery_unknown_s`, `not_recording_s`, `gaps`,
+`gap_list`, `events`, `counters`, `gauges_last`, `builds`, `os`, `models`, `launches`.
+
 ## HTTP API
 
 All `/v1/*` endpoints require `Authorization: Bearer <token>`. JSON responses use
@@ -284,6 +326,7 @@ Small JSON side events, uploaded through the same durable outbox:
 | `button` | `{"code": 1}` single tap = bookmark (rendered in the note); `{"code": 2}` double tap = end the current conversation now; `{"code": 3}` double tap set to "star" = star the conversation this moment belongs to (no split; servers with `pendant_star`) |
 | `voice_enrollment_start` | `{"enrollment_id": "<uuid>"}` with top-level `capture_id` + `offset_us` (window start on the live capture). The phone holds that capture's chunks from here until this event is acknowledged. |
 | `voice_enrollment_end` | `{"enrollment_id": "<uuid>", "end_offset_us": 55000000, "outcome": "completed" \| "cancelled" \| "interrupted"}` with top-level `capture_id` + `offset_us` (= the end). Held by the phone until the start is acknowledged. Speech inside the window is never transcribed; only `completed` windows are judged for enrollment (`docs/speaker-learning.md`). |
+| `watch_perf` | Apple Watch performance batch (see "Watch performance" above): `{"schema": 1, "batch_id": "<uuid = event_id>", "samples": [...], "dropped_batches": 0}`. `device_id` is the Watch's (`watch-…`); no `capture_id`. Stored like any event; nothing in note processing reads it. |
 | `heartbeat` | `{"battery": 83, "charging": false, "firmware_revision": "3.0.21", "model_number": "Omi CV 1", "rtc_valid": true, "offline_unread": 0, "outbox_chunks": 3, "outbox_bytes": 812345, "app_state": "background", "coverage": {"capture_id": "…", "through_offset_us": 734000000, "through_chunk_sequence": 11}}` (all optional) |
 
 `201` first receipt, `200` duplicate (same id and body), `409` same id with a different body (keep,

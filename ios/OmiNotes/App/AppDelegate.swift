@@ -75,7 +75,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
                 return (data, 200)
             }
         }
-        // `-OmiNotesDebugWatchDrop YES`: ingest Watch outbox files copied into Documents/WatchDrop
+        // `-OmiNotesDebugWatchDrop YES`: ingest Watch outbox files (and `perf-*.json` telemetry
+        // batches) copied into Documents/WatchDrop
         // through the same calls WatchConnectivity uses (simulator automation where WatchConnectivity
         // file transfer doesn't work).
         if UserDefaults.standard.bool(forKey: "OmiNotesDebugWatchDrop") {
@@ -87,7 +88,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
                 let base = String(name.dropLast(5))
                 let audio = drop.appendingPathComponent("\(base).m4a")
                 do {
-                    if FileManager.default.fileExists(atPath: audio.path) {
+                    if name.hasPrefix("perf-") {  // a telemetry batch from the Watch's queue
+                        acks.append(try engine.acceptWatchPerf(manifest))
+                    } else if FileManager.default.fileExists(atPath: audio.path) {
                         acks.append(try engine.acceptWatchSegment(file: audio, manifest: manifest))
                     } else {
                         acks.append(try engine.acceptWatchEnd(manifest))

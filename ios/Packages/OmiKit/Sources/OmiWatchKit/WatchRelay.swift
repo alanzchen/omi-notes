@@ -88,7 +88,7 @@ public struct WatchReport: Codable, Equatable, Sendable {
 /// WatchConnectivity payload keys (property-list values only).
 public enum WatchWire {
     public static let kind = "kind", manifest = "manifest", acks = "acks", rejects = "rejects", binding = "binding"
-    public static let segment = "segment", end = "end", report = "report"
+    public static let segment = "segment", end = "end", report = "report", perf = "perf"
 
     public static func encode<T: Encodable>(_ v: T) -> Data {
         let e = JSONEncoder()

@@ -23,6 +23,20 @@ public final class SegmentWriter {
         public var bufferAllocations = 0
         public var boundaryCopies = 0
         public var segments = 0
+        /// Wall time spent inside `append` (conversion, encoding, file writes), in microseconds.
+        /// Elapsed time, not CPU use.
+        public var appendMicros: Int64 = 0
+
+        public init() {}
+
+        public mutating func add(_ o: Stats) {
+            callbacks += o.callbacks
+            frames += o.frames
+            bufferAllocations += o.bufferAllocations
+            boundaryCopies += o.boundaryCopies
+            segments += o.segments
+            appendMicros += o.appendMicros
+        }
     }
 
     public static let rate = 16_000.0
@@ -57,6 +71,8 @@ public final class SegmentWriter {
     /// of this buffer (the first one fixes where this run starts). Returns the segments it completed.
     public func append(_ buffer: AVAudioPCMBuffer, endedAt: Double) throws -> [Finished] {
         stats.callbacks += 1
+        let began = DispatchTime.now().uptimeNanoseconds
+        defer { stats.appendMicros += Int64((DispatchTime.now().uptimeNanoseconds - began) / 1_000) }
         let inRate = buffer.format.sampleRate
         if runStart == nil { runStart = endedAt - Double(buffer.frameLength) / inRate }
         if converter == nil || converter?.inputFormat != buffer.format {

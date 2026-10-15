@@ -70,6 +70,15 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
     }
 
     func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        if userInfo[WatchWire.kind] as? String == WatchWire.perf {
+            do {
+                acknowledge([try engine.acceptWatchPerf(userInfo[WatchWire.manifest] as? Data)], session)
+            } catch {
+                // not acknowledged: the Watch keeps the batch
+                OmiLog.shared.log(.warning, "watch", "performance batch not accepted: \(error.localizedDescription)")
+            }
+            return
+        }
         guard userInfo[WatchWire.kind] as? String == WatchWire.end else { return }
         do {
             acknowledge([try engine.acceptWatchEnd(userInfo[WatchWire.manifest] as? Data)], session)

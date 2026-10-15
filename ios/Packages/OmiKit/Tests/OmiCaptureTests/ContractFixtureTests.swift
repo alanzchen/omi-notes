@@ -160,6 +160,20 @@ import OmiProtocol
             captureId: Self.liveCaptureId, offsetUs: parsed.header.chunkEndOffsetUs)
         try Self.prettyJSON(enrollEnd).write(to: out.appendingPathComponent("event_voice_enrollment_end.json"))
 
+        // Apple Watch performance telemetry: one batch, SYNTHETIC values (docs/capture-format-v1.md, "Watch performance").
+        let perfBatch = "5ee0a000-0000-4000-8000-0000000000b1", rec = "5ee0a000-0000-4000-8000-00000000c0de"
+        func perfSample(_ n: Int, _ event: String, _ battery: Double?, _ state: String) -> WatchPerfSample {
+            WatchPerfSample(id: "5ee0a000-0000-4000-8000-00000000000\(n)", at: "2026-10-15T09:\(String(format: "%02d", n * 5)):00.000Z", uptimeS: 3600 + Double(n * 300),
+                            bootAt: "2026-10-15T08:00:00.000Z", launchId: "5ee0a000-0000-4000-8000-0000000000a1", recordingId: rec,
+                            event: event, state: state, battery: battery, batteryState: battery == nil ? "unknown" : "unplugged",
+                            counters: ["callbacks": n * 3500, "transfers": n * 5, "resends": 0, "acks": n * 5], gauges: ["outbox_parts": 1, "awaiting_ack": 0],
+                            app: "0.1.0 (24)", os: "11.0", model: "Watch7,1")
+        }
+        let perf = EventBody(deviceId: "watch-5ee0a000-synthetic", at: "2026-10-15T09:00:00.000Z", payload: .watchPerf(WatchPerfData(
+            batchId: perfBatch, samples: [perfSample(0, "start", 0.9, "recording"), perfSample(1, "periodic", nil, "recording"),
+                                          perfSample(2, "stopped", 0.89, "idle")], droppedBatches: 0)))
+        try Self.prettyJSON(perf).write(to: out.appendingPathComponent("event_watch_perf.json"))
+
         try Self.readme(live: parsed.header, liveRecords: records, liveSeal: liveSeal, ring: ringParsed.header, ringExpect: expectations, ringSeal: ringSeal)
             .write(to: out.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
         try? FileManager.default.removeItem(at: scratch)
@@ -275,6 +289,8 @@ import OmiProtocol
           chunk 0 of the live sample.
         - `event_voice_enrollment_start.json` / `event_voice_enrollment_end.json` — one enrollment window
           (`enrollment_id` \(Self.enrollmentId)) over the live sample, ending `completed`.
+        - `event_watch_perf.json` — an Apple Watch performance batch (SYNTHETIC values): start, a sample
+          with an unknown battery level (no `battery` field), and stop.
 
         """
     }

@@ -178,6 +178,7 @@ public struct EventBody: Encodable, Sendable, Equatable {
         case heartbeat(HeartbeatData)
         case voiceEnrollmentStart(VoiceEnrollmentStartData)
         case voiceEnrollmentEnd(VoiceEnrollmentEndData)
+        case watchPerf(WatchPerfData)
     }
 
     public var deviceId: String
@@ -201,6 +202,7 @@ public struct EventBody: Encodable, Sendable, Equatable {
         case .heartbeat: return "heartbeat"
         case .voiceEnrollmentStart: return "voice_enrollment_start"
         case .voiceEnrollmentEnd: return "voice_enrollment_end"
+        case .watchPerf: return "watch_perf"
         }
     }
 
@@ -220,6 +222,7 @@ public struct EventBody: Encodable, Sendable, Equatable {
         case .heartbeat(let d): try c.encode(d, forKey: .data)
         case .voiceEnrollmentStart(let d): try c.encode(d, forKey: .data)
         case .voiceEnrollmentEnd(let d): try c.encode(d, forKey: .data)
+        case .watchPerf(let d): try c.encode(d, forKey: .data)
         }
         try c.encodeIfPresent(captureId, forKey: .captureId)
         try c.encodeIfPresent(offsetUs, forKey: .offsetUs)
@@ -346,6 +349,7 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
 
     /// The server understands `voice_enrollment_start`/`_end` (so a reading is never transcribed).
     public var supportsVoiceEnrollment: Bool { features?.contains("voice_enrollment") == true }
+    public var supportsWatchPerformance: Bool { features?.contains("watch_performance") == true }
     public var supportsConversationDetail: Bool { features?.contains("conversation_detail") == true }
     public var supportsIssues: Bool { features?.contains("issues") == true }
     public var supportsRetry: Bool { features?.contains("retry") == true }

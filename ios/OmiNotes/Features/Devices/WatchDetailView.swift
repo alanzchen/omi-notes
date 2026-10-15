@@ -1,4 +1,5 @@
 import OmiBLE
+import OmiProtocol
 import OmiWatchKit
 import SwiftUI
 
@@ -7,6 +8,8 @@ import SwiftUI
 /// stopped on the Watch only.
 struct WatchDetailView: View {
     let model: AppModel
+    /// The server's recording summaries (nil: not loaded, unsupported or unreachable).
+    @State private var performance: WatchPerformance?
 
     /// Where the Watch's audio is; each place separately (they are different queues).
     struct Flow {
@@ -59,6 +62,20 @@ struct WatchDetailView: View {
                         note("Your server makes a note about two minutes after a conversation ends, once its audio has uploaded.")
                     }
 
+                    if summary.configured, let performance {
+                        heading("Battery while recording")
+                        Card {
+                            if performance.sessions.isEmpty {
+                                place("battery.75percent", "No recordings measured yet", "Recordings made with this version appear here.")
+                            }
+                            ForEach(Array(performance.sessions.prefix(3).enumerated()), id: \.element.id) { index, session in
+                                if index > 0 { Divider().padding(.leading, 50) }
+                                place("battery.75percent", Self.when(session), Self.battery(session))
+                            }
+                        }
+                        note("The whole Watch's battery, other apps included. Charging time and gaps are left out.")
+                    }
+
                     heading("Record all day")
                     Card {
                         step(1, "Install", "In the iPhone's Watch app, find Omi Notes under Available Apps and tap Install. It may already be there.")
@@ -90,7 +107,47 @@ struct WatchDetailView: View {
         }
         .navigationTitle("Apple Watch")
         .navigationBarTitleDisplayMode(.inline)
+        .task {
+            #if DEBUG
+            if let name = UserDefaults.standard.string(forKey: "OmiNotesDebugWatchState"), WatchSummary.debugFixture(name) != nil {
+                performance = Self.debugPerformance
+                return
+            }
+            #endif
+            performance = await model.watchPerformance()
+        }
     }
+
+    static func when(_ s: WatchPerformance.Session) -> String {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let start = s.startedAt.flatMap(iso.date(from:)) else { return "A recording" }
+        let end = s.lastAt.flatMap(iso.date(from:))
+        let day = Calendar.current.isDateInToday(start) ? "Today" : start.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
+        let range = "\(start.formatted(date: .omitted, time: .shortened))–\(end?.formatted(date: .omitted, time: .shortened) ?? "?")"
+        return "\(day), \(range)\(s.complete ? "" : " · not finished yet")"
+    }
+
+    static func battery(_ s: WatchPerformance.Session) -> String {
+        let span = Duration.seconds(s.measuredS).formatted(.units(allowed: [.hours, .minutes], width: .abbreviated))
+        var parts: [String] = []
+        if let a = s.batteryStart, let b = s.batteryEnd { parts.append("\(Int((a * 100).rounded()))% → \(Int((b * 100).rounded()))%") }
+        switch (s.rateQuality, s.ratePerHour) {
+        case ("ok", let r?): parts.append(String(format: "%.1f points an hour over %@ on battery", r, span))
+        case ("coarse", _): parts.append("too small a change over \(span) to give a rate")
+        default: parts.append("not enough time on battery to estimate (\(span))")
+        }
+        if s.gaps > 0 { parts.append("\(s.gaps) gap\(s.gaps == 1 ? "" : "s")") }
+        return parts.joined(separator: " · ")
+    }
+
+    #if DEBUG
+    /// Simulator screenshots only (with `-OmiNotesDebugWatchState`): SYNTHETIC summaries.
+    static var debugPerformance: WatchPerformance {
+        let json = #"{"sessions":[{"recording_id":"a","started_at":"2026-10-15T14:02:00.000Z","last_at":"2026-10-15T16:10:00.000Z","complete":false,"battery_start":0.84,"battery_end":0.71,"measured_s":7680,"rate_pp_per_hour":6.1,"rate_quality":"ok","gaps":0,"charging_s":0,"builds":["0.1.0 (24)"]},{"recording_id":"b","started_at":"2026-10-14T13:00:00.000Z","last_at":"2026-10-14T13:25:00.000Z","complete":true,"battery_start":0.9,"battery_end":0.89,"measured_s":1500,"rate_pp_per_hour":null,"rate_quality":"insufficient","gaps":1,"charging_s":0,"builds":["0.1.0 (24)"]}]}"#
+        return try! JSONDecoder().decode(WatchPerformance.self, from: Data(json.utf8))
+    }
+    #endif
 
     @ViewBuilder private func places(_ f: Flow, _ now: Date) -> some View {
         place("applewatch", "On the Watch", f.report.map { r in

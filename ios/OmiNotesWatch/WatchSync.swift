@@ -13,9 +13,12 @@ final class WatchSync: NSObject, WCSessionDelegate {
     private(set) var lastAckAt: Date? = UserDefaults.standard.object(forKey: "omi.lastAckAt") as? Date
     private(set) var activated = false
     let outbox: WatchOutbox
+    /// Performance samples for the server, sent after audio and acknowledged like it.
+    let perf: WatchPerfQueue
 
-    init(outbox: WatchOutbox) {
+    init(outbox: WatchOutbox, perf: WatchPerfQueue) {
         self.outbox = outbox
+        self.perf = perf
         super.init()
         if WCSession.isSupported() {
             WCSession.default.delegate = self
@@ -26,7 +29,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
 
     func refreshCounts() {
         let segments = outbox.segments(), ends = outbox.ends()
-        let waiting = Set(segments.map(\.segment.id) + ends.map(\.id))
+        let waiting = Set(segments.map(\.segment.id) + ends.map(\.id) + perf.ids())
         if resend.entries.keys.contains(where: { !waiting.contains($0) }) { resend.keep(only: waiting) }
         // audio parts only (a recording's end marker isn't audio, but is sent the same way)
         held = segments.filter { $0.segment.binding != binding }.count
@@ -70,11 +73,13 @@ final class WatchSync: NSObject, WCSessionDelegate {
     }
 
     /// Since launch, to compare builds (sent with the status report; nothing is sent for them alone).
-    private var counters: [String: Int] = [:]
+    private(set) var counters: [String: Int] = [:]
     /// The recorder's capture counters, set by the recorder.
     var captureStats: [String: Int] = [:]
 
     private func count(_ key: String, _ n: Int = 1) { counters[key, default: 0] += n }
+
+    var awaitingAck: Int { resend.awaitingAck }
 
     private func markSent(_ id: String, now: Date) {
         count(resend.entries[id] == nil ? "transfers" : "resends")
@@ -117,6 +122,16 @@ final class WatchSync: NSObject, WCSessionDelegate {
             markSent(end.id, now: now)
             session.transferUserInfo([WatchWire.kind: WatchWire.end, "id": end.id, WatchWire.manifest: WatchWire.encode(end)])
         }
+        // telemetry last, two batches at a time (small user-info transfers, after the audio)
+        var perfRoom = 2 - session.outstandingUserInfoTransfers.filter { $0.userInfo[WatchWire.kind] as? String == WatchWire.perf }.count
+        for id in perf.ids() where !inFlight.contains(id) && resend.due(id, now: now) {
+            guard perfRoom > 0 else { break }
+            guard let batch = perf.batch(id), batch.binding == binding else { continue }
+            perfRoom -= 1
+            markSent(batch.id, now: now)
+            count("perf_batches_sent")
+            session.transferUserInfo([WatchWire.kind: WatchWire.perf, "id": batch.id, WatchWire.manifest: WatchWire.encode(batch)])
+        }
         scheduleRecheck()
     }
 
@@ -143,7 +158,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
     /// Looks again later for items whose acknowledgement is overdue.
     private var recheckScheduled = false
     private func scheduleRecheck() {
-        guard !recheckScheduled, pending > 0 else { return }
+        guard !recheckScheduled, pending > 0 || !perf.ids().isEmpty else { return }
         recheckScheduled = true
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(60))
@@ -160,6 +175,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
         if !r.acks.isEmpty {
             watchLog.info("iPhone acknowledged \(r.acks.count) item(s)")
             outbox.acknowledge(r.acks)
+            perf.acknowledge(r.acks)
             resend.acknowledged(r.acks)
             count("acks", r.acks.count)
             lastAckAt = Date()

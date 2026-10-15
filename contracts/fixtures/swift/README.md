@@ -51,3 +51,5 @@ with a 16 kHz mono libopus decoder.
   chunk 0 of the live sample.
 - `event_voice_enrollment_start.json` / `event_voice_enrollment_end.json` — one enrollment window
   (`enrollment_id` 6a0e4c2d-9f1b-4e3a-8c7d-5b2f1e0a9d8c) over the live sample, ending `completed`.
+- `event_watch_perf.json` — an Apple Watch performance batch (SYNTHETIC values): start, a sample
+  with an unknown battery level (no `battery` field), and stop.

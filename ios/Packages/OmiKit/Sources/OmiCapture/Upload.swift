@@ -732,6 +732,10 @@ public struct APIClient: Sendable {
         return r.operation
     }
 
+    public func watchPerformance(days: Int = 14) async throws -> WatchPerformance {
+        try await get("/v1/watch/performance", query: "days=\(days)")
+    }
+
     public func stats(days: Int = 7) async throws -> ServerStats {
         try await get("/v1/stats", query: "days=\(days)")
     }

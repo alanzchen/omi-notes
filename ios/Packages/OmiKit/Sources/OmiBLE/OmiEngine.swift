@@ -492,6 +492,20 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         return end.id
     }
 
+    /// A batch of the Watch's performance samples: queued for the server as a `watch_perf` event
+    /// (event id = batch id, same bytes on every resend) before it is acknowledged to the Watch.
+    public func acceptWatchPerf(_ data: Data?) throws -> String {
+        guard let batch = WatchWire.decode(WatchPerfBatch.self, data), batch.id == batch.data.batchId,
+              batch.id.range(of: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", options: .regularExpression) != nil
+        else { throw WatchRelayError.damaged("telemetry") }
+        guard batch.binding == settings.phoneInstallId else { throw WatchRelayError.wrongPhone }
+        let at = batch.data.samples.first?.at ?? ISO8601UTC.format(Date())
+        let body = EventBody(deviceId: batch.deviceId, at: at, payload: .watchPerf(batch.data))
+        try outbox.write(try ContractJSON.encode(body), kind: .event(eventId: batch.id))
+        queue.async { self.scheduleReconcile() }
+        return batch.id
+    }
+
     /// The Watch app's application context (its latest status report).
     public func acceptWatchReport(_ data: Data?) {
         guard let report = WatchWire.decode(WatchReport.self, data) else { return }
