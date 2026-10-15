@@ -115,8 +115,11 @@ public struct HeartbeatData: Codable, Equatable, Sendable {
     public var outboxBytes: Int64?
     public var appState: String?
     public var coverage: CoverageWatermark?
+    /// The phone's side of the Apple Watch relay (absent before any Watch audio).
+    public var watchRelay: WatchRelayHealth?
 
-    public init(battery: Int? = nil, charging: Bool? = nil, firmwareRevision: String? = nil, modelNumber: String? = nil, rtcValid: Bool? = nil, offlineUnread: Int? = nil, outboxChunks: Int? = nil, outboxBytes: Int64? = nil, appState: String? = nil, coverage: CoverageWatermark? = nil) {
+    public init(battery: Int? = nil, charging: Bool? = nil, firmwareRevision: String? = nil, modelNumber: String? = nil, rtcValid: Bool? = nil, offlineUnread: Int? = nil, outboxChunks: Int? = nil, outboxBytes: Int64? = nil, appState: String? = nil, coverage: CoverageWatermark? = nil, watchRelay: WatchRelayHealth? = nil) {
+        self.watchRelay = watchRelay
         self.battery = battery
         self.charging = charging
         self.firmwareRevision = firmwareRevision
@@ -139,6 +142,30 @@ public struct HeartbeatData: Codable, Equatable, Sendable {
         case outboxBytes = "outbox_bytes"
         case appState = "app_state"
         case coverage
+        case watchRelay = "watch_relay"
+    }
+}
+
+/// Heartbeat `watch_relay`: Watch parts this phone has stored (in all), refused since the app
+/// launched (with the last reason: the Watch keeps refused parts), and still converting.
+public struct WatchRelayHealth: Codable, Equatable, Sendable {
+    public var received: Int
+    public var refused: Int
+    public var lastRefusal: String?
+    public var lastReceivedAt: String?
+    public var inboxPending: Int
+
+    public init(received: Int, refused: Int, lastRefusal: String?, lastReceivedAt: String?, inboxPending: Int) {
+        self.received = received
+        self.refused = refused
+        self.lastRefusal = lastRefusal
+        self.lastReceivedAt = lastReceivedAt
+        self.inboxPending = inboxPending
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case received, refused
+        case lastRefusal = "last_refusal", lastReceivedAt = "last_received_at", inboxPending = "inbox_pending"
     }
 }
 

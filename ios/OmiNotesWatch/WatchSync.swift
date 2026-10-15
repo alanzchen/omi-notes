@@ -88,6 +88,16 @@ final class WatchSync: NSObject, WCSessionDelegate {
 
     var awaitingAck: Int { resend.awaitingAck }
 
+    /// The last WatchConnectivity transfer error's code (0: none since launch), for telemetry.
+    private(set) var lastTransferError = 0
+
+    /// Relay health for a performance sample (cheap: counts already in memory).
+    var relayGauges: [String: Int] {
+        let oldest = outbox.segments().first.map { Int(Date().timeIntervalSince($0.segment.recordingStartedAt)) } ?? 0
+        return ["outbox_parts": pending, "awaiting_ack": awaitingAck, "outstanding_files": activated ? WCSession.default.outstandingFileTransfers.count : -1,
+                "last_transfer_error": lastTransferError, "oldest_waiting_s": oldest]
+    }
+
     private func markSent(_ id: String, now: Date) {
         count(resend.entries[id] == nil ? "transfers" : "resends")
         resend.handedOver(id, now: now)
@@ -220,6 +230,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
     nonisolated func session(_ session: WCSession, didFinish fileTransfer: WCSessionFileTransfer, error: Error?) {
         // delivered or not, the file stays until the iPhone acknowledges it; failures are resent later
         let failed = error.map { "\($0.localizedDescription) (\(($0 as NSError).code))" }
+        let failedCode = error.map { ($0 as NSError).code } ?? 0
         let transferId = fileTransfer.file.metadata?["id"] as? String
         Task { @MainActor in
             if let failed {
@@ -229,6 +240,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
                 // a failed item is due again after the backoff
                 if let transferId { self.resend.failed(transferId) }
                 self.count("transfer_failures")
+                self.lastTransferError = failedCode
             } else {
                 self.failures = 0
                 self.retryAt = nil

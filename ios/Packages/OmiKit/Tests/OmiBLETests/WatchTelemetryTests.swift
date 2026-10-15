@@ -47,6 +47,15 @@ import OmiProtocol
         #expect(q.batches().suffix(2).map(\.data.droppedBatches) == [1, 1] && q.ids().count == WatchPerfQueue.maxBatches)
     }
 
+    @Test func theHeartbeatCarriesTheWatchRelayOnlyWhenThereIsOne() throws {
+        let none = try JSONSerialization.jsonObject(with: ContractJSON.encode(HeartbeatData(battery: 80))) as? [String: Any]
+        #expect(none?["watch_relay"] == nil, "older shape unchanged without Watch audio")
+        let relay = HeartbeatData(watchRelay: WatchRelayHealth(received: 25, refused: 3, lastRefusal: "segment: damaged", lastReceivedAt: nil, inboxPending: 1))
+        let body = try #require(JSONSerialization.jsonObject(with: ContractJSON.encode(relay)) as? [String: Any])
+        let r = try #require(body["watch_relay"] as? [String: Any])
+        #expect(r["received"] as? Int == 25 && r["refused"] as? Int == 3 && r["last_refusal"] as? String == "segment: damaged" && r["inbox_pending"] as? Int == 1)
+    }
+
     @Test func thePhoneQueuesEachBatchOnceAsAnEventAndRefusesAnotherPhones() async throws {
         let dir = root()
         let settings = SettingsStore(defaults: UserDefaults(suiteName: "omi-perf-\(UUID().uuidString)")!, tokens: InMemoryTokenStore())

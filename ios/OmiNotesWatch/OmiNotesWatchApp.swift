@@ -56,7 +56,12 @@ struct OmiNotesWatchApp: App {
                     #endif
                 }
         }
-        .onChange(of: phase) { _, now in if now == .active { sync.pump() } }
+        .onChange(of: phase) { _, now in
+            if now == .active {
+                sync.pump()
+                recorder.noteOpened()
+            }
+        }
     }
 }
 

@@ -301,6 +301,16 @@ final class WatchRecorder: NSObject {
 
     // MARK: Performance samples
 
+    private var lastOpenedSample: Date?
+
+    /// The app came to the front: one sample (at most every 30 min) with the relay's state, so a
+    /// stuck queue shows on the server without a recording. No wake of its own.
+    func noteOpened() {
+        if let last = lastOpenedSample, Date().timeIntervalSince(last) < 30 * 60 { return }
+        lastOpenedSample = Date()
+        perfSample("opened", seal: true)
+    }
+
     /// Capture work so far in this app launch (finished runs plus the running one).
     private var captureTotals = SegmentWriter.Stats()
     private var encodedBytes = 0
@@ -328,7 +338,7 @@ final class WatchRecorder: NSObject {
         }
         telemetry.sample(event, state: state ?? shown, recordingId: recordingId ?? a?.recordingId, mono: mono,
                          counters: sync.counters.merging(captureCounters()) { a, _ in a },
-                         gauges: ["outbox_parts": sync.pending, "awaiting_ack": sync.awaitingAck], binding: sync.binding,
+                         gauges: sync.relayGauges, binding: sync.binding,
                          seal: seal || event == "paused" || event == "failed" || event == "interrupted")
     }
 

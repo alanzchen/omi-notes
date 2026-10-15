@@ -162,6 +162,14 @@ public final class WatchOutbox: @unchecked Sendable {
     private let lock = NSLock()
     private var segmentsDir: URL { root.appendingPathComponent("segments", isDirectory: true) }
     private var endsDir: URL { root.appendingPathComponent("ends", isDirectory: true) }
+    /// What is on disk, read once per launch and then kept current by `add` and `acknowledge`: the
+    /// sync loop asks for the queue after every part, and reading every manifest each time grew
+    /// with the backlog (a day away from the iPhone is over a thousand files). The files stay the
+    /// truth; only this process changes them.
+    private var segmentIndex: [String: WatchSegment]?
+    private var endIndex: [String: WatchRecordingEnd]?
+    /// Manifests read from disk (to compare builds; flat after the first read).
+    public private(set) var manifestReads = 0
 
     public init(root: URL) {
         self.root = root
@@ -178,26 +186,52 @@ public final class WatchOutbox: @unchecked Sendable {
         }
         try Files.fsync(audio)
         try Files.durableWrite(WatchWire.encode(segment), to: segmentsDir.appendingPathComponent("\(segment.id).json"))
+        loadSegments()
+        segmentIndex?[segment.id] = segment
     }
 
     public func add(end: WatchRecordingEnd) throws {
         lock.lock(); defer { lock.unlock() }
         try Files.durableWrite(WatchWire.encode(end), to: endsDir.appendingPathComponent("\(end.id).json"))
+        loadEnds()
+        endIndex?[end.id] = end
+    }
+
+    /// Called with `lock` held.
+    private func loadSegments() {
+        guard segmentIndex == nil else { return }
+        var index: [String: WatchSegment] = [:]
+        for name in Files.names(segmentsDir, suffix: ".json") {
+            manifestReads += 1
+            guard let s = WatchWire.decode(WatchSegment.self, try? Data(contentsOf: segmentsDir.appendingPathComponent(name))),
+                  FileManager.default.fileExists(atPath: segmentsDir.appendingPathComponent("\(s.id).m4a").path) else { continue }
+            index[s.id] = s
+        }
+        segmentIndex = index
+    }
+
+    private func loadEnds() {
+        guard endIndex == nil else { return }
+        var index: [String: WatchRecordingEnd] = [:]
+        for name in Files.names(endsDir, suffix: ".json") {
+            manifestReads += 1
+            if let e = WatchWire.decode(WatchRecordingEnd.self, try? Data(contentsOf: endsDir.appendingPathComponent(name))) { index[e.id] = e }
+        }
+        endIndex = index
     }
 
     public func segments() -> [(segment: WatchSegment, file: URL)] {
         lock.lock(); defer { lock.unlock() }
-        return Files.names(segmentsDir, suffix: ".json").compactMap { name in
-            guard let s = WatchWire.decode(WatchSegment.self, try? Data(contentsOf: segmentsDir.appendingPathComponent(name))) else { return nil }
-            let audio = segmentsDir.appendingPathComponent("\(s.id).m4a")
-            return FileManager.default.fileExists(atPath: audio.path) ? (s, audio) : nil
-        }
-        .sorted { ($0.segment.recordingStartedAt, $0.segment.index) < ($1.segment.recordingStartedAt, $1.segment.index) }
+        loadSegments()
+        return (segmentIndex ?? [:]).values
+            .sorted { ($0.recordingStartedAt, $0.index) < ($1.recordingStartedAt, $1.index) }
+            .map { ($0, segmentsDir.appendingPathComponent("\($0.id).m4a")) }
     }
 
     public func ends() -> [WatchRecordingEnd] {
         lock.lock(); defer { lock.unlock() }
-        return Files.names(endsDir, suffix: ".json").compactMap { WatchWire.decode(WatchRecordingEnd.self, try? Data(contentsOf: endsDir.appendingPathComponent($0))) }
+        loadEnds()
+        return Array((endIndex ?? [:]).values)
     }
 
     /// The phone has these (segment or end ids): only now are they removed from the Watch.
@@ -208,6 +242,8 @@ public final class WatchOutbox: @unchecked Sendable {
                         endsDir.appendingPathComponent("\(id).json")] {
                 _ = try? FileManager.default.removeItem(at: url)
             }
+            segmentIndex?[id] = nil
+            endIndex?[id] = nil
         }
     }
 
@@ -215,7 +251,9 @@ public final class WatchOutbox: @unchecked Sendable {
 
     /// Bytes of audio waiting for the phone.
     public var waitingBytes: Int64 {
-        segments().reduce(0) { $0 + Int64($1.segment.bytes) }
+        lock.lock(); defer { lock.unlock() }
+        loadSegments()
+        return (segmentIndex ?? [:]).values.reduce(0) { $0 + Int64($1.bytes) }
     }
 }
 

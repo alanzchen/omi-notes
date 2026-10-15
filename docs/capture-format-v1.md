@@ -156,8 +156,9 @@ idempotently. Old servers accept the event type unchanged; only the summary belo
 server (`features` contains `watch_performance`).
 
 - **When:** at `start`, `interrupted`, `resumed`, `paused`, `failed`, `stopped`, `recovered`
-  (the app found a recording cut off by termination) and, while recording, `periodic` at most every
-  5 min when a part finishes (no timer or wake of its own). Battery monitoring is on only while a
+  (the app found a recording cut off by termination), `opened` (the app came to the front; at most
+  every 30 min, outside recordings too, for the relay's state) and, while recording, `periodic` at
+  most every 5 min when a part finishes (no timer or wake of its own). Battery monitoring is on only while a
   recording is active.
 - **Sample:** `id` (UUID), `at` (Watch clock), `mono_s` (monotonic seconds since the recording
   started, like chunk offsets; absent when it started before a reboot), `boot_id` (random, new
@@ -168,7 +169,9 @@ server (`features` contains `watch_performance`).
   within `launch_id`: `callbacks`, `buffer_allocations`, `boundary_copies`, `segments`,
   `captured_ms`, `append_ms` = elapsed time inside the capture path (not CPU use), `encoded_bytes`,
   `transfers`, `resends`, `acks`, `transfer_failures`, `perf_batches_sent`), `gauges`
-  (`outbox_parts`, `awaiting_ack`), `app`, `os`, `model` (hardware identifier).
+  (`outbox_parts`, `awaiting_ack`, `outstanding_files` (WatchConnectivity transfers in flight, −1
+  before activation), `last_transfer_error` (the last failed transfer's error code, 0 if none since
+  launch), `oldest_waiting_s`), `app`, `os`, `model` (hardware identifier).
 - **Bounds:** a batch closes at 12 samples, after 30 min, or at a recording event other than
   `periodic`/`start`/`resumed`; at most 200 batches wait on the Watch. Beyond that the oldest are
   discarded and the next batch reports the count in `dropped_batches`.
@@ -187,7 +190,10 @@ negative); `complete` is false until a `stopped` or `recovered` sample arrives. 
 `recording_id`, `device_id`, `started_at`, `last_at`, `complete`, `samples`,
 `samples_battery_unknown`, `battery_start`, `battery_end`, `measured_s`, `battery_drop_pp`,
 `rate_pp_per_hour`, `rate_quality`, `charging_s`, `battery_unknown_s`, `not_recording_s`, `gaps`,
-`gap_list`, `events`, `counters`, `gauges_last`, `builds`, `os`, `models`, `launches`.
+`gap_list`, `events`, `counters`, `gauges_last`, `builds`, `os`, `models`, `launches`. Samples are
+ordered by boot (first seen), then `mono_s`, so a Watch clock change can't reorder a boot. Also:
+`latest_watch` (each Watch's newest sample of any kind: its relay gauges even when not recording)
+and `phone_relay` (each phone's latest heartbeat `watch_relay`, with `heartbeat_at`).
 
 ## HTTP API
 
@@ -329,7 +335,7 @@ Small JSON side events, uploaded through the same durable outbox:
 | `voice_enrollment_start` | `{"enrollment_id": "<uuid>"}` with top-level `capture_id` + `offset_us` (window start on the live capture). The phone holds that capture's chunks from here until this event is acknowledged. |
 | `voice_enrollment_end` | `{"enrollment_id": "<uuid>", "end_offset_us": 55000000, "outcome": "completed" \| "cancelled" \| "interrupted"}` with top-level `capture_id` + `offset_us` (= the end). Held by the phone until the start is acknowledged. Speech inside the window is never transcribed; only `completed` windows are judged for enrollment (`docs/speaker-learning.md`). |
 | `watch_perf` | Apple Watch performance batch (see "Watch performance" above): `{"schema": 1, "batch_id": "<uuid = event_id>", "samples": [...], "dropped_batches": 0}`. `device_id` is the Watch's (`watch-…`); no `capture_id`. Stored like any event; nothing in note processing reads it. |
-| `heartbeat` | `{"battery": 83, "charging": false, "firmware_revision": "3.0.21", "model_number": "Omi CV 1", "rtc_valid": true, "offline_unread": 0, "outbox_chunks": 3, "outbox_bytes": 812345, "app_state": "background", "coverage": {"capture_id": "…", "through_offset_us": 734000000, "through_chunk_sequence": 11}}` (all optional) |
+| `heartbeat` | `{"battery": 83, "charging": false, "firmware_revision": "3.0.21", "model_number": "Omi CV 1", "rtc_valid": true, "offline_unread": 0, "outbox_chunks": 3, "outbox_bytes": 812345, "app_state": "background", "coverage": {"capture_id": "…", "through_offset_us": 734000000, "through_chunk_sequence": 11}}` (all optional). Optional `watch_relay`: `{"received": 25, "refused": 0, "last_refusal": null, "last_received_at": "…", "inbox_pending": 0}` (Watch parts this phone stored in all, refused since launch with the last reason, still converting). |
 
 `201` first receipt, `200` duplicate (same id and body), `409` same id with a different body (keep,
 flag). Heartbeats feed `_status.md`.

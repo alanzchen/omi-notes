@@ -90,5 +90,14 @@ import OmiCapture
         // a relaunch sees the same pending state
         let again = WatchOutbox(root: root.appendingPathComponent("outbox"))
         #expect(again.pendingCount == 2)
+        // the sync loop asks again and again: manifests are read from disk once per launch
+        for _ in 0..<20 { _ = again.segments(); _ = again.ends(); _ = again.waitingBytes }
+        #expect(again.manifestReads == 2)
+        let c = try Self.segmentFile(seconds: 1, in: root, name: "c")
+        let mc = manifest(c, recording: "r", index: 2, binding: "p", start: 2_000_000)
+        try again.add(segmentFile: c, segment: mc)
+        #expect(again.segments().map(\.segment.id) == [mb.id, mc.id] && again.manifestReads == 2, "kept current without rereading")
+        again.acknowledge([mb.id])
+        #expect(again.segments().map(\.segment.id) == [mc.id] && WatchOutbox(root: root.appendingPathComponent("outbox")).segments().map(\.segment.id) == [mc.id])
     }
 }

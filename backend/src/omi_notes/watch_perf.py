@@ -76,8 +76,43 @@ def summarize(samples: list[dict]) -> list[dict]:
     return sorted((_session(rid, rows) for rid, rows in by_recording.items()), key=lambda x: x["started_at"], reverse=True)
 
 
+def _ordered(rows: list[dict]) -> list[dict]:
+    """Boots in the order they first appear; within a boot, by monotonic offset (a Watch clock
+    change can't reorder them), samples without one by their clock."""
+    first: dict[str, float] = {}
+    for s in rows:
+        first[s["boot_id"]] = min(first.get(s["boot_id"], s["_at"]), s["_at"])
+    return sorted(rows, key=lambda s: (first[s["boot_id"]], s["boot_id"], s["_mono"] is None,
+                                       s["_mono"] if s["_mono"] is not None else s["_at"]))  # fmt: skip
+
+
+def latest(samples: list[dict]) -> dict[str, dict]:
+    """Each Watch's newest sample of any kind (also `opened`, outside recordings): its relay state."""
+    out: dict[str, dict] = {}
+    for s in samples:
+        if s["device_id"] not in out or s["_at"] > out[s["device_id"]]["_at"]:
+            out[s["device_id"]] = s
+    keep = ("at", "event", "state", "recording_id", "battery", "battery_state", "counters", "gauges", "app", "os", "model")
+    return {d: {k: s.get(k) for k in keep} for d, s in out.items()}
+
+
+def phone_relay(db) -> dict[str, dict]:
+    """The latest phone heartbeat's `watch_relay` per phone device (pendant id), with its time."""
+    out: dict[str, dict] = {}
+    for row in db.query("SELECT device_id, at, body_json FROM events WHERE type='heartbeat' ORDER BY at DESC LIMIT 200"):
+        if row["device_id"] in out:
+            continue
+        try:
+            relay = (json.loads(row["body_json"]).get("data") or {}).get("watch_relay")
+        except ValueError:
+            continue
+        if isinstance(relay, dict):
+            out[row["device_id"]] = {"heartbeat_at": row["at"], **relay}
+    return out
+
+
 def _session(recording_id: str, rows: list[dict]) -> dict:
-    rows = sorted(rows, key=lambda s: (s["_at"], s["_mono"] if s["_mono"] is not None else -1))
+    rows = _ordered(rows)
     measured = charging = unknown = paused = drop = 0.0
     gaps: list[dict] = []
     for a, b in zip(rows, rows[1:]):
@@ -138,7 +173,7 @@ def _deltas(rows: list[dict]) -> dict[str, int]:
     for s in rows:
         by_launch.setdefault(str(s.get("launch_id")), []).append(s)
     for launch in by_launch.values():
-        launch.sort(key=lambda s: s["_at"])
+        launch[:] = _ordered(launch)
         first: dict[str, int] = {}
         last: dict[str, int] = {}
         for s in launch:  # each counter's first and last observed value (a sample may lack one)

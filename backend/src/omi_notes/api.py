@@ -217,7 +217,8 @@ def create_app(
         """Per-recording Apple Watch battery and work summaries (capture-format-v1.md, "Watch performance")."""
         days = max(1, min(days, 90))
         samples, dropped = watch_perf.load(db, time.time() - days * 86400)
-        return {"schema": 1, "days": days, "sessions": watch_perf.summarize(samples), "dropped_batches": dropped}
+        return {"schema": 1, "days": days, "sessions": watch_perf.summarize(samples), "dropped_batches": dropped,
+                "latest_watch": watch_perf.latest(samples), "phone_relay": watch_perf.phone_relay(db)}  # fmt: skip
 
     @app.get("/v1/conversations/recent")
     def recent(limit: int = 20, before: str | None = None) -> dict:

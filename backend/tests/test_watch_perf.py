@@ -87,6 +87,29 @@ def test_a_relaunch_never_gives_negative_deltas_and_a_reboot_is_a_gap(client):
     assert row["measured_s"] == 15 * 60 and row["rate_pp_per_hour"] is None and row["rate_quality"] == "insufficient"
 
 
+def test_a_watch_clock_change_does_not_reorder_a_boots_samples(client):
+    s = [sample(m, round(0.9 - 0.001 * m, 3)) for m in range(0, 50, 5)]
+    for x in s[5:]:  # the Watch's clock was set back an hour mid-recording; mono_s keeps counting
+        x["at"] = iso(T0 + (int(x["mono_s"]) - 3600))
+    put(client, s)
+    (row,) = summary(client)["sessions"]
+    assert row["measured_s"] == 45 * 60 and row["gaps"] == 0, row
+
+
+def test_the_latest_watch_and_phone_relay_state_are_reported(client):
+    opened = sample(0, None, event="opened", state="idle", rec=None) | {"gauges": {"outbox_parts": 1139, "outstanding_files": 4,
+                                                                                    "last_transfer_error": 7014}}  # fmt: skip
+    opened.pop("recording_id")
+    put(client, [opened])
+    hb = {"device_id": "pendant-1", "type": "heartbeat", "at": iso(T0),
+          "data": {"watch_relay": {"received": 25, "refused": 3, "last_refusal": "segment: damaged", "inbox_pending": 0}}}  # fmt: skip
+    assert client.put(f"/v1/events/{uuid.uuid4()}", json=hb, headers=AUTH).status_code == 201
+    body = summary(client)
+    assert body["sessions"] == [], "an `opened` sample is not a recording"
+    assert body["latest_watch"][WATCH]["gauges"]["outbox_parts"] == 1139 and body["latest_watch"][WATCH]["event"] == "opened"
+    assert body["phone_relay"]["pendant-1"]["refused"] == 3 and body["phone_relay"]["pendant-1"]["last_refusal"] == "segment: damaged"
+
+
 def test_a_long_silence_between_samples_is_a_gap_not_measured_time(client):
     put(client, [sample(0, 0.5), sample(5, 0.49), sample(60, 0.40), sample(65, 0.39)])
     (row,) = summary(client)["sessions"]

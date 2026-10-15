@@ -66,6 +66,7 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
         } catch {
             // not acknowledged: the Watch keeps it (and resends it, or holds it for its own iPhone)
             OmiLog.shared.log(.warning, "watch", "segment not accepted: \(error.localizedDescription)")
+            engine.noteWatchRefusal("segment: \(error.localizedDescription)")
         }
     }
 
@@ -76,6 +77,7 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
             } catch {
                 // not acknowledged: the Watch keeps the batch
                 OmiLog.shared.log(.warning, "watch", "performance batch not accepted: \(error.localizedDescription)")
+                engine.noteWatchRefusal("perf: \(error.localizedDescription)")
             }
             return
         }
@@ -84,6 +86,7 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
             acknowledge([try engine.acceptWatchEnd(userInfo[WatchWire.manifest] as? Data)], session)
         } catch {
             OmiLog.shared.log(.warning, "watch", "recording end not accepted: \(error.localizedDescription)")
+            engine.noteWatchRefusal("end: \(error.localizedDescription)")
         }
     }
 }

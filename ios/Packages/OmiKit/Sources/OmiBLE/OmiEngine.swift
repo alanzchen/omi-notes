@@ -506,6 +506,24 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         return batch.id
     }
 
+    private var watchRefused = 0
+    private var watchLastRefusal: String?
+
+    /// A Watch item this phone didn't accept (the Watch keeps it): counted for the heartbeat.
+    public func noteWatchRefusal(_ reason: String) {
+        queue.async {
+            self.watchRefused += 1
+            self.watchLastRefusal = String(reason.prefix(160))
+        }
+    }
+
+    private func watchRelayHealth() -> WatchRelayHealth? {
+        let received = watchInbox.receivedSummary(), pending = watchInbox.pendingCount
+        guard received.count + pending + watchRefused > 0 else { return nil }
+        return WatchRelayHealth(received: received.count + pending, refused: watchRefused, lastRefusal: watchLastRefusal,
+                                lastReceivedAt: received.last.map(ISO8601UTC.format), inboxPending: pending)
+    }
+
     /// The Watch app's application context (its latest status report).
     public func acceptWatchReport(_ data: Data?) {
         guard let report = WatchWire.decode(WatchReport.self, data) else { return }
@@ -1074,7 +1092,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             battery: info?.battery, charging: info?.charging, firmwareRevision: info?.firmwareRevision,
             modelNumber: info?.modelNumber, rtcValid: info?.rtcValid, offlineUnread: info?.offlineUnread,
             outboxChunks: outboxStats.pendingChunks, outboxBytes: outboxStats.pendingBytes,
-            appState: appActive ? "foreground" : "background", coverage: recorder.coverage())
+            appState: appActive ? "foreground" : "background", coverage: recorder.coverage(), watchRelay: watchRelayHealth())
         do {
             try events.heartbeat(deviceId: deviceId, data: data)
             lastHeartbeatMono = config.clock.monotonicNanoseconds()
