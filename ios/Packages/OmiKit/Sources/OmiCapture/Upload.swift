@@ -209,7 +209,9 @@ public final class Uploader: @unchecked Sendable {
     /// background as discretionary (it ignores `isDiscretionary = false` for them and may defer
     /// them), and starts more only when it wakes the app again; tasks started while the app is open
     /// keep running in the background session after it is suspended. So the open app hands the
-    /// session a larger window, bounded by count and bytes; a background wake keeps `maxInFlight`.
+    /// session a larger window: at most `foregroundWindow` tasks, and beyond the first `maxInFlight`
+    /// only while their bytes stay within `foregroundWindowBytes`. A background wake keeps
+    /// `maxInFlight`.
     public var foreground = false
     public static let foregroundWindow = 400
     public var foregroundWindowBytes: Int64 = 200_000_000
@@ -306,7 +308,8 @@ public final class Uploader: @unchecked Sendable {
         let ordered = pending.sorted { rank($0.kind) < rank($1.kind) }
         for item in ordered where !started.contains(item.name) {
             if let gate, !gate.mayUpload(item) { held += 1; continue }
-            let roomInWindow = foreground && inFlight < Self.foregroundWindow && scheduledBytes < foregroundWindowBytes
+            // beyond the usual window, only what keeps the scheduled bytes within the bound
+            let roomInWindow = foreground && inFlight < Self.foregroundWindow && scheduledBytes + item.size <= foregroundWindowBytes
             guard inFlight < maxInFlight || roomInWindow else { break }
             if start(item, endpoint: endpoint, key: currentKey) {
                 inFlight += 1

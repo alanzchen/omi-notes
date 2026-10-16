@@ -68,7 +68,7 @@ The total body must be exactly `12 + header_len + payload_bytes` bytes. Max body
 | `firmware_revision` | string \| null | `2A26` |
 | `hardware_revision` | string \| null | `2A27` |
 | `source` | string | `live_ble` \| `device_ring` \| `wav_replay` \| `watch_mic` |
-| `payload_format` | string | `ble_notifications_v1` \| `ring_records_v1` \| `pcm16le_v1` |
+| `payload_format` | string | `ble_notifications_v1` \| `ring_records_v1` \| `pcm16le_v1` \| `aac_m4a_v1` (`watch_mic`, servers with `watch_aac`) |
 | `codec_id` | int | `20` Opus 10 ms (DevKit), `21` Opus 20 ms FS320 (CV1). `pcm16le_v1` uses `0`. PCM ids 0/1 over BLE are **not supported** in v1 (no current firmware emits them). |
 | `sample_rate` | int | `16000` |
 | `channels` | int | `1` |
@@ -145,6 +145,20 @@ recording*, finalized as discarded with that reason (no second note; its audio i
 other). Otherwise both are kept (`partial`, `uncertain`, `distinct`). The decision and its evidence
 are in `<conversation dir>/source.json` (written before use; delete it and reprocess to undo).
 
+
+**AAC relay (`aac_m4a_v1`, servers with `watch_aac`).** A phone that sees `watch_aac` in
+`/v1/status` `features` sends each Watch part as the Watch's own AAC file (`.m4a`, 16 kHz mono),
+unchanged: `payload_format: "aac_m4a_v1"`, `codec_id: 0`, `payload` = the file's bytes,
+`record_count` = the file's frame count from its header (encoder priming excluded),
+`chunk_end_offset_us` = start + `record_count` samples. It is decided once per recording and kept: a
+recording the phone already started as PCM stays PCM (queued chunks are never rewritten), and a new
+recording uses AAC only while the server advertises it. The server decodes the file once at ingest
+(bounded time and size) and answers 422 `invalid_audio` if it doesn't decode to `record_count` ±
+1024 samples (the phone keeps refused files); it stores the envelope unchanged (the original AAC is
+in the vault) and decodes it again when building the timeline. PCM and AAC chunks of one recording
+join sample-continuously. Servers without ffmpeg don't advertise `watch_aac`. **Rollback:** a
+server older than this rejects `aac_m4a_v1` (422, kept on the phone); roll back only to a release
+that reads it.
 ### Watch performance (`watch_perf` events)
 
 While a recording is active the Watch takes small samples of its battery and its own work, keeps

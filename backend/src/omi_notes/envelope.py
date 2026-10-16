@@ -20,14 +20,16 @@ OPUS_CODECS = {20: 160, 21: 320}  # codec id -> samples per frame at 16 kHz
 FLAG_SESSION_START = 0x01
 
 Source = Literal["live_ble", "device_ring", "wav_replay", "watch_mic"]
-PayloadFormat = Literal["ble_notifications_v1", "ring_records_v1", "pcm16le_v1"]
+PayloadFormat = Literal["ble_notifications_v1", "ring_records_v1", "pcm16le_v1", "aac_m4a_v1"]
 
-_SOURCE_FORMAT = {
-    "live_ble": "ble_notifications_v1",
-    "device_ring": "ring_records_v1",
-    "wav_replay": "pcm16le_v1",
-    "watch_mic": "pcm16le_v1",
+_SOURCE_FORMATS = {
+    "live_ble": {"ble_notifications_v1"},
+    "device_ring": {"ring_records_v1"},
+    "wav_replay": {"pcm16le_v1"},
+    # the Watch's own AAC file, relayed unchanged (servers with `watch_aac`), or PCM16 (older phones)
+    "watch_mic": {"pcm16le_v1", "aac_m4a_v1"},
 }
+SAMPLE_US = 1_000_000 / 16_000
 
 
 class EnvelopeError(ValueError):
@@ -72,11 +74,11 @@ class EnvelopeHeader(BaseModel):
 
     @model_validator(mode="after")
     def _consistent(self) -> EnvelopeHeader:
-        if _SOURCE_FORMAT[self.source] != self.payload_format:
-            raise ValueError(f"source {self.source} requires payload_format {_SOURCE_FORMAT[self.source]}")
-        if self.payload_format == "pcm16le_v1":
+        if self.payload_format not in _SOURCE_FORMATS[self.source]:
+            raise ValueError(f"source {self.source} requires payload_format {sorted(_SOURCE_FORMATS[self.source])}")
+        if self.payload_format in ("pcm16le_v1", "aac_m4a_v1"):
             if self.codec_id != 0:
-                raise ValueError("pcm16le_v1 requires codec_id 0")
+                raise ValueError(f"{self.payload_format} requires codec_id 0")
         elif self.codec_id not in OPUS_CODECS:
             raise ValueError(f"unsupported codec_id {self.codec_id} (v1 supports Opus 20 and 21)")
         if self.payload_format == "ring_records_v1":
@@ -177,6 +179,13 @@ def parse_envelope(body: bytes, *, capture_id: str | None = None, chunk_sequence
     elif fmt == "pcm16le_v1":
         if len(payload) != 2 * header.record_count:
             raise EnvelopeError("pcm payload length != 2 * record_count")
+    elif fmt == "aac_m4a_v1":
+        # record_count = the file's frames; the chunk spans exactly them (decoded and checked at ingest)
+        if not payload or header.record_count == 0:
+            raise EnvelopeError("aac_m4a_v1 needs a payload and record_count > 0")
+        span = header.chunk_end_offset_us - header.chunk_start_offset_us
+        if abs(span - header.record_count * SAMPLE_US) > 1_000:
+            raise EnvelopeError("aac_m4a_v1: chunk span != record_count samples")
     return env
 
 

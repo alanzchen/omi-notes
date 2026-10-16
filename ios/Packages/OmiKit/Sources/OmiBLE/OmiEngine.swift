@@ -467,7 +467,20 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     public private(set) lazy var watchInbox = PhoneWatchInbox(root: config.dirs.root.appendingPathComponent("watch", isDirectory: true),
                                                              binding: settings.phoneInstallId)
     private lazy var watchProcessor = WatchRelayProcessor(inbox: watchInbox, outbox: outbox, appVersion: config.appVersion,
-                                                          timezone: config.timezone)
+                                                          timezone: config.timezone,
+                                                          serverTakesAAC: { [weak self] in self?.serverTakesWatchAAC ?? false })
+
+    private static let watchAACKey = "omi.serverWatchAAC"
+
+    /// What the server said last (`/v1/status` features), for the server configuration it came from:
+    /// only that server is sent the Watch's AAC unchanged; otherwise parts are converted to PCM.
+    public func noteServerWatchAAC(_ supported: Bool, generation: Int) {
+        if supported { UserDefaults.standard.set(generation, forKey: Self.watchAACKey) } else { UserDefaults.standard.removeObject(forKey: Self.watchAACKey) }
+    }
+
+    var serverTakesWatchAAC: Bool {
+        (UserDefaults.standard.object(forKey: Self.watchAACKey) as? Int) == settings.serverConfig().generation
+    }
     private var watchLastReceivedAt: Date?
     private var watchReceived = 0
     private var watchUploads: (waiting: Int, lastAt: Date?) = (0, nil)

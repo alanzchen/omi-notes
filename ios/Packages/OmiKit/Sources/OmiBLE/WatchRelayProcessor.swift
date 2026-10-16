@@ -14,11 +14,23 @@ final class WatchRelayProcessor {
     let appVersion: String?
     let timezone: String?
 
-    init(inbox: PhoneWatchInbox, outbox: Outbox, appVersion: String?, timezone: String?) {
+    /// The server keeps and decodes the Watch's AAC itself (`watch_aac`).
+    let serverTakesAAC: () -> Bool
+
+    init(inbox: PhoneWatchInbox, outbox: Outbox, appVersion: String?, timezone: String?, serverTakesAAC: @escaping () -> Bool = { false }) {
         self.inbox = inbox
         self.outbox = outbox
         self.appVersion = appVersion
         self.timezone = timezone
+        self.serverTakesAAC = serverTakesAAC
+    }
+
+    /// The part's own AAC file as the payload (no decode, no re-encode), with its frame count from
+    /// the file's header; nil if it isn't the 16 kHz mono file the Watch writes.
+    static func aacPayload(_ url: URL) throws -> (data: Data, frames: Int)? {
+        let file = try AVAudioFile(forReading: url)
+        guard file.fileFormat.sampleRate == 16_000, file.fileFormat.channelCount == 1, file.length > 0 else { return nil }
+        return (try Data(contentsOf: url), Int(file.length))
     }
 
     /// Converts what is waiting; returns how many outbox items were written.
@@ -27,18 +39,24 @@ final class WatchRelayProcessor {
         var written = 0
         for (segment, file) in inbox.pending() {
             do {
-                let pcm = try WatchAudio.pcm16(from: file)
-                let samples = pcm.count / 2
+                let payload: Data, samples: Int, format: PayloadFormat
+                if inbox.format(of: segment.recordingId, choosing: { serverTakesAAC() ? "aac" : "pcm" }) == "aac",
+                   let aac = try Self.aacPayload(file) {
+                    (payload, samples, format) = (aac.data, aac.frames, .aacM4aV1)
+                } else {
+                    let pcm = try WatchAudio.pcm16(from: file)
+                    (payload, samples, format) = (pcm, pcm.count / 2, .pcm16leV1)
+                }
                 let end = segment.startOffsetUs + Int64(samples) * 1_000_000 / 16_000
                 let header = EnvelopeHeader(
                     captureId: segment.recordingId, chunkSequence: segment.index, deviceId: segment.deviceId,
                     deviceName: segment.deviceName, modelNumber: "Apple Watch", firmwareRevision: nil, hardwareRevision: nil,
-                    source: .watchMic, payloadFormat: .pcm16leV1, codecId: 0,
+                    source: .watchMic, payloadFormat: format, codecId: 0,
                     captureStartedAt: ISO8601UTC.format(segment.recordingStartedAt),
                     chunkStartOffsetUs: segment.startOffsetUs, chunkEndOffsetUs: end, clockQuality: .unknown,
-                    timezone: timezone, recordCount: samples, payloadBytes: pcm.count, offlineStorage: nil, ring: nil,
+                    timezone: timezone, recordCount: samples, payloadBytes: payload.count, offlineStorage: nil, ring: nil,
                     appVersion: appVersion)
-                try outbox.write(try Envelope.build(header: header, payload: pcm), kind: .chunk(captureId: segment.recordingId, sequence: segment.index))
+                try outbox.write(try Envelope.build(header: header, payload: payload), kind: .chunk(captureId: segment.recordingId, sequence: segment.index))
                 try inbox.markConverted(segment, chunkEndUs: end)
                 written += 1
             } catch let e as OutboxError {

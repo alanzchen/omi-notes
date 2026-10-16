@@ -176,6 +176,40 @@ def pcm_envelopes(
     return envelopes
 
 
+def aac_m4a(pcm: np.ndarray) -> bytes:
+    """16 kHz mono int16 → AAC in .m4a (32 kbit/s, like the Watch) with ffmpeg (tests, tooling)."""
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "part.m4a"
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", "pipe:0",
+             "-c:a", "aac", "-b:a", "32k", str(out)],
+            input=pcm.astype("<i2").tobytes(), check=True,
+        )  # fmt: skip
+        return out.read_bytes()
+
+
+def aac_envelopes(
+    pcm: np.ndarray, *, capture_id: str, device_id: str, started_at: datetime, chunk_seconds: float = 60.0, first_seq: int = 0,
+    first_sample: int = 0,
+) -> list[bytes]:
+    """Apple Watch parts as the phone relays them to servers with `watch_aac`: the original AAC file."""
+    step = int(chunk_seconds * SAMPLE_RATE)
+    envelopes = []
+    for c, i in enumerate(range(0, max(len(pcm), 1), step)):
+        part = pcm[i : i + step]
+        start = first_sample + i
+        header = base_header(
+            capture_id=capture_id, seq=first_seq + c, device_id=device_id, source="watch_mic", payload_format="aac_m4a_v1",
+            codec_id=0, started_at=started_at, start_us=start * 1_000_000 // SAMPLE_RATE,
+            end_us=(start + len(part)) * 1_000_000 // SAMPLE_RATE, record_count=len(part),
+        )  # fmt: skip
+        envelopes.append(build_envelope(header, aac_m4a(part)))
+    return envelopes
+
+
 def ring_envelopes(
     pcm: np.ndarray,
     *,

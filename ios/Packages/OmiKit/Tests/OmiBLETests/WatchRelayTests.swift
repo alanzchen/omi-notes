@@ -75,6 +75,67 @@ import OmiCapture
         #expect(seal.lastChunkSequence == 1 && seal.source == .watchMic && seal.reason == .userStopped && seal.endOffsetUs == parsed.header.chunkEndOffsetUs)
     }
 
+    /// Servers with `watch_aac`: the Watch's AAC goes up unchanged (no decode, no re-encode), sized by
+    /// the file's own frame count; a recording already started as PCM stays PCM; others get PCM.
+    @Test func theWatchsAACIsRelayedUnchangedWhenTheServerTakesIt() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-waac-\(UUID().uuidString)")
+        let dirs = CaptureDirectories(root: root)
+        try dirs.create()
+        let outbox = Outbox(dirs: dirs)
+        let inbox = PhoneWatchInbox(root: root.appendingPathComponent("watch"), binding: "phone-A")
+        var takesAAC = true
+        let relay = WatchRelayProcessor(inbox: inbox, outbox: outbox, appVersion: "t", timezone: "UTC", serverTakesAAC: { takesAAC })
+        let tmp = root.appendingPathComponent("tmp"); try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let rec = UUID().uuidString.lowercased()
+        let f0 = try Self.segmentFile(seconds: 2.5, in: tmp, name: "a0")
+        let original = try Data(contentsOf: f0)
+        let frames = try AVAudioFile(forReading: f0).length
+        try inbox.accept(file: f0, segment: manifest(f0, recording: rec, index: 0, binding: "phone-A", start: 0))
+        #expect(relay.process() == 1)
+        let chunk = try #require(outbox.pending().first { $0.kind == .chunk(captureId: rec, sequence: 0) })
+        let parsed = try Envelope.parse(Data(contentsOf: chunk.url))
+        #expect(parsed.header.payloadFormat == .aacM4aV1 && parsed.payload == original, "the original file, byte for byte")
+        #expect(parsed.header.recordCount == Int(frames) && parsed.header.chunkEndOffsetUs == Int64(frames) * 1_000_000 / 16_000)
+        #expect(original.count < Int(frames) * 2, "smaller than PCM: \(original.count) vs \(Int(frames) * 2) bytes")
+
+        // the server stops taking AAC: this recording keeps its format (all parts alike)…
+        takesAAC = false
+        let f1 = try Self.segmentFile(seconds: 1, in: tmp, name: "a1")
+        try inbox.accept(file: f1, segment: manifest(f1, recording: rec, index: 1, binding: "phone-A", start: 2_500_000))
+        #expect(relay.process() == 1)
+        let second = try Envelope.parse(Data(contentsOf: try #require(outbox.pending().first { $0.kind == .chunk(captureId: rec, sequence: 1) }).url))
+        #expect(second.header.payloadFormat == .aacM4aV1)
+        // …and a new recording is converted to PCM
+        let other = UUID().uuidString.lowercased()
+        let f2 = try Self.segmentFile(seconds: 1, in: tmp, name: "b0")
+        try inbox.accept(file: f2, segment: manifest(f2, recording: other, index: 0, binding: "phone-A", start: 0))
+        #expect(relay.process() == 1)
+        let pcm = try Envelope.parse(Data(contentsOf: try #require(outbox.pending().first { $0.kind == .chunk(captureId: other, sequence: 0) }).url))
+        #expect(pcm.header.payloadFormat == .pcm16leV1 && pcm.payload.count == pcm.header.recordCount * 2)
+    }
+
+    @Test func aRecordingAnOlderVersionStartedAsPCMStaysPCM() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-wmix-\(UUID().uuidString)")
+        let dirs = CaptureDirectories(root: root)
+        try dirs.create()
+        let outbox = Outbox(dirs: dirs)
+        let inbox = PhoneWatchInbox(root: root.appendingPathComponent("watch"), binding: "phone-A")
+        let tmp = root.appendingPathComponent("tmp"); try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let rec = UUID().uuidString.lowercased()
+        // part 0 converted by an earlier version (PCM, no format recorded)
+        let old = WatchRelayProcessor(inbox: inbox, outbox: outbox, appVersion: "old", timezone: "UTC")
+        let f0 = try Self.segmentFile(seconds: 1, in: tmp, name: "p0")
+        try inbox.accept(file: f0, segment: manifest(f0, recording: rec, index: 0, binding: "phone-A", start: 0))
+        _ = old.process()
+        try? FileManager.default.removeItem(at: root.appendingPathComponent("watch/formats"))  // as before this version
+        let new = WatchRelayProcessor(inbox: inbox, outbox: outbox, appVersion: "new", timezone: "UTC", serverTakesAAC: { true })
+        let f1 = try Self.segmentFile(seconds: 1, in: tmp, name: "p1")
+        try inbox.accept(file: f1, segment: manifest(f1, recording: rec, index: 1, binding: "phone-A", start: 1_000_000))
+        #expect(new.process() == 1)
+        let part1 = try Envelope.parse(Data(contentsOf: try #require(outbox.pending().first { $0.kind == .chunk(captureId: rec, sequence: 1) }).url))
+        #expect(part1.header.payloadFormat == .pcm16leV1, "queued PCM chunks are never rewritten; the recording stays PCM")
+    }
+
     @Test func theWatchDeletesOnlyWhatThePhoneAcknowledged() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-wout-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import Testing
 @testable import OmiCapture
@@ -174,6 +175,30 @@ import OmiProtocol
                                           perfSample(2, "stopped", 0.89, "idle")], droppedBatches: 0)))
         try Self.prettyJSON(perf).write(to: out.appendingPathComponent("event_watch_perf.json"))
 
+        // An Apple Watch part relayed as its own AAC file (aac_m4a_v1), encoded by Apple's encoder
+        // (AVAudioFile, 16 kHz mono, 32 kbit/s, like the Watch), SYNTHETIC tone.
+        let m4a = scratch.appendingPathComponent("watch.m4a")
+        do {
+            let file = try AVAudioFile(forWriting: m4a, settings: [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 16_000.0,
+                                                                  AVNumberOfChannelsKey: 1, AVEncoderBitRateKey: 32_000])
+            let n = AVAudioFrameCount(16_000 * 7 + 1_234)
+            let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: n)!
+            buffer.frameLength = n
+            for i in 0..<Int(n) { buffer.floatChannelData![0][i] = Float(sin(Double(i) * 2 * .pi * 220 / 16_000) * 0.3) }
+            try file.write(from: buffer)
+        }
+        let aacData = try Data(contentsOf: m4a)
+        let aacFrames = Int(try AVAudioFile(forReading: m4a).length)
+        let aacHeader = EnvelopeHeader(
+            captureId: "5ee0a000-0000-4000-8000-0000000000aa", chunkSequence: 0, deviceId: "watch-5ee0a000-synthetic", deviceName: "Apple Watch",
+            modelNumber: "Apple Watch", firmwareRevision: nil, hardwareRevision: nil, source: .watchMic, payloadFormat: .aacM4aV1, codecId: 0,
+            captureStartedAt: "2026-10-16T09:00:00.000Z", chunkStartOffsetUs: 0, chunkEndOffsetUs: Int64(aacFrames) * 1_000_000 / 16_000,
+            clockQuality: .unknown, timezone: "UTC", recordCount: aacFrames, payloadBytes: aacData.count, offlineStorage: nil, ring: nil, appVersion: "fixture")
+        try Envelope.build(header: aacHeader, payload: aacData).write(to: out.appendingPathComponent("watch_aac_sample.omnc"))
+        try Self.prettyJSON(["aac_sha256": Uploader.sha256Hex(aacData), "frames": "\(aacFrames)", "aac_bytes": "\(aacData.count)",
+                             "pcm16_bytes_equivalent": "\(aacFrames * 2)"])
+            .write(to: out.appendingPathComponent("watch_aac_sample.aac.json"))
+
         try Self.readme(live: parsed.header, liveRecords: records, liveSeal: liveSeal, ring: ringParsed.header, ringExpect: expectations, ringSeal: ringSeal)
             .write(to: out.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
         try? FileManager.default.removeItem(at: scratch)
@@ -289,6 +314,9 @@ import OmiProtocol
           chunk 0 of the live sample.
         - `event_voice_enrollment_start.json` / `event_voice_enrollment_end.json` — one enrollment window
           (`enrollment_id` \(Self.enrollmentId)) over the live sample, ending `completed`.
+        - `watch_aac_sample.omnc` / `.aac.json` — an Apple Watch part relayed as its own AAC file
+          (`aac_m4a_v1`, Apple's encoder, SYNTHETIC tone): `record_count` = the file's frames. Its bytes
+          change on every regeneration (the .m4a container carries timestamps); the pair stays consistent.
         - `event_watch_perf.json` — an Apple Watch performance batch (SYNTHETIC values): start, a sample
           with an unknown battery level (no `battery` field), and stop.
 

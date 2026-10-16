@@ -14,6 +14,8 @@ public enum PayloadFormat: String, Codable, Sendable {
     case bleNotificationsV1 = "ble_notifications_v1"
     case ringRecordsV1 = "ring_records_v1"
     case pcm16leV1 = "pcm16le_v1"
+    /// The Apple Watch's own AAC file (`.m4a`), relayed unchanged; `record_count` = its frames.
+    case aacM4aV1 = "aac_m4a_v1"
 }
 
 public enum ClockQuality: String, Codable, Sendable {
@@ -291,6 +293,8 @@ public enum Envelope {
             guard payload.count == header.recordCount * 2 else {
                 throw EnvelopeError.recordCountMismatch(expected: header.recordCount, actual: payload.count / 2)
             }
+        case .aacM4aV1:
+            guard !payload.isEmpty, header.recordCount > 0 else { throw EnvelopeError.corruptRecords }
         }
         return (header, payload)
     }

@@ -122,7 +122,7 @@ def test_dropped_telemetry_is_reported_and_the_event_is_inert_for_notes(client, 
     assert body["dropped_batches"] == {WATCH: 3}
     worker.tick(T0 + 3600)
     assert worker.db.one("SELECT count(*) AS n FROM conversations")["n"] == 0
-    assert client.get("/v1/status", headers=AUTH).json()["features"][-1] == "watch_performance"
+    assert "watch_performance" in client.get("/v1/status", headers=AUTH).json()["features"]
 
 
 def test_the_phones_watch_perf_fixture_is_accepted_and_summarized(client):

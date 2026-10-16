@@ -35,6 +35,7 @@ import numpy as np
 from ..device.ble_frames import AssemblerStats, BleFrameAssembler, FrameEvent
 from ..device.ring_records import parse_record
 from ..envelope import Envelope
+from . import aac
 from .opus import OpusDecoder, OpusError
 
 SAMPLE_RATE = 16000
@@ -133,7 +134,10 @@ class CaptureTimeline:
                 ring_records.append((ring_seq, digest))
                 self._on_ring_record(ring_seq, raw)
         else:
-            pcm = np.frombuffer(env.payload, dtype="<i2").astype(np.int16)
+            if header.payload_format == "aac_m4a_v1":
+                pcm = aac.decode(env.payload, header.record_count)
+            else:
+                pcm = np.frombuffer(env.payload, dtype="<i2").astype(np.int16)
             start = header.chunk_start_epoch
             expected = self._expected()
             if expected is None or abs(start - expected) > PCM_CONTINUITY_SECONDS:

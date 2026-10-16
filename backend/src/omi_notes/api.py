@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.requests import ClientDisconnect
 
 from . import PROTOCOL_VERSION, __version__, operations, priority, recording, search, views, watch_perf
+from .audio import aac
 from .envelope import MAX_BODY_BYTES
 from .ingest import ApiError, Ingest, capture_status
 from .lock import api_lock
@@ -181,7 +182,7 @@ def create_app(
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes
-            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star", "watch_performance"],
+            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star", "watch_performance"] + (["watch_aac"] if aac.available() else []),
             "vault_id": vault.vault_id,
         }
 

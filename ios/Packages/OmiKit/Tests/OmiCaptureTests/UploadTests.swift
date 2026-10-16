@@ -359,7 +359,10 @@ final class UploaderHarness: @unchecked Sendable {
         h.uploader.foreground = true
         h.reconcile()
         let each = sizes[0]
-        #expect(h.started.count == max(32, Int((5_000 + each - 1) / each)), "\(h.started.count) of \(each)-byte files")
+        // the first 32 always (as in the background); beyond them only within the bound
+        #expect(h.started.count == max(32, Int(5_000 / each)), "\(h.started.count) of \(each)-byte files")
+        let scheduled = h.started.dropFirst(32).count
+        #expect(scheduled == 0 || Int64(h.started.count) * each <= 5_000, "never over the bound beyond the baseline")
     }
 
     @Test func disabledUntilRecoveryCompletes() throws {

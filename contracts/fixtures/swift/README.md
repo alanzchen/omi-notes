@@ -51,5 +51,8 @@ with a 16 kHz mono libopus decoder.
   chunk 0 of the live sample.
 - `event_voice_enrollment_start.json` / `event_voice_enrollment_end.json` — one enrollment window
   (`enrollment_id` 6a0e4c2d-9f1b-4e3a-8c7d-5b2f1e0a9d8c) over the live sample, ending `completed`.
+- `watch_aac_sample.omnc` / `.aac.json` — an Apple Watch part relayed as its own AAC file
+  (`aac_m4a_v1`, Apple's encoder, SYNTHETIC tone): `record_count` = the file's frames. Its bytes
+  change on every regeneration (the .m4a container carries timestamps); the pair stays consistent.
 - `event_watch_perf.json` — an Apple Watch performance batch (SYNTHETIC values): start, a sample
   with an unknown battery level (no `battery` field), and stop.

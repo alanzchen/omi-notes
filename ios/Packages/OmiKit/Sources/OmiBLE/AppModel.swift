@@ -206,6 +206,7 @@ public final class AppModel {
         }
         serverStatus = status
         serverStatusAt = Date()
+        engine.noteServerWatchAAC(status.features?.contains("watch_aac") == true, generation: config.generation)
         rememberValueNotesScope(config)
         let epoch = cacheEpoch
         guard data == dataEpoch else { return }  // a vault change just reset everything

@@ -371,6 +371,20 @@ public final class PhoneWatchInbox: @unchecked Sendable {
         return WatchWire.decode(WatchReport.self, try? Data(contentsOf: root.appendingPathComponent("report.json")))
     }
 
+    /// How a recording's parts go to the server, decided once and kept: `aac` (the Watch's file,
+    /// unchanged) or `pcm` (decoded here, for servers without `watch_aac`). A recording this phone
+    /// already started converting to PCM (an earlier version) stays PCM.
+    public func format(of recordingId: String, choosing preferred: () -> String) -> String {
+        lock.lock(); defer { lock.unlock() }
+        let url = root.appendingPathComponent("formats", isDirectory: true).appendingPathComponent(recordingId)
+        if let kept = try? String(contentsOf: url, encoding: .utf8), !kept.isEmpty { return kept }
+        let converted = Files.names(doneDir, suffix: "").contains { $0.hasPrefix(recordingId + "-") && !$0.hasSuffix("-end") }
+        let chosen = converted ? "pcm" : preferred()
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? Files.durableWrite(Data(chosen.utf8), to: url)
+        return chosen
+    }
+
     /// The Watch recordings this phone has queued audio of (one upload capture each).
     public func recordingIds() -> Set<String> {
         lock.lock(); defer { lock.unlock() }

@@ -23,6 +23,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationError
 
+from .audio import aac
 from .db import Database
 from .envelope import EnvelopeError, EnvelopeHeader, parse_envelope
 from .settings import Settings
@@ -390,6 +391,12 @@ class Ingest:
                 env = parse_envelope(body, capture_id=capture_id, chunk_sequence=seq)
             except EnvelopeError as exc:
                 raise ApiError(422, "invalid_envelope", str(exc)) from exc
+            if env.header.payload_format == "aac_m4a_v1":
+                # refuse a file we can't decode before acknowledging it (the phone keeps refused ones)
+                try:
+                    aac.decode(env.payload, env.header.record_count)
+                except aac.AacError as exc:
+                    raise ApiError(422, "invalid_audio", str(exc)) from exc
             header = env.header
             if (header.device_id, capture_id) in self._dirty:
                 self._recover(header.device_id, capture_id)
