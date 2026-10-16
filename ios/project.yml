@@ -64,6 +64,7 @@ targets:
     dependencies:
       - package: OmiKit
         product: OmiWatchKit
+      - target: OmiNotesComplication
     info:
       path: OmiNotesWatch/Info.plist
       properties:
@@ -86,6 +87,35 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         PROVISIONING_PROFILE_SPECIFIER: $(OMI_WATCH_PROFILE)
         SKIP_INSTALL: YES
+  # The circular watch-face complication (WidgetKit), embedded in the Watch app. It reads the Watch
+  # app's snapshot through the shared keychain group in both entitlements files.
+  OmiNotesComplication:
+    type: app-extension
+    platform: watchOS
+    deploymentTarget: "10.0"
+    configFiles:
+      Debug: Config/Base.xcconfig
+      Release: Config/Base.xcconfig
+    sources:
+      - path: OmiNotesComplication
+    dependencies:
+      - package: OmiKit
+        product: OmiWatchKit
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework
+    settings:
+      base:
+        # registered App ID (Omi Notes Watch Complication)
+        PRODUCT_BUNDLE_IDENTIFIER: $(OMI_APP_BUNDLE_ID).watchkitapp.widgets
+        PRODUCT_NAME: OmiNotesComplication
+        INFOPLIST_FILE: OmiNotesComplication/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: OmiNotesComplication/OmiNotesComplication.entitlements
+        SWIFT_VERSION: "6.0"
+        SKIP_INSTALL: YES
+        APPLICATION_EXTENSION_API_ONLY: YES
+        # Release signing names a profile per target (passed on the command line for TestFlight).
+        PROVISIONING_PROFILE_SPECIFIER: $(OMI_COMPLICATION_PROFILE)
 schemes:
   OmiNotes:
     build:
