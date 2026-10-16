@@ -119,8 +119,12 @@ public final class AppModel {
 
     public func finishOnboarding() { engine.settings.onboarded = true }
 
+    /// Omi Notes is installed on a paired Apple Watch (WatchConnectivity; nil until it has activated).
+    public var watchAppInstalled: Bool?
+
     public func health(now: Date = Date()) -> SystemHealth {
-        SystemHealth.evaluate(snapshot: snapshot, server: server, status: serverStatus, statusAt: serverStatusAt, now: now, issues: issues)
+        SystemHealth.evaluate(snapshot: snapshot, server: server, status: serverStatus, statusAt: serverStatusAt, now: now, issues: issues,
+                              watchAppInstalled: watchAppInstalled)
     }
 
     // MARK: Server

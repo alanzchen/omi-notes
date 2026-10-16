@@ -105,6 +105,7 @@ struct RootView: View {
             tab = .server
         case .resumeRecording: model.engine.setRecordingPaused(false)
         case .collectPendantAudio: model.engine.collectPendantAudioNow()
+        case .openDevices: tab = .devices
         }
     }
 }

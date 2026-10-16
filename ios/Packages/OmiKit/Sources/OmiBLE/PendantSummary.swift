@@ -99,7 +99,9 @@ public struct PendantSummary: Equatable, Sendable {
         issues: [ServerIssue] = []
     ) -> PendantSummary {
         let health = SystemHealth.evaluate(snapshot: s, server: server, status: status, statusAt: statusAt, now: now, issues: issues)
-        let pendant = health.steps.first { $0.area == .pendant }!
+        var pendant = health.steps.first { $0.area == .pendant }!
+        // on the pendant's own page, setting up a device means pairing this pendant
+        if pendant.fix == .openDevices { pendant.fix = .pairDevice }
         let phone = health.steps.first { $0.area == .phone }!
         // Both merely delayed: the phone leads (audio not reaching the server matters more than, say, a
         // low battery). Both needing action: the pendant leads (pairing or Bluetooth comes first).
@@ -334,6 +336,7 @@ extension PendantSummary {
     /// `normal`, `mid`, `charging`, `disconnected`, `unpaired`, `blocked` (uploads blocked + low battery + pendant sync).
     public static func debugFixture(_ name: String, now: Date = Date()) -> PendantSummary? {
         var s = EngineSnapshot()
+        s.ready = true
         s.serverConfigured = true
         s.rememberedDeviceId = "5eed0000-fixture"
         s.rememberedDeviceName = "Omi"
@@ -360,6 +363,7 @@ extension PendantSummary {
             s.upload.lastSuccessAt = now.addingTimeInterval(-24 * 60)
         case "unpaired":
             s = EngineSnapshot()
+            s.ready = true
             server = .notConfigured
             statusAt = nil
         case "blocked":

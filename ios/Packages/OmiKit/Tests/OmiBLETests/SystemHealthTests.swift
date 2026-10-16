@@ -10,6 +10,7 @@ import OmiWatchKit
 
     func streaming() -> EngineSnapshot {
         var s = EngineSnapshot()
+        s.ready = true
         s.connection = .streaming
         s.serverConfigured = true
         s.rememberedDeviceName = "Omi"
@@ -152,11 +153,43 @@ import OmiWatchKit
 
     @Test func nothingPairedNeedsAction() {
         var s = EngineSnapshot()
+        s.ready = true  // the engine looked: no pendant remembered, no Watch evidence
         s.serverConfigured = false
         let h = health(s, .notConfigured, nil)
         #expect(h.level == .needsAction && h.headline == "No recording device set up")
         #expect(step(h, .pendant).detail?.contains("Apple Watch") == true, "either device starts recording")
+        #expect(step(h, .pendant).fix == .openDevices, "both choices, not a pendant-only button")
         #expect(step(h, .server).fix == .openServer)
+    }
+
+    /// Alan's screenshot: both devices set up, yet Home said "No recording device set up". Before the
+    /// engine's first snapshot (it runs launch recovery first) the app showed the empty default as if
+    /// it were the engine's answer.
+    @Test func beforeTheEnginesFirstSnapshotNothingIsClaimedMissing() {
+        let h = health(EngineSnapshot(), reachable(), nil)
+        #expect(step(h, .pendant).level == .unknown && step(h, .pendant).fix == nil, "\(step(h, .pendant))")
+        #expect(step(h, .pendant).title == "Checking your devices" && h.level != .needsAction)
+    }
+
+    @Test func aRememberedPendantOutOfRangeAfterARelaunchIsNotUnpaired() {
+        var s = EngineSnapshot()
+        s.ready = true
+        s.serverConfigured = true
+        s.connection = .waitingForDevice
+        s.rememberedDeviceName = "Omi"
+        let h = health(s, reachable(), nil)
+        #expect(step(h, .pendant).title == "Omi isn't connected" && step(h, .pendant).level == .unknown && step(h, .pendant).fix == nil)
+    }
+
+    @Test func anInstalledWatchAppWithoutAReportIsNotNothingSetUp() {
+        var s = EngineSnapshot()
+        s.ready = true
+        s.serverConfigured = true
+        let h = SystemHealth.evaluate(snapshot: s, server: reachable(), status: nil, statusAt: nil, now: now, watchAppInstalled: true)
+        #expect(step(h, .pendant).level == .normal && step(h, .pendant).fix == nil, "\(step(h, .pendant))")
+        #expect(!step(h, .pendant).title.contains("Recording"), "installed is not recording")
+        let unknown = SystemHealth.evaluate(snapshot: s, server: reachable(), status: nil, statusAt: nil, now: now, watchAppInstalled: nil)
+        #expect(step(unknown, .pendant).level == .needsAction, "no evidence at all: the real first-time case")
     }
 
     @Test func aWatchUserWithoutAPendantIsNotToldToPairOne() {

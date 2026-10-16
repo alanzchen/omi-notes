@@ -8,7 +8,7 @@ import Testing
     let now = Date(timeIntervalSince1970: 1_790_000_000)
 
     func streaming(battery: Int? = 82, charging: Bool? = false) -> EngineSnapshot {
-        var s = EngineSnapshot()
+        var s = EngineSnapshot.answered
         s.connection = .streaming
         s.serverConfigured = true
         s.rememberedDeviceId = "dev"
@@ -75,7 +75,7 @@ import Testing
         var stale = streaming(battery: 40)
         stale.connection = .waitingForDevice  // a leftover session must not look live
         #expect(summary(stale, reachable, nil).battery == .unknown(reason: "Not connected"))
-        #expect(summary(EngineSnapshot(), .notConfigured, nil).battery == .unknown(reason: "No pendant"))
+        #expect(summary(EngineSnapshot.answered, .notConfigured, nil).battery == .unknown(reason: "No pendant"))
     }
 
     @Test func lowBatteryFollowsTheHealthRuleAndChargingIsNotLow() {
@@ -96,7 +96,7 @@ import Testing
     }
 
     @Test func unpairedAsksToPair() {
-        let p = summary(EngineSnapshot(), .notConfigured, nil)
+        let p = summary(EngineSnapshot.answered, .notConfigured, nil)
         #expect(p.headline.level == .needsAction && p.headline.fix == .pairDevice)
         #expect(p.flow[0].title == "Not paired" && p.flow[2].title == "Not connected")
     }
@@ -200,8 +200,18 @@ import Testing
         away.device = nil
         #expect(summary(away, reachable, nil).rows.first?.title == "Looking for your pendant")
 
-        let unpaired = summary(EngineSnapshot(), .notConfigured, nil)
+        let unpaired = summary(EngineSnapshot.answered, .notConfigured, nil)
         #expect(unpaired.rows.map(\.title) == ["Pair your pendant", "No server connected"])
         #expect(unpaired.rows[0].fix == .pairDevice)
+    }
+}
+
+
+extension EngineSnapshot {
+    /// An engine answer (not the app's placeholder before the first one).
+    static var answered: EngineSnapshot {
+        var s = EngineSnapshot()
+        s.ready = true
+        return s
     }
 }

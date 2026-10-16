@@ -33,6 +33,8 @@ public struct SystemHealth: Equatable, Sendable {
     public enum Fix: Equatable, Sendable {
         case pairDevice, reconnectDevice, openBluetoothSettings, retryUploads, openServer, openDiagnostics
         case resumeRecording, collectPendantAudio
+        /// Devices, to add a pendant or set up the Apple Watch.
+        case openDevices
     }
 
     public struct Step: Equatable, Sendable, Identifiable {
@@ -56,9 +58,9 @@ public struct SystemHealth: Equatable, Sendable {
     /// from a failure someone must fix.
     public static func evaluate(
         snapshot s: EngineSnapshot, server: ServerReachability, status: ServerStatus?, statusAt: Date?, now: Date,
-        issues: [ServerIssue] = []
+        issues: [ServerIssue] = [], watchAppInstalled: Bool? = nil
     ) -> SystemHealth {
-        let steps = [pendant(s)] + [watch(s, now: now)].compactMap { $0 } + [phone(s, server: server),
+        let steps = [pendant(s, watchAppInstalled: watchAppInstalled)] + [watch(s, now: now)].compactMap { $0 } + [phone(s, server: server),
                      self.server(server, status: status, statusAt: statusAt, now: now, issues: issues),
                      notes(status, statusAt: statusAt, now: now)]
         let worst = steps.map(\.level).max() ?? .unknown
@@ -76,17 +78,23 @@ public struct SystemHealth: Equatable, Sendable {
 
     // MARK: Steps
 
-    static func pendant(_ s: EngineSnapshot) -> Step {
+    /// `watchAppInstalled`: Omi Notes is installed on a paired Apple Watch (nil while unknown).
+    static func pendant(_ s: EngineSnapshot, watchAppInstalled: Bool? = nil) -> Step {
         func step(_ level: Level, _ title: String, _ detail: String? = nil, _ fix: Fix? = nil) -> Step {
             Step(area: .pendant, level: level, title: title, detail: detail, fix: fix)
         }
+        // the app's placeholder before the engine's first snapshot: nothing is known yet
+        guard s.ready else { return step(.unknown, "Checking your devices") }
         switch s.connection {
         case .noDevice:
             // the Apple Watch records too: without a pendant, that's a choice, not a problem
             if s.watchReport != nil || s.watchLastReceivedAt != nil {
                 return step(.normal, "Using Apple Watch, no pendant", "Its state is in Devices. You can add a pendant there too.")
             }
-            return step(.needsAction, "No recording device set up", "Pair an Omi pendant, or set up Apple Watch in Devices.", .pairDevice)
+            if watchAppInstalled == true {
+                return step(.normal, "Apple Watch app installed, no pendant", "Start a recording on the Watch; its state appears in Devices.")
+            }
+            return step(.needsAction, "No recording device set up", "Pair an Omi pendant, or set up Apple Watch in Devices.", .openDevices)
         case .bluetoothUnavailable(let why):
             return step(.needsAction, "Bluetooth is \(why)", "Turn Bluetooth on and allow Omi Notes to use it.", .openBluetoothSettings)
         case .refused(let why):
@@ -130,6 +138,7 @@ public struct SystemHealth: Equatable, Sendable {
             Step(area: .phone, level: level, title: title, detail: detail, fix: fix)
         }
         let waiting = s.outbox.pendingCount
+        guard s.ready else { return step(.unknown, "Checking this iPhone") }  // placeholder: nothing known yet
         if s.storageTripped {
             return step(.needsAction, "Phone storage is full; recording stopped",
                         "Free up space on this iPhone. Audio already saved here is kept.")

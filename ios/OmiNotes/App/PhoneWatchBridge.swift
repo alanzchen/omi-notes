@@ -9,6 +9,8 @@ import WatchConnectivity
 /// to another iPhone install are refused (the Watch keeps them).
 final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
     let engine: OmiEngine
+    /// Omi Notes installed on a paired Watch (for Home's status), on activation and on every change.
+    var onWatchState: (@Sendable (Bool) -> Void)?
 
     init(engine: OmiEngine) {
         self.engine = engine
@@ -35,6 +37,7 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
     func session(_ session: WCSession, activationDidCompleteWith state: WCSessionActivationState, error: Error?) {
         OmiLog.shared.log(.info, "watch", "WatchConnectivity \(state.rawValue) paired \(session.isPaired) installed \(session.isWatchAppInstalled)\(error.map { " error \($0.localizedDescription)" } ?? "")")
         engine.acceptWatchReport(session.receivedApplicationContext[WatchWire.report] as? Data)
+        if state == .activated { onWatchState?(session.isPaired && session.isWatchAppInstalled) }
         announce(session)
     }
 
@@ -44,7 +47,10 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
         session.activate()  // a different Watch was paired: talk to it
     }
 
-    func sessionWatchStateDidChange(_ session: WCSession) { announce(session) }
+    func sessionWatchStateDidChange(_ session: WCSession) {
+        onWatchState?(session.isPaired && session.isWatchAppInstalled)
+        announce(session)
+    }
 
     /// The Watch's latest status report.
     func session(_ session: WCSession, didReceiveApplicationContext context: [String: Any]) {

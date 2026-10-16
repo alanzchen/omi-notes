@@ -62,6 +62,9 @@ public struct EngineSnapshot: Equatable, Sendable {
     public var serverConfigured = false
     public var lastButton: String?
     public var firmware = FirmwareUpdateState.idle
+    /// The engine built this snapshot (false: the app's empty placeholder before the first one arrives,
+    /// which says nothing about what is set up).
+    public var ready = false
     /// Apple Watch recordings: segments received but not yet queued for upload, and the last receipt.
     public var watchPending = 0
     public var watchLastReceivedAt: Date?
@@ -1294,6 +1297,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     /// Current state (call on the engine queue; tests use `snapshotNow()`).
     func buildSnapshot() -> EngineSnapshot {
         var s = EngineSnapshot()
+        s.ready = true
         s.bluetooth = btState
         s.simulated = settings.simulatedMode
         s.rememberedDeviceId = settings.rememberedDeviceId?.uuidString.lowercased()

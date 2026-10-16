@@ -68,6 +68,7 @@ extension SystemHealth.Fix {
         case .openDiagnostics: return "Show details"
         case .resumeRecording: return "Resume"
         case .collectPendantAudio: return "Collect"
+        case .openDevices: return "Set up a device"
         }
     }
 }
