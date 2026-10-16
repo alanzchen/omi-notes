@@ -26,9 +26,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             simulatedTrace: trace)
         let engine = OmiEngine(config: config, settings: SettingsStore(), background: backgroundTasks)
         model = AppModel(engine: engine)
-        watchBridge = PhoneWatchBridge(engine: engine)
         let model = model!
-        watchBridge?.onWatchState = { installed in Task { @MainActor in model.watchAppInstalled = installed } }
+        watchBridge = PhoneWatchBridge(engine: engine) { installed in Task { @MainActor in model.watchAppInstalled = installed } }
         model.problemAlerts.sink = alerts
         engine.watchStopSink = alerts
         UNUserNotificationCenter.current().delegate = self

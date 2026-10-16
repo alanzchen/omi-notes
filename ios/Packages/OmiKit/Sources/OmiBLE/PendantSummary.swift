@@ -98,7 +98,9 @@ public struct PendantSummary: Equatable, Sendable {
         snapshot s: EngineSnapshot, server: ServerReachability, status: ServerStatus?, statusAt: Date?, now: Date,
         issues: [ServerIssue] = []
     ) -> PendantSummary {
-        let health = SystemHealth.evaluate(snapshot: s, server: server, status: status, statusAt: statusAt, now: now, issues: issues)
+        // this page is about the pendant alone, so an unknown Watch doesn't soften "not paired"
+        let health = SystemHealth.evaluate(snapshot: s, server: server, status: status, statusAt: statusAt, now: now, issues: issues,
+                                           watchAppInstalled: false)
         var pendant = health.steps.first { $0.area == .pendant }!
         // on the pendant's own page, setting up a device means pairing this pendant
         if pendant.fix == .openDevices { pendant.fix = .pairDevice }

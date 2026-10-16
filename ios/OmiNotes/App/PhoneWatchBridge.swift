@@ -9,13 +9,19 @@ import WatchConnectivity
 /// to another iPhone install are refused (the Watch keeps them).
 final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
     let engine: OmiEngine
-    /// Omi Notes installed on a paired Watch (for Home's status), on activation and on every change.
-    var onWatchState: (@Sendable (Bool) -> Void)?
+    /// Omi Notes installed on a paired Watch (for Home's status), on activation and on every change;
+    /// false at once where WatchConnectivity is unsupported. Not called while activation is pending or failed.
+    let onWatchState: @Sendable (Bool) -> Void
 
-    init(engine: OmiEngine) {
+    /// `onWatchState` is set before activation starts, so an early callback can't be missed.
+    init(engine: OmiEngine, onWatchState: @escaping @Sendable (Bool) -> Void) {
         self.engine = engine
+        self.onWatchState = onWatchState
         super.init()
-        guard WCSession.isSupported() else { return }
+        guard WCSession.isSupported() else {
+            onWatchState(false)  // no Watch can pair with this device
+            return
+        }
         WCSession.default.delegate = self
         WCSession.default.activate()
     }
@@ -37,7 +43,7 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
     func session(_ session: WCSession, activationDidCompleteWith state: WCSessionActivationState, error: Error?) {
         OmiLog.shared.log(.info, "watch", "WatchConnectivity \(state.rawValue) paired \(session.isPaired) installed \(session.isWatchAppInstalled)\(error.map { " error \($0.localizedDescription)" } ?? "")")
         engine.acceptWatchReport(session.receivedApplicationContext[WatchWire.report] as? Data)
-        if state == .activated { onWatchState?(session.isPaired && session.isWatchAppInstalled) }
+        if state == .activated { onWatchState(session.isPaired && session.isWatchAppInstalled) }
         announce(session)
     }
 
@@ -48,7 +54,7 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
     }
 
     func sessionWatchStateDidChange(_ session: WCSession) {
-        onWatchState?(session.isPaired && session.isWatchAppInstalled)
+        onWatchState(session.isPaired && session.isWatchAppInstalled)
         announce(session)
     }
 

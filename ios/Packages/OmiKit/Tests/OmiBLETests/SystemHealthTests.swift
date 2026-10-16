@@ -155,7 +155,8 @@ import OmiWatchKit
         var s = EngineSnapshot()
         s.ready = true  // the engine looked: no pendant remembered, no Watch evidence
         s.serverConfigured = false
-        let h = health(s, .notConfigured, nil)
+        // confirmed: WatchConnectivity activated and reports no paired Watch with the app
+        let h = SystemHealth.evaluate(snapshot: s, server: .notConfigured, status: nil, statusAt: nil, now: now, watchAppInstalled: false)
         #expect(h.level == .needsAction && h.headline == "No recording device set up")
         #expect(step(h, .pendant).detail?.contains("Apple Watch") == true, "either device starts recording")
         #expect(step(h, .pendant).fix == .openDevices, "both choices, not a pendant-only button")
@@ -188,8 +189,19 @@ import OmiWatchKit
         let h = SystemHealth.evaluate(snapshot: s, server: reachable(), status: nil, statusAt: nil, now: now, watchAppInstalled: true)
         #expect(step(h, .pendant).level == .normal && step(h, .pendant).fix == nil, "\(step(h, .pendant))")
         #expect(!step(h, .pendant).title.contains("Recording"), "installed is not recording")
-        let unknown = SystemHealth.evaluate(snapshot: s, server: reachable(), status: nil, statusAt: nil, now: now, watchAppInstalled: nil)
-        #expect(step(unknown, .pendant).level == .needsAction, "no evidence at all: the real first-time case")
+    }
+
+    /// The engine has answered (no pendant remembered) but WatchConnectivity hasn't activated yet: the
+    /// Watch is unknown, not absent, so Home must not claim nothing is set up.
+    @Test func aReadyEngineWithWatchConnectivityPendingIsNotNothingSetUp() {
+        var s = EngineSnapshot()
+        s.ready = true
+        s.serverConfigured = true
+        let h = SystemHealth.evaluate(snapshot: s, server: reachable(), status: nil, statusAt: nil, now: now, watchAppInstalled: nil)
+        #expect(step(h, .pendant).level == .unknown && h.level != .needsAction, "\(step(h, .pendant))")
+        #expect(step(h, .pendant).title != "No recording device set up")
+        #expect(step(h, .pendant).fix == .openDevices, "Devices still offers both")
+        #expect(!step(h, .pendant).title.contains("Recording"))
     }
 
     @Test func aWatchUserWithoutAPendantIsNotToldToPairOne() {

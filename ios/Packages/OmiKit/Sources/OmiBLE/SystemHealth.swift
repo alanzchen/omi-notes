@@ -78,7 +78,8 @@ public struct SystemHealth: Equatable, Sendable {
 
     // MARK: Steps
 
-    /// `watchAppInstalled`: Omi Notes is installed on a paired Apple Watch (nil while unknown).
+    /// `watchAppInstalled`: Omi Notes is installed on a paired Apple Watch; nil while unknown
+    /// (WatchConnectivity not activated yet, or failed), which is not the same as no Watch.
     static func pendant(_ s: EngineSnapshot, watchAppInstalled: Bool? = nil) -> Step {
         func step(_ level: Level, _ title: String, _ detail: String? = nil, _ fix: Fix? = nil) -> Step {
             Step(area: .pendant, level: level, title: title, detail: detail, fix: fix)
@@ -93,6 +94,9 @@ public struct SystemHealth: Equatable, Sendable {
             }
             if watchAppInstalled == true {
                 return step(.normal, "Apple Watch app installed, no pendant", "Start a recording on the Watch; its state appears in Devices.")
+            }
+            guard watchAppInstalled == false else {
+                return step(.unknown, "No pendant paired", "Checking for Apple Watch. Devices sets up either.", .openDevices)
             }
             return step(.needsAction, "No recording device set up", "Pair an Omi pendant, or set up Apple Watch in Devices.", .openDevices)
         case .bluetoothUnavailable(let why):
