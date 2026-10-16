@@ -335,6 +335,33 @@ final class UploaderHarness: @unchecked Sendable {
         #expect(h.started.count == 3)
     }
 
+    /// A backlog only moved 32 files per app wake: iOS treats tasks started in the background as
+    /// discretionary, so the open app now hands the session a much larger (bounded) window.
+    @Test func theOpenAppSchedulesALargerBoundedWindowThanABackgroundWake() throws {
+        let h = UploaderHarness()
+        for i in 0..<500 { _ = try h.writeChunk(seq: i) }
+        h.reconcile()
+        #expect(h.started.count == 32, "a background wake: the usual window")
+        h.uploader.foreground = true
+        h.reconcile()
+        #expect(h.started.count == Uploader.foregroundWindow, "\(h.started.count)")
+        #expect(Set(h.started.map(\.name)).count == h.started.count, "nothing started twice")
+        h.uploader.foreground = false
+        h.complete(h.started[0].name, status: 201)
+        #expect(h.started.count == Uploader.foregroundWindow, "back in the background: nothing more until fewer than 32 remain")
+    }
+
+    @Test func theForegroundWindowIsBoundedByBytes() throws {
+        let h = UploaderHarness()
+        h.uploader.foregroundWindowBytes = 5_000  // test-sized
+        var sizes: [Int64] = []
+        for i in 0..<100 { sizes.append(try h.writeChunk(seq: i).size) }
+        h.uploader.foreground = true
+        h.reconcile()
+        let each = sizes[0]
+        #expect(h.started.count == max(32, Int((5_000 + each - 1) / each)), "\(h.started.count) of \(each)-byte files")
+    }
+
     @Test func disabledUntilRecoveryCompletes() throws {
         let h = UploaderHarness()
         h.uploader.enabled = false

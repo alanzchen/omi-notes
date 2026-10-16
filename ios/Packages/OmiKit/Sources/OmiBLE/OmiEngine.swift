@@ -842,6 +842,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     public func appDidBecomeActive() {
         queue.async {
             self.appActive = true
+            self.uploader.foreground = true
             self.endKeepAlive()
             self.central?.ensureConnected()  // re-kick a pending connect on foreground
             self.uploader.reconcile()
@@ -855,6 +856,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     public func appDidEnterBackground() {
         queue.async {
             self.appActive = false
+            self.uploader.foreground = false
             self.recorder.syncNow()
             guard self.session != nil else { return }
             // iOS may suspend us right away (e.g. during a silent stretch, when no notification will
