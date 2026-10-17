@@ -205,16 +205,13 @@ public final class Uploader: @unchecked Sendable {
     public let queue: DispatchQueue
     public var policy = UploadPolicy()
     public var maxInFlight = 32
-    /// The app is in the foreground. iOS treats upload tasks started while the app is in the
-    /// background as discretionary (it ignores `isDiscretionary = false` for them and may defer
-    /// them), and starts more only when it wakes the app again; tasks started while the app is open
-    /// keep running in the background session after it is suspended. So the open app hands the
-    /// session a larger window: at most `foregroundWindow` tasks, and beyond the first `maxInFlight`
-    /// only while their bytes stay within `foregroundWindowBytes`. A background wake keeps
-    /// `maxInFlight`.
-    public var foreground = false
-    public static let foregroundWindow = 400
-    public var foregroundWindowBytes: Int64 = 200_000_000
+    /// iOS treats upload tasks started while the app is in the background as discretionary (it
+    /// ignores `isDiscretionary = false` for them and may defer them) and starts more only when it
+    /// wakes the app again. So every reconcile, open or woken in the background, hands the session a
+    /// larger window: at most `window` tasks, and beyond the first `maxInFlight` only while their
+    /// bytes stay within `windowBytes`. A wake then moves a bounded batch rather than 32 files.
+    public static let window = 400
+    public var windowBytes: Int64 = 200_000_000
     public var config: () -> UploadConfig
     public var gate: UploadGate?
     /// False until launch recovery has finished (uploads are gated on it).
@@ -309,7 +306,7 @@ public final class Uploader: @unchecked Sendable {
         for item in ordered where !started.contains(item.name) {
             if let gate, !gate.mayUpload(item) { held += 1; continue }
             // beyond the usual window, only what keeps the scheduled bytes within the bound
-            let roomInWindow = foreground && inFlight < Self.foregroundWindow && scheduledBytes + item.size <= foregroundWindowBytes
+            let roomInWindow = inFlight < Self.window && scheduledBytes + item.size <= windowBytes
             guard inFlight < maxInFlight || roomInWindow else { break }
             if start(item, endpoint: endpoint, key: currentKey) {
                 inFlight += 1

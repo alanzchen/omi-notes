@@ -328,6 +328,7 @@ final class UploaderHarness: @unchecked Sendable {
     @Test func respectsMaxInFlight() throws {
         let h = UploaderHarness()
         h.uploader.maxInFlight = 2
+        h.uploader.windowBytes = 0  // no room beyond the baseline
         for i in 0..<5 { _ = try h.writeChunk(seq: i) }
         h.reconcile()
         #expect(h.started.count == 2)
@@ -336,30 +337,27 @@ final class UploaderHarness: @unchecked Sendable {
     }
 
     /// A backlog only moved 32 files per app wake: iOS treats tasks started in the background as
-    /// discretionary, so the open app now hands the session a much larger (bounded) window.
-    @Test func theOpenAppSchedulesALargerBoundedWindowThanABackgroundWake() throws {
+    /// discretionary and starts more only when it wakes the app again (2026-10-17: one wake, exactly
+    /// 32 uploads, then nothing). Every reconcile, a background wake included, hands the session the
+    /// larger bounded window, and iOS runs them when it chooses.
+    @Test func aBackgroundWakeSchedulesTheBoundedWindowNotJust32() throws {
         let h = UploaderHarness()
         for i in 0..<500 { _ = try h.writeChunk(seq: i) }
         h.reconcile()
-        #expect(h.started.count == 32, "a background wake: the usual window")
-        h.uploader.foreground = true
-        h.reconcile()
-        #expect(h.started.count == Uploader.foregroundWindow, "\(h.started.count)")
+        #expect(h.started.count == Uploader.window, "\(h.started.count)")
         #expect(Set(h.started.map(\.name)).count == h.started.count, "nothing started twice")
-        h.uploader.foreground = false
         h.complete(h.started[0].name, status: 201)
-        #expect(h.started.count == Uploader.foregroundWindow, "back in the background: nothing more until fewer than 32 remain")
+        #expect(h.started.count == Uploader.window + 1, "a completion tops the window back up")
     }
 
-    @Test func theForegroundWindowIsBoundedByBytes() throws {
+    @Test func theWindowIsBoundedByBytes() throws {
         let h = UploaderHarness()
-        h.uploader.foregroundWindowBytes = 5_000  // test-sized
+        h.uploader.windowBytes = 5_000  // test-sized
         var sizes: [Int64] = []
         for i in 0..<100 { sizes.append(try h.writeChunk(seq: i).size) }
-        h.uploader.foreground = true
         h.reconcile()
         let each = sizes[0]
-        // the first 32 always (as in the background); beyond them only within the bound
+        // the first 32 always; beyond them only within the bound
         #expect(h.started.count == max(32, Int(5_000 / each)), "\(h.started.count) of \(each)-byte files")
         let scheduled = h.started.dropFirst(32).count
         #expect(scheduled == 0 || Int64(h.started.count) * each <= 5_000, "never over the bound beyond the baseline")
