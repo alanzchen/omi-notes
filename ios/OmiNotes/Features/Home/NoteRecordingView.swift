@@ -144,6 +144,7 @@ final class AVRecordingEngine: RecordingEngine {
     private var observers: [NSObjectProtocol] = []
     private var watchdog: Task<Void, Never>?
     private var playing = false
+    private var session = AudioSessionOwnership()
 
     init(api: APIClient, conversationId: String) {
         loader = RecordingLoader(api: api, conversationId: conversationId)
@@ -161,19 +162,24 @@ final class AVRecordingEngine: RecordingEngine {
         })
         observers.append(center.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification, object: item, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.playing = false
-                Self.releaseSession()
-                self?.onEnd?()
+                guard let self else { return }
+                self.playing = false
+                self.apply(.end)
+                self.onEnd?()
             }
         })
         // A call, another app's audio, or the headphones going away pause AVPlayer by itself: say so.
         observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
             let began = (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt).flatMap(AVAudioSession.InterruptionType.init) == .began
-            MainActor.assumeIsolated { if began { self?.pausedBySystem() } }
+            MainActor.assumeIsolated { if began { self?.pausedBySystem(.interrupted) } }
         })
         observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] note in
             let lost = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt).flatMap(AVAudioSession.RouteChangeReason.init) == .oldDeviceUnavailable
-            MainActor.assumeIsolated { if lost { self?.pausedBySystem() } }
+            MainActor.assumeIsolated { if lost { self?.pausedBySystem(.outputLost) } }
+        })
+        // posted before any in-app player starts (this note's own controller included, before play())
+        observers.append(center.addObserver(forName: .omiAudioWillPlay, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.apply(.otherAudioStarting) }
         })
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 4), queue: .main) { [weak self] time in
             MainActor.assumeIsolated { self?.onTime?(time.seconds) }
@@ -193,6 +199,7 @@ final class AVRecordingEngine: RecordingEngine {
     func play() {
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio)
         try? AVAudioSession.sharedInstance().setActive(true)
+        apply(.play)
         player.play()
         playing = true
         watch()
@@ -202,20 +209,24 @@ final class AVRecordingEngine: RecordingEngine {
         player.pause()
         playing = false
         watchdog?.cancel()
-        Self.releaseSession()
+        apply(.pause)
     }
 
-    private func pausedBySystem() {
+    private func pausedBySystem(_ why: AudioSessionOwnership.Event) {
         guard playing else { return }
         player.pause()
         playing = false
         watchdog?.cancel()
+        apply(why)
         onPausedBySystem?()
     }
 
-    /// Lets other audio (music, podcasts) resume once this recording stops.
-    private static func releaseSession() {
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    /// Deactivates the session only when this player activated it and still holds it, letting other
+    /// audio (music, podcasts) resume.
+    private func apply(_ event: AudioSessionOwnership.Event) {
+        if session.handle(event) {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
     }
 
     func seek(to seconds: Double) {
@@ -223,7 +234,7 @@ final class AVRecordingEngine: RecordingEngine {
     }
 
     func teardown() {
-        if playing { Self.releaseSession() }
+        apply(.teardown)
         playing = false
         watchdog?.cancel()
         if let timeObserver { player.removeTimeObserver(timeObserver) }

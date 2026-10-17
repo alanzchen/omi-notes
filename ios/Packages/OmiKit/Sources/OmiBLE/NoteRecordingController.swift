@@ -19,6 +19,37 @@ public protocol RecordingEngine: AnyObject {
     func teardown()
 }
 
+/// Whether a note's player may deactivate the app's audio session now (telling other apps they may
+/// resume). The session is shared with the clip players, which activate it before announcing
+/// `omiAudioWillPlay`; only a session this player activated, and still holds, is released.
+public struct AudioSessionOwnership: Equatable, Sendable {
+    public enum Event: Sendable {
+        case play, pause, end, teardown
+        /// The system interrupted playback (a call): it has already deactivated the session.
+        case interrupted
+        /// The headphones went away: paused, but released only on a pause or when leaving, so other
+        /// audio doesn't resume on the speaker by itself.
+        case outputLost
+        /// Another in-app player is starting: the session is its now.
+        case otherAudioStarting
+    }
+
+    public private(set) var holds = false
+    public init() {}
+
+    /// True when the session should be deactivated now.
+    public mutating func handle(_ event: Event) -> Bool {
+        switch event {
+        case .play: holds = true; return false
+        case .interrupted, .otherAudioStarting: holds = false; return false
+        case .outputLost: return false
+        case .pause, .end, .teardown:
+            defer { holds = false }
+            return holds
+        }
+    }
+}
+
 /// Play/pause/seek state for one note's recording (the app's Recording card).
 ///
 /// Every load is one generation: leaving the note (`stop`) or a failure starts a new one and
