@@ -56,25 +56,34 @@ final class ProgressTransport: UploadTransport, UploadProgressReporting, @unchec
                                settings: settings, uploadTransport: transport)
         engine.appDidBecomeActive()
         #expect(await waitFor(5) { transport.started.contains { $0.hasSuffix("chunk_cap-transfer_000000.omnc") } })
-        let id = try #require(transport.started.first { $0.hasSuffix("chunk_cap-transfer_000000.omnc") })
+        let launchId = try #require(transport.started.first { $0.hasSuffix("chunk_cap-transfer_000000.omnc") })
+        // "Retry now": a new epoch, so new attempts begin while counting (the launch ones are obsolete)
+        engine.retryUploads()
+        #expect(await waitFor(5) { transport.started.contains { $0.hasSuffix("chunk_cap-transfer_000000.omnc") && $0 != launchId } })
+        let id = try #require(transport.started.first { $0.hasSuffix("chunk_cap-transfer_000000.omnc") && $0 != launchId })
 
         let queued = engine.snapshotNow().transfer
         #expect(queued.pendingAudioSeconds == 25, "from the chunks' own headers: \(queued.pendingAudioSeconds)")
         #expect(queued.pendingAudioUnknown == 1, "an unreadable chunk stays unknown, not guessed")
         #expect(queued.meter.since != nil, "counting while the app is open")
 
-        engine.queue.sync {
-            transport.onProgress?(id, 0, 1_000)
-            transport.onProgress?(id, 600, 1_000)
-        }
+        engine.queue.sync { transport.onProgress?(id, 600, 1_000) }  // a single first report (no zero-byte one)
         let live = engine.snapshotNow().transfer.meter
-        #expect(live.networkBytes == 600 && live.inFlight.sent == 600 && live.inFlight.total == 1_000)
+        // every attempt handed to iOS is tracked from its start (its file size is the known total)
+        let handed = transport.started.filter { $0.hasPrefix("1.2|") }.count
+        #expect(live.networkBytes == 600, "a single first report counts in full")
+        #expect(live.inFlight.uploads == handed && live.inFlight.sent == 600 && live.inFlight.unknownTotals == 0)
 
         engine.queue.sync { engine.uploader.handleCompletion(identifier: id, statusCode: 201, body: nil, error: nil) }
         #expect(engine.snapshotNow().transfer.meter.deliveredAudioFiles == 1)
         engine.queue.sync { engine.uploader.handleCompletion(identifier: id, statusCode: 200, body: nil, error: nil) }
         #expect(engine.snapshotNow().transfer.meter.deliveredAudioFiles == 1, "acknowledged once, counted once")
-        #expect(engine.snapshotNow().transfer.meter.inFlight.uploads == 0)
+        #expect(engine.snapshotNow().transfer.meter.inFlight.uploads == handed - 1, "the acknowledged one left")
+
+        // UX-LT-ASTRA-04: a late report from an obsolete configuration/epoch counts nothing, leaves nothing
+        engine.queue.sync { transport.onProgress?(launchId, 900, 1_000) }  // the obsolete launch attempt reports late
+        let after = engine.snapshotNow().transfer.meter
+        #expect(after.networkBytes == 600 && after.inFlight.uploads == handed - 1, "bytes \(after.networkBytes), uploads \(after.inFlight.uploads)")
 
         engine.appDidEnterBackground()
         engine.queue.sync {}

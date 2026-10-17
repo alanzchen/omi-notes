@@ -18,8 +18,8 @@ import OmiWatchKit
         snap.outbox.pendingCount = pending
         if counting { snap.transfer.meter.start(atMono: 0, wall: now) }
         if let at = bytesAt {
-            snap.transfer.meter.progress(name: "a", audio: true, sent: 0, expected: 1_000, atMono: at - s)
-            snap.transfer.meter.progress(name: "a", audio: true, sent: 500, expected: 1_000, atMono: at)
+            snap.transfer.meter.progress(id: "a", audio: true, sent: 0, expected: 1_000, atMono: at - s)
+            snap.transfer.meter.progress(id: "a", audio: true, sent: 500, expected: 1_000, atMono: at)
         }
         return snap
     }
@@ -62,6 +62,35 @@ import OmiWatchKit
         snap.watchReport?.at = now.addingTimeInterval(3600)
         w = TransferSummary.evaluate(snapshot: snap, server: reachable(), status: nil, statusAt: nil, watchInstalled: true, nowMono: s, now: now).watch
         #expect(!w.reportFresh, "a report from the future isn't current either")
+    }
+
+    // UX-LT-ASTRA-05/07 (astra-review/EngineHarness.swift)
+
+    @Test func retainedWorkIsNeverAllSent() {
+        var kept = snapshot(pending: 0)
+        kept.outbox.quarantineCount = 1
+        #expect(state(kept, at: 5 * s) == .keptAside(1))
+        var preparing = snapshot(pending: 0)
+        preparing.watchPending = 2
+        #expect(state(preparing, at: 5 * s) == .preparing(2))
+        var unreadable = snapshot(pending: 0)
+        unreadable.outbox.inventoryReadable = false
+        #expect(state(unreadable, at: 5 * s) == .queueUnreadable, "a queue that couldn't be read isn't empty")
+    }
+
+    @Test func anUnknownWatchInstallIsNotNotInUse() {
+        let w = TransferSummary.evaluate(snapshot: snapshot(), server: reachable(), status: nil, statusAt: nil, watchInstalled: nil, nowMono: s, now: now).watch
+        #expect(w.inUse == nil)
+        let no = TransferSummary.evaluate(snapshot: snapshot(), server: reachable(), status: nil, statusAt: nil, watchInstalled: false, nowMono: s, now: now).watch
+        #expect(no.inUse == false)
+    }
+
+    @Test func theReceiptTimeIsAReceiptNotAConversion() {
+        var snap = snapshot()
+        snap.watchReceived = 3
+        snap.watchLastReceivedAt = now  // a conversion marker written now (after a relaunch)
+        let w = TransferSummary.evaluate(snapshot: snap, server: reachable(), status: nil, statusAt: nil, watchInstalled: true, nowMono: s, now: now).watch
+        #expect(w.lastReceivedAt == nil, "no receipt in this run: unknown, not the marker's time")
     }
 
     @Test func ratesReadInTheirUnits() {

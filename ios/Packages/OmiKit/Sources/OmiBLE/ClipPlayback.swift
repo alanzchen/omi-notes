@@ -66,15 +66,20 @@ public final class ClipPlayback {
     public func load(_ id: String, fetch: @escaping (String) async throws -> Data) async {
         if loadedId == id, audio != nil { return }
         if loading == id { return }  // already on its way
-        stop()  // a different clip: the old one's intent ends here
-        await prepareLatest(id, fetch)
+        let intent = begin(id)  // a different clip: the old one's intent ends here
+        await prepare(id, fetch, intent: intent)
     }
 
-    /// Downloads and prepares `id` for the current intent; true if it is still current and ready.
-    @discardableResult
-    private func prepareLatest(_ id: String, _ fetch: @escaping (String) async throws -> Data) async -> Bool {
-        let intent = generation
+    /// A new intent for `id`, taken synchronously (before any task runs): earlier work is void.
+    private func begin(_ id: String) -> Int {
+        stop()
         loading = id
+        return generation
+    }
+
+    /// Downloads and prepares `id` for exactly `intent`; true if that intent is still current and ready.
+    @discardableResult
+    private func prepare(_ id: String, _ fetch: @escaping (String) async throws -> Data, intent: Int) async -> Bool {
         defer { if generation == intent, loading == id { loading = nil } }
         do {
             let bytes = try await data(id, fetch)
@@ -94,14 +99,15 @@ public final class ClipPlayback {
             return
         }
         if loadedId == id, audio != nil {
+            generation += 1  // back to the prepared clip: whatever else was on its way is void
+            loading = nil
             start()
             return
         }
         if loading == id { return }  // a second tap while it downloads: one request, one play
-        stop()
-        let intent = generation
+        let intent = begin(id)
         Task {
-            guard await self.prepareLatest(id, fetch), self.generation == intent else { return }
+            guard await self.prepare(id, fetch, intent: intent), self.generation == intent else { return }
             self.start()
         }
     }
@@ -137,9 +143,11 @@ public final class ClipPlayback {
 
     private func prepare(_ id: String, _ bytes: Data) throws {
         let a = try makeAudio(bytes)
-        a.onFinish = { [weak self] in
-            self?.playing = nil
-            self?.onFinished?()
+        audio?.onFinish = nil  // the retired player's late end must not touch the new one
+        a.onFinish = { [weak self, weak a] in
+            guard let self, let a, self.audio === a else { return }
+            self.playing = nil
+            self.onFinished?()
         }
         audio = a
         data = bytes

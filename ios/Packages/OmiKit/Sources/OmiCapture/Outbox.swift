@@ -82,6 +82,8 @@ public struct OutboxStats: Sendable, Equatable {
     public var sentCount = 0
     public var sentBytes: Int64 = 0
     public var quarantineCount = 0
+    /// The waiting and kept-aside folders could be listed (false: counts are unknown, not zero).
+    public var inventoryReadable = true
     public init() {}
 }
 
@@ -200,6 +202,9 @@ public final class Outbox: @unchecked Sendable {
             s.sentBytes += item.size
         }
         s.quarantineCount = quarantined().count
+        s.inventoryReadable = [dirs.outboxPending, dirs.outboxQuarantine].allSatisfy {
+            (try? FileManager.default.contentsOfDirectory(atPath: $0.path)) != nil
+        }
         return s
     }
 

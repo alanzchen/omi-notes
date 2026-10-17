@@ -145,6 +145,23 @@ import OmiProtocol
         model.cancelEnrollment()
     }
 
+    /// UX-LT-ASTRA-02 (astra-review/EnrollmentHarness.swift): the engine has already ended the window
+    /// as interrupted when Finish is tapped, before the model hears about it. The engine wins.
+    @MainActor @Test func finishRacingAnInterruptionStaysInterrupted() async throws {
+        let (engine, model, _) = try await streamingModel()
+        defer { ServerStub.delay = 0 }
+        ServerStub.delay = 0
+        model.pollInterval = .milliseconds(50)
+        await model.startEnrollment()
+        guard case .reading(let id, _) = model.enrollment else { Issue.record("\(model.enrollment)"); return }
+        engine.disconnect()
+        while engine.snapshotNow().activeEnrollmentId != nil {}  // the engine ended it; the main actor hasn't heard yet
+        model.finishEnrollment()  // tapped in that gap
+        #expect(await waitOnMain(3) { model.enrollment == .interrupted(id: id) }, "\(model.enrollment)")
+        try await Task.sleep(nanoseconds: 300_000_000)
+        #expect(model.enrollment == .interrupted(id: id), "no polling revives it")
+    }
+
     /// UX-AU-005: after Finish the server may be unreachable or refuse the phone. Waiting says so (it
     /// isn't an unexplained spinner); Close keeps the attempt, and coming back checks it again.
     @MainActor @Test func waitingExplainsFailuresAndClosingKeepsTheAttempt() async throws {

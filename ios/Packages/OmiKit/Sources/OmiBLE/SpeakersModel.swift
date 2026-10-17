@@ -22,6 +22,23 @@ public final class SpeakersModel {
         case interrupted(id: String)
     }
 
+    /// A synthetic enrollment state is shown (debug screenshots): nothing is checked with a server.
+    var debugEnrollment = false
+
+    #if DEBUG
+    /// Simulator screenshots only (debug builds): `-OmiNotesDebugEnrollment interrupted|waiting-error`.
+    public func debugShowEnrollment(_ name: String) {
+        debugEnrollment = true
+        switch name {
+        case "interrupted": enrollment = .interrupted(id: "synthetic")
+        case "waiting-error":
+            enrollment = .waiting(id: "synthetic", status: nil)
+            enrollmentProblem = "Can't reach the server (synthetic preview). Still checking."
+        default: debugEnrollment = false
+        }
+    }
+    #endif
+
     /// Why the waiting enrollment can't be checked right now (nil while checks succeed).
     public private(set) var enrollmentProblem: String?
     /// Between checks of a waiting enrollment.
@@ -57,11 +74,18 @@ public final class SpeakersModel {
         }
     }
 
-    /// The engine closed an enrollment window. Ended before Finish (the pendant stopped streaming):
-    /// the attempt is over, and its old prompts must not continue, even after a reconnect.
+    /// The engine closed an enrollment window. Ended as interrupted (the pendant stopped streaming):
+    /// the attempt is over, and its old prompts must not continue, even after a reconnect. The engine's
+    /// outcome wins: Finish may already have moved the screen to waiting before this arrives.
     func enrollmentWindowEnded(id: String, outcome: VoiceEnrollmentEndData.Outcome) {
-        guard outcome == .interrupted, case .reading(let reading, _) = enrollment, reading == id else { return }
-        enrollment = .interrupted(id: id)
+        guard outcome == .interrupted else { return }
+        switch enrollment {
+        case .reading(id, _), .waiting(id, _):
+            pollTask?.cancel()
+            enrollmentProblem = nil
+            enrollment = .interrupted(id: id)
+        default: break
+        }
     }
 
     public var me: Person? { people.first { $0.isMe } }
@@ -338,7 +362,7 @@ public final class SpeakersModel {
 
     /// The enrollment screen appeared (again): check a waiting attempt now. Also "Check again".
     public func enrollmentScreenOpened() {
-        guard case .waiting(let id, _) = enrollment else { return }
+        guard case .waiting(let id, _) = enrollment, !debugEnrollment else { return }
         enrollmentProblem = nil
         poll(id, immediately: true)
     }
@@ -381,7 +405,7 @@ public final class SpeakersModel {
                         self.enrollmentProblem = "The server hasn't received this sample yet. It may still be uploading from this phone; this keeps checking."
                     }
                 } catch APIError.unauthorized {
-                    self.enrollmentProblem = "The server rejected this phone, so the result can't be checked. Pair again from Server, then check again."
+                    self.enrollmentProblem = "The server rejected this phone, so this sample's result can't be checked here. After pairing again, see People for whether your voice was enrolled; if not, teach it again."
                     return  // asking again won't help until the pairing changes
                 } catch {
                     guard !Task.isCancelled else { return }

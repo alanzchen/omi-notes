@@ -36,6 +36,14 @@ struct PeopleView: View {
         .task { await speakers.refresh() }
         .refreshable { await speakers.refresh() }
         .sheet(isPresented: $showEnrollment) { EnrollmentView(model: model) }
+        #if DEBUG
+        .onAppear {
+            if let name = UserDefaults.standard.string(forKey: "OmiNotesDebugEnrollment") {
+                speakers.debugShowEnrollment(name)
+                showEnrollment = true
+            }
+        }
+        #endif
         .sheet(isPresented: $showConsent) { RecognitionConsentView(model: model) }
         .sheet(item: $naming) { suggestion in
             SuggestionPickerView(model: model, suggestion: suggestion)

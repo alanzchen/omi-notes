@@ -25,6 +25,7 @@ struct DevicesView: View {
         switch UserDefaults.standard.string(forKey: "OmiNotesDebugDevicePage") {
         case "pendant": return .pendant
         case "watch": return .watch
+        case "transfers": return .transfers
         default: return nil
         }
         #else
@@ -40,7 +41,7 @@ struct DevicesView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     #if DEBUG
-                    if pendant.synthetic || watch.synthetic { SyntheticBadge().frame(maxWidth: .infinity) }
+                    if pendant.synthetic || watch.synthetic || TransferText.synthetic { SyntheticBadge().frame(maxWidth: .infinity) }
                     #endif
                     ForEach(layout.cards, id: \.self) { device in
                         switch device {

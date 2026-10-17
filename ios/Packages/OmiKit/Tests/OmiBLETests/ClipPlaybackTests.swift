@@ -124,6 +124,70 @@ final class ClipServer {
         #expect(r.plays == 0)
     }
 
+    // UX-LT-ASTRA-01: Astra's schedules (astra-review/AcceptanceHarness.swift), on the production controller.
+
+    @Test func closingInTheSameTurnSuppressesALaterError() async {
+        let r = rig()
+        r.playback.toggle("a", fetch: r.fetch)
+        r.playback.stop()  // before the task even starts
+        await settle()
+        r.server.fail("a")
+        await settle()
+        #expect(r.playback.message == nil && r.plays == 0)
+    }
+
+    @Test func immediateReplacementLeavesTheNewClipLoadedAndPlaying() async {
+        let r = rig()
+        r.playback.toggle("a", fetch: r.fetch)
+        r.playback.toggle("b", fetch: r.fetch)  // same turn
+        await settle()
+        r.server.answer("b")
+        await settle()
+        r.server.answer("a")  // the replaced one answers last
+        await settle()
+        #expect(r.playback.playing == "b" && r.playback.loadedId == "b", "playing \(r.playback.playing ?? "nil"), loaded \(r.playback.loadedId ?? "nil")")
+        #expect(r.made.count == 1, "the replaced clip is never prepared")
+    }
+
+    @Test func returningToTheLoadedClipCancelsTheOneDownloading() async {
+        let r = rig(.pause)
+        let first = Task { await r.playback.load("a", fetch: r.fetch) }
+        await settle()
+        r.server.answer("a")
+        await first.value
+        r.playback.toggle("b", fetch: r.fetch)
+        await settle()
+        r.playback.toggle("a", fetch: r.fetch)  // back to the prepared one while b downloads
+        r.server.answer("b")
+        await settle()
+        #expect(r.playback.playing == "a", "the latest choice stays: \(r.playback.playing ?? "nil")")
+    }
+
+    @Test func aRetiredClipsFinishDoesNotStopTheCurrentOne() async {
+        let r = rig()
+        r.playback.toggle("a", fetch: r.fetch)
+        await settle()
+        r.server.answer("a")
+        await settle()
+        r.playback.toggle("b", fetch: r.fetch)
+        await settle()
+        r.server.answer("b")
+        await settle()
+        #expect(r.playback.playing == "b")
+        r.made[0].onFinish?()  // a's player reports its end late
+        #expect(r.playback.playing == "b")
+    }
+
+    @Test func aDoubleTapInTheSameTurnPreparesOnePlayer() async {
+        let r = rig()
+        r.playback.toggle("a", fetch: r.fetch)
+        r.playback.toggle("a", fetch: r.fetch)
+        await settle()
+        r.server.answer("a")
+        await settle()
+        #expect(r.made.count == 1 && r.plays == 1 && r.server.requests == ["a"])
+    }
+
     @Test func aPreparedClipPlaysPausesAndResumes() async {
         let r = rig(.pause)
         let loading = Task { await r.playback.load("a", fetch: r.fetch) }

@@ -92,6 +92,9 @@ public struct EngineSnapshot: Equatable, Sendable {
     /// The Watch app's latest report about itself (as of its own timestamp).
     public var watchReport: WatchReport?
     public var transfer = TransferSnapshot()
+    /// When this iPhone last stored a part from the Watch, in this run of the app (nil after a relaunch
+    /// until one arrives: a later conversion of an older part isn't a receipt).
+    public var watchLastReceiptAt: Date?
     /// This phone's choices for the pendant (`SettingsStore`).
     public var recordingPaused = false
     public var autoCollect = true
@@ -256,17 +259,25 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         _ = watchInbox  // created now: WatchConnectivity may call in from its own queue
         uploader.enabled = false  // until recovery completes
         uploader.onStatusChange = { [weak self] in self?.scheduleSnapshot() }
-        uploader.onFinished = { [weak self] name, outcome, size in
-            guard let self else { return }
-            let audio = OutboxKind.parse(name)?.isChunk ?? false
-            self.meter.finished(name: name, audio: audio, bytes: size, outcome: outcome, atMono: self.config.clock.monotonicNanoseconds())
+        uploader.onStarted = { [weak self] identifier, size in
+            guard let self, let (_, name) = UploadTaskID.parse(identifier) else { return }
+            self.meter.began(id: identifier, audio: OutboxKind.parse(name)?.isChunk ?? false, expected: size)
+        }
+        uploader.onFinished = { [weak self] identifier, outcome, size in
+            guard let self, let (_, name) = UploadTaskID.parse(identifier) else { return }
+            self.meter.finished(id: identifier, audio: OutboxKind.parse(name)?.isChunk ?? false, bytes: size, outcome: outcome,
+                                atMono: self.config.clock.monotonicNanoseconds())
             self.scheduleTransferSnapshot()
         }
         (transport as? UploadProgressReporting)?.onProgress = { [weak self] identifier, sent, expected in
-            guard let self, let (_, name) = UploadTaskID.parse(identifier) else { return }
-            let audio = OutboxKind.parse(name)?.isChunk ?? false
-            self.meter.progress(name: name, audio: audio, sent: sent, expected: expected > 0 ? expected : nil,
-                                atMono: self.config.clock.monotonicNanoseconds())
+            // only the uploader's current tasks count: an obsolete configuration/epoch's callbacks never
+            // reach the meter (their completions don't acknowledge anything either)
+            guard let self, let (key, name) = UploadTaskID.parse(identifier) else { return }
+            let current = self.uploader.key(for: self.settings.serverConfig())
+            self.meter.retain(key: current)
+            guard key == current else { return }
+            self.meter.progress(id: identifier, audio: OutboxKind.parse(name)?.isChunk ?? false, sent: sent,
+                                expected: expected > 0 ? expected : nil, atMono: self.config.clock.monotonicNanoseconds())
             self.scheduleTransferSnapshot()
         }
         backgroundTransport?.onCompletion = { [weak self] id, status, body, error in
@@ -1447,7 +1458,9 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         s.watchReceived = received.count + s.watchPending
         s.watchLastReceivedAt = [watchLastReceivedAt, received.last].compactMap { $0 }.max()
         s.watchWaitingUpload = watchUploads.waiting
+        meter.retain(key: uploader.key(for: settings.serverConfig()))
         s.transfer.meter = meter
+        s.watchLastReceiptAt = watchLastReceivedAt
         s.transfer.pendingAudioSeconds = pendingAudio.seconds
         s.transfer.pendingAudioUnknown = pendingAudio.unknown
         s.watchLastUploadedAt = watchUploads.lastAt

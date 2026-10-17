@@ -227,8 +227,10 @@ public final class Uploader: @unchecked Sendable {
     public var now: () -> Date = Date.init
     public var random: () -> Double = { Double.random(in: 0...1) }
     public var onStatusChange: (() -> Void)?
-    /// Each finished upload of a current task: file name, outcome and the file's size.
+    /// Each finished upload of a current task: its task identity, outcome and the file's size.
     public var onFinished: ((String, TransferMeter.Outcome, Int64?) -> Void)?
+    /// Each attempt started: its task identity and the file's size.
+    public var onStarted: ((String, Int64) -> Void)?
 
     public private(set) var status = UploaderStatus()
     /// Files with a task in flight: those this uploader started (until their completion arrives,
@@ -350,6 +352,7 @@ public final class Uploader: @unchecked Sendable {
         let rec = state.record(item.name)
         let begin = rec.nextAttemptAt.flatMap { $0 > now() ? $0 : nil }
         transport.startUpload(req, fromFile: item.url, identifier: UploadTaskID.make(key: key, name: item.name), earliestBeginDate: begin)
+        onStarted?(UploadTaskID.make(key: key, name: item.name), item.size)
         started.insert(item.name)
         launched.insert(item.name)
         return true
@@ -370,7 +373,7 @@ public final class Uploader: @unchecked Sendable {
         launched.remove(name)
         let size = outbox.pendingItem(named: name)?.size
         if let e = error as? URLError, e.code == .cancelled {
-            onFinished?(name, .cancelled, size)
+            onFinished?(identifier, .cancelled, size)
             status.inFlight = started.count
             onStatusChange?()
             reconcile()
@@ -387,6 +390,7 @@ public final class Uploader: @unchecked Sendable {
         let detail = Self.detail(body: body, error: error, status: statusCode)
         let action = policy.action(for: outcome, attempts: attempts, badRequests: badRequests, random: random())
         var summary = UploadResultSummary(name: name, status: statusCode, message: detail, date: now(), success: false)
+        var observed = TransferMeter.Outcome.retrying
 
         switch action {
         case .markSent:
@@ -395,6 +399,7 @@ public final class Uploader: @unchecked Sendable {
                 try outbox.markSent(name, now: now())
                 state.remove(name)
                 summary.success = true
+                observed = .delivered
                 summary.message = statusCode == 200 ? "already stored" : "stored"
                 status.lastSuccessAt = now()
                 status.attention.removeAll { $0.hasPrefix("Upload error") }
@@ -414,6 +419,7 @@ public final class Uploader: @unchecked Sendable {
             log(.warning, "upload", "\(name) failed (\(statusCode.map(String.init) ?? "network")): \(detail); retry in \(Int(delay)) s")
         case .reverifyAndRetry(let delay):
             if let problem = verifyLocalFile(name) {
+                observed = .held
                 quarantine(name, reason: "400 and local file invalid: \(problem)")
             } else {
                 state.update(name) {
@@ -426,15 +432,17 @@ public final class Uploader: @unchecked Sendable {
                 log(.warning, "upload", "\(name) got 400 (\(badRequests)/\(policy.maxBadRequestAttempts)); local file verified, retrying")
             }
         case .quarantine(let reason):
+            observed = .held
             quarantine(name, reason: "\(reason) — \(detail)")
         case .pauseAll(let reason):
+            observed = .held
             status.pausedReason = reason
             state.update(name) { $0.lastStatus = statusCode; $0.lastError = detail }
             addAttention(reason)
             log(.error, "upload", "uploads paused: \(reason)")
         }
         status.lastResult = summary
-        onFinished?(name, summary.success ? .delivered : .failed, size)
+        onFinished?(identifier, summary.success ? .delivered : observed, size)
         status.inFlight = started.count
         onStatusChange?()
         if status.pausedReason == nil { reconcile() }

@@ -3,15 +3,19 @@ import Foundation
 /// What the phone has actually sent to the server while the app is open, from the upload tasks' own
 /// progress callbacks (`didSendBodyData`). Times are monotonic nanoseconds.
 ///
-/// - Counting starts at `start` (the app coming to the foreground) and stops at `suspend`: in the
-///   background nothing is live, and the counters describe only this window.
-/// - Bytes are counted from each upload's first report in the window: whatever it sent before that
-///   is never claimed. A restarted attempt (lower total than before) starts a new baseline, so a
-///   delta is never negative; its later bytes are real network bytes (retries included).
+/// - Counting starts at `start` (the app becoming active) and stops at `suspend`: in the background
+///   nothing is live, and the counters describe only this window.
+/// - Uploads are keyed by their full task identity (`"<generation>.<epoch>|<file>"`). An attempt the
+///   uploader `began` starts from 0, so its first report counts in full. An upload adopted from
+///   before (a relaunch, or one that ran while the app was in the background) has no known baseline
+///   until its first report in this window: what it sent before that is never claimed.
+/// - A report lower than the last one starts a new baseline, so a delta is never negative; later
+///   bytes of a retry are real network bytes.
 /// - Delivered = the server acknowledged the file; each file counts once. Audio (chunks) and other
-///   files (events, seals) are counted apart.
+///   files (events, seals) are counted apart. A failed attempt is either retried automatically or
+///   held (kept on this iPhone for a person to look at).
 public struct TransferMeter: Equatable, Sendable {
-    public enum Outcome: Sendable { case delivered, failed, cancelled }
+    public enum Outcome: Sendable { case delivered, retrying, held, cancelled }
 
     /// The rate is the bytes reported over this window (or since `start`, if shorter)...
     public static let rateWindow: UInt64 = 5_000_000_000
@@ -19,9 +23,12 @@ public struct TransferMeter: Equatable, Sendable {
     public static let idleAfter: UInt64 = 3_000_000_000
 
     struct Upload: Equatable, Sendable {
-        var sent: Int64
+        /// Last reported bytes of this attempt; nil = no baseline in this window yet.
+        var sent: Int64?
         var expected: Int64?
         var audio: Bool
+        /// Seen (begun or reported) while counting, with no suspension since: its baseline holds.
+        var current = false
     }
 
     struct Sample: Equatable, Sendable {
@@ -42,7 +49,10 @@ public struct TransferMeter: Equatable, Sendable {
     public private(set) var deliveredAudioFiles = 0
     public private(set) var deliveredAudioBytes: Int64 = 0
     public private(set) var deliveredOtherFiles = 0
-    public private(set) var failedAttempts = 0
+    /// Failed attempts that will be tried again automatically.
+    public private(set) var retryingAttempts = 0
+    /// Failed attempts whose file is now held (kept aside or uploads paused).
+    public private(set) var heldAttempts = 0
 
     public init() {}
 
@@ -56,25 +66,36 @@ public struct TransferMeter: Equatable, Sendable {
         deliveredAudioFiles = 0
         deliveredAudioBytes = 0
         deliveredOtherFiles = 0
-        failedAttempts = 0
-        // uploads keep their last report: a task still running only counts what follows it
+        retryingAttempts = 0
+        heldAttempts = 0
+        // an upload last seen while not counting (before activation, or across a suspension) may have
+        // sent bytes nobody reported: its next report becomes its baseline
+        for (id, u) in uploads where !u.current { uploads[id]?.sent = nil }
+    }
+
+    /// The uploader started a new attempt: it begins at 0 bytes.
+    public mutating func began(id: String, audio: Bool, expected: Int64?) {
+        uploads[id] = Upload(sent: 0, expected: expected.flatMap { $0 > 0 ? $0 : nil }, audio: audio, current: since != nil)
+    }
+
+    /// Drops uploads of any other configuration or epoch (their callbacks no longer count).
+    public mutating func retain(key: String) {
+        uploads = uploads.filter { $0.key.split(separator: "|", maxSplits: 1).first.map(String.init) == key }
     }
 
     public mutating func suspend() {
+        for id in uploads.keys { uploads[id]?.current = false }  // they keep running unobserved
         since = nil
         samples = []
         lastReportMono = nil
     }
 
-    public mutating func progress(name: String, audio: Bool, sent: Int64, expected: Int64?, atMono: UInt64) {
+    public mutating func progress(id name: String, audio: Bool, sent: Int64, expected: Int64?, atMono: UInt64) {
         let total = expected.flatMap { $0 > 0 ? $0 : nil }
-        guard let previous = uploads[name] else {
-            uploads[name] = Upload(sent: sent, expected: total, audio: audio)  // first report: the baseline
-            return
-        }
-        uploads[name] = Upload(sent: sent, expected: total ?? previous.expected, audio: audio)
-        guard since != nil else { return }
-        let delta = sent - previous.sent
+        let previous = uploads[name]
+        uploads[name] = Upload(sent: sent, expected: total ?? previous?.expected, audio: audio, current: since != nil)
+        guard since != nil, let base = previous?.sent else { return }  // no baseline yet: this report becomes it
+        let delta = sent - base
         guard delta > 0 else { return }  // a restarted attempt: its new baseline, never negative
         networkBytes += delta
         samples.append(Sample(at: atMono, bytes: delta))
@@ -83,7 +104,7 @@ public struct TransferMeter: Equatable, Sendable {
         samples.removeAll { $0.at < oldest }
     }
 
-    public mutating func finished(name: String, audio: Bool, bytes: Int64?, outcome: Outcome, atMono: UInt64) {
+    public mutating func finished(id name: String, audio: Bool, bytes: Int64?, outcome: Outcome, atMono: UInt64) {
         uploads[name] = nil
         guard since != nil else { return }
         switch outcome {
@@ -95,7 +116,8 @@ public struct TransferMeter: Equatable, Sendable {
             } else {
                 deliveredOtherFiles += 1
             }
-        case .failed: failedAttempts += 1
+        case .retrying: retryingAttempts += 1
+        case .held: heldAttempts += 1
         case .cancelled: break
         }
     }
@@ -114,7 +136,7 @@ public struct TransferMeter: Equatable, Sendable {
     public var inFlight: (sent: Int64, total: Int64, uploads: Int, unknownTotals: Int) {
         var sent: Int64 = 0, total: Int64 = 0, unknown = 0
         for u in uploads.values {
-            if let e = u.expected { sent += min(u.sent, e); total += e } else { unknown += 1 }
+            if let e = u.expected { sent += min(u.sent ?? 0, e); total += e } else { unknown += 1 }
         }
         return (sent, total, uploads.count, unknown)
     }
