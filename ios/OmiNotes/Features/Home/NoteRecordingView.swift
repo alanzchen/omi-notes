@@ -179,7 +179,7 @@ final class AVRecordingEngine: RecordingEngine {
         })
         // posted before any in-app player starts (this note's own controller included, before play())
         observers.append(center.addObserver(forName: .omiAudioWillPlay, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.apply(.otherAudioStarting) }
+            MainActor.assumeIsolated { self?.relinquishSession() }
         })
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 4), queue: .main) { [weak self] time in
             MainActor.assumeIsolated { self?.onTime?(time.seconds) }
@@ -211,6 +211,9 @@ final class AVRecordingEngine: RecordingEngine {
         watchdog?.cancel()
         apply(.pause)
     }
+
+    /// Also from the controller before it pauses for another player (independent of observer order).
+    func relinquishSession() { apply(.otherAudioStarting) }
 
     private func pausedBySystem(_ why: AudioSessionOwnership.Event) {
         guard playing else { return }

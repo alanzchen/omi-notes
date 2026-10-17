@@ -15,6 +15,9 @@ public protocol RecordingEngine: AnyObject {
     func waitUntilReady() async throws
     func play()
     func pause()
+    /// Another player is taking the shared audio session: stop holding it (a later pause must not
+    /// deactivate it). Called before that pause, whatever order notification observers run in.
+    func relinquishSession()
     func seek(to seconds: Double)
     func teardown()
 }
@@ -94,6 +97,7 @@ public final class NoteRecordingController {
             let sender = note.object.map { ObjectIdentifier($0 as AnyObject) }
             MainActor.assumeIsolated {
                 guard let self, sender != ObjectIdentifier(self), self.isPlaying else { return }
+                self.engine?.relinquishSession()  // the session is the other player's now: never deactivate it
                 self.pause()  // another sound started: one at a time
             }
         }

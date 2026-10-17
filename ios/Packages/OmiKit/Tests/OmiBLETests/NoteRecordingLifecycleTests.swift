@@ -31,8 +31,40 @@ final class FakeEngine: RecordingEngine {
     func waitUntilReady() async throws { try await ready.wait() }
     func play() { plays += 1 }
     func pause() { pauses += 1 }
+    func relinquishSession() {}
     func seek(to seconds: Double) {}
     func teardown() { teardowns += 1 }
+}
+
+
+/// An engine that holds the shared audio session like `AVRecordingEngine`: the same policy, its own
+/// `.omiAudioWillPlay` observer registered after the controller's (as in the app), and a count of
+/// the deactivations it would perform.
+@MainActor
+final class SessionOwningEngine: RecordingEngine {
+    let ready = Gate<Void>()
+    var session = AudioSessionOwnership()
+    var deactivations = 0
+    var onFailure: ((String) -> Void)?
+    var onTime: ((Double) -> Void)?
+    var onEnd: (() -> Void)?
+    var onPausedBySystem: (() -> Void)?
+    private var observer: NSObjectProtocol?
+    init() {
+        observer = NotificationCenter.default.addObserver(forName: .omiAudioWillPlay, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.relinquishSession() }
+        }
+    }
+    private func apply(_ e: AudioSessionOwnership.Event) { if session.handle(e) { deactivations += 1 } }
+    func waitUntilReady() async throws { try await ready.wait() }
+    func play() { apply(.play) }
+    func pause() { apply(.pause) }
+    func relinquishSession() { apply(.otherAudioStarting) }
+    func seek(to seconds: Double) {}
+    func teardown() {
+        apply(.teardown)
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+    }
 }
 
 @MainActor
@@ -120,6 +152,32 @@ final class FakeEngine: RecordingEngine {
         #expect(!h.controller.isPlaying && h.controller.state == .ready, "paused, not failed")
         await h.controller.toggle()
         #expect(h.controller.isPlaying && h.engines[0].plays == 2 && h.engines.count == 1, "the same player continues")
+    }
+
+
+    /// Another player starting (a voice clip activates the session, then announces) must not get its
+    /// session deactivated by this note's pause, whatever order the observers run in.
+    @Test func anotherPlayerStartingNeverHasItsSessionDeactivated() async {
+        let info = Gate<RecordingInfo>()
+        var engine: SessionOwningEngine?
+        let c = NoteRecordingController(conversationId: "c1", fetchInfo: { try await info.wait() },
+                                        makeEngine: { _ in let e = SessionOwningEngine(); engine = e; return e })
+        let tap = Task { await c.toggle() }
+        await settle()
+        info.open(.success(Self.info))
+        await settle()
+        engine?.ready.open(.success(()))
+        await tap.value
+        #expect(c.isPlaying && engine?.session.holds == true)
+        let clip = NSObject()
+        NotificationCenter.default.post(name: .omiAudioWillPlay, object: clip)
+        #expect(!c.isPlaying, "one sound at a time")
+        #expect(engine?.deactivations == 0, "the clip's session is left alone")
+        await c.toggle()  // our own start: we hold it again, and a user pause releases it
+        #expect(c.isPlaying && engine?.session.holds == true)
+        await c.toggle()
+        #expect(!c.isPlaying && engine?.deactivations == 1)
+        c.stop()
     }
 
     @Test func aFailureWhilePlayingStopsAndOffersRetry() async {
