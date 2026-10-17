@@ -56,3 +56,5 @@ with a 16 kHz mono libopus decoder.
   change on every regeneration (the .m4a container carries timestamps); the pair stays consistent.
 - `event_watch_perf.json` — an Apple Watch performance batch (SYNTHETIC values): start, a sample
   with an unknown battery level (no `battery` field), and stop.
+- `event_phone_status.json` — the phone's own status (`phone_status`, SYNTHETIC values): no
+  pendant remembered, a Watch receipt as the trigger, outbox counts and `watch_relay`.

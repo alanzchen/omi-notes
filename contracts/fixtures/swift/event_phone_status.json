@@ -1,0 +1,26 @@
+{
+  "at" : "2026-10-17T07:00:00.000Z",
+  "data" : {
+    "app_state" : "background",
+    "app_version" : "0.1.0 (35)",
+    "launch_id" : "5d3e2a10-0000-4000-8000-000000000001",
+    "outbox_bytes" : 480000,
+    "outbox_chunks" : 2,
+    "outbox_pending" : 3,
+    "outbox_quarantined" : 0,
+    "pendant_remembered" : false,
+    "schema" : 1,
+    "trigger" : "watch_receipt",
+    "upload_held" : 0,
+    "upload_in_flight" : 2,
+    "upload_paused" : false,
+    "watch_relay" : {
+      "inbox_pending" : 1,
+      "last_received_at" : "2026-10-17T06:59:30.000Z",
+      "received" : 12,
+      "refused" : 0
+    }
+  },
+  "device_id" : "phone-0b6f6c1e-synthetic",
+  "type" : "phone_status"
+}

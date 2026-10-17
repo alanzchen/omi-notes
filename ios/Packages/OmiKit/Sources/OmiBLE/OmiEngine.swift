@@ -156,6 +156,10 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     private var pendingDisconnectReason: SealReason?
     private var appActive = true
     private var lastHeartbeatMono: UInt64 = 0
+    private let launchId = UUID().uuidString.lowercased()
+    /// A lifecycle callback has said whether the app is active (`appActive` defaults to true before).
+    private var appStateKnown = false
+    private var lastPhoneStatusMono: UInt64?
     private var keepAliveTask: Int?
     private var lastAudioMono: UInt64 = 0
     private var keepAliveSinceMono: UInt64 = 0
@@ -273,6 +277,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         recoveryComplete = true
         uploader.enabled = true
         processWatch()
+        writePhoneStatus(trigger: "launch")
 
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + config.tickInterval, repeating: config.tickInterval, leeway: .milliseconds(100))
@@ -497,6 +502,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             self.watchLastReceivedAt = Date()
             self.watchReceived += 1
             self.processWatch()
+            self.writePhoneStatus(trigger: "watch_receipt")
         }
         return segment.id
     }
@@ -859,6 +865,8 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     public func appDidBecomeActive() {
         queue.async {
             self.appActive = true
+            self.appStateKnown = true
+            self.writePhoneStatus(trigger: "foreground")
             self.endKeepAlive()
             self.central?.ensureConnected()  // re-kick a pending connect on foreground
             self.uploader.reconcile()
@@ -872,6 +880,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     public func appDidEnterBackground() {
         queue.async {
             self.appActive = false
+            self.appStateKnown = true
             self.recorder.syncNow()
             guard self.session != nil else { return }
             // iOS may suspend us right away (e.g. during a silent stretch, when no notification will
@@ -903,6 +912,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             return
         }
         bg.eventsLatch.register(completion)
+        queue.async { self.writePhoneStatus(trigger: "background_wake") }
     }
 
     /// Protected data became available (first unlock): settings and the Keychain read normally now,
@@ -1138,6 +1148,30 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             log(.error, "engine", "heartbeat write failed: \(error)")
         }
         scheduleReconcile()
+    }
+
+    /// The phone's own status, independent of any pendant: on launch, foreground, a background
+    /// session wake and Watch receipts, at most once per `heartbeatInterval` (the first of each launch
+    /// always). Never before recovery, and never without this install's identity (no stand-in id).
+    private func writePhoneStatus(trigger: String) {
+        guard recoveryComplete, let install = settings.phoneInstallId else { return }
+        let now = config.clock.monotonicNanoseconds()
+        if let last = lastPhoneStatusMono, now &- last < Self.heartbeatInterval { return }
+        refreshOutboxStats()
+        let data = PhoneStatusData(
+            appVersion: config.appVersion, launchId: launchId, trigger: trigger,
+            appState: !appStateKnown ? "unknown" : appActive ? "foreground" : "background",
+            outboxPending: outboxStats.pendingCount, outboxChunks: outboxStats.pendingChunks, outboxBytes: outboxStats.pendingBytes,
+            outboxQuarantined: outboxStats.quarantineCount, uploadInFlight: uploader.status.inFlight, uploadHeld: uploader.status.held,
+            uploadPaused: uploader.status.pausedReason != nil, pendantRemembered: settings.rememberedDeviceId != nil,
+            watchRelay: watchRelayHealth())
+        do {
+            try events.phoneStatus(deviceId: "phone-\(install)", data: data)
+            lastPhoneStatusMono = now
+            scheduleReconcile()
+        } catch {
+            log(.error, "engine", "phone status write failed: \(error)")
+        }
     }
 
     // MARK: Keep-alive (background)

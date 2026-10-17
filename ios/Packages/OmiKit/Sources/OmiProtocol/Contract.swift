@@ -169,6 +169,55 @@ public struct WatchRelayHealth: Codable, Equatable, Sendable {
     }
 }
 
+/// `phone_status`: the phone's own state, sent whether or not a pendant is involved (heartbeats are
+/// pendant-only). `device_id` is `phone-<install id>`; `at` is when it was generated. The counts
+/// describe the outbox, not what is eligible to upload now.
+public struct PhoneStatusData: Codable, Equatable, Sendable {
+    public var schema = 1
+    /// "0.1.0 (34)": the build that wrote this event.
+    public var appVersion: String?
+    /// One per app process: tells a relaunch from continuous running.
+    public var launchId: String
+    /// What prompted it: `launch`, `foreground`, `background_wake` or `watch_receipt`.
+    public var trigger: String
+    public var appState: String
+    public var outboxPending: Int
+    public var outboxChunks: Int
+    public var outboxBytes: Int64
+    public var outboxQuarantined: Int
+    public var uploadInFlight: Int
+    public var uploadHeld: Int
+    public var uploadPaused: Bool
+    public var pendantRemembered: Bool
+    public var watchRelay: WatchRelayHealth?
+
+    public init(appVersion: String?, launchId: String, trigger: String, appState: String, outboxPending: Int, outboxChunks: Int,
+                outboxBytes: Int64, outboxQuarantined: Int, uploadInFlight: Int, uploadHeld: Int, uploadPaused: Bool,
+                pendantRemembered: Bool, watchRelay: WatchRelayHealth?) {
+        self.appVersion = appVersion
+        self.launchId = launchId
+        self.trigger = trigger
+        self.appState = appState
+        self.outboxPending = outboxPending
+        self.outboxChunks = outboxChunks
+        self.outboxBytes = outboxBytes
+        self.outboxQuarantined = outboxQuarantined
+        self.uploadInFlight = uploadInFlight
+        self.uploadHeld = uploadHeld
+        self.uploadPaused = uploadPaused
+        self.pendantRemembered = pendantRemembered
+        self.watchRelay = watchRelay
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case schema, trigger
+        case appVersion = "app_version", launchId = "launch_id", appState = "app_state"
+        case outboxPending = "outbox_pending", outboxChunks = "outbox_chunks", outboxBytes = "outbox_bytes"
+        case outboxQuarantined = "outbox_quarantined", uploadInFlight = "upload_in_flight", uploadHeld = "upload_held"
+        case uploadPaused = "upload_paused", pendantRemembered = "pendant_remembered", watchRelay = "watch_relay"
+    }
+}
+
 public struct ButtonData: Codable, Equatable, Sendable {
     public var code: Int
     public init(code: Int) { self.code = code }
@@ -206,6 +255,7 @@ public struct EventBody: Encodable, Sendable, Equatable {
         case voiceEnrollmentStart(VoiceEnrollmentStartData)
         case voiceEnrollmentEnd(VoiceEnrollmentEndData)
         case watchPerf(WatchPerfData)
+        case phoneStatus(PhoneStatusData)
     }
 
     public var deviceId: String
@@ -230,6 +280,7 @@ public struct EventBody: Encodable, Sendable, Equatable {
         case .voiceEnrollmentStart: return "voice_enrollment_start"
         case .voiceEnrollmentEnd: return "voice_enrollment_end"
         case .watchPerf: return "watch_perf"
+        case .phoneStatus: return "phone_status"
         }
     }
 
@@ -250,6 +301,7 @@ public struct EventBody: Encodable, Sendable, Equatable {
         case .voiceEnrollmentStart(let d): try c.encode(d, forKey: .data)
         case .voiceEnrollmentEnd(let d): try c.encode(d, forKey: .data)
         case .watchPerf(let d): try c.encode(d, forKey: .data)
+        case .phoneStatus(let d): try c.encode(d, forKey: .data)
         }
         try c.encodeIfPresent(captureId, forKey: .captureId)
         try c.encodeIfPresent(offsetUs, forKey: .offsetUs)

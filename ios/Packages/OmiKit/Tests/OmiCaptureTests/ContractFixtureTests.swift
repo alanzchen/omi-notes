@@ -175,6 +175,14 @@ import OmiProtocol
                                           perfSample(2, "stopped", 0.89, "idle")], droppedBatches: 0)))
         try Self.prettyJSON(perf).write(to: out.appendingPathComponent("event_watch_perf.json"))
 
+        // The phone's own status, with no pendant involved (SYNTHETIC values).
+        let phone = EventBody(deviceId: "phone-0b6f6c1e-synthetic", at: "2026-10-17T07:00:00.000Z", payload: .phoneStatus(PhoneStatusData(
+            appVersion: "0.1.0 (35)", launchId: "5d3e2a10-0000-4000-8000-000000000001", trigger: "watch_receipt", appState: "background",
+            outboxPending: 3, outboxChunks: 2, outboxBytes: 480_000, outboxQuarantined: 0, uploadInFlight: 2, uploadHeld: 0,
+            uploadPaused: false, pendantRemembered: false,
+            watchRelay: WatchRelayHealth(received: 12, refused: 0, lastRefusal: nil, lastReceivedAt: "2026-10-17T06:59:30.000Z", inboxPending: 1))))
+        try Self.prettyJSON(phone).write(to: out.appendingPathComponent("event_phone_status.json"))
+
         // An Apple Watch part relayed as its own AAC file (aac_m4a_v1), encoded by Apple's encoder
         // (AVAudioFile, 16 kHz mono, 32 kbit/s, like the Watch), SYNTHETIC tone.
         let m4a = scratch.appendingPathComponent("watch.m4a")
@@ -319,6 +327,8 @@ import OmiProtocol
           change on every regeneration (the .m4a container carries timestamps); the pair stays consistent.
         - `event_watch_perf.json` — an Apple Watch performance batch (SYNTHETIC values): start, a sample
           with an unknown battery level (no `battery` field), and stop.
+        - `event_phone_status.json` — the phone's own status (`phone_status`, SYNTHETIC values): no
+          pendant remembered, a Watch receipt as the trigger, outbox counts and `watch_relay`.
 
         """
     }

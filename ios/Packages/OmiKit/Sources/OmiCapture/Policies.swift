@@ -205,6 +205,11 @@ public struct EventWriter: Sendable {
     }
 
     @discardableResult
+    public func phoneStatus(deviceId: String, data: PhoneStatusData) throws -> OutboxItem {
+        try write(EventBody(deviceId: deviceId, at: ISO8601UTC.format(clock.wallNow()), payload: .phoneStatus(data)))
+    }
+
+    @discardableResult
     /// `at`: only when writing a lost start event again (the original wall time).
     public func voiceEnrollmentStart(enrollmentId: String, deviceId: String, captureId: String, offsetUs: Int64,
                                      at: String? = nil) throws -> OutboxItem {

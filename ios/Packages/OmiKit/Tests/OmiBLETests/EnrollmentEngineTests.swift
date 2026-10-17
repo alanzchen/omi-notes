@@ -52,7 +52,7 @@ import OmiProtocol
         await model.startEnrollment()
         guard case .failed(let reason) = model.enrollment else { Issue.record("started against an older server"); return }
         #expect(reason == SpeakersModel.serverTooOld)
-        #expect(events(root).isEmpty, "no start event was written")
+        #expect(startEvents(root).isEmpty, "no start event was written")
     }
 
     @MainActor @Test func aFailedRefreshForgetsTheLastServersCapabilities() async throws {
