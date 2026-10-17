@@ -115,6 +115,8 @@ struct HomeView: View {
                     NavigationLink("Notes saved on this phone") { SavedConversationsView(model: model) }
                 } else if model.serverURL == nil {
                     Text("Connect your server to see your conversations here.").font(.subheadline).foregroundStyle(.secondary)
+                } else if model.recentLoadedAt == nil, model.recentSavedAt == nil {
+                    HStack { ProgressView(); Text("Loading conversations…").foregroundStyle(.secondary).padding(.leading, 6) }
                 } else {
                     Text("No conversations yet. A note appears here a few minutes after a conversation ends.")
                         .font(.subheadline).foregroundStyle(.secondary)
@@ -161,9 +163,12 @@ struct HomeView: View {
 struct ConversationLink: View {
     let model: AppModel
     let conversation: ConversationSummary
+    /// Lists without day headers (search) show the day in each row.
+    var showsDay = false
 
     private var row: ConversationRow {
-        ConversationRow(conversation: conversation, priority: model.priorityState(of: conversation))
+        ConversationRow(conversation: conversation, priority: model.priorityState(of: conversation), showsDay: showsDay,
+                        priorityMessage: model.priorityMessages[conversation.id])
     }
 
     var body: some View {
@@ -186,6 +191,10 @@ struct ConversationRow: View {
     let conversation: ConversationSummary
     /// The owner's choice (and whether it is still being saved).
     var priority: (state: String, pending: Bool) = ("auto", false)
+    /// The day before the time (lists without day headers).
+    var showsDay = false
+    /// Why the owner's last importance choice didn't save, if it didn't.
+    var priorityMessage: String?
     @Environment(\.dynamicTypeSize) private var typeSize
 
     private var c: ConversationSummary { conversation }
@@ -217,6 +226,9 @@ struct ConversationRow: View {
             if let issue = c.issues?.first {
                 Label(issue.message, systemImage: "exclamationmark.circle").font(.caption).foregroundStyle(.orange).lineLimit(2)
             }
+            if let priorityMessage {
+                Label(priorityMessage, systemImage: "exclamationmark.circle").font(.caption).foregroundStyle(.orange).lineLimit(2)
+            }
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
@@ -228,7 +240,7 @@ struct ConversationRow: View {
     }
 
     private var meta: String {
-        var parts = [Fmt.time(c.startedDate)]
+        var parts = [showsDay ? c.startedDate.map { "\(Fmt.day($0)), \(Fmt.time($0))" } ?? Fmt.time(nil) : Fmt.time(c.startedDate)]
         if let d = Fmt.duration(c.duration) { parts.append(d) }
         if let names = c.speakerNames, !names.isEmpty { parts.append(names.joined(separator: ", ")) }
         if c.provisional == true { parts.append("may be incomplete") }
@@ -267,7 +279,7 @@ struct SearchResults: View {
                 if result.conversations.isEmpty {
                     Text(loading ? "Searching…" : "No matching conversations.").foregroundStyle(.secondary)
                 }
-                ForEach(result.conversations) { c in ConversationLink(model: model, conversation: c) }
+                ForEach(result.conversations) { c in ConversationLink(model: model, conversation: c, showsDay: true) }
                 if result.nextCursor != nil {
                     Button("Show more") { Task { await load(more: true) } }.disabled(loading)
                 }
@@ -275,7 +287,9 @@ struct SearchResults: View {
                 HStack { ProgressView(); Text("Searching…").foregroundStyle(.secondary).padding(.leading, 6) }
             }
         } footer: {
-            if result?.offline == true {
+            if result?.serverLacksSearch == true {
+                Text("This server doesn't support search yet, so only notes saved on this phone were searched (their transcripts may be partial).")
+            } else if result?.offline == true {
                 Text("The server can't be reached, so only notes saved on this phone were searched (their transcripts may be partial).")
             } else if let pending = result?.pending, pending > 0 {
                 Text("\(pending) conversation\(pending == 1 ? " isn't" : "s aren't") searchable yet; the server is still indexing.")
@@ -334,7 +348,8 @@ struct SavedConversationsView: View {
                     ConversationDetailView(model: model, summary: d.entry)
                         .onAppear { model.openSaved(d) }
                 } label: {
-                    ConversationRow(conversation: d.entry, priority: model.priorityState(of: d.entry))
+                    ConversationRow(conversation: d.entry, priority: model.priorityState(of: d.entry), showsDay: true,
+                                    priorityMessage: model.priorityMessages[d.entry.id])
                 }
                 .modifier(PriorityActions(model: model, conversation: d.entry))
             }

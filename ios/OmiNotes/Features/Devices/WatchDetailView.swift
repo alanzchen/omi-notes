@@ -252,6 +252,8 @@ private struct WatchAlertToggle: View {
                 }
             }))
             .font(.subheadline.weight(.semibold))
+            Text("The same switch as Settings › Alerts: it also covers full storage and uploads that stop.")
+                .font(.footnote).foregroundStyle(.secondary)
             if let message { Text(message).font(.footnote).foregroundStyle(Pendant.warnForeground) }
         }
         .padding(.horizontal, 12).padding(.vertical, 10)

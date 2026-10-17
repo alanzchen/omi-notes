@@ -215,3 +215,22 @@ extension EngineSnapshot {
         return s
     }
 }
+
+/// Tapping Disconnect isn't a recording pause: the pendant may keep recording to its own storage.
+@Suite struct DisconnectedByYouTests {
+    @Test func aDisconnectByTheOwnerIsNotCalledRecordingPaused() {
+        var s = EngineSnapshot.answered
+        s.rememberedDeviceId = "a"
+        s.connection = .paused(ConnectionPhase.disconnectedByYou)
+        let now = Date()
+        #expect(PendantSummary.connectionTitle(s) == "Disconnected")
+        #expect(PendantSummary.stateLine(s, now: now).hasPrefix("Disconnected by you"))
+        #expect(PendantSummary.pendantFlow(s, now: now).title == "Disconnected")
+        let step = SystemHealth.pendant(s)
+        #expect(step.title == "Pendant disconnected" && step.fix == .reconnectDevice)
+        #expect(!(step.detail ?? "").contains("paused"))
+
+        s.connection = .paused("phone storage low")  // a real pause keeps its wording
+        #expect(PendantSummary.connectionTitle(s) == "Recording paused" && SystemHealth.pendant(s).title == "Recording is paused")
+    }
+}

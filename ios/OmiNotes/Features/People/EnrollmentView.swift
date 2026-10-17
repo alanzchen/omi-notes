@@ -86,6 +86,9 @@ struct EnrollmentView: View {
             }
             .buttonStyle(.borderedProminent)
             .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || creating)
+            if let error = speakers.error, !creating {
+                Label(error, systemImage: "exclamationmark.triangle").font(.footnote).foregroundStyle(.orange)
+            }
         }
     }
 
@@ -138,7 +141,7 @@ struct EnrollmentView: View {
             if status.state == "accepted" {
                 Image(systemName: "checkmark.seal.fill").font(.system(size: 48)).foregroundStyle(.green)
                 Text("Your voice is enrolled.").font(.headline)
-                Text("Notes start labeling you once you've confirmed yourself in a few conversations on different days; until then the app suggests.")
+                Text("Notes start labeling you once you've confirmed yourself in three recordings (with this voice sample, that can be the same day); until then the app suggests.")
                     .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
             } else {
                 Image(systemName: "arrow.clockwise.circle").font(.system(size: 48)).foregroundStyle(.orange)

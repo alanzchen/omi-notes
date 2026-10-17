@@ -27,6 +27,7 @@ final class FakeEngine: RecordingEngine {
     var onFailure: ((String) -> Void)?
     var onTime: ((Double) -> Void)?
     var onEnd: (() -> Void)?
+    var onPausedBySystem: (() -> Void)?
     func waitUntilReady() async throws { try await ready.wait() }
     func play() { plays += 1 }
     func pause() { pauses += 1 }
@@ -102,6 +103,23 @@ final class FakeEngine: RecordingEngine {
         await first.value
         #expect(h.controller.state == .ready && h.controller.isPlaying, "the old operation can't fail the new one")
         #expect(h.engines[0].plays == 0 && h.engines[1].teardowns == 0)
+    }
+
+    /// A phone call or unplugged headphones pause the player: the button must say Play again, and
+    /// nothing resumes by itself; play continues from there.
+    @Test func aSystemPauseShowsPlayAndResumesOnlyWhenAsked() async {
+        let h = harness()
+        let tap = Task { await h.controller.toggle() }
+        await settle()
+        h.info.open(.success(Self.info))
+        await settle()
+        h.engines[0].ready.open(.success(()))
+        await tap.value
+        #expect(h.controller.isPlaying)
+        h.engines[0].onPausedBySystem?()
+        #expect(!h.controller.isPlaying && h.controller.state == .ready, "paused, not failed")
+        await h.controller.toggle()
+        #expect(h.controller.isPlaying && h.engines[0].plays == 2 && h.engines.count == 1, "the same player continues")
     }
 
     @Test func aFailureWhilePlayingStopsAndOffersRetry() async {

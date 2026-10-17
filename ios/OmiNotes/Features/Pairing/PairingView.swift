@@ -13,8 +13,11 @@ struct PairingView: View {
             Section {
                 if s.bluetooth != .poweredOn && !s.simulated {
                     Label(bluetoothHint(s.bluetooth), systemImage: "antenna.radiowaves.left.and.right.slash").foregroundStyle(.orange)
+                    if s.bluetooth == .unauthorized, let url = URL(string: UIApplication.openSettingsURLString) {
+                        Button("Open Settings") { UIApplication.shared.open(url) }
+                    }
                 }
-                if s.scanResults.isEmpty {
+                if s.scanResults.isEmpty, s.bluetooth == .poweredOn || s.simulated {
                     HStack {
                         ProgressView()
                         Text("Looking for Omi devices…").foregroundStyle(.secondary).padding(.leading, 6)
@@ -39,7 +42,11 @@ struct PairingView: View {
                     }
                 }
             } footer: {
-                Text("Only one phone app can be connected to the pendant. Disconnect or quit the official Omi app first. In the Simulator, turn on the simulated device in the Debug tab.")
+                #if DEBUG
+                Text("Only one phone app can be connected to the pendant. Disconnect or quit the official Omi app first. In the Simulator, turn on the simulated device in Server › Developer tools.")
+                #else
+                Text("Only one phone app can be connected to the pendant. Disconnect or quit the official Omi app first.")
+                #endif
             }
         }
         .navigationTitle("Pair device")

@@ -26,9 +26,14 @@ public enum ConnectionPhase: Equatable, Sendable {
         case .settingUp: return "Connecting…"
         case .streaming: return "Recording"
         case .refused: return "Unsupported device"
-        case .paused: return "Paused"
+        case .paused: return isUserDisconnect ? "Disconnected" : "Paused"
         }
     }
+
+    /// The reason the engine gives when the owner tapped Disconnect (not a recording pause).
+    public static let disconnectedByYou = "disconnected by you"
+    /// Disconnected on purpose: the pendant may keep recording on its own; nothing is paused.
+    public var isUserDisconnect: Bool { self == .paused(Self.disconnectedByYou) }
 }
 
 public struct LiveSnapshot: Equatable, Sendable {
@@ -1394,7 +1399,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         }
         if settings.rememberedDeviceId == nil { return .noDevice }
         if storageTripped { return .paused("phone storage low") }
-        if settings.userDisconnected { return .paused("disconnected by you") }
+        if settings.userDisconnected { return .paused(ConnectionPhase.disconnectedByYou) }
         if settings.simulatedMode { return .waitingForDevice }
         switch btState {
         case .poweredOn: break

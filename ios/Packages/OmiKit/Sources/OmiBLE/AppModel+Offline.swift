@@ -65,6 +65,8 @@ extension AppModel {
         public var pending: Int
         /// Only notes saved on this phone were searched (the server couldn't be reached).
         public var offline: Bool
+        /// Only saved notes were searched because the server doesn't support search (it's reachable).
+        public var serverLacksSearch = false
     }
 
     public enum SearchRange: String, CaseIterable, Sendable {
@@ -97,6 +99,7 @@ extension AppModel {
         }
         let data = dataEpoch
         let answer: Result<SearchResponse, Error>
+        var unsupported = false
         if serverStatus?.supportsSearch == true || serverStatus == nil {
             answer = await Result {
                 try await APIClient(endpoint: endpoint, session: session)
@@ -104,6 +107,7 @@ extension AppModel {
             }
         } else {
             answer = .failure(APIError.transport("this server doesn't support search"))
+            unsupported = true
         }
         guard !Task.isCancelled, isCurrent(config), data == dataEpoch else { return .failure(CancellationError()) }
         switch answer {
@@ -116,7 +120,7 @@ extension AppModel {
             if personId != nil { return .failure(SearchError.personNeedsServer) }
             let rows = noteCache.search(query, scope: scope).map(\.entry)
                 .filter { c in fromDate.map { (c.startedDate ?? .distantPast) >= $0 } ?? true }
-            return .success(SearchResult(conversations: rows, nextCursor: nil, pending: 0, offline: true))
+            return .success(SearchResult(conversations: rows, nextCursor: nil, pending: 0, offline: !unsupported, serverLacksSearch: unsupported))
         }
     }
 

@@ -152,7 +152,9 @@ struct WorthRevisitingSection: View {
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(important ? "Important" : "Worth revisiting"): \(c.title ?? "Conversation")")
+        .accessibilityLabel(([ "\(important ? "Important" : "Worth revisiting"): \(c.title ?? "Conversation")" ]
+                             + [c.isRecommended ? c.value?.highlight : nil, meta(c, important: important)].compactMap { $0 })
+                            .joined(separator: ". "))
     }
 
     private func meta(_ c: ConversationSummary, important: Bool) -> String {

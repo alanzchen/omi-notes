@@ -10,6 +10,8 @@ public protocol RecordingEngine: AnyObject {
     /// The playhead moved / playback reached the end.
     var onTime: ((Double) -> Void)? { get set }
     var onEnd: (() -> Void)? { get set }
+    /// The system paused playback (a call or another app's audio, headphones unplugged).
+    var onPausedBySystem: (() -> Void)? { get set }
     func waitUntilReady() async throws
     func play()
     func pause()
@@ -111,6 +113,10 @@ public final class NoteRecordingController {
             engine.onEnd = { [weak self, weak engine] in
                 guard let self, let engine, self.engine === engine else { return }
                 self.reachedEnd()
+            }
+            engine.onPausedBySystem = { [weak self, weak engine] in
+                guard let self, let engine, self.engine === engine else { return }
+                self.isPlaying = false  // paused where it was; play continues from there, never by itself
             }
             self.engine = engine
             try await bounded(until: deadline, gen: gen) { try await engine.waitUntilReady() }

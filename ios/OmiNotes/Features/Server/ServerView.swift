@@ -84,7 +84,8 @@ struct ServerView: View {
         if let a = status?.activity {
             Section {
                 if let running = a.running?.first {
-                    Label("\(running.stage == "summarizing" ? "Writing the summary of" : "Transcribing") the \(when(running.startedAt)) conversation",
+                    Label("\(running.stage == "summarizing" ? "Writing the summary of" : "Transcribing") a conversation"
+                          + (startedPhrase(running.startedAt).map { " that started \($0)" } ?? ""),
                           systemImage: "gearshape.2")
                 }
                 if let waiting = a.waiting, waiting > 0 {
@@ -101,6 +102,13 @@ struct ServerView: View {
                 Text("A successful request to a service means it answered; the note still has to be written. Times reset when the server rebuilds its index.")
             }
         }
+    }
+
+    /// "3:04 PM", "yesterday 3:04 PM" or "Thursday, Oct 15 3:04 PM" (mid-sentence), nil without a time.
+    private func startedPhrase(_ iso: String?) -> String? {
+        guard let d = iso.flatMap(ISO8601UTC.parse) else { return nil }
+        if Calendar.current.isDateInToday(d) { return Fmt.time(d) }
+        return "\(Calendar.current.isDateInYesterday(d) ? "yesterday" : Fmt.day(d)) \(Fmt.time(d))"
     }
 
     private func when(_ iso: String?) -> String {
@@ -299,7 +307,7 @@ struct RetryControl: View {
             if let msg = model.retryMessages[conversationId] { Text(msg).font(.caption).foregroundStyle(.secondary) }
         }
         .confirmationDialog("Keep as a transcript?", isPresented: $confirming, titleVisibility: .visible) {
-            Button("Keep as Transcript") { send() }
+            Button("Keep as transcript") { send() }
         } message: {
             Text("The automated text becomes a note with the speaker unknown, and this leaves the server's list of problems. Nothing is deleted.")
         }
@@ -334,12 +342,12 @@ struct WeekSection: View {
                         BarMark(x: .value("Day", Self.weekday(day.date)), y: .value("Minutes", day.conversationS / 60))
                             .foregroundStyle(.tint)
                             .accessibilityLabel(Self.weekday(day.date))
-                            .accessibilityValue("\(Fmt.duration(day.conversationS) ?? "none"), \(day.conversations) conversations")
+                            .accessibilityValue("\(Fmt.duration(day.conversationS) ?? "none"), \(day.conversations) conversation\(day.conversations == 1 ? "" : "s")")
                     }
                     .chartYAxisLabel("minutes")
                     .frame(height: 140)
                     HStack {
-                        Tile(value: "\(stats.totals.conversations)", label: "conversations")
+                        Tile(value: "\(stats.totals.conversations)", label: stats.totals.conversations == 1 ? "conversation" : "conversations")
                         Tile(value: Fmt.duration(stats.totals.conversationS) ?? "0 min", label: "conversation time")
                         Tile(value: "\(stats.totals.people)", label: stats.totals.people == 1 ? "person" : "people")
                     }

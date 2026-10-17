@@ -102,7 +102,7 @@ struct HealthCard: View {
             }
             .buttonStyle(.plain)
             .accessibilityElement(children: .combine)
-            .accessibilityLabel("\(health.level.accessibilityName). \(health.headline)")
+            .accessibilityLabel(["\(health.level.accessibilityName). \(health.headline)", health.detail].compactMap { $0 }.joined(separator: ". "))
             .accessibilityHint(expanded ? "Hides the details" : "Shows each step")
 
             if expanded {
@@ -138,6 +138,14 @@ struct StepRow: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(step.area.title): \(step.level.accessibilityName). \(step.title). \(step.detail ?? "")")
+        // the combined element hides the fix button: offer it as an action and say so
+        .accessibilityActions { if let fix = shownFix { Button(fix.title) { onFix(fix) } } }
+        .accessibilityHint(shownFix.map { "Actions: \($0.title)" } ?? "")
+    }
+
+    private var shownFix: SystemHealth.Fix? {
+        guard let fix = step.fix, fix != hiding, step.level >= .delayed else { return nil }
+        return fix
     }
 }
 
@@ -195,6 +203,21 @@ extension Fmt {
         if cal.isDateInToday(date) { return "Today" }
         if cal.isDateInYesterday(date) { return "Yesterday" }
         return date.formatted(.dateTime.weekday(.wide).month(.abbreviated).day())
+    }
+}
+
+/// The pendant-button tip, as currently set (the double tap can be changed or the buttons turned off).
+enum PendantTip {
+    static func text(_ s: EngineSnapshot) -> String {
+        guard s.buttonActionsEnabled else { return "Taps on the pendant are turned off (Devices › Pendant › Manage pendant)." }
+        let double: String
+        switch s.doubleTapAction {
+        case .endConversation: double = "double-tap to end the conversation now"
+        case .bookmark: double = "double-tap bookmarks too"
+        case .pauseRecording: double = "double-tap to pause or resume recording"
+        case .starConversation: double = "double-tap to star the conversation"
+        }
+        return "Tap the pendant once to bookmark a moment; \(double)."
     }
 }
 

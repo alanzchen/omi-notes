@@ -104,6 +104,10 @@ public struct SystemHealth: Equatable, Sendable {
         case .refused(let why):
             return step(.needsAction, "This pendant can't be used", why, .pairDevice)
         case .paused(let why):
+            if s.connection.isUserDisconnect {
+                return step(.needsAction, "Pendant disconnected",
+                            "You disconnected it. It may keep recording to its own storage; reconnect to collect that audio.", .reconnectDevice)
+            }
             return step(.needsAction, "Recording is paused", why, s.storageTripped ? nil : .reconnectDevice)
         case .settingUp:
             return step(.working, "Connecting to the pendant")

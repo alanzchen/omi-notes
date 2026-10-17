@@ -80,7 +80,7 @@ struct OnboardingView: View {
                 Label("Your first note appears a few minutes after a conversation ends.", systemImage: "clock")
                 Label("Leave the app in the background. Don't force-quit it: that stops the pendant from reconnecting until you open it again.", systemImage: "moon.zzz")
                 Label("Only one phone can connect to the pendant. Disconnect the official Omi app.", systemImage: "iphone.slash")
-                Label("Tap the pendant once to bookmark a moment; double-tap to end the conversation now.", systemImage: "hand.tap")
+                Label(PendantTip.text(model.snapshot), systemImage: "hand.tap")
                 Label("If your server is a Mac, it must be awake and logged in to transcribe. If you use Tailscale, keep it connected on this phone.",
                       systemImage: "desktopcomputer")
             }

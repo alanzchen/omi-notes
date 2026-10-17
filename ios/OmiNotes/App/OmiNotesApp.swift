@@ -155,6 +155,7 @@ struct ConfigureConfirmSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var error: String?
     @State private var testResult: String?
+    @State private var testing = false
 
     var body: some View {
         let (url, verdict) = ServerURLPolicy.evaluate(link.url)
@@ -177,9 +178,14 @@ struct ConfigureConfirmSheet: View {
                 }
                 if let url, verdict.isAcceptable {
                     Section {
-                        Button("Test connection") {
-                            Task { testResult = await model.testConnection(url: url, token: link.token) }
+                        Button(testing ? "Testing…" : "Test connection") {
+                            testing = true
+                            Task {
+                                testResult = await model.testConnection(url: url, token: link.token)
+                                testing = false
+                            }
                         }
+                        .disabled(testing)
                         if let testResult { Text(testResult).font(.footnote) }
                     }
                 }

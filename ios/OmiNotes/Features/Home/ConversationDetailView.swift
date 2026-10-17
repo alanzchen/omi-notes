@@ -40,6 +40,9 @@ struct ConversationDetailView: View {
         ScrollViewReader { proxy in
         List {
             header
+            if let message = model.priorityMessages[summary.id] {
+                Section { Label(message, systemImage: "exclamationmark.circle").font(.footnote).foregroundStyle(.orange) }
+            }
             if let saved = model.detailSavedAt[summary.id] {
                 Section {
                     Label("Saved copy from \(Fmt.relative(saved)). The server can't be reached right now.", systemImage: "tray.full")
@@ -90,6 +93,8 @@ struct ConversationDetailView: View {
                             .foregroundStyle(state == "important" ? ValueStyle.important : Color.accentColor)
                     }
                     .accessibilityLabel("Importance")
+                    .accessibilityValue(model.priority(of: entry).state == "important" ? "Important"
+                                        : model.priority(of: entry).state == "less_useful" ? "Less useful" : "Automatic")
                 }
             }
         }
@@ -99,6 +104,11 @@ struct ConversationDetailView: View {
             NameVoiceView(model: model, items: run.items)
         }
         .refreshable { await load() }
+        // a retry or keep that finished changed the note: show the new state, not "Failed"
+        .onChange(of: model.retries[summary.id]?.state) { _, state in
+            if state == "done" { Task { await load() } }
+        }
+        .onDisappear { recording.stop() }
     }
 
     // MARK: Sections
@@ -187,8 +197,10 @@ struct ConversationDetailView: View {
         withAnimation { showTranscript = true }
         let first = h.target?.firstSegment
         Task {
-            while let first, detail?.transcript.map({ $0.segments.count <= first && $0.nextFrom != nil }) == true {
+            while let first, detail?.transcript.map({ $0.segments.count <= first && $0.nextFrom != nil }) == true, !Task.isCancelled {
+                let before = detail?.transcript?.segments.count
                 await loadMoreTranscript()
+                if detail?.transcript?.segments.count == before { break }  // failed or empty page: don't spin
             }
             try? await Task.sleep(for: .milliseconds(350))  // the transcript opens first, then scroll to it
             withAnimation { proxy.scrollTo(first.map { "seg-\($0)" } ?? "transcript", anchor: .top) }

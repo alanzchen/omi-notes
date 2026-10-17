@@ -45,7 +45,6 @@ struct NoteRecordingSection: View {
         } header: {
             Text("Recording")
         }
-        .onDisappear { player.stop() }
     }
 
     private var playButton: some View {
@@ -61,7 +60,7 @@ struct NoteRecordingSection: View {
         }
         .buttonStyle(.plain)
         .disabled(!playable || player.state == .loading)
-        .accessibilityLabel(player.isPlaying ? "Pause the recording" : "Play the recording")
+        .accessibilityLabel(player.state == .loading ? "Loading the recording" : player.isPlaying ? "Pause the recording" : "Play the recording")
     }
 
     private var playable: Bool {
@@ -135,6 +134,7 @@ final class AVRecordingEngine: RecordingEngine {
     var onFailure: ((String) -> Void)?
     var onTime: ((Double) -> Void)?
     var onEnd: (() -> Void)?
+    var onPausedBySystem: (() -> Void)?
     static let stallLimit: Duration = .seconds(15)
 
     private let player: AVPlayer
@@ -162,8 +162,18 @@ final class AVRecordingEngine: RecordingEngine {
         observers.append(center.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification, object: item, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.playing = false
+                Self.releaseSession()
                 self?.onEnd?()
             }
+        })
+        // A call, another app's audio, or the headphones going away pause AVPlayer by itself: say so.
+        observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
+            let began = (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt).flatMap(AVAudioSession.InterruptionType.init) == .began
+            MainActor.assumeIsolated { if began { self?.pausedBySystem() } }
+        })
+        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] note in
+            let lost = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt).flatMap(AVAudioSession.RouteChangeReason.init) == .oldDeviceUnavailable
+            MainActor.assumeIsolated { if lost { self?.pausedBySystem() } }
         })
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 4), queue: .main) { [weak self] time in
             MainActor.assumeIsolated { self?.onTime?(time.seconds) }
@@ -192,6 +202,20 @@ final class AVRecordingEngine: RecordingEngine {
         player.pause()
         playing = false
         watchdog?.cancel()
+        Self.releaseSession()
+    }
+
+    private func pausedBySystem() {
+        guard playing else { return }
+        player.pause()
+        playing = false
+        watchdog?.cancel()
+        onPausedBySystem?()
+    }
+
+    /// Lets other audio (music, podcasts) resume once this recording stops.
+    private static func releaseSession() {
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
     func seek(to seconds: Double) {
@@ -199,6 +223,7 @@ final class AVRecordingEngine: RecordingEngine {
     }
 
     func teardown() {
+        if playing { Self.releaseSession() }
         playing = false
         watchdog?.cancel()
         if let timeObserver { player.removeTimeObserver(timeObserver) }

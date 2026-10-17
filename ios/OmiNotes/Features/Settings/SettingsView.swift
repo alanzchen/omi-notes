@@ -21,7 +21,7 @@ struct SettingsView: View {
                 Label("Leave Omi Notes running in the background. Force-quitting it stops the pendant from reconnecting until you open the app again.",
                       systemImage: "moon.zzz")
                 Label("Only one phone can connect to the pendant. Disconnect the official Omi app.", systemImage: "iphone.slash")
-                Label("Tap the pendant once to bookmark a moment; double-tap to end the conversation now.", systemImage: "hand.tap")
+                Label(PendantTip.text(model.snapshot), systemImage: "hand.tap")
             } header: {
                 Text("Tips")
             }

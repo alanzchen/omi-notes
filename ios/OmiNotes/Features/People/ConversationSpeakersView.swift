@@ -195,7 +195,8 @@ struct SpeakerPickerView: View {
                     choose(.unknown, "Unknown speaker", system: "questionmark.circle")
                 }
             }
-            .navigationTitle(label.name ?? "Speaker \(label.label.dropFirst())")
+            .navigationTitle(label.name ?? (label.label == "unknown" ? "Unknown speaker"
+                                            : label.label.hasPrefix("S") && Int(label.label.dropFirst()) != nil ? "Speaker \(label.label.dropFirst())" : label.label))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
             .sheet(isPresented: $showConsent) { RecognitionConsentView(model: model) }

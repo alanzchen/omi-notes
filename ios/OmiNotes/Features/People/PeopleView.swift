@@ -4,6 +4,12 @@ import SwiftUI
 
 /// You, the people the server recognizes, suggestions for recurring voices, and recognition settings.
 struct PeopleView: View {
+    /// "3 conversations · 2 days"; only what the server said (nothing rather than "0" when it didn't).
+    static func evidence(_ s: SpeakerSuggestion) -> String? {
+        let parts = [s.conversations.map { "\($0) conversation\($0 == 1 ? "" : "s")" }, s.days.map { "\($0) day\($0 == 1 ? "" : "s")" }].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
     @Bindable var model: AppModel
     @State private var showEnrollment = false
     @State private var showConsent = false
@@ -38,7 +44,7 @@ struct PeopleView: View {
             NameVoiceView(model: model, items: r.items)
         }
         .confirmationDialog(
-            "Forget \(forgetting?.name ?? "")'s voice?", isPresented: .init(get: { forgetting != nil }, set: { if !$0 { forgetting = nil } }),
+            forgetting?.isMe == true ? "Forget your voice?" : "Forget \(forgetting?.name ?? "")'s voice?", isPresented: .init(get: { forgetting != nil }, set: { if !$0 { forgetting = nil } }),
             titleVisibility: .visible
         ) {
             if let p = forgetting {
@@ -46,7 +52,9 @@ struct PeopleView: View {
                 Button("Forget voice and delete their note", role: .destructive) { Task { await speakers.forgetVoice(p, deleteNote: true) } }
             }
         } message: {
-            Text("Their voiceprints are deleted from your server and past notes go back to “Speaker N”.")
+            Text(forgetting?.isMe == true
+                 ? "Your voice sample, confirmations and voiceprints are deleted from your server, and past notes go back to “Speaker N”. You stay in People. This can't be undone. “Delete their note” also deletes your People note in the vault."
+                 : "Their voiceprints are deleted from your server and past notes go back to “Speaker N”. They stay in People. This can't be undone. “Delete their note” also deletes their People note in the vault.")
         }
         .onDisappear { player.stop() }
     }
@@ -109,7 +117,7 @@ struct PeopleView: View {
                             if let text = s.clips?.first?.text ?? s.excerpt {
                                 Text("“\(text)”").font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
                             }
-                            Text("\(s.conversations ?? 0) conversations · \(s.days ?? 0) days").font(.caption2).foregroundStyle(.tertiary)
+                            if let e = Self.evidence(s) { Text(e).font(.caption2).foregroundStyle(.tertiary) }
                         }
                     }
                 } else {
@@ -118,7 +126,7 @@ struct PeopleView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(title(s)).font(.body.weight(.medium))
                         if let excerpt = s.excerpt { Text("“\(excerpt)”").font(.subheadline).foregroundStyle(.secondary).lineLimit(2) }
-                        Text("\(s.conversations ?? 0) conversations · \(s.days ?? 0) days").font(.caption2).foregroundStyle(.tertiary)
+                        if let e = Self.evidence(s) { Text(e).font(.caption2).foregroundStyle(.tertiary) }
                         HStack {
                             Button("Name…") { naming = s }.buttonStyle(.bordered)
                             Button("Dismiss") { Task { await speakers.dismiss(s) } }.buttonStyle(.borderless)
@@ -151,7 +159,7 @@ struct PeopleView: View {
         } header: {
             Text("Recognition")
         } footer: {
-            Text("Automatic naming applies to a person only after they've been confirmed in several conversations on different days. Voiceprints never leave your server.")
+            Text("Automatic naming applies to a person only after they've been confirmed in conversations on at least two different days (for you: your voice sample plus confirmations in three recordings is enough). Voiceprints never leave your server.")
         }
         .disabled(model.settings.endpoint == nil)
     }
@@ -225,6 +233,8 @@ struct SuggestionPickerView: View {
 struct RecognitionConsentView: View {
     @Bindable var model: AppModel
     @Environment(\.dismiss) private var dismiss
+    @State private var saving = false
+    @State private var failed: String?
 
     var body: some View {
         NavigationStack {
@@ -239,15 +249,24 @@ struct RecognitionConsentView: View {
                 .padding()
             }
             .safeAreaInset(edge: .bottom) {
-                Button {
-                    Task {
-                        await model.speakers.acknowledgeRecognition()
-                        dismiss()
+                VStack(spacing: 8) {
+                    // stays open if the server didn't take it, and says why
+                    if let failed { Label(failed, systemImage: "exclamationmark.triangle").font(.footnote).foregroundStyle(.orange) }
+                    Button {
+                        saving = true
+                        Task {
+                            await model.speakers.acknowledgeRecognition()
+                            saving = false
+                            if model.speakers.settings?.acknowledgedAt != nil { dismiss() } else {
+                                failed = model.speakers.error ?? "Couldn't turn it on; try again."
+                            }
+                        }
+                    } label: {
+                        Text(saving ? "Turning on…" : "I understand — turn on").frame(maxWidth: .infinity)
                     }
-                } label: {
-                    Text("I understand — turn on").frame(maxWidth: .infinity)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(saving)
                 }
-                .buttonStyle(.borderedProminent)
                 .padding()
             }
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Not now") { dismiss() } } }

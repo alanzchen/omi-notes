@@ -333,9 +333,12 @@ public final class AppModel {
         let api = APIClient(endpoint: ServerEndpoint(baseURL: url, token: token))
         do {
             let st = try await api.status()
-            return "OK — server \(st.serverVersion ?? "?"), protocol \(st.protocolVersion.map(String.init) ?? "?"), STT \(st.stt?.ready == true ? "ready" : "not ready"), LLM \(st.llm?.ready == true ? "ready" : "not ready")"
+            return "Connected to server \(st.serverVersion ?? "?"). Transcription \(st.stt?.ready == true ? "ready" : "not ready"); "
+                + "summaries \(st.llm?.ready == true ? "ready" : "not ready")."
+        } catch APIError.http(401, _) {
+            return "Couldn't connect: the server rejected this token."
         } catch {
-            return "Failed: \(error)"
+            return "Couldn't connect: \(Self.describe(error))"
         }
     }
 

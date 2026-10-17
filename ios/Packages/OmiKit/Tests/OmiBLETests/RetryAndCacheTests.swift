@@ -250,6 +250,17 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         #expect(RetryStore(url: root.appendingPathComponent("app-retries.json")).entries(server: "https://mac.ts.net|vault-a").isEmpty)
     }
 
+    /// A reachable server without search: only saved notes are searched, and that isn't called
+    /// "can't be reached".
+    @Test func aServerWithoutSearchIsNotCalledUnreachable() async throws {
+        let (m, _) = try model()
+        AppServerStub.routes["/v1/status"] = [(200, Self.status.replacingOccurrences(of: #""search","#, with: ""))]
+        await m.refreshServer()
+        #expect(m.serverStatus?.supportsSearch == false)
+        let r = try await m.search("budget", personId: nil, range: .any).get()
+        #expect(r.serverLacksSearch && !r.offline)
+    }
+
     // The stub's state is shared: offline reading runs in this serialized suite too.
 
     @Test func anUnreachableServerShowsTheSavedListAndNotes() async throws {

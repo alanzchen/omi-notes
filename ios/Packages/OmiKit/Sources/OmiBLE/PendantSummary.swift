@@ -149,7 +149,7 @@ public struct PendantSummary: Equatable, Sendable {
         case .settingUp: return "Connecting…"
         case .streaming: return "Connected · recording"
         case .refused: return "Can't use this pendant"
-        case .paused: return "Recording paused"
+        case .paused: return s.connection.isUserDisconnect ? "Disconnected" : "Recording paused"
         }
     }
 
@@ -249,7 +249,7 @@ public struct PendantSummary: Equatable, Sendable {
         case .noDevice: return "No pendant paired"
         case .bluetoothUnavailable: return "Bluetooth is unavailable"
         case .refused: return "This pendant can't be used"
-        case .paused: return "Recording paused"
+        case .paused: return s.connection.isUserDisconnect ? "Disconnected by you · may still record on its own" : "Recording paused"
         }
     }
 
@@ -288,7 +288,7 @@ public struct PendantSummary: Equatable, Sendable {
         case .noDevice: return flow(.needsAction, "Not paired")
         case .bluetoothUnavailable: return flow(.needsAction, "Bluetooth off")
         case .refused: return flow(.needsAction, "Can't be used")
-        case .paused: return flow(.needsAction, "Paused")
+        case .paused: return flow(.needsAction, s.connection.isUserDisconnect ? "Disconnected" : "Paused")
         }
     }
 

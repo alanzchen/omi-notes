@@ -309,8 +309,8 @@ public enum ServerURLPolicy {
                 return (url, .insecureLocal("Plain http: the token and audio travel unencrypted on this network. Use only for local development."))
             }
             return (nil, .rejected(allowInsecureLocal
-                ? "Use https (e.g. `tailscale serve`); plain http is only allowed for local-network hosts"
-                : "Use https (e.g. `tailscale serve`); plain http is only allowed in development builds"))
+                ? "Use https (e.g. from tailscale serve); plain http is only allowed for local-network hosts"
+                : "Use https (e.g. from tailscale serve); plain http is only allowed in development builds"))
         default:
             return (nil, .rejected("Unsupported scheme \(scheme)"))
         }
