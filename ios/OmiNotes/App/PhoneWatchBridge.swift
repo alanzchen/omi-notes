@@ -26,6 +26,12 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
         WCSession.default.activate()
     }
 
+    /// After the first unlock, when the identity became readable.
+    func announceIdentity() {
+        guard WCSession.isSupported() else { return }
+        announce(WCSession.default)
+    }
+
     private func announce(_ session: WCSession) {
         // unreadable before the first unlock: announcing nothing beats announcing a wrong identity
         guard session.activationState == .activated, let phone = engine.settings.phoneInstallId else { return }

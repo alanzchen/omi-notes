@@ -176,6 +176,9 @@ final class WatchSync: NSObject, WCSessionDelegate {
         guard session.activationState == .activated, session.isReachable else { return }
         session.sendMessage(["hello": 1], replyHandler: { reply in
             let r = Received(reply)
+            // the iPhone can't read its identity yet (not unlocked since it restarted): asking again at
+            // once would loop; it announces itself after unlocking, and the recheck asks again
+            guard r.binding != nil || !r.acks.isEmpty else { return }
             Task { @MainActor in self.handle(r) }
         }, errorHandler: nil)
     }

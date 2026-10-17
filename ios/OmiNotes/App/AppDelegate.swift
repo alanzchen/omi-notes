@@ -143,6 +143,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
 
     func applicationProtectedDataDidBecomeAvailable(_ application: UIApplication) {
         model?.engine.protectedDataDidBecomeAvailable()
+        watchBridge?.announceIdentity()
     }
 
     func application(_ application: UIApplication, handleEventsForBackgroundURLSession identifier: String, completionHandler: @escaping () -> Void) {
