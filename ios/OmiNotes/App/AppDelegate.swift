@@ -24,7 +24,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         let config = EngineConfiguration(
             dirs: .appDefault(), appVersion: "\(bundleVersion) (\(build))", timezone: TimeZone.current.identifier,
             simulatedTrace: trace)
-        let engine = OmiEngine(config: config, settings: SettingsStore(), background: backgroundTasks)
+        let settings = SettingsStore()
+        // launched in the background before the first unlock: settings read as empty until then
+        settings.unlockedSinceBoot = application.isProtectedDataAvailable
+        let engine = OmiEngine(config: config, settings: settings, background: backgroundTasks)
         model = AppModel(engine: engine)
         let model = model!
         watchBridge = PhoneWatchBridge(engine: engine) { installed in Task { @MainActor in model.watchAppInstalled = installed } }
@@ -117,7 +120,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
                                 bootId: "synthetic", launchId: "synthetic", recordingId: rec, event: event, state: "recording", battery: nil,
                                 batteryState: "unknown", counters: [:], gauges: [:], app: "synthetic", os: "synthetic", model: "synthetic")
             }
-            let data = WatchWire.encode(WatchPerfBatch(id: batch, deviceId: "watch-synthetic-alert", binding: engine.settings.phoneInstallId,
+            let data = WatchWire.encode(WatchPerfBatch(id: batch, deviceId: "watch-synthetic-alert", binding: engine.settings.phoneInstallId ?? "",
                                                        data: WatchPerfData(batchId: batch, samples: [sample("start", 300), sample("interrupted", 180)], droppedBatches: 0)))
             _ = try? engine.acceptWatchPerf(data)
         }
@@ -136,6 +139,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         let restored = launchOptions?[.bluetoothCentrals] != nil
         OmiLog.shared.log(.info, "app", "launched\(restored ? " by Bluetooth state restoration" : "") (\(application.applicationState == .background ? "background" : "foreground"))")
         return true
+    }
+
+    func applicationProtectedDataDidBecomeAvailable(_ application: UIApplication) {
+        model?.engine.protectedDataDidBecomeAvailable()
     }
 
     func application(_ application: UIApplication, handleEventsForBackgroundURLSession identifier: String, completionHandler: @escaping () -> Void) {

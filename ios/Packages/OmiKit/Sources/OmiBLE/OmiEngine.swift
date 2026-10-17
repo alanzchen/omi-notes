@@ -468,7 +468,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     // MARK: Apple Watch relay
 
     public private(set) lazy var watchInbox = PhoneWatchInbox(root: config.dirs.root.appendingPathComponent("watch", isDirectory: true),
-                                                             binding: settings.phoneInstallId)
+                                                             currentBinding: { [settings] in settings.phoneInstallId })
     private lazy var watchProcessor = WatchRelayProcessor(inbox: watchInbox, outbox: outbox, appVersion: config.appVersion,
                                                           timezone: config.timezone,
                                                           serverTakesAAC: { [weak self] in self?.serverTakesWatchAAC ?? false })
@@ -514,7 +514,8 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         guard let batch = WatchWire.decode(WatchPerfBatch.self, data), batch.id == batch.data.batchId,
               batch.id.range(of: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", options: .regularExpression) != nil
         else { throw WatchRelayError.damaged("telemetry") }
-        guard batch.binding == settings.phoneInstallId else { throw WatchRelayError.wrongPhone }
+        guard let phone = settings.phoneInstallId else { throw WatchRelayError.identityUnreadable }
+        guard batch.binding == phone else { throw WatchRelayError.wrongPhone }
         let at = batch.data.samples.first?.at ?? ISO8601UTC.format(Date())
         let body = EventBody(deviceId: batch.deviceId, at: at, payload: .watchPerf(batch.data))
         try outbox.write(try ContractJSON.encode(body), kind: .event(eventId: batch.id))
@@ -904,8 +905,10 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         bg.eventsLatch.register(completion)
     }
 
-    /// Protected data became available (first unlock): retry a Keychain read that failed earlier.
+    /// Protected data became available (first unlock): settings and the Keychain read normally now,
+    /// so retry a Keychain read that failed earlier.
     public func protectedDataDidBecomeAvailable() {
+        settings.unlockedSinceBoot = true
         settings.invalidateTokenCache()
         queue.async { self.uploader.reconcile() }
     }

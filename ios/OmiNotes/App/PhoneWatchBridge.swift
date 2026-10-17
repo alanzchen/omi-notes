@@ -27,15 +27,16 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
     }
 
     private func announce(_ session: WCSession) {
-        guard session.activationState == .activated else { return }
+        // unreadable before the first unlock: announcing nothing beats announcing a wrong identity
+        guard session.activationState == .activated, let phone = engine.settings.phoneInstallId else { return }
         // a changing field, so the context is always transmitted (an unchanged one may not reach a
         // freshly installed Watch app)
-        try? session.updateApplicationContext([WatchWire.binding: engine.settings.phoneInstallId, "at": Date().timeIntervalSince1970])
+        try? session.updateApplicationContext([WatchWire.binding: phone, "at": Date().timeIntervalSince1970])
     }
 
     private func acknowledge(_ ids: [String], _ session: WCSession) {
-        guard !ids.isEmpty else { return }
-        let message: [String: Any] = [WatchWire.acks: ids, WatchWire.binding: engine.settings.phoneInstallId]
+        guard !ids.isEmpty, let phone = engine.settings.phoneInstallId else { return }
+        let message: [String: Any] = [WatchWire.acks: ids, WatchWire.binding: phone]
         session.transferUserInfo(message)  // delivered even if the Watch app isn't running now
         if session.isReachable { session.sendMessage(message, replyHandler: nil, errorHandler: nil) }
     }
@@ -65,7 +66,7 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
 
     /// The Watch asks who its iPhone is (it has no binding yet).
     func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
-        replyHandler([WatchWire.binding: engine.settings.phoneInstallId])
+        replyHandler(engine.settings.phoneInstallId.map { [WatchWire.binding: $0] } ?? [:])
         announce(session)
     }
 

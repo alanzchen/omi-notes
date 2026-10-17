@@ -212,8 +212,20 @@ public final class SettingsStore: @unchecked Sendable {
 
     /// This phone install's stable id: Apple Watch recordings are bound to it, so a Watch paired
     /// with another iPhone never sends them there.
-    public var phoneInstallId: String {
+    /// False until this iPhone has been unlocked since it started (the app sets it). Before that,
+    /// settings read as empty, which says nothing about what is stored.
+    public var unlockedSinceBoot: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return unlocked }
+        set { lock.lock(); unlocked = newValue; lock.unlock() }
+    }
+    private var unlocked = true
+
+    /// This install's identity, which the Watch binds its recordings to. Nil while it can't be read
+    /// (before the first unlock): a replacement then would leave every recording bound to the real
+    /// one held on the Watch for good.
+    public var phoneInstallId: String? {
         if let id = defaults.string(forKey: Key.installId) { return id }
+        guard unlockedSinceBoot else { return nil }
         let id = UUID().uuidString.lowercased()
         defaults.set(id, forKey: Key.installId)
         return id

@@ -113,11 +113,12 @@ public enum WatchWire {
 }
 
 public enum WatchRelayError: Error, Equatable, LocalizedError {
-    case damaged(String), wrongPhone
+    case damaged(String), wrongPhone, identityUnreadable
     public var errorDescription: String? {
         switch self {
         case .damaged(let s): return "segment damaged in transfer (\(s))"
         case .wrongPhone: return "the recording belongs to another iPhone"
+        case .identityUnreadable: return "this iPhone hasn't been unlocked since it restarted"
         }
     }
 }
@@ -271,21 +272,27 @@ public final class WatchOutbox: @unchecked Sendable {
 /// changes nothing.
 public final class PhoneWatchInbox: @unchecked Sendable {
     public let root: URL
-    public let binding: String
+    /// This iPhone's identity, read at each use; nil while unreadable (nothing is accepted then).
+    private let binding: () -> String?
     private let lock = NSLock()
     private var inboxDir: URL { root.appendingPathComponent("inbox", isDirectory: true) }
     private var endsDir: URL { root.appendingPathComponent("ends", isDirectory: true) }
     private var doneDir: URL { root.appendingPathComponent("done", isDirectory: true) }
 
-    public init(root: URL, binding: String) {
+    public convenience init(root: URL, binding: String) {
+        self.init(root: root, currentBinding: { binding })
+    }
+
+    public init(root: URL, currentBinding: @escaping () -> String?) {
         self.root = root
-        self.binding = binding
+        self.binding = currentBinding
         for d in [inboxDir, endsDir, doneDir] { try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
     }
 
     /// Stores a received segment (copied from WatchConnectivity's temporary file before the
     /// callback returns). Returns normally only when it is durable and matches its hash.
     public func accept(file: URL, segment: WatchSegment) throws {
+        guard let binding = binding() else { throw WatchRelayError.identityUnreadable }
         guard segment.binding == binding else { throw WatchRelayError.wrongPhone }
         lock.lock(); defer { lock.unlock() }
         if isDone(segment.id) || FileManager.default.fileExists(atPath: inboxDir.appendingPathComponent("\(segment.id).json").path) { return }
@@ -298,6 +305,7 @@ public final class PhoneWatchInbox: @unchecked Sendable {
     }
 
     public func accept(end: WatchRecordingEnd) throws {
+        guard let binding = binding() else { throw WatchRelayError.identityUnreadable }
         guard end.binding == binding else { throw WatchRelayError.wrongPhone }
         lock.lock(); defer { lock.unlock() }
         if isDone(end.id) { return }

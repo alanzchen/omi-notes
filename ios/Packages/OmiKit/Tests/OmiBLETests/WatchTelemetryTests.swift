@@ -62,8 +62,8 @@ import OmiProtocol
         let engine = OmiEngine(config: EngineConfiguration(dirs: CaptureDirectories(root: dir), appVersion: "t", timezone: "UTC", useCoreBluetooth: false),
                                settings: settings, uploadTransport: CountingUploadTransport())
         let q = WatchPerfQueue(root: dir.appendingPathComponent("w"))
-        q.append(sample(0, event: "start"), deviceId: "watch-1", binding: settings.phoneInstallId)
-        q.append(sample(1, event: "stopped"), deviceId: "watch-1", binding: settings.phoneInstallId, seal: true)
+        q.append(sample(0, event: "start"), deviceId: "watch-1", binding: settings.phoneInstallId!)
+        q.append(sample(1, event: "stopped"), deviceId: "watch-1", binding: settings.phoneInstallId!, seal: true)
         let batch = try #require(q.batches().first)
         #expect(try engine.acceptWatchPerf(WatchWire.encode(batch)) == batch.id)
         let outbox = Outbox(dirs: CaptureDirectories(root: dir))

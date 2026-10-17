@@ -54,7 +54,7 @@ import OmiProtocol
         let rec = UUID().uuidString.lowercased()
         for i in 0..<3 {  // three minutes of a recording the wearer hasn't stopped (no end marker)
             let f = try WatchRelayTests.segmentFile(seconds: 1, in: tmp, name: "s\(i)")
-            let m = WatchRelayTests().manifest(f, recording: rec, index: i, binding: settings.phoneInstallId, start: Int64(i) * 60_000_000)
+            let m = WatchRelayTests().manifest(f, recording: rec, index: i, binding: settings.phoneInstallId!, start: Int64(i) * 60_000_000)
             #expect(try engine.acceptWatchSegment(file: f, manifest: WatchWire.encode(m)) == m.id)
         }
         func waitFor(_ condition: () -> Bool) async -> Bool {
