@@ -4,67 +4,50 @@ import OmiBLE
 import OmiCapture
 import SwiftUI
 
+/// AVAudioPlayer behind `ClipPlayback` (OmiKit holds the play/stop/close logic and its tests).
+@MainActor
+final class AVClipAudio: NSObject, ClipAudio, AVAudioPlayerDelegate {
+    private let player: AVAudioPlayer
+    var onFinish: (() -> Void)?
+    init(_ data: Data) throws {
+        player = try AVAudioPlayer(data: data)
+        super.init()
+        player.delegate = self
+        player.prepareToPlay()
+    }
+    var duration: Double { player.duration }
+    var currentTime: Double { get { player.currentTime } set { player.currentTime = newValue } }
+    var isPlaying: Bool { player.isPlaying }
+    func play() { player.play() }
+    func pause() { player.pause() }
+    func stop() { player.stop() }
+    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        Task { @MainActor in self.onFinish?() }
+    }
+
+    /// Before a clip starts (then it announces `omiAudioWillPlay`, so a playing note gives up the session).
+    static func activateSession() {
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio)
+        try? AVAudioSession.sharedInstance().setActive(true)
+    }
+}
+
 /// Plays short WAV clips fetched from the server. The phone never decodes Opus: the server renders
 /// clips as 16 kHz PCM WAV, downloaded with an authenticated request and played from memory.
 @MainActor
 @Observable
-final class ClipPlayer: NSObject, AVAudioPlayerDelegate {
-    private(set) var playing: String?
-    private(set) var loading: String?
-    private(set) var message: String?
-    private var player: AVAudioPlayer?
-    private var focus: NSObjectProtocol?
-
-    override init() {
-        super.init()
-        focus = NotificationCenter.default.addObserver(forName: .omiAudioWillPlay, object: nil, queue: .main) { [weak self] note in
-            let sender = note.object.map { ObjectIdentifier($0 as AnyObject) }
-            MainActor.assumeIsolated {
-                guard let self, sender != ObjectIdentifier(self) else { return }
-                self.stop()  // another sound started: one at a time
-            }
-        }
-    }
+final class ClipPlayer {
+    private let core = ClipPlayback(tap: .stop, makeAudio: { try AVClipAudio($0) }, activate: AVClipAudio.activateSession)
+    var playing: String? { core.playing }
+    var loading: String? { core.loading }
+    var message: String? { core.message }
 
     func toggle(_ clipId: String, speakers: SpeakersModel) {
-        if playing == clipId {
-            stop()
-            return
-        }
-        Task { await play(clipId, speakers: speakers) }
+        core.toggle(clipId) { try await speakers.clip($0) }
     }
 
-    func play(_ clipId: String, speakers: SpeakersModel) async {
-        stop()
-        loading = clipId
-        defer { if loading == clipId { loading = nil } }
-        do {
-            let data = try await speakers.clip(clipId)
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio)
-            try AVAudioSession.sharedInstance().setActive(true)
-            let p = try AVAudioPlayer(data: data)
-            p.delegate = self
-            NotificationCenter.default.post(name: .omiAudioWillPlay, object: self)
-            p.play()
-            player = p
-            playing = clipId
-            message = nil
-        } catch APIError.http(410, _) {
-            message = "That audio has expired on the server."
-        } catch {
-            message = "Couldn't play the clip: \(error)"
-        }
-    }
-
-    func stop() {
-        player?.stop()
-        player = nil
-        playing = nil
-    }
-
-    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        Task { @MainActor in self.playing = nil }
-    }
+    /// Back / Close: also cancels a clip that is still downloading.
+    func stop() { core.stop() }
 }
 
 struct PlayButton: View {

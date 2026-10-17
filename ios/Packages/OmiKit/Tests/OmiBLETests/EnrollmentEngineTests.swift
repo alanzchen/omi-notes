@@ -120,6 +120,58 @@ import OmiProtocol
         #expect(await waitOnMain(2) { self.events(root).contains { ($0["data"] as? [String: Any])?["outcome"] as? String == "cancelled" } })
     }
 
+    /// UX-AU-002: the pendant drops while reading. The engine closes the window, so the sheet must
+    /// stop prompting; reconnecting must not bring the old attempt back; Try again is a new attempt.
+    @MainActor @Test func aDroppedPendantEndsTheAttemptAndReconnectingDoesNotReviveIt() async throws {
+        let (engine, model, root) = try await streamingModel()
+        defer { ServerStub.delay = 0 }
+        ServerStub.delay = 0
+        await model.startEnrollment()
+        guard case .reading(let first, 0) = model.enrollment else { Issue.record("\(model.enrollment)"); return }
+        model.nextPrompt()
+        engine.disconnect()
+        #expect(await waitOnMain(3) { model.enrollment == .interrupted(id: first) }, "\(model.enrollment)")
+        engine.reconnect()
+        #expect(await waitOnMain(10) { engine.snapshotNow().connection == .streaming })
+        #expect(model.enrollment == .interrupted(id: first), "reconnecting doesn't bring back the old prompts")
+        model.nextPrompt()
+        model.finishEnrollment()
+        #expect(model.enrollment == .interrupted(id: first), "stale Next/Finish do nothing")
+        #expect(events(root).contains { ($0["data"] as? [String: Any])?["enrollment_id"] as? String == first
+                                        && ($0["data"] as? [String: Any])?["outcome"] as? String == "interrupted" })
+        await model.startEnrollment()  // Try again
+        guard case .reading(let second, 0) = model.enrollment else { Issue.record("\(model.enrollment)"); return }
+        #expect(second != first && engine.snapshotNow().activeEnrollmentId == second)
+        model.cancelEnrollment()
+    }
+
+    /// UX-AU-005: after Finish the server may be unreachable or refuse the phone. Waiting says so (it
+    /// isn't an unexplained spinner); Close keeps the attempt, and coming back checks it again.
+    @MainActor @Test func waitingExplainsFailuresAndClosingKeepsTheAttempt() async throws {
+        let (_, model, _) = try await streamingModel()
+        defer { ServerStub.delay = 0 }
+        ServerStub.delay = 0
+        model.pollInterval = .milliseconds(50)
+        ServerStub.routes["/v1/people"] = (200, #"{"people":[]}"#)  // People loaded first, as in the app
+        ServerStub.routes["/v1/speakers/settings"] = (200, #"{"acknowledged_at":null,"unknown_voices_enabled":false,"auto_assign":true}"#)
+        await model.refresh()
+        await model.startEnrollment()
+        guard case .reading(let id, _) = model.enrollment else { Issue.record("\(model.enrollment)"); return }
+        ServerStub.routes["/v1/speakers/enrollments/\(id)"] = (401, #"{"error":"unauthorized","detail":"bad token"}"#)
+        model.finishEnrollment()
+        #expect(await waitOnMain(3) { model.enrollmentProblem != nil }, "a refused check is explained")
+        #expect(model.enrollmentProblem?.contains("rejected") == true, "\(model.enrollmentProblem ?? "nil")")
+        guard case .waiting(id, _) = model.enrollment else { Issue.record("\(model.enrollment)"); return }
+        model.enrollmentScreenClosed()  // Close / Check later: processing continues on the server
+        guard case .waiting(id, _) = model.enrollment else { Issue.record("Close dropped the attempt: \(model.enrollment)"); return }
+        ServerStub.routes["/v1/speakers/enrollments/\(id)"] = (200, #"{"state":"accepted","speech_s":31.0}"#)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        guard case .waiting = model.enrollment else { Issue.record("kept polling after Close"); return }
+        model.enrollmentScreenOpened()  // came back
+        #expect(await waitOnMain(3) { if case .finished = model.enrollment { return true } else { return false } })
+        #expect(model.enrollmentProblem == nil)
+    }
+
     @MainActor @Test func aServerChangedWhileItWasCheckedStartsNothing() async throws {
         let (engine, model, root) = try await streamingModel()
         defer { ServerStub.delay = 0 }

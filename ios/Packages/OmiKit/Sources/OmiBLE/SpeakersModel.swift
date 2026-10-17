@@ -18,7 +18,14 @@ public final class SpeakersModel {
         case waiting(id: String, status: EnrollmentStatus?)
         case finished(EnrollmentStatus)
         case failed(String)
+        /// The window ended before Finish (the pendant stopped streaming): this attempt is over.
+        case interrupted(id: String)
     }
+
+    /// Why the waiting enrollment can't be checked right now (nil while checks succeed).
+    public private(set) var enrollmentProblem: String?
+    /// Between checks of a waiting enrollment.
+    public var pollInterval: Duration = .seconds(3)
 
     public static let prompts = [
         "I'm wearing my Omi so it can learn what my voice sounds like.",
@@ -43,7 +50,19 @@ public final class SpeakersModel {
     private let engine: OmiEngine
     private var pollTask: Task<Void, Never>?
 
-    public init(engine: OmiEngine) { self.engine = engine }
+    public init(engine: OmiEngine) {
+        self.engine = engine
+        engine.setEnrollmentEndSink { [weak self] id, outcome in
+            Task { @MainActor in self?.enrollmentWindowEnded(id: id, outcome: outcome) }
+        }
+    }
+
+    /// The engine closed an enrollment window. Ended before Finish (the pendant stopped streaming):
+    /// the attempt is over, and its old prompts must not continue, even after a reconnect.
+    func enrollmentWindowEnded(id: String, outcome: VoiceEnrollmentEndData.Outcome) {
+        guard outcome == .interrupted, case .reading(let reading, _) = enrollment, reading == id else { return }
+        enrollment = .interrupted(id: id)
+    }
 
     public var me: Person? { people.first { $0.isMe } }
     public var others: [Person] { people.filter { !$0.isMe } }
@@ -78,7 +97,7 @@ public final class SpeakersModel {
         switch enrollment {
         case .idle: break
         case .checking, .reading: cancelEnrollment()
-        case .waiting, .finished, .failed:
+        case .waiting, .finished, .failed, .interrupted:
             pollTask?.cancel()
             enrollment = .idle
         }
@@ -257,7 +276,7 @@ public final class SpeakersModel {
     /// attempt, if it wasn't cancelled meanwhile, and for the server that is still configured.
     public func startEnrollment() async {
         switch enrollment {
-        case .idle, .failed, .finished: break
+        case .idle, .failed, .finished, .interrupted: break
         case .checking, .reading, .waiting: return  // one attempt at a time
         }
         let attempt = UUID()
@@ -312,27 +331,44 @@ public final class SpeakersModel {
     public func enrollmentScreenClosed() {
         switch enrollment {
         case .checking, .reading: cancelEnrollment()
-        case .idle, .waiting, .finished, .failed: break
+        case .waiting: pollTask?.cancel()  // processing continues on the server; checked again on return
+        case .idle, .finished, .failed, .interrupted: break
         }
+    }
+
+    /// The enrollment screen appeared (again): check a waiting attempt now. Also "Check again".
+    public func enrollmentScreenOpened() {
+        guard case .waiting(let id, _) = enrollment else { return }
+        enrollmentProblem = nil
+        poll(id, immediately: true)
     }
 
     public func cancelEnrollment() {
         startAttempt = nil
         pollTask?.cancel()
+        enrollmentProblem = nil
         if case .reading = enrollment { engine.finishVoiceEnrollment(outcome: .cancelled) }
         enrollment = .idle
     }
 
     /// Polls until the server reports a final state. Success is only ever what the server says
     /// ("accepted" = enrolled, not yet calibrated), never inferred from elapsed time.
-    private func poll(_ id: String) {
+    /// 404s (the start event not processed yet) before saying the server hasn't got the sample.
+    static let unseenChecks = 20
+
+    private func poll(_ id: String, immediately: Bool = false) {
         pollTask?.cancel()
         pollTask = Task { [weak self] in
+            var unseen = 0
+            var first = immediately
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
-                guard let self else { return }
+                if !first { try? await Task.sleep(for: self?.pollInterval ?? .seconds(3)) }
+                first = false
+                guard let self, !Task.isCancelled else { return }
                 do {
                     let status = try await self.api().enrollmentStatus(id)
+                    guard !Task.isCancelled, case .waiting(id, _) = self.enrollment else { return }
+                    self.enrollmentProblem = nil
                     if status.isFinal {
                         self.enrollment = .finished(status)
                         await self.refresh()
@@ -340,9 +376,16 @@ public final class SpeakersModel {
                     }
                     self.enrollment = .waiting(id: id, status: status)
                 } catch APIError.http(404, _) {
-                    continue  // the start event may not have been processed yet
+                    unseen += 1  // the start event may not have been processed yet
+                    if unseen >= Self.unseenChecks {
+                        self.enrollmentProblem = "The server hasn't received this sample yet. It may still be uploading from this phone; this keeps checking."
+                    }
+                } catch APIError.unauthorized {
+                    self.enrollmentProblem = "The server rejected this phone, so the result can't be checked. Pair again from Server, then check again."
+                    return  // asking again won't help until the pairing changes
                 } catch {
-                    self.error = Self.describe(error)
+                    guard !Task.isCancelled else { return }
+                    self.enrollmentProblem = "Can't reach the server (\(Self.describe(error))). Still checking."
                 }
             }
         }

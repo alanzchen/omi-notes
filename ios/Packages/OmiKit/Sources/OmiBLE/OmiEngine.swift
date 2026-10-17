@@ -36,6 +36,17 @@ public enum ConnectionPhase: Equatable, Sendable {
     public var isUserDisconnect: Bool { self == .paused(Self.disconnectedByYou) }
 }
 
+/// The live transfer picture, phone side. `meter` is evaluated by the screen against the monotonic
+/// clock (so a rate decays to none when bytes stop); the rest is as of the snapshot.
+public struct TransferSnapshot: Equatable, Sendable {
+    public var meter = TransferMeter()
+    /// Audio still queued for the server, from each chunk's own header (start/end offsets).
+    public var pendingAudioSeconds: Double = 0
+    /// Queued chunks whose duration couldn't be read (left unknown, not guessed).
+    public var pendingAudioUnknown = 0
+    public init() {}
+}
+
 public struct LiveSnapshot: Equatable, Sendable {
     public var captureId: String?
     public var chunkSequence = 0
@@ -80,6 +91,7 @@ public struct EngineSnapshot: Equatable, Sendable {
     public var watchLastUploadedAt: Date?
     /// The Watch app's latest report about itself (as of its own timestamp).
     public var watchReport: WatchReport?
+    public var transfer = TransferSnapshot()
     /// This phone's choices for the pendant (`SettingsStore`).
     public var recordingPaused = false
     public var autoCollect = true
@@ -157,6 +169,12 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     private var storageTripped = false
     private var freeBytes: Int64?
     private var outboxStats = OutboxStats()
+    private var meter = TransferMeter()
+    private var lastTransferSnapshotMono: UInt64 = 0
+    private var transferSnapshotPending = false
+    /// Queued chunk durations from their headers (files never change; nil = unreadable).
+    private var chunkSeconds: [String: Double?] = [:]
+    private var pendingAudio: (seconds: Double, unknown: Int) = (0, 0)
     private var quarantined: [String] = []
     private var pendingDisconnectReason: SealReason?
     private var appActive = true
@@ -238,6 +256,19 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         _ = watchInbox  // created now: WatchConnectivity may call in from its own queue
         uploader.enabled = false  // until recovery completes
         uploader.onStatusChange = { [weak self] in self?.scheduleSnapshot() }
+        uploader.onFinished = { [weak self] name, outcome, size in
+            guard let self else { return }
+            let audio = OutboxKind.parse(name)?.isChunk ?? false
+            self.meter.finished(name: name, audio: audio, bytes: size, outcome: outcome, atMono: self.config.clock.monotonicNanoseconds())
+            self.scheduleTransferSnapshot()
+        }
+        (transport as? UploadProgressReporting)?.onProgress = { [weak self] identifier, sent, expected in
+            guard let self, let (_, name) = UploadTaskID.parse(identifier) else { return }
+            let audio = OutboxKind.parse(name)?.isChunk ?? false
+            self.meter.progress(name: name, audio: audio, sent: sent, expected: expected > 0 ? expected : nil,
+                                atMono: self.config.clock.monotonicNanoseconds())
+            self.scheduleTransferSnapshot()
+        }
         backgroundTransport?.onCompletion = { [weak self] id, status, body, error in
             self?.uploader.handleCompletion(identifier: id, statusCode: status, body: body, error: error)
         }
@@ -841,9 +872,18 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         queue.async { self.finishEnrollment(outcome: outcome) }
     }
 
+    /// Told (on the engine queue) when an enrollment window ends, whoever ended it.
+    private var enrollmentEndSink: (@Sendable (String, VoiceEnrollmentEndData.Outcome) -> Void)?
+    /// Asynchronous: never blocks the caller (the app's launch) behind recovery; it is queued before
+    /// any later enrollment start, which goes through the same queue.
+    public func setEnrollmentEndSink(_ sink: (@Sendable (String, VoiceEnrollmentEndData.Outcome) -> Void)?) {
+        queue.async { self.enrollmentEndSink = sink }
+    }
+
     private func finishEnrollment(outcome: VoiceEnrollmentEndData.Outcome) {
         guard let e = activeEnrollment else { return }
         activeEnrollment = nil
+        enrollmentEndSink?(e.id, outcome)
         guard recorder.captureId == e.captureId, let end = recorder.nowOffsetUs() else {
             log(.warning, "enrollment", "capture of enrollment \(e.id) already ended; no end event")
             return
@@ -871,6 +911,8 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         queue.async {
             self.appActive = true
             self.appStateKnown = true
+            self.meter.start(atMono: self.config.clock.monotonicNanoseconds(), wall: self.config.clock.wallNow())
+            self.refreshOutboxStats()
             self.writePhoneStatus(trigger: "foreground")
             self.endKeepAlive()
             self.central?.ensureConnected()  // re-kick a pending connect on foreground
@@ -886,6 +928,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         queue.async {
             self.appActive = false
             self.appStateKnown = true
+            self.meter.suspend()
             self.recorder.syncNow()
             guard self.session != nil else { return }
             // iOS may suspend us right away (e.g. during a silent stretch, when no notification will
@@ -1300,8 +1343,40 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         scheduleSnapshot()
     }
 
+    /// Live transfer numbers while the app is open: at most about one snapshot a second.
+    private func scheduleTransferSnapshot() {
+        guard appActive, !transferSnapshotPending else { return }
+        let now = config.clock.monotonicNanoseconds()
+        let wait = now &- lastTransferSnapshotMono >= 1_000_000_000 ? 0 : 1_000_000_000 - (now &- lastTransferSnapshotMono)
+        transferSnapshotPending = true
+        queue.asyncAfter(deadline: .now() + .nanoseconds(Int(wait))) { [weak self] in
+            guard let self else { return }
+            self.transferSnapshotPending = false
+            self.lastTransferSnapshotMono = self.config.clock.monotonicNanoseconds()
+            self.scheduleSnapshot()
+        }
+    }
+
+    /// Audio waiting for the server, summed from the queued chunks' own headers (cached per file).
+    private func refreshPendingAudio(_ pending: [OutboxItem]) {
+        var seconds = 0.0, unknown = 0
+        var seen: Set<String> = []
+        for item in pending where item.kind.isChunk {
+            seen.insert(item.name)
+            if chunkSeconds[item.name] == nil {
+                chunkSeconds[item.name] = Envelope.header(at: item.url).flatMap { h in
+                    h.chunkEndOffsetUs > h.chunkStartOffsetUs ? Double(h.chunkEndOffsetUs - h.chunkStartOffsetUs) / 1e6 : nil
+                }
+            }
+            if let s = chunkSeconds[item.name] ?? nil { seconds += s } else { unknown += 1 }
+        }
+        chunkSeconds = chunkSeconds.filter { seen.contains($0.key) }
+        pendingAudio = (seconds, unknown)
+    }
+
     private func refreshOutboxStats() {
         outboxStats = outbox.stats()
+        refreshPendingAudio(outbox.pending())
         let watchIds = watchInbox.recordingIds()
         if !watchIds.isEmpty {
             func watch(_ item: OutboxItem) -> Bool { item.kind.isChunk && item.kind.captureId.map(watchIds.contains) == true }
@@ -1372,6 +1447,9 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         s.watchReceived = received.count + s.watchPending
         s.watchLastReceivedAt = [watchLastReceivedAt, received.last].compactMap { $0 }.max()
         s.watchWaitingUpload = watchUploads.waiting
+        s.transfer.meter = meter
+        s.transfer.pendingAudioSeconds = pendingAudio.seconds
+        s.transfer.pendingAudioUnknown = pendingAudio.unknown
         s.watchLastUploadedAt = watchUploads.lastAt
         s.watchReport = watchInbox.latestReport
         s.recordingPaused = settings.recordingPaused

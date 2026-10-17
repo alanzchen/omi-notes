@@ -135,6 +135,8 @@ struct WorthRevisitingSection: View {
 
     private func pickRow(_ c: ConversationSummary) -> some View {
         let important = model.priority(of: c).state == "important"
+        let pending = model.priorityState(of: c).pending
+        let failed = model.priorityMessages[c.id]
         return HStack(alignment: .top, spacing: 12) {
             Image(systemName: important ? "star.fill" : "sparkles")
                 .font(.title3).foregroundStyle(important ? ValueStyle.important : ValueStyle.recommended)
@@ -148,12 +150,14 @@ struct WorthRevisitingSection: View {
                     Text(h).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
                 }
                 Text(meta(c, important: important)).font(.caption).foregroundStyle(.secondary)
+                PriorityFeedback(pending: pending, message: failed)
             }
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(([ "\(important ? "Important" : "Worth revisiting"): \(c.title ?? "Conversation")" ]
-                             + [c.isRecommended ? c.value?.highlight : nil, meta(c, important: important)].compactMap { $0 })
+                             + [c.isRecommended ? c.value?.highlight : nil, meta(c, important: important),
+                                PriorityFeedback.spoken(pending: pending, message: failed)].compactMap { $0 })
                             .joined(separator: ". "))
     }
 
@@ -161,6 +165,25 @@ struct WorthRevisitingSection: View {
         let when = c.startedDate.map { "\(Fmt.day($0)), \(Fmt.time($0))" } ?? ""
         let mark = c.value?.user?.source == "pendant" ? "Starred from the pendant" : "Marked important"
         return [when, important ? mark : nil].compactMap { $0 }.joined(separator: " · ")
+    }
+}
+
+/// Where an importance choice stands, on whichever row it was made: still saving, or why it didn't
+/// save. Shared by the day rows, search, saved notes and the Worth revisiting cards.
+struct PriorityFeedback: View {
+    let pending: Bool
+    let message: String?
+
+    var body: some View {
+        if let message {
+            Label(message, systemImage: "exclamationmark.circle").font(.caption).foregroundStyle(.orange).lineLimit(2)
+        } else if pending {
+            Label("Saving your choice…", systemImage: "clock.arrow.circlepath").font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    static func spoken(pending: Bool, message: String?) -> String? {
+        message ?? (pending ? "Saving your choice" : nil)
     }
 }
 

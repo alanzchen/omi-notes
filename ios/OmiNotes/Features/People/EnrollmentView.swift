@@ -22,16 +22,24 @@ struct EnrollmentView: View {
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
-                        Button(isDone ? "Done" : "Cancel") {
-                            speakers.cancelEnrollment()
-                            dismiss()
+                        if isWaiting {
+                            // submitted: closing doesn't cancel the server's work; the attempt is kept
+                            Button("Close") { dismiss() }
+                        } else {
+                            Button(isDone ? "Done" : isReading || isChecking ? "Cancel" : "Close") {
+                                speakers.cancelEnrollment()
+                                dismiss()
+                            }
                         }
                     }
                 }
         }
         .interactiveDismissDisabled(isReading || isChecking)
+        .onAppear { speakers.enrollmentScreenOpened() }
         .onDisappear { speakers.enrollmentScreenClosed() }
     }
+
+    private var isWaiting: Bool { if case .waiting = speakers.enrollment { return true } else { return false } }
 
     private var isReading: Bool { if case .reading = speakers.enrollment { return true } else { return false } }
     private var isChecking: Bool { speakers.enrollment == .checking }
@@ -51,10 +59,27 @@ struct EnrollmentView: View {
             readingStep(prompt)
         case .waiting(_, let status):
             VStack(spacing: 16) {
-                ProgressView()
-                Text(waitingText(status)).multilineTextAlignment(.center)
-                Text("Keep the app open or come back later; the result is saved on your server.")
+                if let problem = speakers.enrollmentProblem {
+                    Image(systemName: "exclamationmark.triangle").font(.largeTitle).foregroundStyle(.orange)
+                    Text(problem).multilineTextAlignment(.center)
+                    Button("Check again") { speakers.enrollmentScreenOpened() }.buttonStyle(.bordered)
+                } else {
+                    ProgressView()
+                    Text(waitingText(status)).multilineTextAlignment(.center)
+                }
+                Text("Your server keeps processing the sample. You can close this and check later; the result is saved there.")
                     .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            }
+            .padding(.top, 40)
+        case .interrupted:
+            VStack(spacing: 16) {
+                Image(systemName: "waveform.slash").font(.largeTitle).foregroundStyle(.orange)
+                Text("The pendant stopped streaming, so this sample was stopped and won't be used.").multilineTextAlignment(.center)
+                Button("Try again") { Task { await speakers.startEnrollment() } }
+                    .buttonStyle(.borderedProminent).disabled(!streaming)
+                if !streaming {
+                    Text("Reconnect the pendant first.").font(.footnote).foregroundStyle(.secondary)
+                }
             }
             .padding(.top, 40)
         case .finished(let status):

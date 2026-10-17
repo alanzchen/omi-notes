@@ -122,6 +122,15 @@ public final class AppModel {
     /// Omi Notes is installed on a paired Apple Watch (WatchConnectivity; nil until it has activated).
     public var watchAppInstalled: Bool?
 
+    /// The engine's monotonic clock, for evaluating live transfer rates on screen.
+    public func monotonicNow() -> UInt64 { engine.config.clock.monotonicNanoseconds() }
+
+    /// The three transfer stages as of now (Watch → iPhone, iPhone → server, server).
+    public func transfers(watchInstalled: Bool?, now: Date = Date()) -> TransferSummary {
+        TransferSummary.evaluate(snapshot: snapshot, server: server, status: serverStatus, statusAt: serverStatusAt,
+                                 watchInstalled: watchInstalled, nowMono: monotonicNow(), now: now)
+    }
+
     public func health(now: Date = Date()) -> SystemHealth {
         SystemHealth.evaluate(snapshot: snapshot, server: server, status: serverStatus, statusAt: serverStatusAt, now: now, issues: issues,
                               watchAppInstalled: watchAppInstalled)

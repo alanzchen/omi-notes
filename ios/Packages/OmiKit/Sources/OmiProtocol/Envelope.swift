@@ -261,6 +261,17 @@ public enum Envelope {
         return out
     }
 
+    /// The header alone, read without loading the payload (nil if the file isn't a valid envelope).
+    public static func header(at url: URL) -> EnvelopeHeader? {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? h.close() }
+        guard let head = try? h.read(upToCount: 12), head.count == 12, head.prefix(8) == magic else { return nil }
+        let b = [UInt8](head)
+        let hlen = Int(UInt32(b[8]) | UInt32(b[9]) << 8 | UInt32(b[10]) << 16 | UInt32(b[11]) << 24)
+        guard hlen > 0, hlen <= maxHeaderBytes, let json = try? h.read(upToCount: hlen), json.count == hlen else { return nil }
+        return try? JSONDecoder().decode(EnvelopeHeader.self, from: json)
+    }
+
     /// Parses and validates framing (and record CRCs for live payloads).
     public static func parse(_ body: Data) throws -> (header: EnvelopeHeader, payload: Data) {
         let b = [UInt8](body)

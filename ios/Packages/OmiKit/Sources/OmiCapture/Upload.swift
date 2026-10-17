@@ -147,6 +147,12 @@ public protocol UploadTransport: AnyObject {
     func cancelAll()
 }
 
+/// A transport that reports upload progress (`didSendBodyData`): task identifier, bytes sent so far
+/// in this attempt, and the expected total (≤ 0 when unknown). Called on the uploader's queue.
+public protocol UploadProgressReporting: AnyObject {
+    var onProgress: ((String, Int64, Int64) -> Void)? { get set }
+}
+
 /// Immutable server configuration snapshot. `generation` changes whenever URL or token change and
 /// is persisted, so tasks that survive a relaunch are still recognized.
 public struct UploadConfig: Equatable, Sendable {
@@ -182,6 +188,8 @@ public struct UploaderStatus: Equatable, Sendable {
     public var inFlight = 0
     /// Items waiting for a dependency (ring `sync_complete` seals behind earlier captures).
     public var held = 0
+    /// Waiting files whose last attempt failed and that wait to be tried again.
+    public var backingOff = 0
     public var lastResult: UploadResultSummary?
     public var lastSuccessAt: Date?
     public var attention: [String] = []
@@ -219,6 +227,8 @@ public final class Uploader: @unchecked Sendable {
     public var now: () -> Date = Date.init
     public var random: () -> Double = { Double.random(in: 0...1) }
     public var onStatusChange: (() -> Void)?
+    /// Each finished upload of a current task: file name, outcome and the file's size.
+    public var onFinished: ((String, TransferMeter.Outcome, Int64?) -> Void)?
 
     public private(set) var status = UploaderStatus()
     /// Files with a task in flight: those this uploader started (until their completion arrives,
@@ -315,6 +325,8 @@ public final class Uploader: @unchecked Sendable {
         }
         status.inFlight = started.count
         status.held = held
+        let t = now()
+        status.backingOff = pending.filter { item in state.record(item.name).nextAttemptAt.map { $0 > t } ?? false }.count
         onStatusChange?()
     }
 
@@ -356,7 +368,9 @@ public final class Uploader: @unchecked Sendable {
         }
         started.remove(name)
         launched.remove(name)
+        let size = outbox.pendingItem(named: name)?.size
         if let e = error as? URLError, e.code == .cancelled {
+            onFinished?(name, .cancelled, size)
             status.inFlight = started.count
             onStatusChange?()
             reconcile()
@@ -420,6 +434,7 @@ public final class Uploader: @unchecked Sendable {
             log(.error, "upload", "uploads paused: \(reason)")
         }
         status.lastResult = summary
+        onFinished?(name, summary.success ? .delivered : .failed, size)
         status.inFlight = started.count
         onStatusChange?()
         if status.pausedReason == nil { reconcile() }
@@ -598,7 +613,7 @@ public struct UploadTaskOwnership: Sendable {
 
 /// Real transport: one background `URLSession` (survives suspension and relaunches the app for
 /// completions). Delegate callbacks are delivered on the engine queue.
-public final class BackgroundSessionTransport: NSObject, UploadTransport, URLSessionDataDelegate, @unchecked Sendable {
+public final class BackgroundSessionTransport: NSObject, UploadTransport, UploadProgressReporting, URLSessionDataDelegate, @unchecked Sendable {
     public static let sessionIdentifier = "omi-notes.upload"
 
     private var session: URLSession!
@@ -607,6 +622,7 @@ public final class BackgroundSessionTransport: NSObject, UploadTransport, URLSes
     private let ownershipLock = NSLock()
     private var ownership = UploadTaskOwnership()
     public var onCompletion: ((String, Int?, Data?, Error?) -> Void)?
+    public var onProgress: ((String, Int64, Int64) -> Void)?
     public let eventsLatch = BackgroundEventsLatch()
 
     public init(queue: DispatchQueue, identifier: String = BackgroundSessionTransport.sessionIdentifier) {
@@ -650,6 +666,12 @@ public final class BackgroundSessionTransport: NSObject, UploadTransport, URLSes
 
     public func cancelAll() {
         session.getAllTasks { tasks in tasks.forEach { $0.cancel() } }
+    }
+
+    public func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64,
+                           totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
+        guard let id = task.taskDescription else { return }
+        onProgress?(id, totalBytesSent, totalBytesExpectedToSend)
     }
 
     public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {

@@ -505,103 +505,54 @@ struct WaveformView: View {
 }
 
 /// Plays one clip at a time with progress; loads its samples (for the waveform) without playing.
+/// The play/close/replace logic is `ClipPlayback` (OmiKit, tested); this adds progress and bars.
 @MainActor
 @Observable
-final class VoicePlayer: NSObject, AVAudioPlayerDelegate {
-    private(set) var bars: [Float]?
-    private(set) var duration: Double?
+final class VoicePlayer {
+    private let core = ClipPlayback(tap: .pause, makeAudio: { try AVClipAudio($0) }, activate: AVClipAudio.activateSession)
     private(set) var elapsed: Double = 0
-    private(set) var isPlaying = false
-    private(set) var loading = false
-    private(set) var unavailable: String?
-    private var loadedId: String?
-    private var cache: [String: Data] = [:]
-    private var player: AVAudioPlayer?
-    private var ticker: Task<Void, Never>?
-    private var focus: NSObjectProtocol?
+    @ObservationIgnored private var ticker: Task<Void, Never>?
+    @ObservationIgnored private var barsFor: (id: String, bars: [Float]?)?
 
-    override init() {
-        super.init()
-        focus = NotificationCenter.default.addObserver(forName: .omiAudioWillPlay, object: nil, queue: .main) { [weak self] note in
-            let sender = note.object.map { ObjectIdentifier($0 as AnyObject) }
-            MainActor.assumeIsolated {
-                guard let self, sender != ObjectIdentifier(self), self.isPlaying else { return }
-                self.player?.pause()  // another sound started: one at a time
-                self.isPlaying = false
-                self.ticker?.cancel()
-            }
+    init() {
+        core.onFinished = { [weak self] in
+            guard let self else { return }
+            self.ticker?.cancel()
+            self.elapsed = self.duration ?? 0
         }
     }
 
+    var bars: [Float]? {
+        guard let id = core.loadedId, let data = core.data else { return nil }
+        if let cached = barsFor, cached.id == id { return cached.bars }
+        let bars = Waveform.bars(wav: data, count: 46)
+        barsFor = (id, bars)
+        return bars
+    }
+    var duration: Double? { core.audio?.duration }
+    var isPlaying: Bool { core.playing != nil }
+    var loading: Bool { core.loading != nil }
+    var unavailable: String? { core.message }
     var progress: Double { duration.map { $0 > 0 ? elapsed / $0 : 0 } ?? 0 }
 
     func load(_ clipId: String, speakers: SpeakersModel) async {
-        guard loadedId != clipId else { return }
-        stop()
-        loadedId = clipId
-        bars = nil
-        duration = nil
-        unavailable = nil
-        loading = true
-        defer { if loadedId == clipId { loading = false } }
-        do {
-            let data: Data
-            if let cached = cache[clipId] { data = cached } else { data = try await speakers.clip(clipId) }
-            guard loadedId == clipId else { return }
-            cache[clipId] = data
-            let p = try AVAudioPlayer(data: data)
-            p.delegate = self
-            p.prepareToPlay()
-            player = p
-            duration = p.duration
-            bars = Waveform.bars(wav: data, count: 46)
-        } catch APIError.http(410, _) {
-            unavailable = "This audio has expired on the server, so it can't be played."
-        } catch {
-            guard loadedId == clipId else { return }
-            if Task.isCancelled {
-                loadedId = nil  // superseded, not failed: the next load asks again
-                return
-            }
-            loadedId = nil  // a tap on play tries again
-            unavailable = "Couldn't load the audio (\(error)). Tap play to try again."
-        }
+        await core.load(clipId) { try await speakers.clip($0) }
     }
 
     func toggle(_ clipId: String, speakers: SpeakersModel) {
-        guard loadedId == clipId, let player else {
-            Task {
-                await load(clipId, speakers: speakers)
-                if loadedId == clipId, self.player != nil, !isPlaying { toggle(clipId, speakers: speakers) }
-            }
-            return
-        }
-        if player.isPlaying {
-            player.pause()
-            isPlaying = false
-            ticker?.cancel()
-        } else {
-            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio)
-            try? AVAudioSession.sharedInstance().setActive(true)
-            if player.currentTime >= player.duration - 0.05 { player.currentTime = 0 }
-            NotificationCenter.default.post(name: .omiAudioWillPlay, object: self)
-            player.play()
-            isPlaying = true
-            tick()
-        }
+        core.toggle(clipId) { try await speakers.clip($0) }
+        tick()
     }
 
     func seek(to fraction: Double) {
-        guard let player else { return }
-        player.currentTime = fraction * player.duration
-        elapsed = player.currentTime
+        core.seek(to: fraction)
+        elapsed = core.audio?.currentTime ?? 0
     }
 
+    /// Close / another voice: also cancels a clip that is still downloading.
     func stop() {
         ticker?.cancel()
-        player?.stop()
-        player?.currentTime = 0
-        isPlaying = false
+        core.stop()
         elapsed = 0
     }
 
@@ -609,18 +560,10 @@ final class VoicePlayer: NSObject, AVAudioPlayerDelegate {
         ticker?.cancel()
         ticker = Task { [weak self] in
             while !Task.isCancelled {
-                guard let self, let p = self.player else { return }
-                self.elapsed = p.currentTime
+                guard let self else { return }
+                if let a = self.core.audio, self.core.playing != nil { self.elapsed = a.currentTime }
                 try? await Task.sleep(for: .milliseconds(50))
             }
-        }
-    }
-
-    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        Task { @MainActor in
-            self.ticker?.cancel()
-            self.isPlaying = false
-            self.elapsed = self.duration ?? 0
         }
     }
 }

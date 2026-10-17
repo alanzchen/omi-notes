@@ -68,6 +68,11 @@ struct DevicesView: View {
                         Text("Both can record at the same time. Each sends its audio through this iPhone.")
                             .font(.footnote).foregroundStyle(Pendant.secondary).padding(.horizontal, 4)
                     }
+                    // where audio is right now: Watch → iPhone → server, each from its own source
+                    if model.snapshot.serverConfigured || !layout.cards.isEmpty || model.snapshot.outbox.pendingCount > 0 {
+                        TransferCardView(model: model, watchInstalled: Self.watchAppInstalled) { page = .transfers }
+                            .padding(.top, 6)
+                    }
                 }
                 .padding(.horizontal, 16).padding(.top, 8).padding(.bottom, 24)
             }
@@ -112,7 +117,7 @@ struct DevicesView: View {
     }
 }
 
-enum DevicePage: Hashable { case pendant, watch }
+enum DevicePage: Hashable { case pendant, watch, transfers }
 
 /// A device's own page; Settings opens the same pages.
 struct DevicePageView: View {
@@ -124,6 +129,7 @@ struct DevicePageView: View {
         switch page {
         case .pendant: PendantView(model: model, onFix: onFix)
         case .watch: WatchDetailView(model: model)
+        case .transfers: TransferDetailView(model: model, watchInstalled: DevicesView.watchAppInstalled)
         }
     }
 }

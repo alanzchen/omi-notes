@@ -226,9 +226,7 @@ struct ConversationRow: View {
             if let issue = c.issues?.first {
                 Label(issue.message, systemImage: "exclamationmark.circle").font(.caption).foregroundStyle(.orange).lineLimit(2)
             }
-            if let priorityMessage {
-                Label(priorityMessage, systemImage: "exclamationmark.circle").font(.caption).foregroundStyle(.orange).lineLimit(2)
-            }
+            if priorityMessage != nil { PriorityFeedback(pending: false, message: priorityMessage) }
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
