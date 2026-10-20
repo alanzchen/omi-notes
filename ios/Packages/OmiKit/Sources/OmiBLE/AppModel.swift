@@ -70,6 +70,8 @@ public final class AppModel {
     public let problemAlerts = ProblemAlerts()
     /// Incremented when something (a tapped Watch alert) asks to show Devices ▸ Apple Watch.
     public var watchPageRequests = 0
+    /// Devices → Transfers was asked for (the sync Live Activity's `omi-notes://transfers`).
+    public var transferPageRequests = 0
     public let noteCache: NoteCache
     /// Bumped when the cache is cleared or the server changes: an answer that started before then
     /// is not saved (it would bring cleared notes back).
@@ -361,6 +363,10 @@ public final class AppModel {
     /// `omi-notes://configure?url=…&token=…` → confirmation sheet (never saved silently).
     @discardableResult
     public func handleOpenURL(_ url: URL) -> Bool {
+        if url.scheme == "omi-notes", url.host == "transfers" {
+            transferPageRequests += 1
+            return true
+        }
         guard let link = ConfigureLink.parse(url) else {
             OmiLog.shared.log(.warning, "app", "ignored URL \(OmiLog.redact(url.absoluteString))")
             return false

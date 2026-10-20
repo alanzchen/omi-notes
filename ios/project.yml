@@ -22,6 +22,7 @@ targets:
       Release: Config/Base.xcconfig
     sources:
       - path: OmiNotes
+      - path: Shared
     dependencies:
       - package: OmiKit
         product: OmiProtocol
@@ -32,6 +33,7 @@ targets:
       - package: OmiKit
         product: OmiWatchKit
       - target: OmiNotesWatch
+      - target: OmiNotesLiveActivity
     settings:
       base:
         INFOPLIST_FILE: OmiNotes/Resources/Info.plist
@@ -116,6 +118,36 @@ targets:
         APPLICATION_EXTENSION_API_ONLY: YES
         # Release signing names a profile per target (passed on the command line for TestFlight).
         PROVISIONING_PROFILE_SPECIFIER: $(OMI_COMPLICATION_PROFILE)
+  # The sync Live Activity (Lock Screen and Dynamic Island), embedded in the iPhone app. Presentation
+  # only: the app updates it while it runs; it never fetches anything itself.
+  OmiNotesLiveActivity:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "17.0"
+    configFiles:
+      Debug: Config/Base.xcconfig
+      Release: Config/Base.xcconfig
+    sources:
+      - path: OmiNotesLiveActivity
+      - path: Shared
+    dependencies:
+      - package: OmiKit
+        product: OmiProtocol
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework
+      - sdk: ActivityKit.framework
+    settings:
+      base:
+        # needs its own registered App ID and App Store profile before a release (not yet registered)
+        PRODUCT_BUNDLE_IDENTIFIER: $(OMI_APP_BUNDLE_ID).liveactivity
+        PRODUCT_NAME: OmiNotesLiveActivity
+        INFOPLIST_FILE: OmiNotesLiveActivity/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_VERSION: "6.0"
+        SKIP_INSTALL: YES
+        APPLICATION_EXTENSION_API_ONLY: YES
+        TARGETED_DEVICE_FAMILY: "1"
+        PROVISIONING_PROFILE_SPECIFIER: $(OMI_LIVE_ACTIVITY_PROFILE)
 schemes:
   OmiNotes:
     build:

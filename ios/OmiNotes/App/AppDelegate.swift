@@ -10,6 +10,8 @@ import UserNotifications
 /// background for a Bluetooth event or a finished upload.
 final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     private(set) var model: AppModel!
+    /// The sync Live Activity (presentation only).
+    private(set) lazy var syncActivity = SyncActivityCoordinator()
     private var watchBridge: PhoneWatchBridge?
     private var backgroundTasks: UIKitBackgroundTasks!
     private let alerts = LocalAlerts()

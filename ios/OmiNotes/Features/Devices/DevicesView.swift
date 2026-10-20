@@ -13,6 +13,14 @@ struct DevicesView: View {
     /// The last request shown (so returning to the tab doesn't reopen the page).
     @MainActor private static var shownRequests = 0
 
+    @MainActor private static var shownTransferRequests = 0
+
+    private func openRequestedTransferPage() {
+        guard model.transferPageRequests != Self.shownTransferRequests else { return }
+        Self.shownTransferRequests = model.transferPageRequests
+        page = .transfers
+    }
+
     private func openRequestedWatchPage() {
         guard model.watchPageRequests != Self.shownRequests else { return }
         Self.shownRequests = model.watchPageRequests
@@ -83,8 +91,12 @@ struct DevicesView: View {
         .navigationTitle("Devices")
         .navigationBarTitleDisplayMode(.inline)
         // a tapped Watch alert: cold launch (the view appears after the request) or warm
-        .onAppear(perform: openRequestedWatchPage)
+        .onAppear {
+            openRequestedWatchPage()
+            openRequestedTransferPage()
+        }
         .onChange(of: model.watchPageRequests) { openRequestedWatchPage() }
+        .onChange(of: model.transferPageRequests) { openRequestedTransferPage() }
         .navigationDestination(item: $page) { page in
             DevicePageView(page: page, model: model, onFix: onFix)
         }

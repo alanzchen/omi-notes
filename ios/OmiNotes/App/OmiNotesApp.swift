@@ -12,6 +12,10 @@ struct OmiNotesApp: App {
         WindowGroup {
             RootView(model: appDelegate.model)
                 .onOpenURL { url in appDelegate.model.handleOpenURL(url) }
+                // the sync Live Activity follows the transfer state (throttled in the controller)
+                .onChange(of: appDelegate.model.snapshot) {
+                    appDelegate.syncActivity.refresh(appDelegate.model, foreground: scenePhase == .active)
+                }
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -19,6 +23,7 @@ struct OmiNotesApp: App {
             case .background: appDelegate.model.engine.appDidEnterBackground()
             default: break
             }
+            appDelegate.syncActivity.refresh(appDelegate.model, foreground: phase == .active)
         }
     }
 }
@@ -58,9 +63,16 @@ struct RootView: View {
         }
         .onAppear {
             showOnboarding = model.needsOnboarding
-            if model.watchPageRequests > 0 { tab = .devices }  // launched by tapping a Watch alert
+            if model.watchPageRequests > 0 || model.transferPageRequests > 0 { tab = .devices }  // a Watch alert / the Live Activity
         }
         .onChange(of: model.watchPageRequests) { tab = .devices }
+        #if DEBUG
+        .overlay { if SyncActivityPreviewGallery.requested { SyncActivityPreviewGallery() } }
+        #endif
+        .onChange(of: model.transferPageRequests) {
+            settings = nil
+            tab = .devices
+        }
         // One refresh loop for every tab: status, issues and the first page of conversations.
         .task {
             while !Task.isCancelled {
