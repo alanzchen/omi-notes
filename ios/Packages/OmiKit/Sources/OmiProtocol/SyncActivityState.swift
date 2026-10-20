@@ -20,6 +20,9 @@ public struct SyncActivityState: Codable, Hashable, Sendable {
     /// The batch currently handed to iOS, when its size is known (not a total for the whole backlog).
     public var batchSent: Int64?
     public var batchTotal: Int64?
+    /// Uploads in that batch whose size isn't known (not in `batchTotal`): the bar then isn't "the batch".
+    /// Optional so a state written by an earlier build still decodes.
+    public var batchUnknownUploads: Int?
     /// Audio waiting on the Watch, from the Watch's own report (as of `watchReportAt`).
     public var watchWaitingSeconds: Int?
     public var watchReportAt: Date?
@@ -38,7 +41,7 @@ public struct SyncActivityState: Codable, Hashable, Sendable {
 
     public init(stage: Stage, title: String, detail: String? = nil, rate: Double? = nil, queuedAudioSeconds: Double? = nil,
                 queuedAudioPartial: Bool = false, queuedFiles: Int? = nil, batchSent: Int64? = nil, batchTotal: Int64? = nil,
-                watchWaitingSeconds: Int? = nil, watchReportAt: Date? = nil, serverPending: Int? = nil, asOf: Date) {
+                batchUnknownUploads: Int? = nil, watchWaitingSeconds: Int? = nil, watchReportAt: Date? = nil, serverPending: Int? = nil, asOf: Date) {
         self.stage = stage
         self.title = title
         self.detail = detail
@@ -48,6 +51,7 @@ public struct SyncActivityState: Codable, Hashable, Sendable {
         self.queuedFiles = queuedFiles
         self.batchSent = batchSent
         self.batchTotal = batchTotal
+        self.batchUnknownUploads = batchUnknownUploads
         self.watchWaitingSeconds = watchWaitingSeconds
         self.watchReportAt = watchReportAt
         self.serverPending = serverPending

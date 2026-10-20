@@ -3,17 +3,23 @@ import OmiBLE
 import OmiProtocol
 import SwiftUI
 
-/// ActivityKit behind `SyncActivityController` (OmiKit holds the lifecycle and its tests).
+/// ActivityKit behind `SyncActivityController` (OmiKit holds the lifecycle and its tests). Updates and
+/// ends run one after another (`OrderedActivityOperations`), so a slow SDK call never lands after a
+/// newer one or after the end.
 @MainActor
 final class ActivityKitSyncHost: SyncActivityHost {
     var onEnded: ((String, Bool) -> Void)?
+    private let operations = OrderedActivityOperations(
+        send: { id, state, staleDate in await ActivityKitSyncHost.push(id, state, staleDate: staleDate) },
+        finish: { id, final, ending in await ActivityKitSyncHost.finish(id, final, ending) })
 
     var enabled: Bool { ActivityAuthorizationInfo().areActivitiesEnabled }
 
-    func existing() -> [String] {
-        let live = Activity<SyncActivityAttributes>.activities.filter { $0.activityState == .active || $0.activityState == .stale }
-        live.forEach(observe)
-        return live.map(\.id)
+    /// Running (active or stale) and ended-but-shown cards; dismissed ones are gone.
+    func existing() -> [(id: String, running: Bool)] {
+        let shown = Activity<SyncActivityAttributes>.activities.filter { $0.activityState != .dismissed }
+        shown.forEach(observe)
+        return shown.map { ($0.id, $0.activityState == .active || $0.activityState == .stale) }
     }
 
     func start(_ state: SyncActivityState, staleDate: Date) throws -> String {
@@ -23,11 +29,11 @@ final class ActivityKitSyncHost: SyncActivityHost {
     }
 
     func update(_ id: String, _ state: SyncActivityState, staleDate: Date) {
-        Task.detached { await Self.push(id, state, staleDate: staleDate) }
+        operations.update(id, state, staleDate: staleDate)
     }
 
-    func end(_ id: String, final: SyncActivityState?) {
-        Task.detached { await Self.finish(id, final) }
+    func end(_ id: String, final: SyncActivityState?, ending: SyncActivityEnding) {
+        operations.end(id, final: final, ending: ending)
     }
 
     nonisolated private static func find(_ id: String) -> Activity<SyncActivityAttributes>? {
@@ -38,11 +44,16 @@ final class ActivityKitSyncHost: SyncActivityHost {
         await find(id)?.update(.init(state: state, staleDate: staleDate))
     }
 
-    nonisolated private static func finish(_ id: String, _ final: SyncActivityState?) async {
-        await find(id)?.end(final.map { .init(state: $0, staleDate: nil) }, dismissalPolicy: final == nil ? .immediate : .default)
+    nonisolated private static func finish(_ id: String, _ final: SyncActivityState?, _ ending: SyncActivityEnding) async {
+        let policy: ActivityUIDismissalPolicy
+        switch ending {
+        case .immediate: policy = .immediate
+        case .after(let date): policy = .after(date)
+        }
+        await find(id)?.end(final.map { .init(state: $0, staleDate: nil) }, dismissalPolicy: policy)
     }
 
-    /// Removed from the Lock Screen by the user (`dismissed`) vs. ended by the system or by us.
+    /// `.dismissed` (removed by the person or by the system; ActivityKit doesn't say which) vs. ended.
     private func observe(_ a: Activity<SyncActivityAttributes>) {
         let id = a.id
         Task { [weak self] in
@@ -57,30 +68,61 @@ final class ActivityKitSyncHost: SyncActivityHost {
     }
 }
 
+/// A dismissal holds until a sync is confirmed finished, across relaunches.
+@MainActor
+final class DefaultsSyncActivityMemory: SyncActivityMemory {
+    static let key = "omi.syncLiveActivityDismissed"
+    var dismissed: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.key) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.key) }
+    }
+}
+
 /// Keeps the one sync Live Activity in step with the transfer state while the app runs. It only
-/// presents: it never starts, stops or keeps alive an upload.
+/// presents: it never starts, stops or keeps alive an upload. In the foreground it looks again at
+/// the controller's next check (a shown rate, a renewal); in the background it does nothing.
 @MainActor
 final class SyncActivityCoordinator {
     static let optOutKey = "omi.syncLiveActivityOff"
     private let host = ActivityKitSyncHost()
     private let controller: SyncActivityController
+    private weak var model: AppModel?
+    private var foreground = false
+    private var recheck: Task<Void, Never>?
 
     init() {
-        controller = SyncActivityController(host: host)
-        host.onEnded = { [weak self] id, byUser in self?.controller.ended(id, byUser: byUser) }
+        controller = SyncActivityController(host: host, memory: DefaultsSyncActivityMemory())
+        host.onEnded = { [weak self] id, dismissed in self?.controller.ended(id, dismissed: dismissed) }
         controller.adopt()  // after a relaunch: the one that exists, never a second
     }
 
     func refresh(_ model: AppModel, foreground: Bool) {
+        self.model = model
+        self.foreground = foreground
         #if DEBUG
         if let name = UserDefaults.standard.string(forKey: "OmiNotesDebugLiveActivity") {
             startDebugFixture(name)
             return
         }
         #endif
-        let summary = model.transfers(watchInstalled: DevicesView.watchAppInstalled)
-        controller.refresh(SyncActivityState(summary, now: Date()), foreground: foreground,
-                           optedOut: UserDefaults.standard.bool(forKey: Self.optOutKey), now: Date())
+        let now = Date()
+        // nothing decided before the engine's first snapshot (its placeholder says nothing)
+        let state = model.snapshot.ready ? SyncActivityState(model.transfers(watchInstalled: DevicesView.watchAppInstalled, now: now), now: now) : nil
+        controller.refresh(state, foreground: foreground, optedOut: UserDefaults.standard.bool(forKey: Self.optOutKey), now: now)
+        schedule(now: now)
+    }
+
+    /// One pending look at a time, only while in the foreground.
+    private func schedule(now: Date) {
+        recheck?.cancel()
+        recheck = nil
+        guard foreground, let at = controller.nextCheck(now: now) else { return }
+        let delay = max(1, at.timeIntervalSince(now))
+        recheck = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self, let model = self.model, self.foreground else { return }
+            self.refresh(model, foreground: true)
+        }
     }
 
     #if DEBUG

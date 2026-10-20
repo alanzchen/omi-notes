@@ -7,15 +7,17 @@ import SwiftUI
 struct OmiNotesApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
+    @AppStorage(SyncActivityCoordinator.optOutKey) private var liveActivityOff = false
 
     var body: some Scene {
         WindowGroup {
             RootView(model: appDelegate.model)
                 .onOpenURL { url in appDelegate.model.handleOpenURL(url) }
                 // the sync Live Activity follows the transfer state (throttled in the controller)
-                .onChange(of: appDelegate.model.snapshot) {
-                    appDelegate.syncActivity.refresh(appDelegate.model, foreground: scenePhase == .active)
-                }
+                .onChange(of: appDelegate.model.snapshot) { refreshSyncActivity() }
+                .onChange(of: appDelegate.model.server) { refreshSyncActivity() }
+                .onChange(of: appDelegate.model.serverStatusAt) { refreshSyncActivity() }
+                .onChange(of: liveActivityOff) { refreshSyncActivity() }  // turning it off removes it at once
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -25,6 +27,10 @@ struct OmiNotesApp: App {
             }
             appDelegate.syncActivity.refresh(appDelegate.model, foreground: phase == .active)
         }
+    }
+
+    private func refreshSyncActivity() {
+        appDelegate.syncActivity.refresh(appDelegate.model, foreground: scenePhase == .active)
     }
 }
 

@@ -16,7 +16,8 @@ extension SyncActivityState {
         case .preparing: (stage, title) = (.preparing, "Preparing Watch audio")
         case .keptAside: (stage, title) = (.keptAside, "Files kept aside on this iPhone")
         case .queueUnreadable: (stage, title) = (.queueUnreadable, "Upload queue can't be read")
-        case .allSent: (stage, title) = (.allSent, "Everything has reached your server")
+        // the iPhone's own queue: the Watch may still have audio on its way (shown on its own line)
+        case .allSent: (stage, title) = (.allSent, "This iPhone has sent everything")
         case .notConfigured: (stage, title) = (.notConfigured, "No server connected")
         case .unknown: (stage, title) = (.unknown, "Not measured right now")
         }
@@ -39,22 +40,37 @@ extension SyncActivityState {
             queuedAudioSeconds: queuedAudio, queuedAudioPartial: p.queuedAudioUnknown > 0 && knownAudio > 0,
             queuedFiles: stage == .queueUnreadable ? nil : p.queuedFiles,
             batchSent: p.inFlightTotal > 0 ? p.inFlightSent : nil, batchTotal: p.inFlightTotal > 0 ? p.inFlightTotal : nil,
+            batchUnknownUploads: p.inFlightTotal > 0 ? p.inFlightUnknownTotals : nil,
             watchWaitingSeconds: watchWaiting, watchReportAt: watchWaiting == nil ? nil : t.watch.reportAt,
             serverPending: t.server.conversationsPending, asOf: now)
     }
 }
 
-/// The system side of the sync Live Activity (ActivityKit in the app; a fake in tests).
+/// How an ended activity leaves the Lock Screen.
+public enum SyncActivityEnding: Equatable, Sendable {
+    case immediate
+    case after(Date)
+}
+
+/// The system side of the sync Live Activity (ActivityKit in the app; doubles in tests).
 @MainActor
 public protocol SyncActivityHost: AnyObject {
     /// Live Activities are allowed for this app (Settings).
     var enabled: Bool { get }
-    /// Activities that already exist (e.g. after a relaunch), oldest first.
-    func existing() -> [String]
+    /// This feature's activities that still exist (e.g. after a relaunch), oldest first: running ones
+    /// and ended ones still shown.
+    func existing() -> [(id: String, running: Bool)]
     func start(_ state: SyncActivityState, staleDate: Date) throws -> String
     func update(_ id: String, _ state: SyncActivityState, staleDate: Date)
-    /// `final`: shown after it ends (nil: removed at once).
-    func end(_ id: String, final: SyncActivityState?)
+    /// `final`: what an ended card shows until `ending` removes it (nil: removed at once).
+    func end(_ id: String, final: SyncActivityState?, ending: SyncActivityEnding)
+}
+
+/// What survives a relaunch: the activity was dismissed, so it isn't shown again until a sync is
+/// confirmed finished (UserDefaults in the app).
+@MainActor
+public protocol SyncActivityMemory: AnyObject {
+    var dismissed: Bool { get set }
 }
 
 /// One sync Live Activity, driven by the transfer state while the app runs. Presentation only: it
@@ -67,76 +83,181 @@ public final class SyncActivityController {
     /// other states describe a queue, which stays true longer.
     public static let liveStale: TimeInterval = 90
     public static let queueStale: TimeInterval = 15 * 60
+    /// An unchanged state, measured again while the app runs, is pushed again this often (fresh
+    /// "as of" and stale date).
+    public static let renewAfter: TimeInterval = 5 * 60
+    /// While a rate is shown, it is checked this soon again (it disappears once bytes stop).
+    public static let rateRecheck: TimeInterval = 4
+    /// A finished card stays this long (then the system removes it); a new sync or turning it off
+    /// removes it at once.
+    public static let finishedCardFor: TimeInterval = 10 * 60
 
     private let host: SyncActivityHost
+    private let memory: SyncActivityMemory
     public private(set) var activityId: String?
-    /// The user removed it from the Lock Screen: not recreated until this sync is over.
-    public private(set) var dismissedThisSync = false
+    /// The finished card still on screen (ours to remove).
+    public private(set) var finishedId: String?
     private var lastPushed: SyncActivityState?
     private var lastPushAt: Date?
 
-    public init(host: SyncActivityHost) { self.host = host }
-
-    /// After a relaunch: keep the first existing activity, end any extras (never two).
-    public func adopt() {
-        let all = host.existing()
-        activityId = all.first
-        for extra in all.dropFirst() { host.end(extra, final: nil) }
+    public init(host: SyncActivityHost, memory: SyncActivityMemory) {
+        self.host = host
+        self.memory = memory
     }
 
-    /// The system ended it: by the user (dismissed) or for its own reasons (time limit).
-    public func ended(_ id: String, byUser: Bool) {
+    public var dismissed: Bool { memory.dismissed }
+
+    /// After a relaunch: keep one running activity and one finished card, end any others.
+    public func adopt() {
+        let all = host.existing()
+        let running = all.filter(\.running).map(\.id), finished = all.filter { !$0.running }.map(\.id)
+        activityId = running.last
+        finishedId = finished.last
+        for extra in running.dropLast() + finished.dropLast() { host.end(extra, final: nil, ending: .immediate) }
+        lastPushed = nil
+        lastPushAt = nil
+    }
+
+    /// The system reports the activity gone. `dismissed`: ActivityKit's `.dismissed` (by the person or
+    /// by the system; it doesn't say which), so it isn't shown again until this sync is confirmed done.
+    /// Otherwise it ended (e.g. its time limit) and may show again on the next foreground.
+    public func ended(_ id: String, dismissed: Bool) {
+        if id == finishedId { finishedId = nil }
         guard id == activityId else { return }
         activityId = nil
         lastPushed = nil
-        if byUser { dismissedThisSync = true }
+        if dismissed { memory.dismissed = true }
     }
 
     public static func staleDate(_ s: SyncActivityState, now: Date) -> Date {
         now.addingTimeInterval(s.rate != nil ? liveStale : queueStale)
     }
 
-    /// `foreground`: the app is active (the only time a new activity is started). `optedOut`: the
-    /// owner turned it off in the app.
-    public func refresh(_ s: SyncActivityState, foreground: Bool, optedOut: Bool, now: Date) {
+    /// `state`: nil while nothing is known (the engine's first snapshot hasn't come, or the app isn't
+    /// measuring): nothing is decided then. `foreground`: the app is active (the only time a new
+    /// activity starts). `optedOut`: turned off in the app.
+    public func refresh(_ state: SyncActivityState?, foreground: Bool, optedOut: Bool, now: Date) {
         guard host.enabled, !optedOut else {
-            if let id = activityId { host.end(id, final: nil) }
-            activityId = nil
-            lastPushed = nil
+            removeAll()
             return
         }
-        guard let id = activityId else {
-            if !s.hasWork {
-                dismissedThisSync = false  // this sync is over: a later one may show again
-                return
+        guard let s = state, s.stage != .unknown else { return }
+        let finished = s.stage == .allSent && !s.hasWork  // confirmed: measured, read, nothing left
+        if let id = activityId {
+            if finished {
+                if let old = finishedId { host.end(old, final: nil, ending: .immediate) }
+                host.end(id, final: s, ending: .after(now.addingTimeInterval(Self.finishedCardFor)))
+                finishedId = id
+                activityId = nil
+                lastPushed = nil
+                memory.dismissed = false
+            } else if !s.hasWork {
+                host.end(id, final: nil, ending: .immediate)  // e.g. no server: nothing to follow
+                activityId = nil
+                lastPushed = nil
+            } else {
+                push(id, s, foreground: foreground, now: now)
             }
-            guard foreground, !dismissedThisSync, s.stage != .unknown else { return }
-            if let started = try? host.start(s, staleDate: Self.staleDate(s, now: now)) {
-                activityId = started
-                lastPushed = s
-                lastPushAt = now
-            }
             return
         }
-        guard s.stage != .unknown else { return }  // not measured now: leave the last state to go stale
-        if !s.hasWork {
-            host.end(id, final: s)  // everything reached the server (processing continues there)
-            activityId = nil
-            lastPushed = nil
-            dismissedThisSync = false
+        if finished {
+            memory.dismissed = false  // this sync is over: a later one may show again
             return
         }
-        let stageChanged = lastPushed.map { $0.stage != s.stage || $0.title != s.title || $0.detail != s.detail } ?? true
-        let due = lastPushAt.map { now.timeIntervalSince($0) >= Self.minInterval } ?? true
-        guard stageChanged || (due && Self.differs(lastPushed, s)) else { return }
+        guard s.hasWork, foreground, !memory.dismissed else { return }
+        if let old = finishedId {  // never two cards
+            host.end(old, final: nil, ending: .immediate)
+            finishedId = nil
+        }
+        if let started = try? host.start(s, staleDate: Self.staleDate(s, now: now)) {
+            activityId = started
+            lastPushed = s
+            lastPushAt = now
+        }
+    }
+
+    /// When the running app should look again (a shown rate may have stopped; an unchanged state is
+    /// renewed); nil when there's nothing to look after.
+    public func nextCheck(now: Date) -> Date? {
+        guard activityId != nil, let at = lastPushAt else { return nil }
+        let renew = at.addingTimeInterval(Self.renewAfter)
+        guard lastPushed?.rate != nil else { return renew }
+        return min(renew, now.addingTimeInterval(Self.rateRecheck))
+    }
+
+    private func push(_ id: String, _ s: SyncActivityState, foreground: Bool, now: Date) {
+        let changed = lastPushed.map { $0.stage != s.stage || $0.title != s.title || $0.detail != s.detail } ?? true
+        let since = lastPushAt.map { now.timeIntervalSince($0) } ?? .infinity
+        // the same state, measured again now; only while the app runs in front (in the background
+        // nothing is being watched, so nothing is renewed)
+        let renew = foreground && since >= Self.renewAfter
+        guard changed || (since >= Self.minInterval && Self.differs(lastPushed, s)) || renew else { return }
         host.update(id, s, staleDate: Self.staleDate(s, now: now))
         lastPushed = s
         lastPushAt = now
+    }
+
+    private func removeAll() {
+        for id in [activityId, finishedId].compactMap({ $0 }) { host.end(id, final: nil, ending: .immediate) }
+        activityId = nil
+        finishedId = nil
+        lastPushed = nil
     }
 
     private static func differs(_ a: SyncActivityState?, _ b: SyncActivityState) -> Bool {
         guard var a else { return true }
         a.asOf = b.asOf
         return a != b
+    }
+}
+
+/// The ActivityKit calls, in order. Each update or end runs only after the previous one finished,
+/// so an update delayed at the SDK can't land after a newer one or after the end; an update that
+/// has been superseded (or whose activity ended) before its turn is skipped.
+@MainActor
+public final class OrderedActivityOperations {
+    public typealias Send = @Sendable (String, SyncActivityState, Date) async -> Void
+    public typealias Finish = @Sendable (String, SyncActivityState?, SyncActivityEnding) async -> Void
+
+    private let send: Send
+    private let finish: Finish
+    private var tail: Task<Void, Never>?
+    private var revision = 0
+    private var newest: [String: Int] = [:]
+    private var retired: Set<String> = []
+
+    public init(send: @escaping Send, finish: @escaping Finish) {
+        self.send = send
+        self.finish = finish
+    }
+
+    public func update(_ id: String, _ state: SyncActivityState, staleDate: Date) {
+        guard !retired.contains(id) else { return }
+        revision += 1
+        let r = revision
+        newest[id] = r
+        let send = send
+        chain { [weak self] in
+            guard let self, self.newest[id] == r, !self.retired.contains(id) else { return }  // superseded or ended
+            await send(id, state, staleDate)
+        }
+    }
+
+    public func end(_ id: String, final: SyncActivityState?, ending: SyncActivityEnding) {
+        retired.insert(id)
+        newest[id] = nil
+        let finish = finish
+        chain { await finish(id, final, ending) }
+    }
+
+    /// Everything queued so far has run (tests).
+    public func drain() async { await tail?.value }
+
+    private func chain(_ op: @escaping @MainActor () async -> Void) {
+        let previous = tail
+        tail = Task { @MainActor in
+            await previous?.value
+            await op()
+        }
     }
 }

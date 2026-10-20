@@ -20,56 +20,6 @@ extension Color {
     }
 }
 
-enum SyncWords {
-    static func duration(_ seconds: Double) -> String {
-        let s = Int(seconds.rounded())
-        if s < 60 { return "\(s) s" }
-        if s < 3600 { return "\(s / 60) min" }
-        return "\(s / 3600) h \((s % 3600) / 60) min"
-    }
-
-    static func rate(_ bps: Double) -> String {
-        if bps < 1_000 { return "\(Int(bps.rounded())) B/s" }
-        if bps < 1_000_000 { return String(format: "%.0f KB/s", bps / 1_000) }
-        return String(format: "%.1f MB/s", bps / 1_000_000)
-    }
-
-    static func shortStage(_ s: SyncActivityState) -> String {
-        switch s.stage {
-        case .sending: return "Sending"
-        case .waiting: return "Waiting"
-        case .retrying: return "Retrying"
-        case .offline: return "Offline"
-        case .paused: return "Paused"
-        case .preparing: return "Preparing"
-        case .keptAside: return "Kept aside"
-        case .queueUnreadable: return "Unknown"
-        case .allSent: return "Sent"
-        case .notConfigured: return "No server"
-        case .unknown: return "Unknown"
-        }
-    }
-
-    /// The audio still to send, honestly: unknown stays unknown, a lower bound says so.
-    static func queued(_ s: SyncActivityState) -> String? {
-        guard let seconds = s.queuedAudioSeconds else { return s.queuedFiles == nil ? "Queue unknown" : nil }
-        if seconds == 0 { return s.queuedFiles == 0 ? nil : "Audio length unknown" }
-        return "\(s.queuedAudioPartial ? "At least " : "")\(duration(seconds)) of audio to send"
-    }
-
-    static func trailing(_ s: SyncActivityState, stale: Bool) -> String {
-        if !stale, let r = s.rate { return rate(r) }
-        if let q = s.queuedAudioSeconds, q > 0 { return duration(q) }
-        return ""
-    }
-
-    static func compact(_ s: SyncActivityState, stale: Bool) -> String {
-        if !stale, let r = s.rate { return rate(r) }
-        if let q = s.queuedAudioSeconds, q > 0 { return duration(q) }
-        return shortStage(s)
-    }
-}
-
 struct SyncStageIcon: View {
     let stage: SyncActivityState.Stage
     var body: some View {
@@ -101,15 +51,18 @@ struct SyncLines: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            if let q = SyncWords.queued(state) { Text("iPhone → server: \(q)").font(.caption).lineLimit(1) }
+            if let q = SyncWords.queued(state) { Text("iPhone → server: \(q)").font(.caption).lineLimit(1).minimumScaleFactor(0.75) }
             if !stale, let r = state.rate { Text("Sending now at \(SyncWords.rate(r))").font(.caption).foregroundStyle(SyncPalette.secondary) }
-            if let sent = state.batchSent, let total = state.batchTotal, total > 0, !stale {
-                ProgressView(value: Double(sent), total: Double(total)) { Text("Current batch").font(.caption2) }
-                    .tint(SyncPalette.ink).frame(maxWidth: .infinity)
+            if !stale, let batch = SyncWords.batch(state) {
+                if let f = batch.fraction {
+                    ProgressView(value: f) { Text(batch.text).font(.caption2) }.tint(SyncPalette.ink).frame(maxWidth: .infinity)
+                } else {
+                    Text(batch.text).font(.caption2).foregroundStyle(SyncPalette.secondary).lineLimit(2)
+                }
             }
             if let w = state.watchWaitingSeconds, w > 0 {
                 Text("Watch: \(SyncWords.duration(Double(w))) waiting\(state.watchReportAt.map { " · reported \($0.formatted(date: .omitted, time: .shortened))" } ?? "")")
-                    .font(.caption).foregroundStyle(SyncPalette.secondary).lineLimit(1)
+                    .font(.caption).foregroundStyle(SyncPalette.secondary).lineLimit(1).minimumScaleFactor(0.75)
             }
             if let d = state.detail { Text(d).font(.caption).foregroundStyle(SyncPalette.secondary).lineLimit(2) }
             if stale {
