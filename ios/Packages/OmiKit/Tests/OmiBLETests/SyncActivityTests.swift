@@ -175,7 +175,7 @@ final class FakeMemory: SyncActivityMemory {
         c.refresh(state(.waiting), foreground: false, optedOut: false, now: now)
         #expect(host.started == 1 && !memory.dismissed)
         c.refresh(state(.waiting), foreground: true, optedOut: false, now: now)
-        #expect(host.started == 2)
+        #expect(host.started == 2 && host.cards.map(\.id) == ["act-2"], "the ended card is removed, not left beside the new one")
     }
 
     /// LA-03 (Astra `completed_cards_accumulate`): drain/refill cycles leave at most one card, a
@@ -195,6 +195,25 @@ final class FakeMemory: SyncActivityMemory {
         relaunched.adopt()
         relaunched.refresh(state(.waiting), foreground: true, optedOut: true, now: now.addingTimeInterval(500))
         #expect(host.cards.isEmpty, "turning it off removes this feature's cards")
+    }
+
+    /// LA-03, found by the repair harness with the real adapter: ActivityKit reports a card ended with a
+    /// later dismissal as `.ended` at once. It is still on screen, so it stays ours to remove.
+    @Test func aFinishedCardReportedEndedIsStillRemoved() {
+        let (host, _, c) = rig()
+        c.refresh(state(.waiting), foreground: true, optedOut: false, now: now)
+        c.refresh(done, foreground: true, optedOut: false, now: now.addingTimeInterval(10))
+        c.ended("act-1", dismissed: false)  // what ActivityKit reports right after end(_:dismissalPolicy: .after)
+        #expect(c.finishedId == "act-1")
+        c.refresh(state(.waiting), foreground: true, optedOut: false, now: now.addingTimeInterval(20))
+        #expect(host.cards.count == 1 && host.cards[0].id == "act-2", "the finished card is replaced, not left beside it")
+        c.refresh(done, foreground: true, optedOut: false, now: now.addingTimeInterval(30))
+        c.ended("act-2", dismissed: false)
+        c.refresh(done, foreground: true, optedOut: true, now: now.addingTimeInterval(40))
+        #expect(host.cards.isEmpty, "turning it off removes it")
+        c.refresh(state(.waiting), foreground: true, optedOut: false, now: now.addingTimeInterval(50))
+        c.ended("act-3", dismissed: true)  // gone from the screen: nothing left to remove
+        #expect(c.finishedId == nil && c.activityId == nil)
     }
 
     @Test func aFinishedSyncSaysTheServerStillProcesses() {

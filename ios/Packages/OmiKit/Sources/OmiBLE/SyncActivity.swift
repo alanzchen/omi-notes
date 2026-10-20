@@ -118,15 +118,21 @@ public final class SyncActivityController {
         lastPushAt = nil
     }
 
-    /// The system reports the activity gone. `dismissed`: ActivityKit's `.dismissed` (by the person or
-    /// by the system; it doesn't say which), so it isn't shown again until this sync is confirmed done.
-    /// Otherwise it ended (e.g. its time limit) and may show again on the next foreground.
+    /// The system reports an activity ended. `dismissed`: ActivityKit's `.dismissed`, off the screen (by
+    /// the person or by the system; it doesn't say which), so it isn't shown again until this sync is
+    /// confirmed done. Otherwise it is `.ended` but may still be on screen (a finished card, or a time
+    /// limit): ours to remove, and a new one may show on the next foreground.
     public func ended(_ id: String, dismissed: Bool) {
-        if id == finishedId { finishedId = nil }
+        if id == finishedId, dismissed { finishedId = nil }
         guard id == activityId else { return }
         activityId = nil
         lastPushed = nil
-        if dismissed { memory.dismissed = true }
+        if dismissed {
+            memory.dismissed = true
+        } else {
+            if let old = finishedId { host.end(old, final: nil, ending: .immediate) }
+            finishedId = id
+        }
     }
 
     public static func staleDate(_ s: SyncActivityState, now: Date) -> Date {
