@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -42,8 +43,18 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
 @pytest.fixture(autouse=True)
 def hermetic_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Ignore the developer's shell environment and backend/.env."""
+    scrub_env(monkeypatch, tmp_path)
+
+
+def scrub_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for name in Settings.model_fields:
         monkeypatch.delenv(name.upper(), raising=False)
+    # Credentials the provider SDKs find on their own (ANTHROPIC_AUTH_TOKEN, ANTHROPIC_PROFILE and the
+    # profiles under ~/.config/anthropic) would let a regression reach a real provider.
+    for name in list(os.environ):
+        if name.startswith(("ANTHROPIC_", "OPENAI_", "DEEPGRAM_")):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(tmp_path / "no-anthropic-config"))
     monkeypatch.setenv("OMI_NOTES_ENV_FILE", str(tmp_path / "no.env"))
 
 

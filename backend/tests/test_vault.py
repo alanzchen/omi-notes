@@ -83,7 +83,8 @@ def test_explicit_render_settings_are_recorded_in_vault_json(tmp_path):
 
 
 def test_legacy_install_refuses_to_start_and_names_the_migration(tmp_path):
-    legacy = Settings(omi_notes_token="t", notes_dir=tmp_path / "notes", data_dir=tmp_path / "data")
+    legacy = Settings(omi_notes_token="t", notes_dir=tmp_path / "notes", data_dir=tmp_path / "data",
+                      index_dir=tmp_path / "index", lock_dir=tmp_path / "locks")  # never this Mac's real locks
     with pytest.raises(VaultError, match="migrate-vault --notes-dir .*notes --data-dir .*data"):
         create_app(legacy, start_worker=False)
 
@@ -349,13 +350,14 @@ def test_retention_writes_evidence_then_tombstones(client, worker, settings):
 # -- doctor ------------------------------------------------------------------------------------------------
 
 
-def test_doctor_reports_vault_index_and_sync_pitfalls(client, settings):
+def test_doctor_reports_vault_index_and_sync_pitfalls(client, settings, monkeypatch):
     from typer.testing import CliRunner
 
     from omi_notes.cli import app as cli
 
     from .conftest import cli_env
 
+    monkeypatch.setattr("omi_notes.cli._tailscale_url", lambda: None)  # never this Mac's tailscale
     (settings.vault_dir / ".obsidian").mkdir()
     foreign_lease(settings, time.time() - 30)
     result = CliRunner().invoke(cli, ["doctor"], env=cli_env(settings))
@@ -365,11 +367,13 @@ def test_doctor_reports_vault_index_and_sync_pitfalls(client, settings):
     assert "other-host.local renewed its writer lease" in out
 
 
-def test_doctor_names_the_migration_for_a_legacy_install(tmp_path):
+def test_doctor_names_the_migration_for_a_legacy_install(tmp_path, monkeypatch):
     from typer.testing import CliRunner
 
     from omi_notes.cli import app as cli
 
-    env = {"NOTES_DIR": str(tmp_path / "notes"), "DATA_DIR": str(tmp_path / "data"), "OMI_NOTES_TOKEN": "t"}
+    monkeypatch.setattr("omi_notes.cli._tailscale_url", lambda: None)  # never this Mac's tailscale
+    env = {"NOTES_DIR": str(tmp_path / "notes"), "DATA_DIR": str(tmp_path / "data"), "OMI_NOTES_TOKEN": "t",
+           "INDEX_DIR": str(tmp_path / "index"), "LOCK_DIR": str(tmp_path / "locks")}
     result = CliRunner().invoke(cli, ["doctor"], env=env)
     assert "omi-notes migrate-vault --notes-dir" in result.output and result.exit_code == 1

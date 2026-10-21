@@ -1,9 +1,11 @@
 """Worker + conversation pipeline behaviors through the real HTTP ingest."""
 
 import json
+import os
 import time
 import uuid
 from datetime import timedelta
+from pathlib import Path
 
 import numpy as np
 from fastapi.testclient import TestClient
@@ -298,3 +300,16 @@ def test_rebuild_makes_no_api_calls_and_reproduces_notes(client, worker, setting
     conversation = [p for p in before if p.parts[0] == "Conversations"]
     assert conversation and all(after[p] == before[p] for p in conversation)
     assert after[next(p for p in before if p.parts[0] == "Daily")] == before[next(p for p in before if p.parts[0] == "Daily")]
+
+
+def test_tests_never_inherit_provider_credentials(monkeypatch, tmp_path):
+    """"No keys" above must also hold on a machine that has them: the provider SDKs find credentials on
+    their own (ANTHROPIC_AUTH_TOKEN, a profile under ANTHROPIC_CONFIG_DIR)."""
+    from .conftest import scrub_env
+
+    for name in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY", "DEEPGRAM_API_KEY"):
+        monkeypatch.setenv(name, "from-the-developer")
+    scrub_env(monkeypatch, tmp_path)
+    left = [n for n in os.environ if n.startswith(("ANTHROPIC_", "OPENAI_", "DEEPGRAM_")) and n != "ANTHROPIC_CONFIG_DIR"]
+    assert left == []
+    assert Path(os.environ["ANTHROPIC_CONFIG_DIR"]).is_relative_to(tmp_path)
