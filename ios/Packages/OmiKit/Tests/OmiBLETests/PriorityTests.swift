@@ -104,11 +104,8 @@ final class PriorityServerStub: URLProtocol, @unchecked Sendable {
 
     @Test func offlineMarkingNeedsTheSameConfirmedScopeAndNothingCrossesARePair() async throws {
         let (m, root) = try model()
-        await m.refreshServer()                                      // saves the list for this scope…
+        await m.refreshServer()                                      // saves the list for this scope
         let scope = NoteCache.Scope(serverURL: "https://mac.ts.net", generation: 1, vaultId: "vault-a")
-        if m.noteCache.lastScope == nil {                            // …except on a Mac host, which refuses
-            try JSONEncoder().encode(scope).write(to: root.appendingPathComponent("cache/scope.json"))  // file protection
-        }
         #expect(m.noteCache.lastScope == scope)
         PriorityServerStub.offline = true
         // relaunched offline: the same server, pairing and vault said it supports value notes
