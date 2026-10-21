@@ -11,7 +11,7 @@ Design: [`../docs/architecture.md`](../docs/architecture.md). Wire contract:
 ## Setup (macOS)
 
 ```sh
-brew install opus uv                 # libopus for decoding; uv manages Python 3.13 + deps
+brew install opus ffmpeg uv          # libopus for Opus; ffmpeg for Apple Watch AAC (and its tests); uv manages Python 3.13 + deps
 cd backend
 uv sync
 uv run omi-notes fetch-models        # Silero VAD model (~2 MB, checksum verified)

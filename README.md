@@ -22,7 +22,7 @@ Omi pendant ──BLE──▶ iPhone app ──HTTPS (Tailscale)──▶ backe
 On the Mac that will run the server:
 
 ```bash
-make setup                       # brew opus/uv/xcodegen, uv sync, fetch the VAD model
+make setup                       # brew opus/ffmpeg/uv/xcodegen, uv sync, fetch the VAD model
 cp backend/.env.example backend/.env
 #   fill in DEEPGRAM_API_KEY and ANTHROPIC_API_KEY (VAULT_DIR/TIMEZONE optional)
 make pair                        # generates the token, prints a QR code for the app

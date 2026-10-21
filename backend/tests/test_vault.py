@@ -367,6 +367,22 @@ def test_doctor_reports_vault_index_and_sync_pitfalls(client, settings, monkeypa
     assert "other-host.local renewed its writer lease" in out
 
 
+def test_doctor_says_what_a_missing_ffmpeg_costs(client, settings, monkeypatch):
+    import shutil
+
+    from typer.testing import CliRunner
+
+    from omi_notes.cli import app as cli
+
+    from .conftest import cli_env
+
+    which = shutil.which
+    monkeypatch.setattr("omi_notes.cli._tailscale_url", lambda: None)
+    monkeypatch.setattr("omi_notes.cli.shutil.which", lambda name: None if name == "ffmpeg" else which(name))
+    out = CliRunner().invoke(cli, ["doctor"], env=cli_env(settings)).output
+    assert "ffmpeg (Apple Watch AAC recordings" in out and "sends Watch audio as PCM" in out
+
+
 def test_doctor_names_the_migration_for_a_legacy_install(tmp_path, monkeypatch):
     from typer.testing import CliRunner
 

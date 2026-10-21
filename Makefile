@@ -2,6 +2,7 @@
 
 setup:
 	brew list opus >/dev/null 2>&1 || brew install opus
+	brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
 	command -v uv >/dev/null || brew install uv
 	command -v xcodegen >/dev/null || brew install xcodegen
 	cd backend && uv sync && uv run omi-notes fetch-models

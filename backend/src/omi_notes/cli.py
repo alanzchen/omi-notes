@@ -291,7 +291,8 @@ def doctor() -> None:
             serving = False
         check(serving, "tailscale serve proxies to this server",
               f"tailscale serve --bg --https=443 http://127.0.0.1:{settings.port}", required=False)  # fmt: skip
-    check(shutil.which("ffmpeg") is not None, "ffmpeg (optional, for replay-wav resampling)", required=False)
+    check(shutil.which("ffmpeg") is not None, "ffmpeg (Apple Watch AAC recordings, replay-wav resampling)",
+          "without it the phone sends Watch audio as PCM and stored Watch AAC can't be decoded", required=False)
     raise typer.Exit(1 if problems else 0)
 
 
