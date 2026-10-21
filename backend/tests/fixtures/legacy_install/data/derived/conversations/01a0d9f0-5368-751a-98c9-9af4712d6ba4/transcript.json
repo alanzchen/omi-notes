@@ -1,0 +1,20 @@
+{
+ "segments": [
+  {
+   "start": 1790362800.7,
+   "end": 1790362816.0,
+   "speaker": "S1",
+   "text": "We should review the quarterly plan and send the updated budget to the team before friday so everyone can agree on the launch date.",
+   "confidence": 0.99
+  }
+ ],
+ "language": "en",
+ "audio_sha": "d7af4097af9a36fe77823da9c59d2b15ee98cc843a36421f3603820dc7ae617f",
+ "stt": "fake/fake-stt",
+ "speaker_source": "provider",
+ "speaker_labels_consistent": true,
+ "stt_file": "stt-fake-fake-stt-en-d7af4097af9a36fe.json",
+ "transcribed_at": 1790450000.0,
+ "submitted_seconds": 15.3,
+ "missing": []
+}

@@ -1,0 +1,20 @@
+{
+ "segments": [
+  {
+   "start": 1790276400.7,
+   "end": 1790276406.0,
+   "speaker": "S1",
+   "text": "Mm-hmm.",
+   "confidence": 0.99
+  }
+ ],
+ "language": "en",
+ "audio_sha": "d8fb9d3d2e33ff40d322e459f7c3aa18a2c9dbef9549c8199b255e30550ea9de",
+ "stt": "fake/fake-stt",
+ "speaker_source": "provider",
+ "speaker_labels_consistent": true,
+ "stt_file": "stt-fake-fake-stt-en-d8fb9d3d2e33ff40.json",
+ "transcribed_at": 1790449900.0,
+ "submitted_seconds": 5.3,
+ "missing": []
+}

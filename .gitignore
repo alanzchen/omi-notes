@@ -14,6 +14,9 @@ __pycache__/
 backend/.env
 data/
 backend/data/
+# ...but the pre-vault install that the migrate-vault tests copy is a committed fixture
+!backend/tests/fixtures/legacy_install/data/
+backend/tests/fixtures/legacy_install/data/*.sqlite3-*
 backend/models/*.onnx
 
 # Xcode
