@@ -34,6 +34,16 @@ public final class NoteCache: @unchecked Sendable {
     public static let maxDetails = 50
     public static let maxBytes: Int64 = 20 * 1024 * 1024
 
+    /// Saved copies can't be read while the phone is locked. macOS, where OmiKit's tests run, refuses
+    /// this protection class for an ordinary process (EPERM), so there they are written without it.
+    static let writeOptions: Data.WritingOptions = {
+        #if os(macOS)
+        return [.atomic]
+        #else
+        return [.atomic, .completeFileProtection]
+        #endif
+    }()
+
     private let root: URL
     private let lock = NSLock()
 
@@ -114,9 +124,9 @@ public final class NoteCache: @unchecked Sendable {
             let e = JSONEncoder()
             e.dateEncodingStrategy = .secondsSince1970
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try e.encode(value).write(to: url, options: [.atomic, .completeFileProtection])
+            try e.encode(value).write(to: url, options: Self.writeOptions)
             if read(Scope.self, pointerURL) != scope {
-                try e.encode(scope).write(to: pointerURL, options: [.atomic, .completeFileProtection])
+                try e.encode(scope).write(to: pointerURL, options: Self.writeOptions)
             }
         } catch {
             OmiLog.shared.log(.warning, "cache", "couldn't save a note for offline reading: \(error)")

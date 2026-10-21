@@ -335,6 +335,17 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         #expect(c.detail("c1", scope: a) == nil && c.lastScope == nil)
     }
 
+    /// The phone writes saved copies with complete file protection (unreadable while it is locked).
+    /// Only the option can be checked here: the simulator reports no protection class (nil) and macOS
+    /// refuses the option, so its effect needs a device.
+    @Test func savedCopiesAreWrittenProtectedOnThePhone() {
+        #if os(macOS)
+        #expect(NoteCache.writeOptions == [.atomic])
+        #else
+        #expect(NoteCache.writeOptions == [.atomic, .completeFileProtection])
+        #endif
+    }
+
     @Test func theOldestSavedCopiesAreEvicted() throws {
         let c = cache()
         let s = NoteCache.Scope(serverURL: "https://a", generation: 1, vaultId: "v1")
