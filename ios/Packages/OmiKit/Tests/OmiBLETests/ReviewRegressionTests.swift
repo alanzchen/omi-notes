@@ -256,13 +256,17 @@ final class MismatchCounter: @unchecked Sendable {
 
         let uploads = CountingUploadTransport()
         var config = EngineConfiguration(dirs: dirs, appVersion: "t", useCoreBluetooth: false, tickInterval: 0.2)
-        config.testBeforeRecovery = { Thread.sleep(forTimeInterval: 0.8) }
-        let started = Date()
+        // Recovery is held until init has returned. If init waited for recovery, the hold would time out
+        // instead: an ordering check, not a time limit a busy machine can miss.
+        let initReturned = DispatchSemaphore(value: 0)
+        let heldUntilInitReturned = Locked(false)
+        config.testBeforeRecovery = { heldUntilInitReturned.value = initReturned.wait(timeout: .now() + 5) == .success }
         let engine = OmiEngine(config: config, settings: try makeSettings(), uploadTransport: uploads)
-        #expect(Date().timeIntervalSince(started) < 0.5, "init must not block on recovery")
         #expect(uploads.started.isEmpty, "no uploads before recovery")
+        initReturned.signal()
         let done = engine.queue.sync { engine.recoveryComplete }  // waits behind recovery on the queue
         #expect(done)
+        #expect(heldUntilInitReturned.value, "init must not block on recovery")
         engine.queue.sync {}
         #expect(uploads.startedNames.contains(OutboxKind.seal(captureId: abandoned).fileName))
         #expect(uploads.startedNames.contains(OutboxKind.chunk(captureId: abandoned, sequence: 0).fileName))
