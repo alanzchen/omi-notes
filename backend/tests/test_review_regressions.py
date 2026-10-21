@@ -316,7 +316,7 @@ def test_f09_new_directories_are_fsynced_before_the_ack(tmp_path, monkeypatch):
     synced: list[Path] = []
     monkeypatch.setattr(spool, "fsync_dir", lambda p: synced.append(Path(p)))
     raw = tmp_path / "data" / "raw"
-    spool.store_chunk(raw, "dev", "cap", 0, b"body")
+    spool.atomic_write_bytes(raw / "dev" / "cap" / "0.omnc", b"body")  # how ingest stores a chunk (ingest.py)
     for created in (tmp_path / "data", raw, raw / "dev", raw / "dev" / "cap"):
         assert created.parent in synced, created
     assert synced[-1] == raw / "dev" / "cap"  # the rename itself

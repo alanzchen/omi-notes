@@ -18,7 +18,6 @@ from omi_notes.db import Database
 from omi_notes.pipeline.worker import Worker
 from omi_notes.providers.fake import FakeStt
 from omi_notes.speakers.service import SpeakerService
-from omi_notes.vault import Vault
 
 from .conftest import AUTH
 from .test_speaker_learning import ALAN, PRIYA, RAVI, CountingLlm, FakeEmbedder, dialogue, env, name_label, new_person, talk  # noqa: F401

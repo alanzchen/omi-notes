@@ -55,14 +55,3 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
             pass
         raise
     fsync_dir(path.parent)
-
-
-def chunk_path(raw_dir: Path, device_id: str, capture_id: str, chunk_sequence: int) -> Path:
-    return raw_dir / safe_component(device_id) / safe_component(capture_id) / f"{chunk_sequence}.omnc"
-
-
-def store_chunk(raw_dir: Path, device_id: str, capture_id: str, chunk_sequence: int, body: bytes) -> Path:
-    """Durably store a chunk body. Only after this returns may the ledger row be committed."""
-    path = chunk_path(raw_dir, device_id, capture_id, chunk_sequence)
-    atomic_write_bytes(path, body)
-    return path

@@ -108,14 +108,6 @@ def version() -> str:
     return _lib().opus_get_version_string().decode(errors="replace")
 
 
-def available() -> bool:
-    try:
-        _lib()
-    except OpusError:
-        return False
-    return True
-
-
 class OpusDecoder:
     """Stateful mono decoder. Feed packets in order; call `conceal()` for a lost packet."""
 

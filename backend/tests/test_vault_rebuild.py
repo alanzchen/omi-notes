@@ -10,7 +10,6 @@ import sqlite3
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -19,17 +18,15 @@ from typer.testing import CliRunner
 
 from omi_notes.api import create_app
 from omi_notes.cli import app as cli
-from omi_notes.db import COLUMN_SOURCES, SCHEMA, Database
+from omi_notes.db import COLUMN_SOURCES, SCHEMA
 from omi_notes.devtools import live_envelopes, pcm_envelopes, ring_envelopes, synth_speech_like
 from omi_notes.envelope import iso_utc, parse_envelope
 from omi_notes.migrate import migrate
-from omi_notes.pipeline import worker as worker_mod
 from omi_notes.pipeline.conversations import Providers
 from omi_notes.pipeline.worker import Worker
-from omi_notes.providers import LlmResult, ProviderError
+from omi_notes.providers import ProviderError
 from omi_notes.providers.fake import FakeLlm, FakeStt
-from omi_notes.rebuild import open_index
-from omi_notes.vault import Vault, index_dir
+from omi_notes.vault import Vault
 
 from .conftest import AUTH, DEVICE, FIXTURES, cli_env, make_settings
 

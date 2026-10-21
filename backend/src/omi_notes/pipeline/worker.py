@@ -20,7 +20,6 @@ import logging
 import threading
 import time
 from collections import OrderedDict
-from pathlib import Path
 
 from .. import __version__, operations, priority, search
 from ..audio.timeline import RING_RECORD_SECONDS, CaptureTimeline, ChunkDecode

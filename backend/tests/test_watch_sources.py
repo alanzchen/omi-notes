@@ -13,7 +13,7 @@ import numpy as np
 from omi_notes.devtools import pcm_envelopes, synth_speech_like
 
 from .conftest import put_chunk, upload_all
-from .helpers import STARTED, T0, convs, live, note_text, replay, silence
+from .helpers import STARTED, T0, convs, live, replay, silence
 
 WATCH = "watch-0f3a9c2e"
 

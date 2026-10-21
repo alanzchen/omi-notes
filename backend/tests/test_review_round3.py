@@ -30,7 +30,7 @@ from omi_notes.util import canonical_json, sha256_hex
 from omi_notes.vault import Vault, VaultError
 
 from .conftest import AUTH, cli_env, make_settings
-from .helpers import STARTED, T0, convs, replay, silence
+from .helpers import T0, convs, replay, silence
 from .test_enrollment import CountingStt, start_event
 from .test_enrollment import voice as reading
 from .test_speaker_learning import ALAN, PRIYA, RAVI, CountingLlm, FakeEmbedder, dialogue, name_label, new_person, talk

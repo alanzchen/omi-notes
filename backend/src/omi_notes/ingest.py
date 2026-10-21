@@ -326,10 +326,6 @@ def tombstone_header(tomb: dict) -> EnvelopeHeader:
 # -- ingest ----------------------------------------------------------------------------------------
 
 
-class ReadOnly(Exception):
-    """The vault is open read-only (incomplete sync, divergence, foreign writer)."""
-
-
 class Ingest:
     """HTTP ingest against one vault + index. One process-wide lock serializes identity checks."""
 
