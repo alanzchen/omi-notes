@@ -47,6 +47,18 @@ import OmiProtocol
             timezone: "America/Chicago", idGenerator: { fixed })
     }
 
+    /// "Re-running produces byte-identical files" also holds for the AAC fixture: Apple's encoder stamps
+    /// the encode time into the container, which must not reach the committed bytes.
+    @Test func theWatchAACFixtureDoesNotCarryTheEncodeTime() throws {
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("omikit-aac-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let times = Self.mp4Times(try Self.watchAAC(in: scratch).data)
+        #expect(times.count == 6 && times.allSatisfy { $0 == Self.aacContainerTime }, "\(times)")
+    }
+
+    /// The committed fixture's container time (2026-10-16), seconds since 1904.
+    static let aacContainerTime: UInt64 = 3_875_022_489
+
     @Test func writeLiveAndRingFixtures() throws {
         let packets = loadOpusPackets()
         try #require(packets.count >= 64, "opus_packets.bin resource missing")
@@ -183,20 +195,8 @@ import OmiProtocol
             watchRelay: WatchRelayHealth(received: 12, refused: 0, lastRefusal: nil, lastReceivedAt: "2026-10-17T06:59:30.000Z", inboxPending: 1))))
         try Self.prettyJSON(phone).write(to: out.appendingPathComponent("event_phone_status.json"))
 
-        // An Apple Watch part relayed as its own AAC file (aac_m4a_v1), encoded by Apple's encoder
-        // (AVAudioFile, 16 kHz mono, 32 kbit/s, like the Watch), SYNTHETIC tone.
-        let m4a = scratch.appendingPathComponent("watch.m4a")
-        do {
-            let file = try AVAudioFile(forWriting: m4a, settings: [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 16_000.0,
-                                                                  AVNumberOfChannelsKey: 1, AVEncoderBitRateKey: 32_000])
-            let n = AVAudioFrameCount(16_000 * 7 + 1_234)
-            let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: n)!
-            buffer.frameLength = n
-            for i in 0..<Int(n) { buffer.floatChannelData![0][i] = Float(sin(Double(i) * 2 * .pi * 220 / 16_000) * 0.3) }
-            try file.write(from: buffer)
-        }
-        let aacData = try Data(contentsOf: m4a)
-        let aacFrames = Int(try AVAudioFile(forReading: m4a).length)
+        // An Apple Watch part relayed as its own AAC file (aac_m4a_v1), encoded by Apple's encoder.
+        let (aacData, aacFrames) = try Self.watchAAC(in: scratch)
         let aacHeader = EnvelopeHeader(
             captureId: "5ee0a000-0000-4000-8000-0000000000aa", chunkSequence: 0, deviceId: "watch-5ee0a000-synthetic", deviceName: "Apple Watch",
             modelNumber: "Apple Watch", firmwareRevision: nil, hardwareRevision: nil, source: .watchMic, payloadFormat: .aacM4aV1, codecId: 0,
@@ -258,6 +258,54 @@ import OmiProtocol
         records.append(RingProtocol.be(ts0 + 1) + payload + Data(count: 440 - payload.count))
         expect.append(.init(sequence: 1202, unix_ts: ts0 + 1, frame_lengths: lens, note: "starts with the frame that overflowed record 1201"))
         return (records, expect)
+    }
+
+    /// A SYNTHETIC tone encoded by Apple's encoder (AVAudioFile, 16 kHz mono, 32 kbit/s, like the Watch).
+    static func watchAAC(in scratch: URL) throws -> (data: Data, frames: Int) {
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        let m4a = scratch.appendingPathComponent("watch-\(UUID().uuidString).m4a")
+        defer { try? FileManager.default.removeItem(at: m4a) }
+        do {
+            let file = try AVAudioFile(forWriting: m4a, settings: [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 16_000.0,
+                                                                  AVNumberOfChannelsKey: 1, AVEncoderBitRateKey: 32_000])
+            let n = AVAudioFrameCount(16_000 * 7 + 1_234)
+            let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: n)!
+            buffer.frameLength = n
+            for i in 0..<Int(n) { buffer.floatChannelData![0][i] = Float(sin(Double(i) * 2 * .pi * 220 / 16_000) * 0.3) }
+            try file.write(from: buffer)
+        }
+        var data = try Data(contentsOf: m4a)
+        for field in mp4TimeFields(data) {  // the encode time, not part of the audio
+            for i in 0..<field.width { data[field.offset + i] = UInt8(truncatingIfNeeded: aacContainerTime >> (8 * (field.width - 1 - i))) }
+        }
+        return (data, Int(try AVAudioFile(forReading: m4a).length))
+    }
+
+    /// The creation and modification times (seconds since 1904) in an MP4 file's mvhd, tkhd and mdhd boxes.
+    static func mp4Times(_ data: Data) -> [UInt64] {
+        let b = [UInt8](data)
+        return mp4TimeFields(data).map { f in (0..<f.width).reduce(UInt64(0)) { $0 << 8 | UInt64(b[f.offset + $1]) } }
+    }
+
+    static func mp4TimeFields(_ data: Data) -> [(offset: Int, width: Int)] {
+        let b = [UInt8](data)
+        func be(_ at: Int, _ n: Int) -> UInt64 { (0..<n).reduce(UInt64(0)) { $0 << 8 | UInt64(b[at + $1]) } }
+        var fields: [(offset: Int, width: Int)] = []
+        func walk(_ from: Int, _ end: Int) {
+            var at = from
+            while at + 8 <= end {
+                let size = Int(be(at, 4)), type = String(decoding: b[at + 4 ..< at + 8], as: UTF8.self)
+                guard size >= 8, at + size <= end else { return }
+                if ["mvhd", "tkhd", "mdhd"].contains(type) {
+                    let w = b[at + 8] == 1 ? 8 : 4  // version 1 boxes carry 64-bit times
+                    fields += [(at + 12, w), (at + 12 + w, w)]
+                }
+                if ["moov", "trak", "mdia"].contains(type) { walk(at + 8, at + size) }
+                at += size
+            }
+        }
+        walk(0, b.count)
+        return fields
     }
 
     static func prettyJSON<T: Encodable>(_ v: T) throws -> Data {
