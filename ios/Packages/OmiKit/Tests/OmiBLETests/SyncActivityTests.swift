@@ -351,7 +351,7 @@ final class FakeMemory: SyncActivityMemory {
         let settings = SettingsStore(defaults: UserDefaults(suiteName: "omi-link-\(UUID().uuidString)")!, tokens: InMemoryTokenStore())
         let engine = OmiEngine(config: EngineConfiguration(dirs: CaptureDirectories(root: dir), appVersion: "t", timezone: "UTC", useCoreBluetooth: false),
                                settings: settings, uploadTransport: CountingUploadTransport())
-        let model = AppModel(engine: engine)
+        let model = AppModel(engine: engine, noteCache: NoteCache(root: dir.appendingPathComponent("cache")))  // never ~/Library/Caches
         #expect(model.handleOpenURL(URL(string: "omi-notes://transfers")!))
         #expect(model.transferPageRequests == 1 && model.pendingConfigure == nil)
         #expect(!model.handleOpenURL(URL(string: "omi-notes://elsewhere")!) && model.transferPageRequests == 1)

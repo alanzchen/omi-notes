@@ -54,7 +54,7 @@ import OmiProtocol
         let (t, gate, start) = try setUp()
         let end = try EventWriter(outbox: t.outbox, clock: t.clock)
             .voiceEnrollmentEnd(enrollmentId: "e1", deviceId: "dev-1", captureId: "cap-1", endOffsetUs: 9, outcome: .completed)
-        guard case .event(let endId) = end.kind else { return }
+        guard case .event(let endId) = end.kind else { throw InjectedFault(what: "kind") }
         gate.attachEndEvent(enrollmentId: "e1", endEventId: endId)
         #expect(!gate.mayUpload(end))
         try t.outbox.markSent(start.name)

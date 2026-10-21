@@ -192,11 +192,14 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         await m.refreshServer()
         _ = try await m.conversation("c1")
         let before = m.serverIdentity
+        let vaultA = try #require(m.noteCache.lastScope)
+        #expect(vaultA.vaultId == "vault-a" && !m.noteCache.details(scope: vaultA).isEmpty)  // saved, so there is something to clear
         AppServerStub.routes["/v1/status"] = [(200, Self.status.replacingOccurrences(of: "vault-a", with: "vault-b"))]
         AppServerStub.routes["/v1/conversations/recent"] = [(200, #"{"conversations":[],"next_cursor":null}"#)]
         await m.refreshServer()
         #expect(m.serverIdentity != before && m.details.isEmpty && m.recent.isEmpty)
         #expect(m.noteCache.lastScope?.vaultId != "vault-a" && m.savedConversations().isEmpty)
+        #expect(m.noteCache.details(scope: vaultA).isEmpty && m.noteCache.recent(scope: vaultA) == nil, "the other vault's saved notes are removed")
     }
 
     @Test func aLateAnswerFromBeforeAVaultChangeIsDropped() async throws {

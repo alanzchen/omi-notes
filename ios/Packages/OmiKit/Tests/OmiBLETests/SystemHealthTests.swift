@@ -242,11 +242,12 @@ import OmiWatchKit
     }
 
     func model() -> AppModel {
-        let dirs = CaptureDirectories(root: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let dirs = CaptureDirectories(root: root)
         let settings = SettingsStore(defaults: UserDefaults(suiteName: "omi-merge-\(UUID().uuidString)")!, tokens: InMemoryTokenStore())
         let engine = OmiEngine(config: EngineConfiguration(dirs: dirs, appVersion: "test", useCoreBluetooth: false),
                                settings: settings, uploadTransport: CountingUploadTransport())
-        return AppModel(engine: engine)
+        return AppModel(engine: engine, noteCache: NoteCache(root: root.appendingPathComponent("cache")))  // never ~/Library/Caches
     }
 
     @Test func refreshingPageOneKeepsOlderLoadedPages() {
