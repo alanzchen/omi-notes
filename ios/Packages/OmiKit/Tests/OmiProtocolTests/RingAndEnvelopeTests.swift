@@ -3,16 +3,6 @@ import Testing
 @testable import OmiProtocol
 
 func hex(_ d: Data) -> String { d.map { String(format: "%02x", $0) }.joined() }
-func fromHex(_ s: String) -> Data {
-    var d = Data()
-    var i = s.startIndex
-    while i < s.endIndex {
-        let j = s.index(i, offsetBy: 2)
-        d.append(UInt8(s[i..<j], radix: 16)!)
-        i = j
-    }
-    return d
-}
 
 /// A 444-byte record with the given timestamp and frames (zero padded).
 func makeRecord(ts: UInt32, frames: [Data], tail: [UInt8] = []) -> Data {

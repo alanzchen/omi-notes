@@ -32,7 +32,6 @@ public final class AppModel {
     public private(set) var serverStatus: ServerStatus?
     /// When `serverStatus` was received (a failed refresh leaves it alone).
     public private(set) var serverStatusAt: Date?
-    public private(set) var lastCheckAt: Date?
     public private(set) var issues: [ServerIssue] = []
     public internal(set) var recent: [ConversationSummary] = []
     public private(set) var recentError: String?
@@ -187,7 +186,6 @@ public final class AppModel {
             return
         }
         server = .checking
-        lastCheckAt = Date()
         let data = dataEpoch  // before any await: a reset while we wait makes this answer stale
         let api = APIClient(endpoint: endpoint, session: session)
         let reach: ServerReachability

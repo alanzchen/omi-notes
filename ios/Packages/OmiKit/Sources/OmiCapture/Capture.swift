@@ -206,12 +206,9 @@ public struct CaptureEnvironment: Sendable {
 /// Not thread-safe: confine to the engine queue.
 public final class LiveCaptureRecorder {
     public struct Stats: Equatable, Sendable {
-        public var captureId: String?
         public var chunkSequence = 0
         public var chunkRecords = 0
         public var totalRecords = 0
-        public var totalBytes: Int64 = 0
-        public var chunksFinalized = 0
     }
 
     public let env: CaptureEnvironment
@@ -279,7 +276,7 @@ public final class LiveCaptureRecorder {
         lastSyncMono = a.monoNs
         outOfSpace = false
         manifestDirty = false
-        stats = Stats(captureId: id)
+        stats = Stats()
         log(.info, "capture", "live capture \(id) started for device \(meta.deviceId)")
         return id
     }
@@ -324,7 +321,6 @@ public final class LiveCaptureRecorder {
         lastRecordOffsetUs = nowUs
         stats.chunkRecords = chunkRecordCount
         stats.totalRecords += 1
-        stats.totalBytes += Int64(notification.count)
         if mono &- lastSyncMono >= 1_000_000_000 { syncJournal(mono: mono) }
         return true
     }
@@ -437,7 +433,6 @@ public final class LiveCaptureRecorder {
         chunkRecordCount = 0
         lastRecordOffsetUs = nil
         manifestDirty = false
-        stats.captureId = nil
     }
 
     private func ensureJournal() -> Bool {
@@ -534,7 +529,6 @@ public final class LiveCaptureRecorder {
         lastRecordOffsetUs = nil
         stats.chunkSequence = seq + 1
         stats.chunkRecords = 0
-        stats.chunksFinalized += 1
         manifestDirty = true
         commitManifest()
         _ = ensureJournal()
@@ -586,7 +580,6 @@ public final class RingCaptureWriter {
     private var lastSyncMono: UInt64 = 0
     private var manifestDirty = false
     public private(set) var recordsWritten = 0
-    public private(set) var chunksFinalized = 0
     /// Highest sequence known to be on disk (fsync'd).
     public private(set) var lastDurableSeq: UInt64?
 
@@ -631,7 +624,6 @@ public final class RingCaptureWriter {
         lastSyncMono = a.monoNs
         manifestDirty = false
         recordsWritten = 0
-        chunksFinalized = 0
         lastDurableSeq = nil
         log(.info, "ring", "ring capture \(id) started (read \(ctx.info.readSeq) write \(ctx.info.writeSeq) gen \(ctx.generation))")
         return id
@@ -738,7 +730,6 @@ public final class RingCaptureWriter {
         m.openChunkStartOffsetUs = end
         manifest = m
         chunkCount = 0
-        chunksFinalized += 1
         manifestDirty = true
         commitManifest()
         try? FileManager.default.removeItem(at: journalURL)
@@ -786,7 +777,6 @@ public enum CaptureRecovery {
     public struct Report: Sendable, Equatable {
         public var liveRecovered: [String] = []
         public var ringRecovered: [String] = []
-        public var chunksWritten = 0
         /// Highest durable ring sequence per (device, generation), to advance the dedupe cursor.
         public var ringDurable: [RingDurableMark] = []
         public var quarantined: [String] = []
@@ -921,7 +911,6 @@ public enum CaptureRecovery {
                 if let written = try finalizeRecovered(manifest: m, raw: raw, env: env, codecFallback: codecFallback, report: &report) {
                     endUs = written
                     m.openChunkSequence = seq + 1
-                    report.chunksWritten += 1
                 }
             } catch RecoveryError.codecUnknown {
                 quarantine(dir, env: env, why: "codec unknown for \(m.captureId)", report: &report)

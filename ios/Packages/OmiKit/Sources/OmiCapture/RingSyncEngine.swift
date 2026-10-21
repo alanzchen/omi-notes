@@ -106,8 +106,6 @@ public final class RingSyncEngine {
         self.cursors = cursors
     }
 
-    public var isBusy: Bool { phase != .idle && phase != .finished }
-
     public func start(_ context: RingSyncContext) {
         resetSession()
         ctx = context

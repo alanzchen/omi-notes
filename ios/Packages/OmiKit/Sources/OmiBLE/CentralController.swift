@@ -137,14 +137,8 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
 
     /// Connections are accepted only for the remembered device and only without suppression.
     public var connectionAllowed: Bool { suppression.isEmpty && rememberedId != nil }
-    public var shouldAutoReconnect: Bool { connectionAllowed }
 
     private func mayAccept(_ p: PeripheralHandle) -> Bool { connectionAllowed && p.identifier == rememberedId }
-
-    public var connectedIdentifier: UUID? {
-        guard let p = peripheral, p.connectionState == .connected else { return nil }
-        return p.identifier
-    }
 
     public func suppress(_ reason: ReconnectSuppression) { suppression.insert(reason) }
     public func unsuppress(_ reason: ReconnectSuppression) { suppression.remove(reason) }

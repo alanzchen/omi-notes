@@ -26,7 +26,6 @@ public struct ComplicationCircle: View {
 /// B: mark-led.
 public struct ComplicationCircleB: View {
     public let display: ComplicationDisplay
-    @Environment(\.widgetRenderingMode) private var mode
     public init(display: ComplicationDisplay) { self.display = display }
 
     public var body: some View {

@@ -144,7 +144,6 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
     public private(set) var connectedAt: Date
     /// Characteristics in the order their notifications were requested (tests check subscribe-first).
     public private(set) var notifyOrder: [OmiCharacteristic] = []
-    public private(set) var gattLog: [String] = []
 
     private var discoveryComplete = false
     private var discoveryAttempts = 0
@@ -431,7 +430,6 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
         subscribeAttempts += 1
         subscribeDeadline = clock.monotonicNanoseconds() &+ Self.subscribeTimeout
         notifyOrder.append(.audioData)
-        gattLog.append("notify audioData")
         transport.setNotify(true, for: .audioData)
     }
 
@@ -616,7 +614,6 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
             audioSubscribeRequested = false
             subscribeDeadline = nil
             if discoveryComplete || audioSubscribed {
-                gattLog.append("notify audioData false")
                 transport.setNotify(false, for: .audioData)
             }
             endAudioCoverage(reason: .userStopped)
@@ -845,7 +842,6 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
             let op = ops.removeFirst()
             if case .barrier(let body) = op { body(); continue }
             current = (op, clock.monotonicNanoseconds() &+ Self.opTimeout)
-            gattLog.append(describe(op))
             switch op {
             case .read(let c, _): transport.read(c)
             case .write(let d, let c, _): transport.write(d, to: c)

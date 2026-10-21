@@ -104,7 +104,6 @@ enum Pendant {
     static let secondary = Color(light: 0x8a8578, dark: 0x9d988c)
     static let card = Color(light: 0xffffff, dark: 0x22201d, lightOpacity: 0.78, darkOpacity: 1)
     static let cardShadow = Color(light: 0x000000, dark: 0x000000, lightOpacity: 0.04, darkOpacity: 0.30)
-    static let divider = Color(light: 0x000000, dark: 0xffffff, lightOpacity: 0.10, darkOpacity: 0.08)
     static let iconBackground = Color(light: 0xefece6, dark: 0x302d29)
     static let iconForeground = Color(light: 0x6e6a60, dark: 0xb8b2a6)
     static let warnBackground = Color(light: 0xfbe3cc, dark: 0x4a2c17)

@@ -244,15 +244,5 @@ enum Fmt {
         return SystemHealth.relative(date, Date())
     }
 
-    static func iso(_ s: String?) -> String {
-        guard let s, let d = ISO8601UTC.parse(s) else { return s ?? "—" }
-        return d.formatted(date: .abbreviated, time: .shortened)
-    }
-
     static func shortId(_ s: String?) -> String { s.map { String($0.prefix(8)) } ?? "—" }
-}
-
-struct StatusDot: View {
-    let color: Color
-    var body: some View { Circle().fill(color).frame(width: 10, height: 10) }
 }

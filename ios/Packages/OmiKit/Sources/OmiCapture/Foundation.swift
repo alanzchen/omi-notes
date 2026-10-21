@@ -349,7 +349,6 @@ public struct CaptureDirectories: Sendable {
 final class FaultInjector: @unchecked Sendable {
     var manifestSave: (() throws -> Void)?
     var journalSync: (() throws -> Void)?
-    var cursorSave: (() throws -> Void)?
     init() {}
 }
 

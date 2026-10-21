@@ -9,7 +9,6 @@ public enum OmiCodec: Int, Sendable, Codable, CaseIterable {
     /// Opus FS320, Omi CV1, 320 samples = 20 ms.
     case opus20ms = 21
 
-    public var frameSamples: Int { self == .opus10ms ? 160 : 320 }
     public var label: String { self == .opus10ms ? "Opus 10 ms (DevKit)" : "Opus 20 ms (CV1)" }
 
     public enum Evaluation: Equatable, Sendable {
