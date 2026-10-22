@@ -1,9 +1,16 @@
-# Omi Notes — iPhone app
+# Omi Notes — iPhone and Apple Watch apps
 
-The phone is an **audio courier**. It pairs with an Omi pendant over Bluetooth LE, journals every
-audio notification to disk first, pulls the pendant's offline backlog (ring storage), and uploads
-immutable chunk files to your own omi-notes server. The server does the decoding, transcription
-and note writing. The phone never decodes Opus or reassembles frames.
+The phone is an **audio courier** for two independent sources:
+
+- an **Omi pendant** over Bluetooth LE: the phone journals every audio notification to disk first,
+  pulls the pendant's offline backlog (ring storage), and uploads immutable chunk files;
+- the **Apple Watch app** (watchOS 10+): you start a recording on the Watch, it records in
+  one-minute AAC parts, and the phone receives them over WatchConnectivity and uploads them.
+
+Use either one, or both at once. Everything goes to your own omi-notes server, which does the
+decoding, transcription and note writing. The phone never decodes the pendant's Opus or
+reassembles its frames; it decodes Watch audio only to send PCM to a server without Watch AAC
+support.
 
 Contract: [`docs/capture-format-v1.md`](../docs/capture-format-v1.md). Device facts:
 [`docs/device-protocol.md`](../docs/device-protocol.md). Design decisions:
@@ -23,19 +30,22 @@ Simulator with the simulated pendant, uploading to a local backend (fake STT/LLM
 
 ## Using the app
 
-- **Home** answers "is it working?" in one sentence (tap it for pendant → phone → server → notes,
+- **Home** answers "is it working?" in one sentence (tap it for pendant/Watch → phone → server → notes,
   each with a fix), lists what needs you, and shows conversations by day. Tap one for its summary,
   action items, speakers, transcript and My Notes; fix speaker names from there, open the note in
   Obsidian (set the vault name in Settings), or retry it if it failed. Search covers titles,
   summaries, speaker names and transcripts, with time and person filters.
+- **Devices**: a card for each device in use (pendant, Apple Watch) with its own page, plus
+  **Transfers**, which shows each stage separately: Watch → iPhone, iPhone → server (with the
+  current upload rate while the app is open) and what the server is still processing.
 - **People**: teach the server your voice, name people and recurring voices.
 - **Server**: what the server is doing now, what needs attention with plain reasons and next
   steps (and Retry where the phone can do it), the past seven days, its configuration (view only;
   it is changed on the server) and the connection. **Diagnostics** has the pendant, Bluetooth and
   upload details that used to be on Home.
-- **Settings** (gear on Home): the pendant, opt-in alerts for problems the phone sees (recording
-  stopped, audio that couldn't upload, uploads paused), the Obsidian vault name, and notes saved
-  for reading offline.
+- **Settings** (gear on Home): the devices, opt-in alerts for problems the phone sees (recording
+  stopped on the pendant or the Watch, audio that couldn't upload, uploads paused), the Obsidian
+  vault name, and notes saved for reading offline.
 
 Health states: *normal*, *working* (uploading, processing), *unknown* (not checked yet, or the last
 answer is over 5 minutes old; a disconnected pendant is unknown because it may be recording to its
@@ -52,18 +62,25 @@ ios/
   project.yml                  XcodeGen spec (OmiNotes.xcodeproj is generated and gitignored)
   Config/Base.xcconfig         shared settings; includes the optional Local.xcconfig
   Config/Local.xcconfig.example
-  OmiNotes/                    thin SwiftUI app: App/ (entry, AppDelegate), Features/, Resources/
-  Packages/OmiKit/             all logic, testable with `swift test` on the Mac
+  OmiNotes/                    thin SwiftUI iPhone app: App/ (entry, AppDelegate, Watch bridge), Features/, Resources/
+  OmiNotesWatch/               Apple Watch app: recorder, relay to the iPhone, its one screen
+  OmiNotesComplication/        circular watch-face complication (WidgetKit)
+  OmiNotesLiveActivity/        sync Live Activity (not released yet; see below)
+  Shared/                      views shared by the iPhone app and the Live Activity
+  Packages/OmiKit/             most logic, testable with `swift test` on the Mac
     Sources/OmiProtocol/       GATT ids, ring protocol, button/codec/firmware parsing, CRC32, OMINOTE1 envelope
     Sources/OmiCapture/        journal, chunk rotation, outbox, uploader, ring sync, recovery, retention, storage guard
-    Sources/OmiBLE/            CoreBluetooth central, per-connection sequence, simulated device, engine, app model
+    Sources/OmiBLE/            CoreBluetooth central, per-connection sequence, simulated device, engine, app model, Watch relay
+    Sources/OmiWatchKit/       shared by the Watch and iPhone apps: segment writer, relay messages, complication state
   Tools/make_sim_trace.py      regenerates the simulated-device trace and the test Opus packets
+  Tools/make_app_icon.swift    draws the app icon
 ```
 
 ## Build and test
 
 Requires Xcode 27 or later (iOS 27 SDK), and XcodeGen (`brew install xcodegen`). The deployment
-target is iOS 17. There are no third-party dependencies.
+targets are iOS 17 and watchOS 10; the `OmiNotes` scheme builds the iPhone app with the Watch app,
+the complication and the Live Activity embedded. There are no third-party dependencies.
 
 ```sh
 cd ios/Packages/OmiKit && swift test          # all unit + integration tests (macOS host)
@@ -83,7 +100,10 @@ parses them.
    - `DEVELOPMENT_TEAM`: your team id. A free Apple ID "Personal Team" works; add it in
      Xcode › Settings › Accounts. The id appears in the team list, or at developer.apple.com ›
      Membership for paid accounts.
-   - `PRODUCT_BUNDLE_IDENTIFIER`: something unique to you, e.g. `com.yourname.omi-notes`.
+   - `OMI_APP_BUNDLE_ID`: something unique to you, e.g. `com.yourname.omi-notes`. The Watch app
+     (`….watchkitapp`), the complication (`….watchkitapp.widgets`) and the Live Activity
+     (`….liveactivity`) derive their bundle IDs from it, so set this rather than
+     `PRODUCT_BUNDLE_IDENTIFIER`.
 2. `cd ios && xcodegen generate && open OmiNotes.xcodeproj`
 3. Connect the iPhone with a cable (or pair it for Wi‑Fi debugging). Choose it as the run
    destination and press Run.
@@ -93,6 +113,14 @@ parses them.
      **VPN & Device Management** › your Apple ID › Trust.
 5. With a free Personal Team the provisioning profile expires after 7 days. Run from Xcode again
    to renew it. Your recordings are kept; the app just won't launch until you re-sign it.
+
+### Apple Watch
+
+The Watch app is embedded in the iPhone app, so installing the iPhone app is all the building it
+needs. On the iPhone, open the **Watch** app, find Omi Notes under *Available Apps* and tap
+**Install** (it may already be installed). A development build may also need Developer Mode turned
+on in the Watch's own Settings. The Watch app works with this iPhone install only: it learns which
+iPhone it belongs to the first time they connect, and nothing else needs pairing.
 
 ## TestFlight
 
@@ -109,8 +137,12 @@ certificates or profiles need to be set up by hand. One-time setup, in App Store
    at export). Save `AuthKey_<KEY_ID>.p8` to `~/.appstoreconnect/private_keys/` and note the Key ID
    and Issuer ID.
 2. **App record:** Apps › + › New App (iOS, any available name, bundle ID from
-   `PRODUCT_BUNDLE_IDENTIFIER`, default `dev.omi-notes.app`; register it under Identifiers first if
+   `OMI_APP_BUNDLE_ID`, default `dev.omi-notes.app`; register it under Identifiers first if
    it isn't offered). Any SKU.
+
+> **Limitation:** `testflight.sh` predates the Watch app. It passes the app's bundle ID to every
+> target, which the embedded Watch app, complication and Live Activity can't use, and each of
+> those also needs its own App ID and profile for App Store distribution. Expect to adapt it.
 
 Then `ASC_KEY_ID=… ASC_ISSUER_ID=… make testflight`. The build number is a UTC timestamp to the second, so every
 upload is newer. After processing, add yourself under TestFlight › Internal Testing. Internal
@@ -136,16 +168,55 @@ testing needs no Beta App Review; external testers do. The app ships with an ori
    app remembers it and reconnects on its own from then on.
    - **Only one phone app can connect to the pendant at a time.** Disconnect or quit the official
      Omi app first, or the pendant won't show up.
+   - Using only the Apple Watch? Skip the pendant; see [Apple Watch](#apple-watch-recording).
 
 Pendant button: **single tap** = bookmark (shown in the note); **double tap** = end the current
 conversation now. A 3 s long press powers the pendant off.
 
-The **Pendant** tab shows the pendant with a battery ring (green, amber, coral at 15% or less and
-not charging; grey dashed and "Battery unknown" when it isn't connected) and one connection dot,
-then "Recording" only when audio actually arrived in the last minute, plus a short card: an issue
-and its fix, files waiting on this iPhone, audio collected from the pendant's own storage, and the
-tap gestures. Pendant details and Disconnect/Pair/Forget are under **Manage pendant**; everything
+The pendant's page (Devices › pendant) shows the pendant with a battery ring (green, amber, coral
+at 15% or less and not charging; grey dashed and "Battery unknown" when it isn't connected) and
+one connection dot, then "Recording" only when audio actually arrived in the last minute, plus a
+short card: an issue and its fix, files waiting on this iPhone, audio collected from the pendant's
+own storage, and the tap gestures. Pendant details and Disconnect/Pair/Forget are under **Manage pendant**; everything
 else is in **Troubleshooting**.
+
+## Apple Watch recording
+
+- **Start and Stop on the Watch.** Open Omi Notes on the Watch and tap the red microphone. It keeps
+  recording with your wrist down or the screen off (background audio, only while you have started
+  a recording) until you tap Stop. It records nothing by itself: it does not start again after the
+  Watch restarts, its battery runs out or the app is closed. Open it and tap the microphone again.
+- **Interruptions.** A call or Siri interrupts the recording. It resumes when the system allows;
+  otherwise the Watch shows Resume. Notifications and alarms don't stop it. With alerts on
+  (Devices › Apple Watch, or Settings), the iPhone tells you when a recording stopped without your
+  Stop, once the Watch can send it that news.
+- **Parts and hand-over.** The Watch writes 16 kHz mono AAC (32 kbit/s) in one-minute parts cut
+  inside the audio stream, so there is no gap between parts. It sends them over WatchConnectivity
+  whenever the iPhone is reachable; when that happens is up to the system, so keep the iPhone
+  nearby, ideally with Omi Notes open. A part is deleted from the Watch only after the iPhone has
+  stored it and checked its hash. Away from the iPhone the Watch keeps about 40 hours of audio (or
+  until it is nearly full), then pauses until it can send; it never deletes waiting audio.
+- **To the server.** The iPhone queues each part like pendant audio. A server that advertises
+  `watch_aac` (it has ffmpeg) gets the Watch's AAC file unchanged; any other server gets 16 kHz PCM
+  converted on the iPhone. A recording keeps whichever format it started with.
+- **Where the audio is.** The Watch's one screen, Devices › Apple Watch and Devices › Transfers
+  show it stage by stage: on the Watch, on this iPhone, uploaded. The length shown is the recorded
+  length of the parts still waiting, not a part count. "All audio on iPhone" means the iPhone has
+  it, not that the server or your notes do.
+- **Complication.** Add the circular *Omi Notes* complication to a watch face. It shows whether the
+  Watch is recording, paused or stopped by an error, and how much audio is waiting for the iPhone
+  (e.g. `12m`). It is updated by the Watch app; the system decides when the face refreshes, and an
+  old state turns into "unknown" rather than claiming to be live. Tapping it opens the app's status
+  screen; it starts and stops nothing.
+- **Both devices.** The pendant and the Watch can record at the same time. If they recorded the same
+  conversation, the server compares them and may keep the Watch audio as an alternate recording of
+  the pendant note instead of a second note.
+- While recording (and once when the app comes to the front), the Watch also sends small samples of
+  its battery level and its own work to your server (`watch_perf` events), shown under Devices ›
+  Apple Watch. They describe the whole Watch, other apps included. This README makes no battery-life
+  claim: recording all day uses the Watch's battery, so charge it overnight.
+- Voice enrollment (People) uses the pendant; Watch audio is still transcribed and its speakers
+  can be named like any other.
 
 ## People and voices
 
@@ -185,7 +256,8 @@ Clips are rendered by the server as WAV and played from memory; the phone never 
 - **Storage guard:** below 200 MB free, the app stops recording and deliberately disconnects so
   the pendant buffers to its own storage. It reconnects once 300 MB are free again.
 - Data lives in `Application Support/OmiNotes/` (excluded from backups):
-  `journal/{live,ring}/`, `outbox/{pending,sent,quarantine}/`, `state/`.
+  `journal/{live,ring}/`, `outbox/{pending,sent,quarantine}/`, `watch/` (parts received from the
+  Watch), `state/`.
 
 ## Background behavior and limits
 
@@ -203,6 +275,13 @@ Clips are rendered by the server as WAV and played from memory; the phone never 
 - Firmware limitation: the pendant frees offline audio once it has *sent* it, so a phone crash
   in the ~1 s between receiving and fsyncing can lose that second.
 - Low Power Mode and poor reception can delay uploads. They are never dropped.
+
+## Sync status on the Lock Screen (not released yet)
+
+The source includes a Live Activity (`OmiNotesLiveActivity/`) that shows sync progress on the Lock
+Screen and in the Dynamic Island, with an off switch in Devices › Transfers. It builds and has unit
+tests, but it isn't in a released build yet and hasn't been checked on a real Lock Screen or
+Dynamic Island. It only reflects what the app sees while it runs; it never keeps uploads alive.
 
 ## Simulator
 
@@ -225,6 +304,10 @@ shows the (token-redacted) log.
   `-OmiNotesDebugSearch <text>` to start with a search. `-omi.onboarded YES` skips onboarding.
   `xcrun simctl spawn booted defaults write <bundle-id> omi.simulatedDevice -bool YES` turns on
   the simulated device before launch.
+- The Watch app runs in a paired watchOS Simulator. Its debug builds accept
+  `-OmiWatchDebugSyntheticAudio YES` (synthetic speech instead of the microphone),
+  `-OmiWatchDebugAutoStart YES`, `-OmiWatchDebugAutoStopAfter <seconds>` and
+  `-OmiWatchDebugSegmentSeconds <seconds>` (shorter parts).
 
 ## Troubleshooting
 
@@ -242,3 +325,6 @@ shows the (token-redacted) log.
 | "MTU payload low" | CV1 frames need an ATT MTU ≥ 166. Frames may be fragmented or dropped; move closer or restart Bluetooth. |
 | "No audio yet" | Normal in a quiet room: the pendant's mic sleeps until there is sound. |
 | Phone storage low | Free space. Recording resumes automatically at 300 MB free; the pendant buffers meanwhile. |
+| Watch: "Open Omi Notes on iPhone to connect" | The Watch hasn't reached its iPhone yet. Open the iPhone app with the Watch nearby. |
+| Watch: "Paused: too much is waiting…" or "…almost full" | Open Omi Notes on the iPhone so the Watch can send what's waiting, then tap Resume on the Watch. |
+| Watch: "Some audio is kept for another iPhone" | Those parts were recorded for a different iPhone install. They are kept on the Watch, never sent here. |

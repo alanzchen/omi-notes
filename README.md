@@ -1,21 +1,28 @@
 # omi-notes
 
-Your own pipeline for the [Omi](https://omi.me) wearable: an iPhone app that pairs with the pendant
-and ships its audio to a server you run, which transcribes it and writes **Markdown notes**
-(summary, key points, decisions, action items, full transcript) into a folder. The folder can
-live inside an Obsidian vault.
+Your own note-taking pipeline for conversations: record with an [Omi](https://omi.me) pendant, an
+Apple Watch, or both. An iPhone app collects the audio and ships it to a server you run, which
+transcribes it and writes **Markdown notes** (summary, key points, decisions, action items, full
+transcript) into a folder. The folder can live inside an Obsidian vault.
 
 ```
-Omi pendant ──BLE──▶ iPhone app ──HTTPS (Tailscale)──▶ backend on your Mac ──▶ ~/Documents/OmiNotes/
-                     journal + upload                  decode · VAD · Deepgram · Claude
+Omi pendant ───BLE───────────────┐
+                                 ▼
+                          iPhone app ──HTTPS (Tailscale)──▶ backend on your Mac ──▶ ~/Documents/OmiNotes/
+                                 ▲   journal + upload         decode · VAD · transcription · LLM
+Apple Watch ──WatchConnectivity──┘
 ```
+
+The two sources are independent: use the pendant alone, the Watch alone (no pendant needed), or
+both at once. There is no App Store or public TestFlight build; you build and sign the apps
+yourself (see [`ios/README.md`](ios/README.md)).
 
 | Directory | What it is |
 |---|---|
-| [`ios/`](ios/README.md) | SwiftUI app (iOS 17+). Pairs with the pendant, journals raw BLE audio durably, syncs the pendant's offline storage, uploads chunks in the background. |
-| [`backend/`](backend/README.md) | Python/FastAPI server. Reassembles and decodes Opus, detects speech, splits conversations, transcribes with speaker labels (Deepgram or any OpenAI-compatible service, plus optional local diarization), summarizes (Claude or any OpenAI-compatible LLM), writes the notes. |
+| [`ios/`](ios/README.md) | SwiftUI iPhone app (iOS 17+) with an Apple Watch app (watchOS 10+) and a watch-face complication. The iPhone pairs with the pendant, journals raw BLE audio durably, syncs the pendant's offline storage, receives the Watch's recordings, and uploads everything in the background. |
+| [`backend/`](backend/README.md) | Python/FastAPI server. Reassembles and decodes the pendant's Opus (and the Watch's AAC, with ffmpeg), detects speech, splits conversations, transcribes with speaker labels (Deepgram or any OpenAI-compatible service, plus optional local diarization), summarizes (Claude or any OpenAI-compatible LLM), writes the notes. |
 | [`docs/`](docs/) | [Architecture decisions](docs/architecture.md), [phone ↔ server contract](docs/capture-format-v1.md), [Omi BLE protocol notes](docs/device-protocol.md). |
-| `contracts/fixtures/` | Envelopes produced by each side and checked by the other side's tests. |
+| `contracts/fixtures/` | Envelopes the phone writes (parsed by the backend's tests) and reference envelopes for the server's decoder. |
 
 ## Quick start
 
@@ -32,11 +39,20 @@ make server                      # or backend/scripts/install-launchd.sh to star
 
 On the iPhone (Tailscale connected):
 
-1. `make ios`, pick your personal team (or set it in `ios/Config/Local.xcconfig`), and run on the phone.
+1. Put your team and your own `OMI_APP_BUNDLE_ID` in `ios/Config/Local.xcconfig` (see
+   [Install on your iPhone](ios/README.md#install-on-your-iphone)), then `make ios` and run on the phone.
 2. Scan the `make pair` QR code with the Camera app and confirm the server shown.
-3. Disconnect the official Omi app (the pendant accepts one phone at a time), then pick your pendant.
+3. **Pendant:** disconnect the official Omi app (the pendant accepts one phone at a time), then
+   pick your pendant.
+4. **Apple Watch:** in the iPhone's Watch app, install Omi Notes (under Available Apps), open it on
+   the Watch and tap the red microphone (allow the microphone the first time). It records until you
+   tap Stop.
 
-Notes appear in the vault folder (`VAULT_DIR`) about two minutes after a conversation ends:
+A note is written once a conversation has ended (120 s without speech, or Stop on the Watch) and
+its audio has reached the server. That is usually a few minutes after you stop talking. It takes
+longer while audio is still waiting on the pendant, the Watch or the phone (out of range, offline,
+server unreachable), and a Watch-only conversation that overlaps a pendant one waits for it (up to
+30 min): nothing is lost, it just arrives later. Notes go to the vault folder (`VAULT_DIR`):
 
 ```
 OmiNotes/
@@ -66,17 +82,27 @@ uv run omi-notes replay-wav /tmp/talk.wav --as ble # encodes like the firmware, 
 ```
 
 The iOS app also has a simulated pendant (Server › Developer tools, debug builds) that replays real CV1-format Opus in the Simulator.
+To try the Watch app without a Watch, see "Simulator" in [`ios/README.md`](ios/README.md#simulator).
 
 ## How it works (short version)
 
-- The phone never decodes audio. It journals every BLE notification (with a CRC) before doing
-  anything else, then uploads ~60 s immutable chunks. A chunk is deleted from the phone only after
-  the server has fsync'd it and answered 2xx.
+- The phone doesn't decode the pendant's audio. It journals every BLE notification (with a CRC)
+  before doing anything else, then uploads ~60 s immutable chunks. A chunk is deleted from the
+  phone only after the server has fsync'd it and answered 2xx.
 - While the phone is away, the pendant records to its own storage; on reconnect the app downloads
   that backlog (firmware ≥ 3.0.20) while live audio keeps streaming.
+- The Watch records only after you tap Start, continuously (wrist down, screen off) in one-minute
+  AAC parts until you tap Stop. Each part stays on the Watch until the iPhone has stored it and
+  confirmed its hash. The iPhone relays the Watch's AAC file unchanged when the server advertises
+  that it can decode it (it needs ffmpeg); otherwise it converts the part to 16 kHz PCM first, and
+  a recording that started as PCM stays PCM. "On iPhone" on the Watch means the iPhone has it,
+  not that the server or your notes do.
 - The server segments per device across live and offline audio. A conversation ends after 120 s
   without speech, Omi's own rule, but only once the phone has proven that stretch was silence
   rather than missing audio (otherwise the note is written after a short wait and marked provisional).
+  A Watch recording also ends its conversation when you tap Stop. If the pendant heard the same
+  conversation, the server compares the two recordings' loudness over time and, when they match,
+  keeps the Watch audio as an alternate recording instead of writing a second note.
 - Only detected speech is transcribed: Deepgram by default (batch pricing, speaker labels
   included), or any OpenAI-compatible transcription service (Mistral Voxtral, OpenAI, Together,
   or a self-hosted server). Every transcript gets speaker labels, from the service or from local
@@ -94,12 +120,23 @@ it borrows from.
 
 ```bash
 make test        # backend pytest + OmiKit swift test
-make ios-build   # simulator build of the app
+make ios-build   # simulator build of the iPhone app, with the Watch app and the extensions
 ```
 
 ## Privacy
 
-Audio stays on your phone and your Mac, except that detected speech goes to your transcription
-service and transcripts go to your LLM service (Deepgram and Anthropic by default). Point both at
-self-hosted servers and nothing leaves your machines. The server listens on localhost only and is
-reachable over your tailnet through `tailscale serve`, behind a bearer token.
+Audio goes from the pendant (Bluetooth) or the Watch (WatchConnectivity) to your iPhone, and from
+there only to your own server. The server sends detected speech to your transcription service and
+transcripts to your LLM service (Deepgram and Anthropic by default); point both at self-hosted
+servers (and use local diarization) and no audio or text leaves your machines. Voice enrollment and
+voiceprints stay on your server. The server listens on localhost only and is reachable over your
+tailnet through `tailscale serve`. Every `/v1/` API route requires the bearer token; `/healthz` and
+FastAPI's generated API docs (`/docs`, `/openapi.json`) answer without it and contain no notes or
+audio.
+
+## Not released yet
+
+The repository also contains a Live Activity that shows sync progress on the Lock Screen and in
+the Dynamic Island. It builds, but it is not in a released build yet and hasn't been checked on a
+real Lock Screen. Everything else described here, Apple Watch support included, is part of the
+current app.

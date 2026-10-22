@@ -3,5 +3,7 @@
 // or at developer.apple.com › Membership.
 
 DEVELOPMENT_TEAM = ABCDE12345
-// Must be unique to you; a personal team cannot use someone else's identifier.
-PRODUCT_BUNDLE_IDENTIFIER = com.yourname.omi-notes
+// Must be unique to you; a personal team cannot use someone else's identifier. The Watch app,
+// complication and Live Activity derive their ids from it (….watchkitapp, ….watchkitapp.widgets,
+// ….liveactivity), so set this rather than PRODUCT_BUNDLE_IDENTIFIER.
+OMI_APP_BUNDLE_ID = com.yourname.omi-notes
