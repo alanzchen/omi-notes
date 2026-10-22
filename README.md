@@ -46,13 +46,15 @@ On the iPhone (Tailscale connected):
    pick your pendant.
 4. **Apple Watch:** in the iPhone's Watch app, install Omi Notes (under Available Apps), open it on
    the Watch and tap the red microphone (allow the microphone the first time). It records until you
-   tap Stop.
+   tap Stop, subject to interruptions and system limits (see
+   [Apple Watch recording](ios/README.md#apple-watch-recording)).
 
 A note is written once a conversation has ended (120 s without speech, or Stop on the Watch) and
 its audio has reached the server. That is usually a few minutes after you stop talking. It takes
 longer while audio is still waiting on the pendant, the Watch or the phone (out of range, offline,
 server unreachable), and a Watch-only conversation that overlaps a pendant one waits for it (up to
-30 min): nothing is lost, it just arrives later. Notes go to the vault folder (`VAULT_DIR`):
+30 min). Waiting audio is kept and queued for retry; when it gets through depends on connectivity,
+storage and the OS. Notes go to the vault folder (`VAULT_DIR`):
 
 ```
 OmiNotes/
@@ -91,12 +93,12 @@ To try the Watch app without a Watch, see "Simulator" in [`ios/README.md`](ios/R
   phone only after the server has fsync'd it and answered 2xx.
 - While the phone is away, the pendant records to its own storage; on reconnect the app downloads
   that backlog (firmware ≥ 3.0.20) while live audio keeps streaming.
-- The Watch records only after you tap Start, continuously (wrist down, screen off) in one-minute
-  AAC parts until you tap Stop. Each part stays on the Watch until the iPhone has stored it and
-  confirmed its hash. The iPhone relays the Watch's AAC file unchanged when the server advertises
-  that it can decode it (it needs ffmpeg); otherwise it converts the part to 16 kHz PCM first, and
-  a recording that started as PCM stays PCM. "On iPhone" on the Watch means the iPhone has it,
-  not that the server or your notes do.
+- The Watch records only after you tap Start, in the background (wrist down, screen off) in
+  one-minute AAC parts until you tap Stop, unless an interruption or the system stops it. Each part
+  stays on the Watch until the iPhone has stored it and confirmed its hash. The iPhone relays the
+  Watch's AAC file unchanged when the server advertises that it can decode it (it needs ffmpeg);
+  otherwise it converts the part to 16 kHz PCM first, and a recording that started as PCM stays
+  PCM. "On iPhone" on the Watch means the iPhone has it, not that the server or your notes do.
 - The server segments per device across live and offline audio. A conversation ends after 120 s
   without speech, Omi's own rule, but only once the phone has proven that stretch was silence
   rather than missing audio (otherwise the note is written after a short wait and marked provisional).

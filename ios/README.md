@@ -97,9 +97,10 @@ parses them.
 
 1. **Signing.** Copy `Config/Local.xcconfig.example` to `Config/Local.xcconfig` (it is
    gitignored). Set:
-   - `DEVELOPMENT_TEAM`: your team id. A free Apple ID "Personal Team" works; add it in
-     Xcode › Settings › Accounts. The id appears in the team list, or at developer.apple.com ›
-     Membership for paid accounts.
+   - `DEVELOPMENT_TEAM`: your team id; add your account in Xcode › Settings › Accounts. Which
+     signing capabilities and provisioning are available depends on the team; a free Apple ID
+     "Personal Team" hasn't been verified with the Watch app and extensions. The id appears in
+     the team list, or at developer.apple.com › Membership for paid accounts.
    - `OMI_APP_BUNDLE_ID`: something unique to you, e.g. `com.yourname.omi-notes`. The Watch app
      (`….watchkitapp`), the complication (`….watchkitapp.widgets`) and the Live Activity
      (`….liveactivity`) derive their bundle IDs from it, so set this rather than
@@ -177,25 +178,29 @@ The pendant's page (Devices › pendant) shows the pendant with a battery ring (
 at 15% or less and not charging; grey dashed and "Battery unknown" when it isn't connected) and
 one connection dot, then "Recording" only when audio actually arrived in the last minute, plus a
 short card: an issue and its fix, files waiting on this iPhone, audio collected from the pendant's
-own storage, and the tap gestures. Pendant details and Disconnect/Pair/Forget are under **Manage pendant**; everything
-else is in **Troubleshooting**.
+own storage, and the tap gestures. Pendant details and Disconnect/Pair/Forget are under
+**Manage pendant**; everything else is in **Troubleshooting**.
 
 ## Apple Watch recording
+
+User-started background recording is supported. Continuous all-day use on a real Watch (endurance,
+battery) and every interruption condition have not been validated.
 
 - **Start and Stop on the Watch.** Open Omi Notes on the Watch and tap the red microphone. It keeps
   recording with your wrist down or the screen off (background audio, only while you have started
   a recording) until you tap Stop. It records nothing by itself: it does not start again after the
   Watch restarts, its battery runs out or the app is closed. Open it and tap the microphone again.
 - **Interruptions.** A call or Siri interrupts the recording. It resumes when the system allows;
-  otherwise the Watch shows Resume. Notifications and alarms don't stop it. With alerts on
-  (Devices › Apple Watch, or Settings), the iPhone tells you when a recording stopped without your
-  Stop, once the Watch can send it that news.
+  otherwise the Watch shows Resume. With alerts on (Devices › Apple Watch, or Settings), the iPhone
+  tells you when a recording stopped without your Stop, once the Watch can send it that news.
 - **Parts and hand-over.** The Watch writes 16 kHz mono AAC (32 kbit/s) in one-minute parts cut
-  inside the audio stream, so there is no gap between parts. It sends them over WatchConnectivity
-  whenever the iPhone is reachable; when that happens is up to the system, so keep the iPhone
-  nearby, ideally with Omi Notes open. A part is deleted from the Watch only after the iPhone has
-  stored it and checked its hash. Away from the iPhone the Watch keeps about 40 hours of audio (or
-  until it is nearly full), then pauses until it can send; it never deletes waiting audio.
+  inside the audio stream; rotation is designed to avoid a stop/start gap between parts (not proven
+  as uninterrupted capture on a real Watch). It sends them over WatchConnectivity whenever the
+  iPhone is reachable; when that happens is up to the system, so keep the iPhone nearby, ideally
+  with Omi Notes open. A part is deleted from the Watch only after the iPhone has stored it and
+  checked its hash. Away from the iPhone the Watch keeps waiting audio up to a configured backlog
+  cap (600 MB, about 40 hours at 32 kbit/s; not a measured recording time) or until it is nearly
+  full, then pauses until it can send; it never deletes waiting audio.
 - **To the server.** The iPhone queues each part like pendant audio. A server that advertises
   `watch_aac` (it has ffmpeg) gets the Watch's AAC file unchanged; any other server gets 16 kHz PCM
   converted on the iPhone. A recording keeps whichever format it started with.
