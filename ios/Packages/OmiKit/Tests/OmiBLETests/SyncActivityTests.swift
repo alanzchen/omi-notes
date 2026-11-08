@@ -278,7 +278,7 @@ final class FakeMemory: SyncActivityMemory {
         let (_, shown, stale) = try #require(host.updates.last)
         #expect(shown.rate == nil, "no frozen live rate")
         #expect(shown.queuedFiles == 4 && shown.queuedAudioSeconds == 600 && shown.asOf == now, "the last measured numbers, as of then")
-        #expect(shown.title.contains("background") && shown.hasWork)
+        #expect(shown.stage == .waiting && shown.title == "Waiting to send" && shown.hasWork, "no claim that bytes move")
         #expect(stale == later.addingTimeInterval(SyncActivityController.queueStale))
         #expect(c.decision == "showing")
         let pushes = host.updates.count
@@ -286,6 +286,19 @@ final class FakeMemory: SyncActivityMemory {
         #expect(host.updates.count == pushes && c.decision == "showing", "no repeats, no flapping")
         c.refresh(state(.sending, rate: 2_000_000), foreground: true, optedOut: false, now: later.addingTimeInterval(60))
         #expect(host.updates.last?.1.rate == 2_000_000 && c.decision == "showing", "live again in front")
+    }
+
+    /// ASTRA-IT1-07: an offline (or waiting, retrying…) activity was relabelled "Uploading in the
+    /// background" when the app left the foreground. Without a measurement it keeps what it said.
+    @Test func inTheBackgroundAStateWithoutSpeedKeepsItsOwnWords() {
+        let (host, _, c) = rig()
+        let offline = SyncActivityState(stage: .offline, title: "Can't reach your server", detail: "timed out", queuedFiles: 4, asOf: now)
+        c.refresh(offline, foreground: true, optedOut: false, now: now)
+        c.refresh(state(.unknown, files: nil, seconds: nil), foreground: false, optedOut: false, now: now.addingTimeInterval(1))
+        #expect(host.updates.isEmpty, "nothing new to say: no update")
+        #expect(host.cards.first?.title == "Can't reach your server" && c.decision == "showing")
+        c.refresh(state(.unknown, files: nil, seconds: nil), foreground: false, optedOut: true, now: now.addingTimeInterval(2))
+        #expect(host.ended.count == 1, "turning it off still ends it")
     }
 
     /// Build 40 showed no activity and the log said nothing: each refresh now records the gate that

@@ -103,8 +103,8 @@ public final class SyncActivityController {
     /// A finished card stays this long (then the system removes it); a new sync or turning it off
     /// removes it at once.
     public static let finishedCardFor: TimeInterval = 10 * 60
-    /// The title while the app is in the background (the numbers are the last measured ones).
-    public static let backgroundTitle = "Uploading in the background"
+    /// A sending activity's title once the app is in the background (no rate: nothing is measured).
+    public static let backgroundTitle = "Waiting to send"
 
     private let host: SyncActivityHost
     private let memory: SyncActivityMemory
@@ -174,13 +174,14 @@ public final class SyncActivityController {
         }
         guard let s = state else { note("waiting: no engine snapshot yet"); return }
         guard s.stage != .unknown else {
-            // In the background nothing is measured, but uploads go on: a shown activity keeps the last
-            // known numbers (without a live rate, which would freeze) until done or stale.
+            // In the background nothing is measured. A shown activity keeps what it last said; only a
+            // live rate (which would freeze, and go stale in 90 s) becomes the queue it describes,
+            // "Waiting to send", with the last numbers. Nothing claims bytes are moving.
             if let id = activityId, let last = lastPushed {
-                if !last.title.hasPrefix(Self.backgroundTitle) {
+                if last.rate != nil {
                     var held = last
+                    held.stage = .waiting
                     held.title = Self.backgroundTitle
-                    held.stage = last.stage == .sending ? .waiting : last.stage
                     held.rate = nil
                     host.update(id, held, staleDate: Self.staleDate(held, now: now))
                     lastPushed = held
