@@ -142,3 +142,20 @@ def test_a_cached_window_is_reused_only_for_the_same_audio(tmp_path):
     changed = ConversationAudio(changed_pcm, assembled.timemap, assembled.blocks_out, [])
     result = transcribe_windows(provider, changed, SttRequest(changed.flac(), 4, [(0, 4)], "en", []), [Turn(0, 4, 1)], cache)
     assert len(seen) == 2 and result["results"]["utterances"][0]["transcript"] == "second"
+
+
+def test_the_incident_conversation_transcribes_every_sample_once(tmp_path):
+    """01a11a12 (transcribe502-20261108): one speaker window of 43.268 s whose pauses sit around the
+    30 s limit. Every request is accepted by a service that refuses under 0.1 s."""
+    rng = np.random.default_rng(3)
+    spans = [(0, 22.804), (23.304, 29.788), (30.288, 43.268)]
+    pcm = np.zeros(round(43.268 * 16000), np.int16)
+    for a, b in spans:
+        pcm[round(a * 16000):round(b * 16000)] = rng.integers(-3000, 3000, round(b * 16000) - round(a * 16000))
+    assembled = ConversationAudio(pcm, [MapSegment(0, 0, 43.268)], spans, [])
+    request = SttRequest(assembled.flac(), 43.268, spans, "en", [])
+    seen = []
+    provider = strict_service(seen)
+    transcribe_windows(provider, assembled, request, [Turn(0, 43.268, 1)], tmp_path / "stt.json")
+    assert all(len(s) / 16000 >= 0.25 for s in seen) and all(len(s) / 16000 <= 30 for s in seen)
+    np.testing.assert_array_equal(np.concatenate(seen), assembled.pcm)

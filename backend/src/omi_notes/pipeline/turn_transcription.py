@@ -29,22 +29,19 @@ import soundfile as sf
 
 from ..audio.diarize import Turn
 from ..providers import ProviderError, SttRequest
-from ..providers.openai_stt import _flac, split_request
+from ..providers.openai_stt import MIN_PART_SECONDS, _flac, pad_short, split_request
 from ..spool import atomic_write_bytes
 
 SR = 16000
 # Requests shorter than this are padded with trailing silence (the service minimum is 0.1 s).
-MIN_REQUEST_SECONDS = 0.25
+MIN_REQUEST_SECONDS = MIN_PART_SECONDS
 CACHE_FORMAT = 2
 
 
 def _padded(piece: SttRequest) -> tuple[SttRequest, np.ndarray]:
     """The request to send (padded with silence when too short) and its samples."""
-    pcm = sf.read(io.BytesIO(piece.flac), dtype="int16")[0]
-    if piece.duration >= MIN_REQUEST_SECONDS:
-        return piece, pcm
-    padded = np.concatenate([pcm, np.zeros(round(MIN_REQUEST_SECONDS * SR) - len(pcm), np.int16)])
-    return SttRequest(_flac(padded), len(padded) / SR, piece.blocks, piece.language, piece.keyterms), padded
+    sent = pad_short(piece, MIN_REQUEST_SECONDS)
+    return sent, sf.read(io.BytesIO(sent.flac), dtype="int16")[0]
 
 
 def _cache_path(cache_path: Path, provider, sent: SttRequest, pcm: np.ndarray) -> Path:

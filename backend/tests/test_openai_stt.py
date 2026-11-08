@@ -379,3 +379,95 @@ def test_non_json_response_is_transient():
     with pytest.raises(ProviderError) as info:
         provider.transcribe(audio_with_blocks([1.0]))
     assert not info.value.terminal
+
+
+# -- OMI-SPLITTER-502 (transcribe502-20261108): every outbound part within [minimum, maximum] -----
+
+# conversation 01a11a12: blocks [0, 22.804], [23.304, 29.788], [30.288, 43.268] (0.5 s spacers)
+INCIDENT_BLOCKS = [22.804, 6.484, 12.98]
+
+
+def sent_seconds(request: httpx.Request) -> float:
+    return sf.read(io.BytesIO(form(request)["file"][0][2]))[0].shape[0] / SR
+
+
+def test_the_incident_split_stays_within_its_bounds():
+    req = audio_with_blocks(INCIDENT_BLOCKS)
+    parts = split_request(req, max_seconds=30)
+    durations = [part.duration for _, part in parts]
+    assert all(0.25 <= d <= 30 + 1e-6 for d in durations), durations
+    spacers = [(a[1], b[0]) for a, b in zip(req.blocks, req.blocks[1:], strict=False)]
+    assert all(any(lo < offset < hi for lo, hi in spacers) for offset, _ in parts[1:]), "cut only in pauses"
+    total = sum(sf.read(io.BytesIO(part.flac))[0].shape[0] for _, part in parts)
+    assert total == round(req.duration * SR)
+
+
+def test_no_outbound_request_is_shorter_than_the_service_minimum():
+    """The 30.038 s piece the old outer split produced, sent through the adapter: its own split must
+    not emit a 38 ms sliver (the service answered 502 for it, every retry)."""
+    full = audio_with_blocks(INCIDENT_BLOCKS)
+    pcm = sf.read(io.BytesIO(full.flac), dtype="int16")[0][: round(30.038 * SR)]
+    piece = SttRequest(flac(pcm), len(pcm) / SR, [(0, 22.804), (23.304, 29.788)], "en", [])
+
+    def handler(request, n):
+        if sent_seconds(request) < 0.1:
+            return httpx.Response(502, text="<!DOCTYPE html><title>Bad Gateway</title>")
+        return httpx.Response(200, json={"text": f"part {n}"})
+
+    provider, seen = stt("https://example.test/v1", "gpt-transcribe", handler, style="json", max_request_seconds=30)
+    provider.transcribe(piece)
+    assert all(sent_seconds(r) >= 0.25 for r in seen)
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_any_geometry_splits_within_bounds_and_keeps_every_sample(seed):
+    rng = np.random.default_rng(seed)
+    blocks = [float(x) for x in rng.choice([0.03, 0.2, 1.5, 6.0, 12.0, 22.0, 29.7, 29.95, 31.0, 75.0], size=rng.integers(1, 8))]
+    req = audio_with_blocks(blocks)
+    parts = split_request(req, max_seconds=30)
+    if req.duration <= 30:
+        assert len(parts) == 1
+        return
+    assert all(0.25 <= part.duration <= 30 + 1e-6 for _, part in parts), [p.duration for _, p in parts]
+    total = sum(sf.read(io.BytesIO(part.flac))[0].shape[0] for _, part in parts)
+    assert total == round(req.duration * SR)
+
+
+def test_a_part_the_service_keeps_failing_fast_becomes_permanent_with_a_reason():
+    """The upstream answered 500 within ~0.3 s for one part, every attempt, while other requests
+    succeeded: that is a rejection of this audio, not an outage."""
+    bad, good = audio_with_blocks([1.0]), audio_with_blocks([2.0])
+
+    def handler(request, n):
+        if sent_seconds(request) < 1.5:
+            return httpx.Response(502, text="<!DOCTYPE html>", headers={"cf-ray": "8f00-DFW"})
+        return httpx.Response(200, json={"text": "fine"})
+
+    provider, _ = stt("https://example.test/v1", "gpt-transcribe", handler, style="json")
+    errors = []
+    for _ in range(3):
+        with pytest.raises(ProviderError) as info:
+            provider.transcribe(bad)
+        errors.append(info.value)
+        provider.transcribe(good)
+    assert [e.terminal for e in errors] == [False, False, True]
+    assert "this audio" in str(errors[-1]) and errors[-1].kind == "request"
+
+
+def test_fast_failures_during_an_outage_stay_transient():
+    provider, _ = stt("https://example.test/v1", "gpt-transcribe",
+                      lambda request, n: httpx.Response(502, text="<!DOCTYPE html>"), style="json")  # fmt: skip
+    for _ in range(5):
+        with pytest.raises(ProviderError) as info:
+            provider.transcribe(audio_with_blocks([1.0]))
+        assert not info.value.terminal, "nothing else succeeded: the service may simply be down"
+
+
+def test_a_failed_transcription_logs_its_status_ray_and_response_head(caplog):
+    provider, _ = stt("https://example.test/v1", "gpt-transcribe",
+                      [httpx.Response(500, text="<html>upstream boom</html>", headers={"cf-ray": "8f00abc-DFW", "server": "cloudflare"})],
+                      style="json")  # fmt: skip
+    with caplog.at_level("WARNING"), pytest.raises(ProviderError):
+        provider.transcribe(audio_with_blocks([1.0]))
+    line = next(r.getMessage() for r in caplog.records if "transcription HTTP" in r.getMessage())
+    assert "500" in line and "8f00abc-DFW" in line and "cloudflare" in line and "upstream boom" in line and "1.000 s" in line

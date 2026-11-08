@@ -25,9 +25,12 @@ namespaced per piece and the result records how many pieces there were.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
+import math
 import re
+import time
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -42,6 +45,13 @@ log = logging.getLogger(__name__)
 
 Style = Literal["openai_diarized", "mistral", "together", "verbose", "json"]
 SAMPLE_RATE = 16000
+# No outbound request is shorter than this: the service rejects audio under 0.1 s (the configured
+# proxy answered 502, then upstream 500, for a 38 ms silent piece; transcribe502-20261108).
+MIN_PART_SECONDS = 0.25
+# The same audio failing with a fast 5xx this many times, while other requests succeed, is a
+# rejection of that audio rather than an outage.
+FAST_FAILURE_SECONDS = 5.0
+FAST_FAILURES_TO_GIVE_UP = 3
 MAX_CONTEXT_BIAS = 100
 # Known per-request limits (seconds). OpenAI's diarize model tops out around 1400 s (community
 # reports); 1200 s also keeps 16 kHz FLAC under its 25 MB upload cap. Together's upload cap is 80 MB.
@@ -102,6 +112,9 @@ class OpenAICompatStt:
         self.style: Style = resolve_style(base_url, model, style)
         self.max_seconds = default_max_seconds(self.style, base_url) if max_request_seconds is None else max_request_seconds
         self._context_bias = True
+        self._successes = 0
+        # audio digest → (fast 5xx count, successes seen before the first of them)
+        self._fast_failures: dict[str, tuple[int, int]] = {}
         self._client = httpx.Client(timeout=httpx.Timeout(timeout, connect=15.0), transport=transport)
 
     @property
@@ -125,7 +138,7 @@ class OpenAICompatStt:
 
     def _transcribe_part(self, offset: float, part: SttRequest) -> list[tuple[float, dict]]:
         try:
-            data = self._post(part)
+            data = self._post(pad_short(part))
             if self.style == "json":
                 if not isinstance(data.get("text"), str):
                     raise ProviderError("JSON transcription response is missing text", kind="response")
@@ -183,6 +196,7 @@ class OpenAICompatStt:
     def _post(self, request: SttRequest) -> dict:
         while True:
             headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+            began = time.monotonic()
             try:
                 response = self._client.post(
                     self.url, data=self.fields(request), files={"file": ("audio.flac", request.flac, "audio/flac")},
@@ -191,6 +205,12 @@ class OpenAICompatStt:
             except httpx.HTTPError as exc:
                 raise ProviderError(f"transcription request to {self.url} failed: {exc}", kind="network") from exc
             status, detail = response.status_code, response.text[:300]
+            seconds = time.monotonic() - began
+            if status >= 400:
+                log.warning("transcription HTTP %d for %.3f s (%d bytes) in %.2f s; cf-ray=%s server=%s type=%s; %r",
+                            status, request.duration, len(request.flac), seconds,
+                            response.headers.get("cf-ray", "-"), response.headers.get("server", "-"),
+                            response.headers.get("content-type", "-"), response.text[:160])  # fmt: skip
             lowered = detail.lower()
             if status in (400, 422) and self.style == "mistral" and self._context_bias and "context_bias" in lowered:
                 log.warning("%s rejected context_bias (%s); sending keyterms no more", self.url, detail)
@@ -207,6 +227,8 @@ class OpenAICompatStt:
             raise ProviderError(f"transcription auth error (HTTP {status}): {detail}", terminal=True, kind="auth")
         if status == 402:
             raise ProviderError(f"transcription billing error: {detail}", terminal=True, kind="billing")
+        if status >= 500 and seconds < FAST_FAILURE_SECONDS:
+            self._fast_failure(request, status, seconds)
         if status in (408, 409, 429) or status >= 500:
             raise ProviderError(f"transcription HTTP {status}: {detail}", kind="transient")
         if status >= 400:
@@ -217,7 +239,23 @@ class OpenAICompatStt:
             raise ProviderError(f"transcription server returned no JSON: {detail}", kind="transient") from exc
         if not isinstance(data, dict):
             raise ProviderError("transcription response is not a JSON object", kind="transient")
+        self._successes += 1
+        self._fast_failures.pop(_digest(request), None)
         return data
+
+    def _fast_failure(self, request: SttRequest, status: int, seconds: float) -> None:
+        """Counts a fast 5xx for this exact audio; gives up on it once it keeps failing while other
+        requests succeed (an outage fails everything, so it stays transient)."""
+        key = _digest(request)
+        count, before = self._fast_failures.get(key, (0, self._successes))
+        count += 1
+        self._fast_failures[key] = (count, before)
+        if count >= FAST_FAILURES_TO_GIVE_UP and self._successes > before:
+            raise ProviderError(
+                f"the transcription service rejected this audio ({request.duration:.2f} s): HTTP {status} within "
+                f"{seconds:.1f} s on {count} attempts while other requests succeeded; retrying it unchanged won't help",
+                terminal=True, kind="request",
+            )
 
 
 # -- response normalization ------------------------------------------------------------------------
@@ -360,30 +398,49 @@ def _pieces(request: SttRequest, pcm: np.ndarray, cuts: list[float]) -> list[tup
     return out
 
 
-def split_request(request: SttRequest, max_seconds: float) -> list[tuple[float, SttRequest]]:
-    """Pieces of at most `max_seconds`, cut in the middle of the silent spacers between speech
-    blocks. Only a single block longer than the limit is cut inside, at its quietest moment."""
+def split_request(request: SttRequest, max_seconds: float, min_seconds: float = MIN_PART_SECONDS) -> list[tuple[float, SttRequest]]:
+    """Pieces of at least `min_seconds` and at most `max_seconds`, each cut at the latest pause that
+    keeps both sides within those bounds (the middle of a silent spacer between speech blocks, or
+    silence before/after them). Only speech longer than the limit is cut inside, at its quietest
+    moment. Cuts fall on whole samples, so the bounds hold for the samples actually sent."""
     pcm, _ = sf.read(io.BytesIO(request.flac), dtype="int16")
-    duration = len(pcm) / SAMPLE_RATE
-    if duration <= max_seconds:
+    total = len(pcm)
+    if total <= max_seconds * SAMPLE_RATE:
         return [(0.0, request)]
+    duration = total / SAMPLE_RATE
     blocks = sorted(request.blocks) or [(0.0, duration)]
+    gaps = [(0.0, blocks[0][0]), *((x[1], y[0]) for x, y in zip(blocks, blocks[1:], strict=False)), (blocks[-1][1], duration)]
+    gaps = [(a, b) for a, b in gaps if b > a]
+    longest, shortest = int(max_seconds * SAMPLE_RATE), math.ceil(min_seconds * SAMPLE_RATE)
     cuts: list[float] = []
-    start = 0.0
-    for i, (a, b) in enumerate(blocks):
-        if b - start <= max_seconds:
-            continue
-        spacer = (blocks[i - 1][1] + a) / 2 if i else None
-        if spacer is not None and spacer > start:
-            cuts.append(spacer)
-            start = spacer
-        while b - start > max_seconds:
-            cut = _quietest(pcm, start + 0.9 * max_seconds, start + max_seconds)
-            cuts.append(cut)
-            start = cut
-    if duration - start > max_seconds:  # trailing silence after the last block
-        cuts.append(start + max_seconds)
+    start = 0
+    while total - start > longest:
+        lo, hi = start + shortest, min(start + longest, total - shortest)
+        lo_s, hi_s = lo / SAMPLE_RATE, hi / SAMPLE_RATE
+        # latest pause that fits: its middle if inside the window, else the window's nearest edge
+        candidates = [min(max((a + b) / 2, lo_s), hi_s) for a, b in gaps if a < hi_s and b > lo_s]
+        if candidates:
+            cut = max(candidates)
+        else:  # inside speech: the quietest moment near the end of the window
+            cut = _quietest(pcm, max(lo_s, hi_s - 0.1 * max_seconds), hi_s)
+        cut_sample = min(max(round(cut * SAMPLE_RATE), lo), hi)
+        cuts.append(cut_sample / SAMPLE_RATE)
+        start = cut_sample
     return _pieces(request, pcm, cuts)
+
+
+def pad_short(request: SttRequest, min_seconds: float = MIN_PART_SECONDS) -> SttRequest:
+    """The request to send: shorter than the service accepts → its samples followed by silence (the
+    caller keeps the real duration for timing)."""
+    if request.duration >= min_seconds:
+        return request
+    pcm = sf.read(io.BytesIO(request.flac), dtype="int16")[0]
+    padded = np.concatenate([pcm, np.zeros(max(0, round(min_seconds * SAMPLE_RATE) - len(pcm)), np.int16)])
+    return SttRequest(_flac(padded), len(padded) / SAMPLE_RATE, request.blocks, request.language, request.keyterms)
+
+
+def _digest(request: SttRequest) -> str:
+    return hashlib.sha256(request.flac).hexdigest()[:16]
 
 
 def halve_request(request: SttRequest) -> list[tuple[float, SttRequest]]:
@@ -391,5 +448,7 @@ def halve_request(request: SttRequest) -> list[tuple[float, SttRequest]]:
     pcm, _ = sf.read(io.BytesIO(request.flac), dtype="int16")
     blocks = sorted(request.blocks)
     spacers = [(x[1] + y[0]) / 2 for x, y in zip(blocks, blocks[1:], strict=False)]
-    middle = len(pcm) / SAMPLE_RATE / 2
-    return _pieces(request, pcm, [min(spacers, key=lambda c: abs(c - middle))])
+    duration = len(pcm) / SAMPLE_RATE
+    middle = duration / 2
+    fitting = [c for c in spacers if MIN_PART_SECONDS <= c <= duration - MIN_PART_SECONDS] or spacers
+    return _pieces(request, pcm, [min(fitting, key=lambda c: abs(c - middle))])
