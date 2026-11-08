@@ -174,6 +174,7 @@ def create_app(
                 or (settings.llm_provider == "anthropic" and bool(settings.anthropic_api_key))
                 or (settings.llm_provider == "openai" and bool(settings.llm_base_url)),
             },
+            "local_transcription": views.local_transcription(db, settings, time.time()),
             "queue": queue_counts(db),
             "worker": {"present": views.worker_present(vault)},
             "activity": views.activity(db, settings, time.time()),

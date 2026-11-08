@@ -57,7 +57,7 @@ from ..records import record_bytes, record_from_row, record_path
 from ..providers import LlmProvider, LlmRequest, ProviderError, SttProvider, SttRequest
 from ..settings import Settings
 from ..spool import atomic_write_bytes
-from ..util import canonical_json, sha256_hex
+from ..util import canonical_json, iso_utc_epoch, sha256_hex
 from ..speakers import match as speaker_match
 from ..speakers.store import SpeakerStore, voices_name
 from ..speakers.voices import cosine_distance, embed_voices, label_turns, select_clips, usable_spans
@@ -93,6 +93,9 @@ _PROMPT_IN_NAME = re.compile(r"-p(\d+)-[0-9a-f]{16}\.json$")
 
 STATUS_INTERVAL = 60.0  # `_status.md` and stubs are rewritten at most once a minute
 EDITED_RETRY = 600.0
+LOCAL_STT_DOWN = "local transcription (the omi-asr sidecar) is unavailable; waiting for it"
+LOCAL_STT_WAIT = 60.0  # how often a waiting conversation looks again
+LOCAL_STT_ALERT_AFTER = 600.0
 BACKGROUND_MIN_VOICES = 200  # stored voices needed for a stable background (speaker linking)
 # why a kept `speakers_unknown` conversation has no summary (shown in its note)
 KEPT_REASON = "kept from the phone without speaker separation"
@@ -168,14 +171,14 @@ class Providers:
         return self._local_reader
 
     def transcriber(self):
-        """The provider for this attempt: the local sidecar while it answers its health check, else STT_*."""
+        """The provider for this attempt: the local sidecar when configured (never another provider in its
+        place: while it is down the conversation waits), else STT_*."""
         local = self.local_stt
-        if local is not None:
-            if local.healthy():
-                return local
-            log.warning("local ASR sidecar at %s is not answering: using the %s provider", self.settings.stt_local_url,
-                        self.settings.stt_provider)  # fmt: skip
-        return self.stt
+        if local is None:
+            return self.stt
+        if not local.healthy():
+            raise ProviderError(LOCAL_STT_DOWN, kind="stt_unavailable", waiting=True)
+        return local
 
     @property
     def local_diarization_problem(self) -> str | None:
@@ -441,6 +444,11 @@ class ConversationPipeline:
 
     def _fail(self, conv_id: str, stage: str, exc: ProviderError, now: float) -> None:
         row = self._row(conv_id)
+        if exc.waiting:  # the engine is down, not this conversation: wait, attempts untouched
+            if row["error_kind"] != exc.kind:
+                log.warning("conversation %s waits: %s", conv_id, exc)
+            self._set(conv_id, error=str(exc)[:500], error_kind=exc.kind, next_attempt_at=now + LOCAL_STT_WAIT, updated_at=now)
+            return
         attempts = row["attempts"] + 1
         if exc.terminal or attempts >= MAX_ATTEMPTS:
             log.error("conversation %s failed permanently in %s: %s", conv_id, stage, exc)
@@ -550,7 +558,13 @@ class ConversationPipeline:
                 windows_path = path.with_name(path.name.replace(f"-w{WINDOW_CACHE_FORMAT}{assembly}-", f"-w{WINDOW_CACHE_FORMAT}-", 1))
                 response = transcribe_windows(stt, audio, request, window_turns, windows_path)
             else:
-                response = stt.transcribe(request)
+                try:
+                    response = stt.transcribe(request)
+                except ProviderError as exc:
+                    # the sidecar went away mid-request: wait for it like any other conversation
+                    if linking and not exc.terminal and not stt.healthy(refresh=True):
+                        raise ProviderError(LOCAL_STT_DOWN, kind="stt_unavailable", waiting=True) from exc
+                    raise
             cached = {"created_at": now, "provider": stt.name, "model": stt.model, "response": response}
             atomic_write_bytes(path, json.dumps(cached).encode())
         if unlabeled:
@@ -772,6 +786,36 @@ class ConversationPipeline:
     def voice_names(self, conv_id: str) -> dict[str, tuple[str, bool]]:
         return {label: (v["name"], v["me"]) for label, v in self.speakers.names(conv_id).items()}
 
+    def watch_local_stt(self, now: float) -> None:
+        """Health of the local sidecar, kept in the index for the API: when it went down, and once it has
+        been down LOCAL_STT_ALERT_AFTER, an error in the log and `logs/alerts/local-transcription.json`
+        (for the brief / an external notifier) until it is back."""
+        local = self.providers.local_stt
+        since = self.db.meta("local_stt_down_since")
+        if local is None:
+            if since:
+                self.db.set_meta("local_stt_down_since", None)
+            return
+        ok = local.healthy(refresh=True)
+        alert = self.settings.logs_dir / "alerts" / "local-transcription.json"
+        alert.parent.mkdir(parents=True, exist_ok=True)
+        if ok and since:
+            log.warning("local transcription is back after %.0f s", now - float(since))
+            self.db.set_meta("local_stt_down_since", None)
+            if self.db.meta("local_stt_alerted"):
+                self.db.set_meta("local_stt_alerted", None)
+                Vault.write_json(alert, {"state": "recovered", "down_since": iso_utc_epoch(float(since)),
+                                         "recovered_at": iso_utc_epoch(now), "url": self.settings.stt_local_url})  # fmt: skip
+        elif not ok and not since:
+            log.warning("local transcription is unavailable (%s): conversations wait for it", self.settings.stt_local_url)
+            self.db.set_meta("local_stt_down_since", repr(now))
+        elif not ok and now - float(since) >= LOCAL_STT_ALERT_AFTER and not self.db.meta("local_stt_alerted"):
+            log.error("local transcription has been unavailable for %.0f min (%s)", (now - float(since)) / 60, self.settings.stt_local_url)
+            self.db.set_meta("local_stt_alerted", repr(now))
+            Vault.write_json(alert, {"state": "down", "down_since": iso_utc_epoch(float(since)), "alerted_at": iso_utc_epoch(now),
+                                     "url": self.settings.stt_local_url,
+                                     "check": "sidecar/asr/scripts/launchagent.sh status; ~/Library/Logs/omi-notes-asr.log"})  # fmt: skip
+
     def _background_voice(self, conv_id: str, embedder) -> np.ndarray | None:
         """The mean of other conversations' stored voices (same model): what every voice recorded here shares."""
         rows = self.db.query("SELECT vector FROM voices WHERE vector IS NOT NULL AND model_sha=? AND conversation_id<>? LIMIT 5000",
@@ -796,18 +840,14 @@ class ConversationPipeline:
         """The provider that already transcribed this audio when its result is still usable (a re-run, e.g.
         after a lost transcript.json, never transcribes again because the sidecar was switched on or is
         down for now), else the one answering now. A forced reprocess excludes the old result."""
-        chosen = self.providers.transcriber()
         ref = row["stt_ref"]
         excluded = set(json.loads(row["skip_stt"])) if row["skip_stt"] else set()
-        if not ref or ref in excluded or not (self.conv_dir(row["id"]) / ref).exists():
-            return chosen
-        if ref.startswith(self._stt_base(chosen, audio_sha)):
-            return chosen
-        for other in (self.providers.stt, self.providers.local_stt_reader):
-            if other is not chosen and ref.startswith(self._stt_base(other, audio_sha)):
-                log.info("conversation %s: reusing its %s transcription", row["id"], other.name)
-                return other
-        return chosen
+        if ref and ref not in excluded and (self.conv_dir(row["id"]) / ref).exists():
+            # checked before asking for a live engine: reading a stored result needs no service
+            for cached in (self.providers.local_stt_reader, self.providers.stt):
+                if ref.startswith(self._stt_base(cached, audio_sha)):
+                    return cached
+        return self.providers.transcriber()
 
     def _speakers(self, conv_id: str, response: dict, audio: ConversationAudio, audio_sha: str,
                   mode: str | None = None) -> SpeakerResult:  # fmt: skip

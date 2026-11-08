@@ -12,8 +12,8 @@ generic OpenAI-compatible server, all deliberate (asr-bench-20261108):
   provider's labels.
 A 900 s piece takes about 80 s (RTF 0.09, plus ~10 s to load the models); the 20 min timeout leaves room
 for MOSS re-splitting a truncated window without letting a hung sidecar hold the worker for an hour.
-`healthy()` asks `/health` (cached 30 s): while the sidecar is down, the pipeline uses the configured
-STT_* provider instead.
+`healthy()` asks `/health` (cached 30 s; `refresh=True` asks again). The sidecar is the only engine:
+while it is down, conversations wait for it (never another provider).
 """
 
 from __future__ import annotations
@@ -69,9 +69,9 @@ class LocalAsrStt(OpenAICompatStt):
             out.append((offset + start, normalize_response(dict(data, segments=shifted))))
         return out
 
-    def healthy(self) -> bool:
+    def healthy(self, *, refresh: bool = False) -> bool:
         now = time.monotonic()
-        if self._health and now - self._health[0] < self.HEALTH_TTL:
+        if not refresh and self._health and now - self._health[0] < self.HEALTH_TTL:
             return self._health[1]
         root = self.base_url[: -len("/v1")] if self.base_url.endswith("/v1") else self.base_url
         try:

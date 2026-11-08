@@ -14,6 +14,7 @@ import os
 import shlex
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -47,6 +48,7 @@ def failure_message(kind: str | None, stage: str | None) -> str:
         "notes": "The note's My Notes section is ambiguous, so the server won't overwrite it.",
         "io": "The server couldn't write the note file.",
         "move": "The server couldn't move the note file.",
+        "stt_unavailable": "Local transcription on the server is unavailable; the conversation is waiting for it.",
         "speakers_unknown": "Words were transcribed, but local speaker separation found no distinct speaker, so no note "
                             "was made. The audio and the automated text are kept on the server.",
     }.get(kind or "", f"The {service} failed.")
@@ -435,9 +437,30 @@ def worker_present(vault) -> bool:
     return worker_lock(vault).held_elsewhere()
 
 
-def server_issues(db, *, read_only: str | None, worker: bool, limit: int = ISSUE_LIMIT) -> list[dict]:
+LOCAL_STT_ISSUE_AFTER = 600.0
+
+
+def local_transcription(db, settings, now: float) -> dict | None:
+    """The local sidecar's state as the worker last saw it (`/v1/status`), or None when it isn't configured."""
+    if not settings.stt_local_url:
+        return None
+    since = db.meta("local_stt_down_since")
+    return {"available": since is None, "down_since": iso_utc_epoch(float(since)) if since else None,
+            "down_seconds": round(now - float(since)) if since else 0}  # fmt: skip
+
+
+def server_issues(db, *, read_only: str | None, worker: bool, limit: int = ISSUE_LIMIT, now: float | None = None) -> list[dict]:
     """Bounded, sanitized list of what needs attention (`GET /v1/issues`), most urgent first."""
     out: list[dict] = []
+    since = db.meta("local_stt_down_since")
+    down = (time.time() if now is None else now) - float(since) if since else 0.0
+    if down >= LOCAL_STT_ISSUE_AFTER:
+        out.append({"code": "local_transcription_unavailable", "severity": "action",
+                    "message": f"Local transcription on the server has been unavailable for {down // 60:.0f} min. "
+                               "Conversations wait and are transcribed when it is back; nothing is lost.",
+                    "next_step": "This needs a fix on the server.",
+                    "server_step": "Check the omi-asr service on the server (`sidecar/asr/scripts/launchagent.sh status`, "
+                                   "log `~/Library/Logs/omi-notes-asr.log`)."})  # fmt: skip
     if read_only:
         out.append({"code": "read_only", "severity": "action", "message": "The server stopped writing to the vault.",
                     "detail": read_only, "next_step": "This needs a fix on the server.",

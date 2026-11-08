@@ -14,6 +14,7 @@ from omi_notes.pipeline.speaker_links import link, overlap_spans
 from omi_notes.pipeline.speakers import resolve_speakers
 from omi_notes.providers.local_asr import LocalAsrStt
 
+from .conftest import AUTH
 from .helpers import T0, convs, replay
 from .test_openai_stt import audio_with_blocks, form
 from .test_speaker_learning import ALAN, PRIYA, RAVI, FakeEmbedder, voice
@@ -125,14 +126,57 @@ def test_the_pipeline_uses_the_sidecar_with_its_speakers_linked_into_one_transcr
     assert len({s["speaker"] for s in transcript["segments"]}) == 1, "one voice in every piece: one speaker"
 
 
-def test_while_the_sidecar_is_down_the_configured_provider_transcribes(client, worker):
-    stt, seen = sidecar(moss_like, down=True)
-    worker.providers._local_stt = stt
+def test_while_the_sidecar_is_down_conversations_wait_without_using_up_attempts_then_resume(client, worker):
+    down, seen = sidecar(moss_like, down=True)
+    worker.providers._local_stt = down
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    for k in range(10):  # well past MAX_ATTEMPTS: waiting is not failing
+        worker.tick(T0 + 400 + 120 * k)
+    (row,) = convs(worker)
+    assert row["status"] == "transcribing" and row["error_kind"] == "stt_unavailable" and row["attempts"] == 0
+    assert not seen and not (worker.pipeline.conv_dir(row["id"]) / "transcript.json").exists(), "never the old path"
+    up, seen = sidecar(moss_like)
+    worker.providers._local_stt = up
+    worker.tick(T0 + 400 + 120 * 11)
+    (row,) = convs(worker)
+    transcript = json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text())
+    assert row["status"] == "done" and transcript["stt"] == "local-asr/omi-asr" and len(seen) == 1
+
+
+def test_a_sidecar_that_dies_mid_request_makes_the_conversation_wait(client, worker):
+    calls = []
+
+    def transport(request):
+        if request.url.path == "/health":
+            return httpx.Response(200 if not calls else 503, json={})
+        calls.append(request)
+        raise httpx.ReadError("connection reset")
+
+    worker.providers._local_stt = LocalAsrStt("http://127.0.0.1:18793/v1", transport=httpx.MockTransport(transport))
     replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
     worker.tick(T0 + 400)
     (row,) = convs(worker)
-    transcript = json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text())
-    assert not seen and transcript["stt"].startswith("fake/"), transcript["stt"]
+    assert calls and row["status"] == "transcribing" and row["error_kind"] == "stt_unavailable" and row["attempts"] == 0
+
+
+def test_a_sidecar_down_ten_minutes_is_an_issue_and_an_alert_until_it_is_back(client, worker, settings):
+    from omi_notes import views
+
+    worker.providers._local_stt, _ = sidecar(down=True)
+    worker.pipeline.watch_local_stt(T0)
+    assert not [i for i in views.server_issues(worker.db, read_only=None, worker=True, now=T0 + 1) if i["code"] == "local_transcription_unavailable"]
+    worker.pipeline.watch_local_stt(T0 + 601)
+    (issue,) = [i for i in views.server_issues(worker.db, read_only=None, worker=True, now=T0 + 601) if i["code"] == "local_transcription_unavailable"]
+    assert "10 min" in issue["message"]
+    alert = json.loads((settings.logs_dir / "alerts" / "local-transcription.json").read_text())
+    assert alert["state"] == "down" and alert["down_since"]
+    worker.providers._local_stt, _ = sidecar()
+    worker.pipeline.watch_local_stt(T0 + 700)
+    assert not [i for i in views.server_issues(worker.db, read_only=None, worker=True, now=T0 + 700) if i["code"] == "local_transcription_unavailable"]
+    assert json.loads((settings.logs_dir / "alerts" / "local-transcription.json").read_text())["state"] == "recovered"
+    assert "local_transcription" in client.get("/v1/status", headers=AUTH).json()
+    configured = settings.model_copy(update={"stt_local_url": "http://127.0.0.1:18793/v1"})
+    assert views.local_transcription(worker.db, configured, T0 + 700) == {"available": True, "down_since": None, "down_seconds": 0}
 
 
 

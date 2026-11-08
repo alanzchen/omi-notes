@@ -56,6 +56,7 @@ MAX_CHUNK_ATTEMPTS = 5
 CHUNKS_PER_TICK = 200
 TIMELINE_CACHE = 32
 RETENTION_INTERVAL = 3600.0
+STT_WATCH_INTERVAL = 30.0  # the local transcription service's health (`watch_local_stt`)
 LATE_EVENT_HORIZON = 7 * 86400
 STAR_CODE = 3  # button event code: star the conversation this moment belongs to (capture-format-v1.md)
 
@@ -93,6 +94,7 @@ class Worker:
         self.lock = worker_lock(self.vault)
         self._decoders: OrderedDict[str, tuple[int, CaptureTimeline, VadStream]] = OrderedDict()
         self._last_retention = 0.0
+        self._last_stt_watch = 0.0
         self._reconciled = False
         self.operations = operations.Sweeper()
         self.search = search.Indexer()
@@ -135,6 +137,12 @@ class Worker:
                 self.operations.run(self.pipeline)
             except Exception:
                 log.exception("could not reconcile app retries")
+            if now - self._last_stt_watch >= STT_WATCH_INTERVAL:
+                self._last_stt_watch = now
+                try:
+                    self.pipeline.watch_local_stt(now)
+                except Exception:
+                    log.exception("could not check the local transcription service")
             advanced = self.pipeline.run(now)
             try:
                 self.search.run(self.pipeline)

@@ -8,12 +8,14 @@ from typing import Protocol
 
 class ProviderError(RuntimeError):
     """`terminal=True`: retrying will not help until the user fixes something (auth, billing,
-    bad request); the conversation is marked failed until `omi-notes retry-failed`."""
+    bad request); the conversation is marked failed until `omi-notes retry-failed`. `waiting=True`: the
+    service itself is down (the local sidecar); the conversation waits for it without using up attempts."""
 
-    def __init__(self, message: str, *, terminal: bool = False, kind: str = "error") -> None:
+    def __init__(self, message: str, *, terminal: bool = False, kind: str = "error", waiting: bool = False) -> None:
         super().__init__(message)
         self.terminal = terminal
         self.kind = kind
+        self.waiting = waiting
 
 
 @dataclass
