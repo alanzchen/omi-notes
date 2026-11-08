@@ -8,6 +8,8 @@ generic OpenAI-compatible server, all deliberate (asr-bench-20261108):
   the keyterms go as `context`, which the sidecar gives Qwen as hotwords;
 - its labels restart in every piece: the pipeline links them across pieces with voiceprints
   (`pipeline.speaker_links`) and uses them as the provider's labels.
+A 900 s piece takes about 80 s (RTF 0.09, plus ~10 s to load the models); the 20 min timeout leaves room
+for MOSS re-splitting a truncated window without letting a hung sidecar hold the worker for an hour.
 `healthy()` asks `/health` (cached 30 s): while the sidecar is down, the pipeline uses the configured
 STT_* provider instead.
 """
@@ -28,7 +30,7 @@ class LocalAsrStt(OpenAICompatStt):
     HEALTH_TTL = 30.0
 
     def __init__(self, base_url: str, model: str = "omi-asr", *, max_request_seconds: float = 900.0,
-                 transport: httpx.BaseTransport | None = None, timeout: float = 3600.0) -> None:  # fmt: skip
+                 transport: httpx.BaseTransport | None = None, timeout: float = 1200.0) -> None:  # fmt: skip
         super().__init__(base_url, "", model, style="openai_diarized", max_request_seconds=max_request_seconds,
                          timeout=timeout, transport=transport)  # fmt: skip
         self._health: tuple[float, bool] | None = None

@@ -4,7 +4,8 @@ The provider labels speakers per request piece (up to 15 min), and `merge_pieces
 labels apart. For every label, the voiceprint of its clean speech (not overlapped by another speaker,
 clips of at least 0.5 s, the longest first up to a minute) is compared with the speakers found so far:
 it joins the closest one when the cosine is at least `threshold` and beats the runner-up by `margin`,
-otherwise it is a new speaker. Two labels of the same piece never join (the provider told them apart).
+otherwise it is a new speaker. Two labels of the same piece never join (the provider told them apart), and a
+label whose closest speaker is already in its piece stays new rather than joining the runner-up.
 Measured on the bench (asr-bench-20261108): meeting links at 0.97 against at most 0.78 for others; a
 noisy dinner is ambiguous (0.876 vs 0.890), which the margin rule leaves as separate speakers.
 """
@@ -99,17 +100,14 @@ def link(response: dict, pcm: np.ndarray, embedder, threshold: float = THRESHOLD
     for label in sorted(first, key=first.get):
         vector = _voiceprint(clips.get(label, []), pcm, embedder)
         piece = piece_of[label]
-        best, best_cos, second = None, -1.0, -1.0
-        if vector is not None:
-            for k, sp in enumerate(speakers):
-                if sp["vector"] is None or piece in sp["pieces"]:
-                    continue
-                cos = float(np.dot(vector, sp["vector"]))
-                if cos > best_cos:
-                    best, best_cos, second = k, cos, best_cos
-                elif cos > second:
-                    second = cos
-        joined = best is not None and best_cos >= threshold and best_cos - second >= margin
+        # every speaker counts for closest and runner-up, including those this piece already has: a label
+        # closest to one of them is another of the provider's labels for that voice, not the runner-up
+        scores = sorted(((float(np.dot(vector, sp["vector"])), k) for k, sp in enumerate(speakers)
+                         if vector is not None and sp["vector"] is not None), reverse=True)  # fmt: skip
+        best, best_cos = (scores[0][1], scores[0][0]) if scores else (None, -1.0)
+        second = scores[1][0] if len(scores) > 1 else -1.0
+        joined = (best is not None and piece not in speakers[best]["pieces"] and best_cos >= threshold
+                  and best_cos - second >= margin)  # fmt: skip
         if joined:
             sp = speakers[best]
             w = sum(e - s for s, e in clips.get(label, [])) or 1.0

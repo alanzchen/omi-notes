@@ -114,6 +114,7 @@ class Providers:
     settings: Settings
     _stt: SttProvider | None = None
     _local_stt: object = None  # LocalAsrStt when STT_LOCAL_URL is set
+    _local_reader: object = None  # LocalAsrStt for reading its cached results once STT_LOCAL_URL is unset
     _llm: LlmProvider | None = None
     _diarizer: object = None  # LocalDiarizer, or False once known to be unavailable
     _embedder: object = None  # speaker embedder, or False once known to be unavailable
@@ -150,6 +151,18 @@ class Providers:
             self._local_stt = LocalAsrStt(self.settings.stt_local_url, self.settings.stt_local_model,
                                           max_request_seconds=self.settings.stt_local_max_request_seconds)  # fmt: skip
         return self._local_stt
+
+    @property
+    def local_stt_reader(self):
+        """The local sidecar as the reader of its cached results, configured or not (after switching back)."""
+        if self.local_stt is not None:
+            return self.local_stt
+        if self._local_reader is None:
+            from ..providers.local_asr import LocalAsrStt
+
+            self._local_reader = LocalAsrStt("http://127.0.0.1:18793/v1", self.settings.stt_local_model,
+                                             max_request_seconds=self.settings.stt_local_max_request_seconds)  # fmt: skip
+        return self._local_reader
 
     def transcriber(self):
         """The provider for this attempt: the local sidecar while it answers its health check, else STT_*."""
@@ -503,7 +516,7 @@ class ConversationPipeline:
         if len(audio.pcm) == 0:
             raise ProviderError("no decodable audio under this conversation's speech", terminal=True, kind="audio")
         audio_sha = sha256_hex(audio.pcm.tobytes() + canonical_json([list(b) for b in audio.blocks_out]).encode())
-        stt = self.providers.transcriber()
+        stt = self._transcriber_for(row, audio_sha)
         windowed = getattr(stt, "needs_speaker_windows", False)
         linking = getattr(stt, "links_speakers", False)  # the local sidecar: its own speakers, linked across pieces
         turns = None
@@ -518,13 +531,8 @@ class ConversationPipeline:
             # words: none ⇒ discarded as no speech; words ⇒ `speakers_unknown`, a terminal status that
             # keeps the audio and invents no speaker (docs/architecture.md #11).
         unlabeled = windowed and not turns
-        tag = f"-{_slug(stt.cache_tag)}" if getattr(stt, "cache_tag", "") else ""
-        if windowed:
-            # the whole-conversation response depends on the windowing version and the vocabulary sent too
-            keyterms = sha256_hex(canonical_json(list(self.settings.keyterms)).encode())[:8]
-            assembly = f"a{WINDOW_ASSEMBLY_FORMAT}" if WINDOW_ASSEMBLY_FORMAT > 1 else ""
-            tag += f"-{_slug(self.providers.diarizer.tag)}-w{WINDOW_CACHE_FORMAT}{assembly}-k{keyterms}"
-        base = f"stt-{stt.name}{tag}-{_slug(stt.model)}-{_slug(self.settings.stt_language)}-{audio_sha[:16]}"
+        assembly = f"a{WINDOW_ASSEMBLY_FORMAT}" if WINDOW_ASSEMBLY_FORMAT > 1 else ""
+        base = self._stt_base(stt, audio_sha)
         conv_dir = self.conv_dir(conv_id)
         name = _reusable(conv_dir, base, row["stt_ref"], row["skip_stt"])
         path = conv_dir / name
@@ -759,6 +767,33 @@ class ConversationPipeline:
 
     def voice_names(self, conv_id: str) -> dict[str, tuple[str, bool]]:
         return {label: (v["name"], v["me"]) for label, v in self.speakers.names(conv_id).items()}
+
+    def _stt_base(self, stt, audio_sha: str) -> str:
+        """The STT result file name (without `.json`) for this provider, its settings and this audio."""
+        tag = f"-{_slug(stt.cache_tag)}" if getattr(stt, "cache_tag", "") else ""
+        if getattr(stt, "needs_speaker_windows", False):
+            # the whole-conversation response depends on the windowing version and the vocabulary sent too
+            keyterms = sha256_hex(canonical_json(list(self.settings.keyterms)).encode())[:8]
+            assembly = f"a{WINDOW_ASSEMBLY_FORMAT}" if WINDOW_ASSEMBLY_FORMAT > 1 else ""
+            tag += f"-{_slug(self.providers.diarizer.tag)}-w{WINDOW_CACHE_FORMAT}{assembly}-k{keyterms}"
+        return f"stt-{stt.name}{tag}-{_slug(stt.model)}-{_slug(self.settings.stt_language)}-{audio_sha[:16]}"
+
+    def _transcriber_for(self, row, audio_sha: str):
+        """The provider that already transcribed this audio when its result is still usable (a re-run, e.g.
+        after a lost transcript.json, never transcribes again because the sidecar was switched on or is
+        down for now), else the one answering now. A forced reprocess excludes the old result."""
+        chosen = self.providers.transcriber()
+        ref = row["stt_ref"]
+        excluded = set(json.loads(row["skip_stt"])) if row["skip_stt"] else set()
+        if not ref or ref in excluded or not (self.conv_dir(row["id"]) / ref).exists():
+            return chosen
+        if ref.startswith(self._stt_base(chosen, audio_sha)):
+            return chosen
+        for other in (self.providers.stt, self.providers.local_stt_reader):
+            if other is not chosen and ref.startswith(self._stt_base(other, audio_sha)):
+                log.info("conversation %s: reusing its %s transcription", row["id"], other.name)
+                return other
+        return chosen
 
     def _speakers(self, conv_id: str, response: dict, audio: ConversationAudio, audio_sha: str,
                   mode: str | None = None) -> SpeakerResult:  # fmt: skip

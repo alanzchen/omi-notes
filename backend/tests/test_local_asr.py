@@ -134,3 +134,64 @@ def test_while_the_sidecar_is_down_the_configured_provider_transcribes(client, w
     transcript = json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text())
     assert not seen and transcript["stt"].startswith("fake/"), transcript["stt"]
 
+
+
+class CodedEmbedder:
+    """Each synthetic voice is a constant sample value; its vector is looked up by that value."""
+
+    def __init__(self, vectors: dict[int, list[float]]):
+        self.vectors = vectors
+
+    def embed(self, pcm: np.ndarray) -> np.ndarray:
+        return np.asarray(self.vectors[int(pcm[len(pcm) // 2])], dtype=np.float64)
+
+
+def test_a_label_kept_from_its_closest_speaker_by_the_piece_rule_never_joins_the_runner_up():
+    # X and Y sound alike (cosine 0.87): piece 1 has X twice (provider over-split), the second must stay
+    # apart rather than becoming Y
+    y = [0.87, float(np.sqrt(1 - 0.87**2)), 0.0]
+    embedder = CodedEmbedder({1: [1.0, 0.0, 0.0], 2: y})
+    pcm = np.concatenate([np.full(10 * SR, v, np.int16) for v in (1, 2, 1, 1)])
+    response = pieces_response([(0, 10, 0), (10, 20, 1), (20, 30, 2), (30, 40, 3)], [0.0, 20.0])
+    out = link(response, pcm, embedder)
+    speakers = [u["speaker"] for u in out["results"]["utterances"]]
+    assert speakers[:3] == [0, 1, 0]
+    assert speakers[3] not in (0, 1), out["omi_notes"]["speakers_linked"]
+
+
+def test_a_finished_conversation_transcribed_again_reuses_its_cached_stt_whichever_provider_is_up(client, worker):
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    assert row["status"] == "done" and row["stt_ref"].startswith("stt-fake")
+    # the sidecar is switched on: a re-run (e.g. a lost transcript.json) must not transcribe again
+    stt, seen = sidecar(moss_like)
+    worker.providers._local_stt = stt
+    worker.pipeline._set(row["id"], status="closed")
+    worker.tick(T0 + 500)
+    (row,) = convs(worker)
+    transcript = json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text())
+    assert row["status"] == "done" and not seen and transcript["stt"].startswith("fake/")
+
+
+def test_a_conversation_from_the_sidecar_keeps_its_transcript_while_the_sidecar_is_down(client, worker):
+    stt, seen = sidecar(moss_like)
+    worker.providers._local_stt = stt
+    worker.providers._embedder = FakeEmbedder()
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    assert row["stt_ref"].startswith("stt-local-asr") and len(seen) == 1
+    down, _ = sidecar(moss_like, down=True)
+    worker.providers._local_stt = down
+    worker.pipeline._set(row["id"], status="closed")
+    worker.tick(T0 + 500)
+    (row,) = convs(worker)
+    transcript = json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text())
+    assert row["status"] == "done" and transcript["stt"] == "local-asr/omi-asr", "not re-transcribed by the fallback"
+    assert transcript["speaker_source"] == "provider"
+
+
+def test_a_long_piece_gets_a_bounded_timeout_not_an_hour():
+    stt, _ = sidecar()
+    assert stt._client.timeout.read <= 1200
