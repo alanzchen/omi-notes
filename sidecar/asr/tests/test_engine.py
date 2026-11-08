@@ -100,3 +100,14 @@ def test_the_windows_moss_ran_on_are_reported_with_their_label_prefixes():
     assert windows[0]["start"] == 0.0 and windows[-1]["end"] == pytest.approx(200, abs=0.01)
     assert windows[0]["end"] == windows[1]["start"]
     assert {s["speaker_id"] for s in out["segments"]} == {"S01", "W1.2-S01"}
+
+
+def test_the_self_test_loads_the_models_and_runs_qwen_briefly_without_moss():
+    class NoMoss:
+        def generate(self, *a, **k):
+            raise AssertionError("MOSS runs to its token cap on non-speech: not part of the self-test")
+
+    e, qwen = engine([])
+    e.models = (NoMoss(), qwen, FakeAligner())
+    e.self_test()
+    assert qwen.seconds == [1.0]

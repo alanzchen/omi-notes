@@ -8,8 +8,8 @@ Answer: {text, language, duration, segments: [{start, end, speaker_id, text}], o
 Omi's `openai_diarized` style reads. GET /health → {ok, version, models_loaded, self_test}; 503 with a
 `reason` when the startup self-test failed or a transcription is stuck past its deadline.
 
-The service is Omi's only transcription engine, so it guards itself: at startup it transcribes a few
-seconds of synthetic audio (models load, MLX runs), and a watchdog exits the process (launchd's KeepAlive
+The service is Omi's only transcription engine, so it guards itself: at startup it loads the models
+and runs Qwen on a second of synthetic audio (MLX works), and a watchdog exits the process (launchd's KeepAlive
 starts a fresh one) when a request runs past 300 s + its audio length (normal is ~0.1x).
 """
 
@@ -49,11 +49,15 @@ class Guard:
         self.lock = threading.Lock()
 
     def self_test(self) -> None:
-        t = np.arange(3 * plan.SR) / plan.SR
-        tone = (0.1 * np.sin(2 * np.pi * 180 * t) * (np.sin(2 * np.pi * 3 * t) > 0)).astype(np.float32)
         try:
-            result = self.run(tone, [])  # under the deadline too: a hang at startup is caught
-            assert isinstance(result.get("segments"), list)
+            with self.lock:  # under the deadline too: a hang at startup is caught
+                self.busy_since = time.time()
+                self.deadline = self.busy_since + DEADLINE_BASE
+            try:
+                self.engine.self_test()
+            finally:
+                with self.lock:
+                    self.busy_since = self.deadline = None
             self.self_test_state = "ok"
             log.info("self-test passed")
         except Exception as exc:  # anything at all: the engine can't serve

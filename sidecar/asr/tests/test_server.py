@@ -26,6 +26,9 @@ class FakeEngine:
     def unload_if_idle(self):
         return False
 
+    def self_test(self):
+        pass
+
 
 def flac(seconds=2.0, rate=16000):
     buf = io.BytesIO()
@@ -61,7 +64,7 @@ def test_it_refuses_to_bind_beyond_loopback(monkeypatch):
 
 
 class BrokenEngine(FakeEngine):
-    def transcribe(self, pcm, context):
+    def self_test(self):
         raise RuntimeError("metal device lost")
 
 

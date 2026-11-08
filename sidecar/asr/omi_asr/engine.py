@@ -65,6 +65,17 @@ class Engine:
             log.info("models unloaded after %.0f s idle", IDLE_UNLOAD_SECONDS)
             return True
 
+    def self_test(self) -> None:
+        """Load the three models and run Qwen on a second of synthetic audio with a tiny token cap: proves MLX
+        works without depending on MOSS ending on non-speech (on a tone it runs to its 16k-token cap)."""
+        with self.lock:
+            import mlx.core as mx
+
+            moss, qwen, aligner = self._load()
+            t = np.arange(plan.SR) / plan.SR
+            qwen.generate(mx.array((0.1 * np.sin(2 * np.pi * 180 * t)).astype(np.float32)), max_tokens=8)
+            self.last_used = time.monotonic()
+
     @property
     def loaded(self) -> bool:
         return self.models is not None
