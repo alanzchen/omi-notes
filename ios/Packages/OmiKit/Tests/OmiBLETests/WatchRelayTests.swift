@@ -205,6 +205,55 @@ import OmiCapture
     }
 }
 
+/// ASTRA-IT9-01: a finished part moved into segments/ before its manifest was published (a failed write,
+/// or the app ending in between) was invisible: not queued, not counted, never sent, never recovered.
+/// The manifest's content is now written first as an intent; a later load publishes it again from that
+/// intent when the audio matches, and keeps (and counts) any audio it can't identify.
+@Suite struct WatchPublicationRecoveryTests {
+    func setUp() throws -> (URL, WatchSegment, URL, URL) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-wpub-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let f = try WatchRelayTests.segmentFile(seconds: 1, in: root, name: "finished")
+        let m = WatchRelayTests().manifest(f, recording: "r", index: 0, binding: "p", start: 0)
+        return (root, m, f, root.appendingPathComponent("watch/segments"))
+    }
+
+    @Test func aFailedManifestPublicationIsRecoveredOnTheNextLoad() throws {
+        let (root, m, source, dir) = try setUp()
+        let out = WatchOutbox(root: root.appendingPathComponent("watch"))
+        let audio = dir.appendingPathComponent("\(m.id).m4a")
+        let bytes = try Data(contentsOf: source)
+        // only the manifest's publication fails, after the payload was moved in (Astra's obstruction)
+        try FileManager.default.createDirectory(at: dir.appendingPathComponent(".\(m.id).json.tmp"), withIntermediateDirectories: false)
+        #expect(throws: (any Error).self) { try out.add(segmentFile: source, segment: m) }
+        #expect(try Data(contentsOf: audio) == bytes && !FileManager.default.fileExists(atPath: source.path))
+        try FileManager.default.removeItem(at: dir.appendingPathComponent(".\(m.id).json.tmp"))
+        // the same state as the app ending between the two steps: a cold load recovers it
+        let cold = WatchOutbox(root: root.appendingPathComponent("watch"))
+        #expect(cold.segments().map(\.segment.id) == [m.id] && cold.pendingCount == 1 && cold.waitingBytes == Int64(m.bytes))
+        #expect(cold.orphans.isEmpty)
+        #expect(cold.retire(receipts: [.init(id: m.id, sha256: m.sha256)]) == [m.id], "and a receipt retires it as usual")
+    }
+
+    @Test(arguments: ["no intent", "intent for other bytes"])
+    func audioThatCantBeIdentifiedIsKeptAndCounted(variant: String) throws {
+        let (root, m, source, dir) = try setUp()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let audio = dir.appendingPathComponent("\(m.id).m4a")
+        try FileManager.default.copyItem(at: source, to: audio)  // an older build's orphan: audio, no manifest
+        if variant != "no intent" {
+            var other = m; other.sha256 = String(repeating: "0", count: 64)
+            try WatchWire.encode(other).write(to: dir.appendingPathComponent("\(m.id).intent"))
+        }
+        let out = WatchOutbox(root: root.appendingPathComponent("watch"))
+        #expect(out.segments().isEmpty, "never sent without a manifest that matches its bytes")
+        #expect(out.orphans == [m.id: m.bytes] && out.waitingBytes == Int64(m.bytes), "counted where storage is counted")
+        out.acknowledgeEnds([m.id])
+        #expect(out.retire(receipts: [.init(id: m.id, sha256: m.sha256)]).isEmpty)
+        #expect(FileManager.default.fileExists(atPath: audio.path), "kept")
+    }
+}
+
 /// OMI-NIGHTLY-2026-11-08: the Watch's backlog sat at ~820 parts "delivered, awaiting
 /// acknowledgement" (Watch gauges: outstanding_files 4, awaiting_ack ≈ outbox_parts), each resent only
 /// after 30 min–4 h and then acknowledged at once (phone log: acks == resends). The Watch now asks

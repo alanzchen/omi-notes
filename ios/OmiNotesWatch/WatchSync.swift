@@ -29,8 +29,13 @@ final class WatchSync: NSObject, WCSessionDelegate {
         refreshCounts()
     }
 
+    /// Audio kept without a usable manifest (`WatchOutbox.orphans`): never sent or deleted, reported so
+    /// it can be recovered by hand.
+    private(set) var orphans = 0
+
     func refreshCounts() {
         let segments = outbox.segments(), ends = outbox.ends()
+        orphans = outbox.orphans.count
         let waiting = Set(segments.map(\.segment.id) + ends.map(\.id) + perf.ids())
         if resend.entries.keys.contains(where: { !waiting.contains($0) }) { resend.keep(only: waiting) }
         // audio parts only (a recording's end marker isn't audio, but is sent the same way)
@@ -64,7 +69,8 @@ final class WatchSync: NSObject, WCSessionDelegate {
         let now = Date()
         let r = WatchReport(state: recorderState.state, since: recorderState.since, waitingParts: pending, waitingSeconds: pendingSeconds, at: now,
                             deviceId: WatchRecorder.deviceId,
-                            stats: counters.merging(captureStats) { a, _ in a }.merging(["awaiting_ack": resend.awaitingAck]) { a, _ in a })
+                            stats: counters.merging(captureStats) { a, _ in a }.merging(["awaiting_ack": resend.awaitingAck]) { a, _ in a }
+                                .merging(orphans > 0 ? ["orphan_parts": orphans] : [:]) { a, _ in a })
         if let l = lastReport, l.state == r.state, l.since == r.since, l.waitingParts == r.waitingParts, now.timeIntervalSince(l.at) < 300 { return }
         do {
             try WCSession.default.updateApplicationContext([WatchWire.report: WatchWire.encode(r)])

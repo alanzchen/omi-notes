@@ -220,6 +220,15 @@ public final class WatchOutbox: @unchecked Sendable {
     /// truth; only this process changes them.
     private var segmentIndex: [String: WatchSegment]?
     private var endIndex: [String: WatchRecordingEnd]?
+    /// Audio under segments/ with no manifest that matches it (an older build ended between moving a
+    /// part in and publishing its manifest, or the metadata is damaged): id → bytes. Kept, never sent
+    /// or deleted, counted in `waitingBytes`; a person can recover it from the files.
+    public var orphans: [String: Int] {
+        lock.lock(); defer { lock.unlock() }
+        loadSegments()
+        return orphanIndex
+    }
+    private var orphanIndex: [String: Int] = [:]
     /// Manifests read from disk (to compare builds; flat after the first read).
     public private(set) var manifestReads = 0
 
@@ -229,8 +238,12 @@ public final class WatchOutbox: @unchecked Sendable {
     }
 
     /// Takes a finished segment file (moved in) and its manifest.
+    /// The manifest is written first as an intent, so a part whose manifest isn't published (a failed
+    /// write, or the app ending in between) is published again from it on the next load.
     public func add(segmentFile: URL, segment: WatchSegment) throws {
         lock.lock(); defer { lock.unlock() }
+        let intent = segmentsDir.appendingPathComponent("\(segment.id).intent")
+        try Files.durableWrite(WatchWire.encode(segment), to: intent)
         let audio = segmentsDir.appendingPathComponent("\(segment.id).m4a")
         if segmentFile != audio {
             _ = try? FileManager.default.removeItem(at: audio)
@@ -238,8 +251,10 @@ public final class WatchOutbox: @unchecked Sendable {
         }
         try Files.fsync(audio)
         try Files.durableWrite(WatchWire.encode(segment), to: segmentsDir.appendingPathComponent("\(segment.id).json"))
+        _ = try? FileManager.default.removeItem(at: intent)
         loadSegments()
         segmentIndex?[segment.id] = segment
+        orphanIndex[segment.id] = nil
     }
 
     public func add(end: WatchRecordingEnd) throws {
@@ -259,7 +274,35 @@ public final class WatchOutbox: @unchecked Sendable {
                   FileManager.default.fileExists(atPath: segmentsDir.appendingPathComponent("\(s.id).m4a").path) else { continue }
             index[s.id] = s
         }
+        reconcile(&index)
         segmentIndex = index
+    }
+
+    /// Audio without a published manifest: published again from its intent when the intent is readable
+    /// and the audio still matches it (size and SHA-256); otherwise kept and counted as an orphan.
+    /// An intent left without audio (the move never happened) is only metadata and is removed.
+    private func reconcile(_ index: inout [String: WatchSegment]) {
+        orphanIndex = [:]
+        for name in Files.names(segmentsDir, suffix: ".m4a") {
+            let id = String(name.dropLast(4))
+            guard index[id] == nil else { continue }
+            let audio = segmentsDir.appendingPathComponent(name), intent = segmentsDir.appendingPathComponent("\(id).intent")
+            let size = (try? FileManager.default.attributesOfItem(atPath: audio.path)[.size] as? Int) ?? -1
+            if let s = WatchWire.decode(WatchSegment.self, try? Data(contentsOf: intent)), s.id == id, s.bytes == size,
+               (try? Files.sha256(audio)) == s.sha256,
+               (try? Files.durableWrite(WatchWire.encode(s), to: segmentsDir.appendingPathComponent("\(id).json"))) != nil {
+                _ = try? FileManager.default.removeItem(at: intent)
+                index[id] = s
+            } else {
+                orphanIndex[id] = max(0, size)
+            }
+        }
+        for name in Files.names(segmentsDir, suffix: ".intent") {
+            let id = String(name.dropLast(7))
+            if !FileManager.default.fileExists(atPath: segmentsDir.appendingPathComponent("\(id).m4a").path) {
+                _ = try? FileManager.default.removeItem(at: segmentsDir.appendingPathComponent(name))
+            }
+        }
     }
 
     private func loadEnds() {
@@ -332,7 +375,7 @@ public final class WatchOutbox: @unchecked Sendable {
     public var waitingBytes: Int64 {
         lock.lock(); defer { lock.unlock() }
         loadSegments()
-        return (segmentIndex ?? [:]).values.reduce(0) { $0 + Int64($1.bytes) }
+        return (segmentIndex ?? [:]).values.reduce(0) { $0 + Int64($1.bytes) } + orphanIndex.values.reduce(0) { $0 + Int64($1) }
     }
 }
 
