@@ -60,6 +60,7 @@ public struct SystemHealth: Equatable, Sendable {
         case "starting": return "Bluetooth is starting…"
         case "resetting": return "Bluetooth is restarting…"
         case "off": return "Bluetooth is off"
+        case "not responding": return "Bluetooth isn't responding"
         default: return why.hasPrefix("not allowed") ? "Bluetooth isn't allowed for Omi Notes" : "Bluetooth is unavailable"
         }
     }
@@ -115,6 +116,11 @@ public struct SystemHealth: Equatable, Sendable {
         case .bluetoothUnavailable(let why):
             // CoreBluetooth's first moments (or a reset): passing, nothing for anyone to fix
             if Self.bluetoothPassing(why) { return step(.working, Self.bluetoothTitle(why)) }
+            if why == "not responding" {
+                return step(.needsAction, Self.bluetoothTitle(why),
+                            "Bluetooth hasn't finished starting. Turn it off and on in Control Center; if that doesn't help, restart the iPhone.",
+                            .openBluetoothSettings)
+            }
             return step(.needsAction, Self.bluetoothTitle(why), "Turn Bluetooth on and allow Omi Notes to use it.", .openBluetoothSettings)
         case .refused(let why):
             return step(.needsAction, "This pendant can't be used", why, .pairDevice)

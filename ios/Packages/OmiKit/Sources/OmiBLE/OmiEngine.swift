@@ -167,6 +167,12 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     private var timer: DispatchSourceTimer?
     private var tickCount = 0
     private var btState: CentralState = .unknown
+    /// When `btState` last changed (monotonic): starting or resetting longer than `bluetoothGrace`
+    /// is no longer a passing moment.
+    private var btStateSinceMono: UInt64 = 0
+    private var btStuckNoted = false
+    /// How long Bluetooth may stay "starting"/"resetting" before the phone asks for action.
+    public static let bluetoothGrace: TimeInterval = 25
     private var scanResults: [UUID: ScanCandidate] = [:]
     private var scanning = false
     private var attention: [String] = []
@@ -205,6 +211,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
 
     public init(config: EngineConfiguration, settings: SettingsStore, uploadTransport: UploadTransport? = nil, background: BackgroundTaskProviding? = nil) {
         self.config = config
+        btStateSinceMono = config.clock.monotonicNanoseconds()
         self.settings = settings
         self.background = background
         queue.sync { setUp(uploadTransport: uploadTransport) }
@@ -1078,6 +1085,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     // MARK: CentralControllerDelegate
 
     public func centralDidUpdateState(_ state: CentralState) {
+        if state != btState { btStateSinceMono = config.clock.monotonicNanoseconds(); btStuckNoted = false }
         btState = state
         if state != .poweredOn, let s = session, !s.transport.isSimulated { endSession(reason: .bleDisconnected) }
         scheduleSnapshot()
@@ -1286,6 +1294,11 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             writeHeartbeat(reason: "periodic")
         }
         if tickCount % 30 == 0 { checkStorage(); processWatch() }
+        if bluetoothStuck, !btStuckNoted {  // the grace period just ran out: say so without waiting for an event
+            btStuckNoted = true
+            log(.warning, "ble", "Bluetooth still \(btState == .resetting ? "resetting" : "starting") after \(Int(Self.bluetoothGrace)) s")
+            scheduleSnapshot()
+        }
         if tickCount % 5 == 0 { refreshOutboxStats() }
         if tickCount % 3600 == 0 { runRetention() }
         if session != nil || tickCount % 5 == 0 { scheduleSnapshot() }
@@ -1489,6 +1502,12 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
 
     public func snapshotNow() -> EngineSnapshot { queue.sync { buildSnapshot() } }
 
+    /// Starting or resetting for longer than `bluetoothGrace` (no callback came).
+    private var bluetoothStuck: Bool {
+        (btState == .unknown || btState == .resetting)
+            && config.clock.monotonicNanoseconds() &- btStateSinceMono >= UInt64(Self.bluetoothGrace * 1e9)
+    }
+
     private func connectionPhase() -> ConnectionPhase {
         if let refusal { return .refused(refusal) }
         if let sess = session {
@@ -1505,11 +1524,11 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         if settings.simulatedMode { return .waitingForDevice }
         switch btState {
         case .poweredOn: break
-        case .unknown: return .bluetoothUnavailable("starting")
+        case .unknown: return bluetoothStuck ? .bluetoothUnavailable("not responding") : .bluetoothUnavailable("starting")
         case .poweredOff: return .bluetoothUnavailable("off")
         case .unauthorized: return .bluetoothUnavailable("not allowed — enable it in Settings")
         case .unsupported: return .bluetoothUnavailable("unsupported (Simulator? use the simulated device)")
-        case .resetting: return .bluetoothUnavailable("resetting")
+        case .resetting: return bluetoothStuck ? .bluetoothUnavailable("not responding") : .bluetoothUnavailable("resetting")
         }
         if central?.suppression.contains(.pairingLost) == true { return .paused("pairing information removed") }
         return .waitingForDevice

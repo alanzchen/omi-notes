@@ -255,4 +255,39 @@ extension EngineSnapshot {
         s.connection = .paused("phone storage low")  // a real pause keeps its wording
         #expect(PendantSummary.connectionTitle(s) == "Recording paused" && SystemHealth.pendant(s).title == "Recording is paused")
     }
+
+    /// ASTRA-IT2-04: "starting" stayed harmless forever when CoreBluetooth never answered. After a grace
+    /// period it asks for action with a way out; any definitive state clears it.
+    @Test func bluetoothThatNeverFinishesStartingAsksForActionAndRecovers() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-bt-\(UUID().uuidString)")
+        let clock = TestClock()
+        let settings = SettingsStore(defaults: UserDefaults(suiteName: "omi-bt-\(UUID().uuidString)")!, tokens: InMemoryTokenStore())
+        settings.rememberedDeviceId = UUID()
+        var config = EngineConfiguration(dirs: CaptureDirectories(root: root), clock: clock, appVersion: "t", useCoreBluetooth: false, tickInterval: 0.01)
+        config.testCentralBackend = { _ in SilentCentral() }
+        let engine = OmiEngine(config: config, settings: settings, uploadTransport: CountingUploadTransport())
+        engine.queue.sync {}
+        func pendant() throws -> SystemHealth.Step {
+            try #require(SystemHealth.evaluate(snapshot: engine.snapshotNow(), server: .reachable(version: "t", detail: ""), status: nil, statusAt: nil, now: clock.wallNow())
+                .steps.first { $0.area == .pendant })
+        }
+        #expect(try pendant().level == .working, "the first moments: nothing to fix")
+        clock.advance(OmiEngine.bluetoothGrace + 1)
+        let stuck = try pendant()
+        #expect(stuck.level == .needsAction && stuck.fix == .openBluetoothSettings && stuck.title == "Bluetooth isn't responding", "\(stuck)")
+        #expect(stuck.detail?.contains("Control Center") == true)
+        engine.queue.sync { engine.centralDidUpdateState(.poweredOn) }  // a late answer
+        #expect(try pendant().title != "Bluetooth isn't responding")
+        engine.queue.sync { engine.centralDidUpdateState(.resetting) }
+        #expect(try pendant().level == .working, "a new reset starts its own grace period")
+    }
+}
+
+final class SilentCentral: CentralBackend, @unchecked Sendable {
+    var state: CentralState { .unknown }
+    func scan(serviceUUIDs: [String]?, allowDuplicates: Bool) {}
+    func stopScan() {}
+    func connect(_ p: PeripheralHandle) {}
+    func cancelConnection(_ p: PeripheralHandle) {}
+    func retrievePeripheral(_ id: UUID) -> PeripheralHandle? { nil }
 }
