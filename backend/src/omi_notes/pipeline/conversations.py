@@ -28,6 +28,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import numpy as np
+
 from .. import operations
 from ..audio.diarize import LocalDiarizer, Turn, local_diarization_status
 from ..audio.timeline import CaptureTimeline, Piece
@@ -91,6 +93,7 @@ _PROMPT_IN_NAME = re.compile(r"-p(\d+)-[0-9a-f]{16}\.json$")
 
 STATUS_INTERVAL = 60.0  # `_status.md` and stubs are rewritten at most once a minute
 EDITED_RETRY = 600.0
+BACKGROUND_MIN_VOICES = 200  # stored voices needed for a stable background (speaker linking)
 # why a kept `speakers_unknown` conversation has no summary (shown in its note)
 KEPT_REASON = "kept from the phone without speaker separation"
 
@@ -557,7 +560,8 @@ class ConversationPipeline:
         elif linking:
             response = cached["response"]
             if self.providers.embedder is not None:
-                response = link_speakers(response, audio.pcm, self.providers.embedder)
+                response = link_speakers(response, audio.pcm, self.providers.embedder,
+                                         background=self._background_voice(conv_id, self.providers.embedder))  # fmt: skip
             # its labels are the transcript's labels (local diarization would only blur its real turns)
             speakers = self._speakers(conv_id, response, audio, audio_sha, mode="provider")
         else:
@@ -767,6 +771,16 @@ class ConversationPipeline:
 
     def voice_names(self, conv_id: str) -> dict[str, tuple[str, bool]]:
         return {label: (v["name"], v["me"]) for label, v in self.speakers.names(conv_id).items()}
+
+    def _background_voice(self, conv_id: str, embedder) -> np.ndarray | None:
+        """The mean of other conversations' stored voices (same model): what every voice recorded here shares."""
+        rows = self.db.query("SELECT vector FROM voices WHERE vector IS NOT NULL AND model_sha=? AND conversation_id<>? LIMIT 5000",
+                             (embedder.model_sha, conv_id))  # fmt: skip
+        if len(rows) < BACKGROUND_MIN_VOICES:
+            return None
+        vectors = np.stack([np.frombuffer(r["vector"], dtype="<f4").astype(np.float64) for r in rows])
+        vectors /= np.linalg.norm(vectors, axis=1, keepdims=True).clip(1e-9)
+        return vectors.mean(axis=0)
 
     def _stt_base(self, stt, audio_sha: str) -> str:
         """The STT result file name (without `.json`) for this provider, its settings and this audio."""

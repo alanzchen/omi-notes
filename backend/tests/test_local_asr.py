@@ -223,3 +223,45 @@ def test_labels_of_a_moss_resplit_inside_one_request_are_linked_by_voice():
     linked = link(response, pcm, FakeEmbedder())
     speakers = [u["speaker"] for u in linked["results"]["utterances"]]
     assert speakers[0] == speakers[3] and speakers[1] == speakers[2] and speakers[0] != speakers[1]
+
+
+def compressed(k: int, dim: int = 16) -> list[float]:
+    """Voices that share a large common part (room, microphone): raw cosines between people ~0.98."""
+    v = np.zeros(dim)
+    v[0] = 1.0
+    v[1 + k] = 0.15
+    return list(v / np.linalg.norm(v))
+
+
+def test_voices_that_all_sound_alike_raw_are_linked_once_centred_on_the_conversation():
+    # three pieces, the same two people (codes 1 and 2) in each: raw cosines are all ~0.98, so no raw link is
+    # clear; centred on the conversation's own mean they separate
+    embedder = CodedEmbedder({1: compressed(0), 2: compressed(1)})
+    pcm = np.concatenate([np.full(10 * SR, v, np.int16) for v in (1, 2, 2, 1, 1, 2)])
+    response = pieces_response([(0, 10, 0), (10, 20, 1), (20, 30, 2), (30, 40, 3), (40, 50, 4), (50, 60, 5)], [0.0, 20.0, 40.0])
+    raw = link(response, pcm, embedder, centre_min=99)
+    assert raw["omi_notes"]["speakers_linked"]["speakers"] > 2
+    out = link(response, pcm, embedder)
+    speakers = [u["speaker"] for u in out["results"]["utterances"]]
+    assert speakers[0] == speakers[3] == speakers[4] and speakers[1] == speakers[2] == speakers[5] and speakers[0] != speakers[1]
+    assert out["omi_notes"]["speakers_linked"]["space"] == "conversation"
+
+
+def test_a_few_labels_are_centred_on_the_background_voice():
+    embedder = CodedEmbedder({1: compressed(0), 2: compressed(1)})
+    pcm = np.concatenate([np.full(10 * SR, v, np.int16) for v in (1, 2, 2, 1)])
+    response = pieces_response([(0, 10, 0), (10, 20, 1), (20, 30, 2), (30, 40, 3)], [0.0, 20.0])
+    background = np.eye(16)[0]  # the common part every voice shares
+    out = link(response, pcm, embedder, background=background)
+    assert [u["speaker"] for u in out["results"]["utterances"]] == [0, 1, 1, 0]
+    assert out["omi_notes"]["speakers_linked"]["space"] == "background"
+
+
+def test_two_alike_labels_inside_one_piece_raise_the_bar_for_every_link():
+    # piece 0 holds the same voice twice (the provider over-split it): that "different people" pair is as
+    # close as voices get, so nothing in this conversation is close enough to link
+    embedder = CodedEmbedder({1: compressed(0), 2: compressed(1), 3: compressed(2)})
+    pcm = np.concatenate([np.full(10 * SR, v, np.int16) for v in (1, 1, 2, 1, 2, 3)])
+    response = pieces_response([(0, 10, 0), (10, 20, 1), (20, 30, 2), (30, 40, 3), (40, 50, 4), (50, 60, 5)], [0.0, 20.0, 40.0])
+    out = link(response, pcm, embedder)
+    assert out["omi_notes"]["speakers_linked"]["speakers"] == 6

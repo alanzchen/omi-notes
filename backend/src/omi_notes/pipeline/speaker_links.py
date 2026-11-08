@@ -6,8 +6,17 @@ clips of at least 0.5 s, the longest first up to a minute) is compared with the 
 it joins the closest one when the cosine is at least `threshold` and beats the runner-up by `margin`,
 otherwise it is a new speaker. Two labels of the same piece never join (the provider told them apart), and a
 label whose closest speaker is already in its piece stays new rather than joining the runner-up.
-Measured on the bench (asr-bench-20261108): meeting links at 0.97 against at most 0.78 for others; a
-noisy dinner is ambiguous (0.876 vs 0.890), which the margin rule leaves as separate speakers.
+
+Raw voiceprints of one recording share a large common part (room, microphone, distance): in a noisy
+64-minute conversation every label was 0.93-0.99 from every other, and the margin rule (rightly) linked
+nothing, leaving 24 speakers. So the comparison is made after removing that common part: with at least
+`centre_min` labels, the conversation's own mean voiceprint; with fewer, the mean of stored voices from
+other conversations (`background`); with neither, raw. The bar is then set by the conversation itself:
+labels of one piece are different people (the provider told them apart), so a link needs a cosine above
+the closest such pair by `gap` (and at least `floor`). A provider that over-split one voice inside a piece
+only raises the bar: mistakes fall on the side of too many speakers, never a false merge. Measured
+(asr-backfill-20261108): a 42-minute lecture, different people <= 0.33 against 0.91-0.93 for the same
+voice; the noisy conversation, <= 0.74 against up to 0.94.
 """
 
 from __future__ import annotations
@@ -24,6 +33,9 @@ THRESHOLD = 0.85
 MARGIN = 0.05
 MIN_CLIP = 0.5
 MAX_SECONDS_PER_LABEL = 60.0
+CENTRE_MIN = 6  # labels needed to estimate the conversation's common part
+FLOOR = 0.5  # in a centred space
+GAP = 0.05
 
 
 def overlap_spans(utterances: list[dict]) -> list[tuple[float, float]]:
@@ -73,7 +85,8 @@ def _voiceprint(clips: list[tuple[float, float]], pcm: np.ndarray, embedder) -> 
     return mean / (np.linalg.norm(mean) or 1.0)
 
 
-def link(response: dict, pcm: np.ndarray, embedder, threshold: float = THRESHOLD, margin: float = MARGIN) -> dict:
+def link(response: dict, pcm: np.ndarray, embedder, threshold: float = THRESHOLD, margin: float = MARGIN, *,
+         background: np.ndarray | None = None, centre_min: int = CENTRE_MIN) -> dict:  # fmt: skip
     """The response with speakers numbered across pieces (and `omi_notes.speakers_linked`), or unchanged
     when it wasn't split or has no labels."""
     meta = response.get("omi_notes") or {}
@@ -94,11 +107,28 @@ def link(response: dict, pcm: np.ndarray, embedder, threshold: float = THRESHOLD
         piece_of.setdefault(label, max(0, bisect.bisect_right(offsets, (start + end) / 2) - 1))
         first[label] = min(first.get(label, start), start)
         clips.setdefault(label, []).extend(_clean(start, end, overlaps))
+    order = sorted(first, key=first.get)
+    prints = {label: _voiceprint(clips.get(label, []), pcm, embedder) for label in order}
+    known = [v for v in prints.values() if v is not None]
+    space, common = "raw", None
+    if len(known) >= centre_min:
+        space, common = "conversation", np.mean(known, axis=0)
+    elif background is not None and known:
+        space, common = "background", np.asarray(background, dtype=np.float64)
+    if common is not None:
+        for label, v in prints.items():
+            if v is not None:
+                v = v - common
+                prints[label] = v / (np.linalg.norm(v) or 1.0)
+        # labels of one piece are different people: a link must be closer than any of them
+        apart = [float(np.dot(prints[a], prints[b])) for i, a in enumerate(order) for b in order[i + 1 :]
+                 if piece_of[a] == piece_of[b] and prints[a] is not None and prints[b] is not None]  # fmt: skip
+        threshold = max(FLOOR, max(apart) + GAP) if apart else max(FLOOR, threshold - 0.25)
     speakers: list[dict] = []  # {vector, weight, pieces}
     mapping: dict[int, int] = {}
     links = []
-    for label in sorted(first, key=first.get):
-        vector = _voiceprint(clips.get(label, []), pcm, embedder)
+    for label in order:
+        vector = prints[label]
         piece = piece_of[label]
         # every speaker counts for closest and runner-up, including those this piece already has: a label
         # closest to one of them is another of the provider's labels for that voice, not the runner-up
@@ -122,6 +152,7 @@ def link(response: dict, pcm: np.ndarray, embedder, threshold: float = THRESHOLD
                       "runner_up": round(second, 3), "joined": joined})  # fmt: skip
     linked = [dict(u, speaker=mapping[u["speaker"]]) if u.get("speaker") is not None else u for u in utterances]
     out = dict(response, results=dict(response.get("results") or {}, utterances=linked))
-    out["omi_notes"] = dict(meta, speakers_linked={"labels": len(first), "speakers": len(speakers), "links": links})
+    out["omi_notes"] = dict(meta, speakers_linked={"labels": len(first), "speakers": len(speakers), "space": space,
+                                                   "threshold": round(threshold, 3), "links": links})  # fmt: skip
     log.info("linked %d piece labels into %d speakers", len(first), len(speakers))
     return out
