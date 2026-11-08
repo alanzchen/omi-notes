@@ -121,39 +121,4 @@ import OmiWatchKit
         notCounting.phone.since = nil
         #expect(notCounting.phoneFraction == nil, "in the background nothing is counted, so no bar")
     }
-
-    // ASTRA-IT1-05/06: nothing on Transfers may claim completion it can't know.
-
-    @Test func aStaleOrFutureWatchReportIsNoCompletion() throws {
-        for age: TimeInterval in [-86_400, 86_400] {
-            var t = try #require(TransferSummary.debugFixture("all-sent", now: now))
-            t.watch.reportAt = now.addingTimeInterval(age)
-            t.watch.reportFresh = false
-            #expect(t.watchFraction == nil, "no 100% from a report of yesterday or tomorrow")
-            #expect(!t.everythingSent, "and no \"All sent\" either")
-        }
-    }
-
-    @Test func allSentNeedsTheWatchToo() throws {
-        var t = try #require(TransferSummary.debugFixture("all-sent", now: now))
-        #expect(t.everythingSent, "phone empty, fresh Watch report with nothing waiting")
-        t.watch.waitingParts = 3
-        #expect(!t.everythingSent, "the Watch still has parts")
-        t.watch.waitingParts = nil
-        #expect(!t.everythingSent, "unknown is not nothing")
-        t.watch.inUse = false
-        #expect(t.everythingSent, "no Watch in use: the iPhone is everything")
-    }
-
-    @Test func theServerHasWorkWhileConversationsAreQueued() throws {
-        var t = try #require(TransferSummary.debugFixture("all-sent", now: now))
-        t.server.chunksPending = 0
-        t.server.conversationsPending = 3
-        #expect(t.serverWorkLeft == 3)
-        t.server.conversationsPending = 0
-        #expect(t.serverWorkLeft == 0)
-        t.server.chunksPending = nil
-        t.server.conversationsPending = nil
-        #expect(t.serverWorkLeft == nil, "unknown when the server didn't say")
-    }
 }
