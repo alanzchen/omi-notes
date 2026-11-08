@@ -54,10 +54,10 @@ public final class OmiLog: @unchecked Sendable {
         try? Data(rows.map { $0 + Data([0x0A]) }.joined()).write(to: url, options: .atomic)
     }
 
-    /// What may leave the phone: upload, Watch, Bluetooth, Live Activity, engine and app lines, and
+    /// What may leave the phone: upload, Watch, Bluetooth, pendant storage, Live Activity, engine and app lines, and
     /// any warning or error. Note, transcript and audio content isn't logged in the first place.
     public static func isDiagnostic(_ level: LogLine.Level, _ category: String) -> Bool {
-        level == .warning || level == .error || ["upload", "watch", "ble", "liveactivity", "app", "engine"].contains(category)
+        level == .warning || level == .error || ["upload", "watch", "ble", "ring", "liveactivity", "app", "engine"].contains(category)
     }
 
     static let persistMaxBytes = 512_000

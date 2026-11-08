@@ -201,7 +201,7 @@ log export. Body (JSON, at most 64 KB and 2,000 lines): `{"device_id": "phone-<i
 UUID, validated as such (never rewritten). Answer `{"stored": n}`; 422 `invalid_log` for a malformed
 body, another `device_id`, or a field that isn't a string (an unknown `level` reads as `info`).
 
-The phone sends only `upload`, `watch`, `ble`, `liveactivity`, `engine` and `app` lines plus any
+The phone sends only `upload`, `watch`, `ble`, `ring` (pendant storage), `liveactivity`, `engine` and `app` lines plus any
 warning or error. Tokens and pairing secrets are redacted, also when percent-encoding hides them, and
 lines an older build wrote are sanitized again before they leave. A rejected link is logged as a
 reason, never as its URL. Messages are cut to 500 characters. It sends lines after the last

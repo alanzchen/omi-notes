@@ -98,4 +98,14 @@ import Testing
         #expect(body.count <= PhoneLogTail.maxBodyBytes && !sent.isEmpty && sent.count < rows.count)
         #expect(sent == Array(rows.prefix(sent.count)))
     }
+
+    /// Pendant-storage sync lines (category "ring") are uploaded too, successes included, so the
+    /// server can show whether offline audio is being collected (the re-subscribe fix, 2026-11-08).
+    @Test func pendantStorageSyncLinesAreKept() {
+        let url = file(), log = OmiLog()
+        log.persist(to: url)
+        log.log(.info, "ring", "sync complete: 12 records, 0 duplicates dropped, next_seq 40")
+        log.log(.info, "ring", "re-subscribing to storage notifications")
+        #expect(PhoneLogTail.lines(at: url, after: nil).map(\.category) == ["ring", "ring"])
+    }
 }
