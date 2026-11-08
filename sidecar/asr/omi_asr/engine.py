@@ -213,7 +213,8 @@ class Engine:
         lines = [dict(line) for line in lines]
         for a, b in capped:  # the speech of every failed span needs MOSS words over it, or it would vanish
             missing, loud = _uncovered_speech(pcm, a, b, [(line["start"], line["end"]) for line in lines if line.get("moss_text")])
-            if missing > max(UNCOVERED_MAX, UNCOVERED_SHARE * loud):
+            # partial gaps are tolerated (noise between lines); speech with no MOSS words at all never is
+            if missing > max(UNCOVERED_MAX, UNCOVERED_SHARE * loud) or (loud >= 0.2 and missing >= loud - 1e-6):
                 raise IncompleteTranscription(f"Qwen failed on {a:.0f}-{b:.0f} s and MOSS has no words for {missing:.0f} s of its speech")
         if not lines:
             if not units:

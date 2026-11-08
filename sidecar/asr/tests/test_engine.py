@@ -188,3 +188,12 @@ def test_a_failed_span_only_partly_under_moss_lines_is_incomplete_not_silently_s
     e.models = (FakeMoss([{"start": 0.0, "end": 1.0, "speaker_id": "S01", "text": "[0][S01] hi"}]), CappingQwen(limit=0), FakeAligner())
     with pytest.raises(IncompleteTranscription):
         e.transcribe(speech(10), [])
+
+
+def test_a_short_failed_span_with_no_moss_words_is_still_an_error():
+    from omi_asr.engine import IncompleteTranscription
+
+    e = Engine()
+    e.models = (FakeMoss([]), CappingQwen(limit=0), FakeAligner())
+    with pytest.raises(IncompleteTranscription):
+        e.transcribe(speech(0.8), [])
