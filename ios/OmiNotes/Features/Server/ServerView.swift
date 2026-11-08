@@ -55,7 +55,8 @@ struct ServerView: View {
         Section {
             TimelineView(.periodic(from: .now, by: 30)) { context in
                 VStack(alignment: .leading, spacing: 8) {
-                    let server = model.health(now: context.date).steps.first { $0.area == .server }!
+                    // the problems themselves are listed right below: the line doesn't repeat or point to them
+                    let server = Self.headline(model.health(now: context.date).steps.first { $0.area == .server }!, listed: !model.issues.isEmpty)
                     StepRow(step: server, onFix: onFix, hiding: .openServer)  // already on the Server page
                     if let at = model.serverStatusAt {
                         Text("Last answered \(SystemHealth.relative(at, context.date))").font(.caption).foregroundStyle(.secondary)
@@ -68,14 +69,17 @@ struct ServerView: View {
         }
     }
 
+    /// The Server page's own status line: with the problems listed below it, no detail pointing to them.
+    static func headline(_ step: SystemHealth.Step, listed: Bool) -> SystemHealth.Step {
+        var step = step
+        if listed { step.detail = nil }
+        return step
+    }
+
     @ViewBuilder private var issuesSection: some View {
         if !model.issues.isEmpty {
-            Section {
+            Section("Needs attention") {
                 ForEach(model.issues) { issue in IssueRow(model: model, issue: issue) }
-            } header: {
-                Text("Couldn't be finished on the server")
-            } footer: {
-                Text("The server keeps the audio. What the server's operator can do is under Diagnostics.")
             }
         }
     }
@@ -89,17 +93,25 @@ struct ServerView: View {
                           systemImage: "gearshape.2")
                 }
                 if let waiting = a.waiting, waiting > 0 {
-                    LabeledContent("Waiting", value: "\(waiting)\(a.oldestWaitingEndedAt.flatMap(ISO8601UTC.parse).map { " · oldest ended \(Fmt.relative($0))" } ?? "")")
+                    LabeledContent("Conversations waiting", value: "\(waiting)")
                 }
                 if let backing = a.backingOff, backing > 0 {
                     LabeledContent("Waiting to try again") { Text("\(backing)").foregroundStyle(.orange) }
                 }
-                ServiceCallsRow(title: "Transcription service", calls: a.stt)
-                if status?.llm?.provider != "none" { ServiceCallsRow(title: "Summary service", calls: a.llm) }
+                ServiceCallsRow(title: "Transcription", calls: a.stt)
+                if status?.llm?.provider != "none" { ServiceCallsRow(title: "Summaries", calls: a.llm) }
+                DisclosureGroup("Details") {
+                    if let oldest = a.oldestWaitingEndedAt.flatMap(ISO8601UTC.parse), (a.waiting ?? 0) > 0 {
+                        LabeledContent("Oldest waiting ended", value: Fmt.relative(oldest))
+                    }
+                    ServiceCallsDetail(title: "Transcription", calls: a.stt)
+                    if status?.llm?.provider != "none" { ServiceCallsDetail(title: "Summaries", calls: a.llm) }
+                    Text("Conversations waiting are recorded but not yet transcribed and summarized; the server works through them oldest first. A service answering means the request worked; the note still has to be written. Times reset when the server rebuilds its index.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .font(.subheadline)
             } header: {
                 Text("Now")
-            } footer: {
-                Text("A successful request to a service means it answered; the note still has to be written. Times reset when the server rebuilds its index.")
             }
         }
     }
@@ -200,8 +212,14 @@ struct IssueRow: View {
                 Image(systemName: issue.needsAction ? "exclamationmark.triangle.fill" : "clock.badge.exclamationmark").foregroundStyle(.orange)
             }
             .font(.subheadline)
-            if let detail = issue.detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
-            if let step = issue.phoneStep { Text(step).font(.caption).foregroundStyle(.secondary) }
+            if issue.detail != nil || issue.phoneStep != nil {
+                DisclosureGroup("What to do") {
+                    if let detail = issue.detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
+                    if let step = issue.phoneStep { Text(step).font(.caption).foregroundStyle(.secondary) }
+                    Text("The server keeps the audio either way.").font(.caption).foregroundStyle(.secondary)
+                }
+                .font(.caption)
+            }
             if issue.code == "conversation_failed", let id = issue.conversationId {
                 if model.canKeep, issue.canKeepFromPhone {
                     RetryControl(model: model, conversationId: id, action: .keep)
@@ -259,15 +277,35 @@ struct ServiceCallsRow: View {
     let title: String
     let calls: ServerStatus.Activity.ProviderCalls?
 
+    /// One line: how the most recent request went (an older failure is history, under Details).
+    var body: some View {
+        LabeledContent(title) {
+            Text(summary).lineLimit(1).foregroundStyle(calls?.lastFailed == true ? .orange : .secondary)
+        }
+    }
+
+    private var summary: String {
+        guard let calls else { return "No requests yet" }
+        if calls.lastFailed, let failed = calls.lastErrorAt.flatMap(ISO8601UTC.parse) { return "Failed \(Fmt.relative(failed))" }
+        if let ok = calls.lastOkAt.flatMap(ISO8601UTC.parse) { return "Answered \(Fmt.relative(ok))" }
+        return "No requests yet"
+    }
+}
+
+/// A service's last success and last failure, for Details.
+struct ServiceCallsDetail: View {
+    let title: String
+    let calls: ServerStatus.Activity.ProviderCalls?
+
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(title)
             if let calls {
                 if let ok = calls.lastOkAt.flatMap(ISO8601UTC.parse) {
-                    Text("Last successful request \(Fmt.relative(ok))").font(.caption).foregroundStyle(.secondary)
+                    Text("Last answered \(Fmt.relative(ok))").font(.caption).foregroundStyle(.secondary)
                 }
                 if let failed = calls.lastErrorAt.flatMap(ISO8601UTC.parse) {
-                    Text("Last attempt failed \(Fmt.relative(failed))\(calls.lastErrorKind.map { " (\($0))" } ?? "")")
+                    Text("Last failure \(Fmt.relative(failed))\(calls.lastErrorKind.map { " (\($0))" } ?? "")")
                         .font(.caption).foregroundStyle(calls.lastFailed ? .orange : .secondary)
                 }
             } else {
