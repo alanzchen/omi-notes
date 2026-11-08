@@ -136,9 +136,8 @@ tailnet through `tailscale serve`. Every `/v1/` API route requires the bearer to
 FastAPI's generated API docs (`/docs`, `/openapi.json`) answer without it and contain no notes or
 audio.
 
-## Not released yet
+## Being checked
 
-The repository also contains a Live Activity that shows sync progress on the Lock Screen and in
-the Dynamic Island. It builds, but it is not in a released build yet and hasn't been checked on a
-real Lock Screen. Everything else described here, Apple Watch support included, is part of the
-current app.
+A Live Activity shows sync progress on the Lock Screen and in the Dynamic Island. It is in internal
+test builds but hasn't yet been checked on a real Lock Screen or Dynamic Island. Everything else
+described here, Apple Watch support included, is part of the current app.

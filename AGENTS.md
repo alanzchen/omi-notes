@@ -83,29 +83,29 @@ below** (`ios/Tools/testflight.sh`, also `make testflight`).
 
 ## TestFlight on this Mac
 
-The following setup was verified on **2026-11-07** (build 39); inspect current Apple state before
+The following setup was verified on **2026-11-07** (build 40); inspect current Apple state before
 each release. Reuse the existing app, signing assets, API key and tester group while they remain valid.
 
 | Item | Existing setup |
 |---|---|
-| App / bundle | Omi Notes / `dev.omi-notes.app` (Watch app `….watchkitapp`, complication `….watchkitapp.widgets`) |
+| App / bundle | Omi Notes / `dev.omi-notes.app` (Watch app `….watchkitapp`, complication `….watchkitapp.widgets`, Live Activity `….liveactivity`) |
 | App Store Connect app ID | `6816608105` |
 | Developer team | `N9YEGD9WDP` |
 | Local signing identity | `Apple Distribution` (check its SHA-1 with `security find-identity -v -p codesigning`) |
-| App Store profiles | `Omi Notes App Store`, `Omi Notes Watch App Store`, `Omi Notes Watch Complication App Store` (valid to 2027-09-27) |
+| App Store profiles | `Omi Notes App Store`, `Omi Notes Watch App Store`, `Omi Notes Watch Complication App Store`, `Omi Notes Live Activity App Store` (all valid to 2027-09-27) |
 | Upload configuration | `~/.appstoreconnect/omi-notes-upload.json` (`key_id`, `issuer_id`, `key_path`, `app_id`) |
 | Private API key | `~/.appstoreconnect/private_keys/AuthKey_<key_id>.p8`, file mode `0600`; role is **Developer** |
 | Internal Testing group | `b442156a-468f-491b-923c-489bd9548859` |
-| Last verified release | `0.1.0 (39)` (2026-11-07, from `352dcf3`), `VALID`, `IN_BETA_TESTING`; query Apple for the next build number |
+| Last verified release | `0.1.0 (40)` (2026-11-07, from `0c5e9c5`, first with the Live Activity), `VALID`, `IN_BETA_TESTING`; query Apple for the next build number |
 
 **Use `ios/Tools/testflight.sh` (manual local signing, one profile per target).** It archives a
 clean `git archive` copy of HEAD (no `Local.xcconfig`, no uncommitted changes), passes
-`OMI_APP_BUNDLE_ID` and `OMI_IOS_PROFILE`/`OMI_WATCH_PROFILE`/`OMI_COMPLICATION_PROFILE` (never a
-global `PRODUCT_BUNDLE_IDENTIFIER` or `PROVISIONING_PROFILE_SPECIFIER`), exports with a three-entry
-profile map, and checks the IPA. It creates nothing on Apple's side and needs no Admin key.
-**The Live Activity is not shipped:** Release builds leave out `OmiNotesLiveActivity.appex` and
-`NSSupportsLiveActivities` (`project.yml`, `Info.plist`) until it has its own App ID and profile and
-has passed Lock Screen acceptance; the script fails if it is embedded.
+`OMI_APP_BUNDLE_ID` and `OMI_IOS_PROFILE`/`OMI_WATCH_PROFILE`/`OMI_COMPLICATION_PROFILE`/
+`OMI_LIVE_ACTIVITY_PROFILE` (never a global `PRODUCT_BUNDLE_IDENTIFIER` or
+`PROVISIONING_PROFILE_SPECIFIER`), exports with a four-entry profile map, and checks the IPA. It
+creates nothing on Apple's side and needs no Admin key. The Live Activity ships from build 40
+(App ID `dev.omi-notes.app.liveactivity`); the app still uses it only when `NSSupportsLiveActivities`
+is declared and the extension is embedded (`SyncActivityAvailability`).
 
 1. Query App Store Connect for existing builds (`build/testflight-ready/asc.py GET
    "/v1/builds?filter[app]=6816608105&sort=-uploadedDate&limit=5"`) and choose an unused, increasing
@@ -115,6 +115,7 @@ has passed Lock Screen acceptance; the script fails if it is embedded.
    TEAM_ID=N9YEGD9WDP OMI_BUILD_NUMBER=<n> \
    OMI_IOS_PROFILE='Omi Notes App Store' OMI_WATCH_PROFILE='Omi Notes Watch App Store' \
    OMI_COMPLICATION_PROFILE='Omi Notes Watch Complication App Store' \
+   OMI_LIVE_ACTIVITY_PROFILE='Omi Notes Live Activity App Store' \
    ios/Tools/testflight.sh
    ```
 
@@ -122,10 +123,10 @@ has passed Lock Screen acceptance; the script fails if it is embedded.
    logs, `ExportOptions.plist`, `ipa-check/`, `ipa-sha256.txt`).
 
 2. Inspect the IPA yourself before uploading: in `ipa-check/Payload/OmiNotes.app`, the app, the
-   Watch app and the complication each carry their own bundle id, App Store profile and Apple
-   Distribution signature; the Watch app and complication have the
-   `N9YEGD9WDP.dev.omi-notes.shared` keychain group; there is no `PlugIns/OmiNotesLiveActivity.appex`
-   and no `NSSupportsLiveActivities`; `get-task-allow` is false. Record Xcode's existing
+   Watch app, the complication and `PlugIns/OmiNotesLiveActivity.appex` each carry their own bundle
+   id, App Store profile and Apple Distribution signature; the Watch app and complication have the
+   `N9YEGD9WDP.dev.omi-notes.shared` keychain group; the app declares `NSSupportsLiveActivities`;
+   `get-task-allow` is false. Record Xcode's existing
    "Metadata extraction skipped, no AppIntents.framework dependency found" note separately from
    compiler warnings.
 

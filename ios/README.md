@@ -65,7 +65,7 @@ ios/
   OmiNotes/                    thin SwiftUI iPhone app: App/ (entry, AppDelegate, Watch bridge), Features/, Resources/
   OmiNotesWatch/               Apple Watch app: recorder, relay to the iPhone, its one screen
   OmiNotesComplication/        circular watch-face complication (WidgetKit)
-  OmiNotesLiveActivity/        sync Live Activity (not released yet; see below)
+  OmiNotesLiveActivity/        sync Live Activity (being checked; see below)
   Shared/                      views shared by the iPhone app and the Live Activity
   Packages/OmiKit/             most logic, testable with `swift test` on the Mac
     Sources/OmiProtocol/       GATT ids, ring protocol, button/codec/firmware parsing, CRC32, OMINOTE1 envelope
@@ -126,12 +126,13 @@ iPhone it belongs to the first time they connect, and nothing else needs pairing
 ## TestFlight
 
 `make testflight` (or `ios/Tools/testflight.sh`) archives a Release build of the committed tree,
-signs the app, the Watch app and the complication manually with one existing App Store profile each,
+signs the app, the Watch app, the complication and the Live Activity manually with one existing App
+Store profile each,
 exports and checks the IPA, and with `--upload` sends it to App Store Connect. It creates nothing on
 Apple's side. You need, once:
 
 1. **App IDs and profiles:** register `OMI_APP_BUNDLE_ID` (default `dev.omi-notes.app`),
-   `….watchkitapp` and `….watchkitapp.widgets` under Identifiers (the Watch app and complication need
+   `….watchkitapp`, `….watchkitapp.widgets` and `….liveactivity` under Identifiers (the Watch app and complication need
    a keychain-sharing group, `<team>.dev.omi-notes.shared`), install an Apple Distribution
    certificate, and create an App Store profile for each id.
 2. **App record:** Apps › + › New App (iOS, any available name, bundle ID from `OMI_APP_BUNDLE_ID`).
@@ -144,12 +145,11 @@ build of the version):
 
 ```sh
 TEAM_ID=… OMI_BUILD_NUMBER=… OMI_IOS_PROFILE='…' OMI_WATCH_PROFILE='…' \
-OMI_COMPLICATION_PROFILE='…' ios/Tools/testflight.sh --upload
+OMI_COMPLICATION_PROFILE='…' OMI_LIVE_ACTIVITY_PROFILE='…' ios/Tools/testflight.sh --upload
 ```
 
 After processing, add the build under TestFlight › Internal Testing. Internal testing needs no Beta
-App Review; external testers do. Release builds leave out the Live Activity (no App ID or profile
-needed for it yet). The app ships with an original icon (`Tools/make_app_icon.swift`), a privacy
+App Review; external testers do. The app ships with an original icon (`Tools/make_app_icon.swift`), a privacy
 manifest, and `ITSAppUsesNonExemptEncryption = NO` (HTTPS only).
 
 ## Pairing
@@ -282,12 +282,11 @@ Clips are rendered by the server as WAV and played from memory; the phone never 
   in the ~1 s between receiving and fsyncing can lose that second.
 - Low Power Mode and poor reception can delay uploads. They are never dropped.
 
-## Sync status on the Lock Screen (not released yet)
+## Sync status on the Lock Screen (being checked)
 
-The source includes a Live Activity (`OmiNotesLiveActivity/`) that shows sync progress on the Lock
-Screen and in the Dynamic Island, with an off switch in Devices › Transfers. It builds and has unit
-tests, but it isn't in a released build yet and hasn't been checked on a real Lock Screen or
-Dynamic Island. It only reflects what the app sees while it runs; it never keeps uploads alive.
+A Live Activity (`OmiNotesLiveActivity/`) shows sync progress on the Lock Screen and in the Dynamic
+Island, with an off switch in Devices › Transfers. It is in internal TestFlight builds from 0.1.0
+(40) and has unit tests, but it hasn't yet been checked on a real Lock Screen or Dynamic Island. It only reflects what the app sees while it runs; it never keeps uploads alive.
 
 ## Simulator
 
