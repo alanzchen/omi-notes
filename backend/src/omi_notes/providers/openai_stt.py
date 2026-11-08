@@ -439,34 +439,6 @@ def split_request(request: SttRequest, max_seconds: float, min_seconds: float = 
     return _pieces(request, pcm, [cut for cut, _ in points])
 
 
-_WORD = re.compile(r"[\w']+")
-
-
-def dedupe_seam(prev: str, nxt: str, max_words: int = 12) -> str:
-    """`nxt` without the words it repeats from the end of `prev` (both requests heard the overlap at a
-    forced cut), only when exactly one alignment fits: the responses carry no word timings, so with
-    repeats ("Go now. Go now." | "Go now. Go now. Then stop.") which occurrence was in the overlap is
-    unknown, and every word is kept. A duplicate at a seam beats lost speech. The one alignment needs
-    two words, or one of at least four letters, to be trusted."""
-    def norm(text: str) -> list[str]:
-        return [w.lower() for w in _WORD.findall(text)]
-
-    tail = norm(prev)[-max_words:]
-    tokens = nxt.split()
-    heads = [norm(t) for t in tokens]
-    flat = [(i, w) for i, ws in enumerate(heads) for w in ws]
-    fits = [k for k in range(1, min(len(tail), len(flat), max_words) + 1) if tail[-k:] == [w for _, w in flat[:k]]]
-    if len(fits) != 1:
-        return nxt  # nothing shared, or ambiguous: keep it all
-    k = fits[0]
-    if k < 2 and len(tail[-1]) < 4:
-        return nxt
-    last_token = flat[k - 1][0]
-    if len(heads[last_token]) > sum(1 for i, _ in flat[:k] if i == last_token):
-        return nxt  # the match would split a token
-    return " ".join(tokens[last_token + 1 :])
-
-
 def pad_short(request: SttRequest, min_seconds: float = MIN_PART_SECONDS) -> SttRequest:
     """The request to send: shorter than the service accepts → its samples followed by silence (the
     caller keeps the real duration for timing)."""

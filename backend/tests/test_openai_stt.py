@@ -475,7 +475,7 @@ def test_a_failed_transcription_logs_its_status_ray_and_response_head(caplog):
 
 # -- split window (Alan: "a sentence cut in two is bad"; split-window-20261108) --------------------
 
-from omi_notes.providers.openai_stt import dedupe_seam, split_points  # noqa: E402
+from omi_notes.providers.openai_stt import split_points  # noqa: E402
 
 
 def speech_with_quiet_runs(seconds: float, quiet: list[tuple[float, float]]) -> SttRequest:
@@ -496,18 +496,3 @@ def test_a_cut_with_no_pause_at_all_is_marked_forced():
     req = speech_with_quiet_runs(50, [])
     (cut, forced), *_ = split_points(req, max_seconds=30)
     assert forced and 27 <= cut <= 30
-
-
-@pytest.mark.parametrize("prev, nxt, expected", [
-    ("I'm going to put...", "To put the sales to size.", "the sales to size."),
-    ("you wanted to visualize. So, for example.", "So, for example, here, this big box.", "here, this big box."),
-    ("losing money on those orange ones.", "On those orange ones. All right.", "All right."),
-    ("We went to the", "the store.", "the store."),  # one short common word: not trusted as overlap
-    ("Completely different.", "Nothing shared here.", "Nothing shared here."),
-    # ASTRA-IT1-01: more than one alignment fits (repeats): keep every word, a duplicate beats a loss
-    ("Go now. Go now.", "Go now. Go now. Then stop.", "Go now. Go now. Then stop."),
-    ("Stop stop.", "Stop stop stop now.", "Stop stop stop now."),
-    ("We said yes, yes.", "Yes, yes, yes, we did.", "Yes, yes, yes, we did."),
-])  # fmt: skip
-def test_the_overlap_at_a_forced_seam_is_said_once(prev, nxt, expected):
-    assert dedupe_seam(prev, nxt) == expected

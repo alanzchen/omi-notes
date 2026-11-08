@@ -164,9 +164,10 @@ def test_the_incident_conversation_transcribes_every_sample_once(tmp_path):
     np.testing.assert_array_equal(np.concatenate(seen), assembled.pcm)
 
 
-def test_a_forced_cut_overlaps_the_audio_and_says_the_seam_once(tmp_path, monkeypatch):
-    """No pause anywhere near the limit: the next request starts 1.5 s early, and the words both
-    requests heard are kept once; times stay contiguous and within the window."""
+def test_a_forced_cut_overlaps_the_audio_and_keeps_both_answers(tmp_path, monkeypatch):
+    """No pause anywhere near the limit: the next request starts 1.5 s early (a word cut at the seam is
+    heard whole by one of them). Nothing is removed from either answer (ASTRA-IT3-01): a phrase from
+    the overlap may appear twice, but no speech is lost. Times stay contiguous and within the window."""
     from omi_notes.pipeline import turn_transcription as tt
 
     seconds = 50
@@ -185,7 +186,8 @@ def test_a_forced_cut_overlaps_the_audio_and_says_the_seam_once(tmp_path, monkey
     np.testing.assert_array_equal(second[:lead], first[-lead:])  # the overlap is real audio, sent twice
     np.testing.assert_array_equal(np.concatenate([first, second[lead:]]), pcm)
     utts = result["results"]["utterances"]
-    assert [u["transcript"] for u in utts] == ["I'm going to put...", "the sales to size."]
+    # no word timings tie the repeated words to the shared audio: both answers are kept whole
+    assert [u["transcript"] for u in utts] == ["I'm going to put...", "To put the sales to size."]
     assert utts[0]["end"] == utts[1]["start"] and utts[-1]["end"] == seconds
 
 
@@ -207,3 +209,32 @@ def test_repeated_words_at_a_forced_seam_are_never_dropped(tmp_path, first, seco
     result = transcribe_windows(provider, assembled, SttRequest(assembled.flac(), seconds, [(0, seconds)], "en", []),
                                 [Turn(0, seconds, 1)], tmp_path / "stt.json")
     assert len(calls) == 2 and [u["transcript"] for u in result["results"]["utterances"]] == [first, second]
+
+
+
+def run_seams(tmp_path, texts, seconds=50):
+    pcm = np.random.default_rng(5).normal(0, 3000, seconds * 16000).astype(np.int16)
+    assembled = ConversationAudio(pcm, [MapSegment(0, 0, seconds)], [(0, seconds)], [])
+    calls = []
+    def handler(req):
+        calls.append(req)
+        return httpx.Response(200, json={"text": texts[len(calls) - 1]})
+    provider = OpenAICompatStt("https://example.test/v1", "", "gpt-transcribe", style="json",
+                               transport=httpx.MockTransport(handler), max_request_seconds=30)
+    result = transcribe_windows(provider, assembled, SttRequest(assembled.flac(), seconds, [(0, seconds)], "en", []),
+                                [Turn(0, seconds, 1)], tmp_path / "stt.json")
+    return [u["transcript"] for u in result["results"]["utterances"]], len(calls)
+
+
+def test_an_empty_middle_part_never_lets_a_later_part_lose_words(tmp_path):
+    """ASTRA-IT3-01: requests 0-28.5, 27-57, 55.5-80 s; the first and third share no samples, yet the
+    third lost "Keep going." when the empty middle answer left the first one as its seam context."""
+    texts, calls = run_seams(tmp_path, ["Keep going.", "", "Keep going. Then stop."], seconds=80)
+    assert calls == 3 and [t for t in texts if t] == ["Keep going.", "Keep going. Then stop."]
+
+
+def test_a_unique_textual_match_is_no_proof_of_overlap(tmp_path):
+    """ASTRA-IT3-01: the shared 1.5 s may hold no words; a genuine repeat spoken outside it (here at 10
+    and 35 s) must stay, even when it is the only suffix/prefix match."""
+    texts, calls = run_seams(tmp_path, ["Keep going.", "Keep going. Then stop."])
+    assert calls == 2 and texts == ["Keep going.", "Keep going. Then stop."]
