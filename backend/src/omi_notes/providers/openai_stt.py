@@ -25,7 +25,6 @@ namespaced per piece and the result records how many pieces there were.
 
 from __future__ import annotations
 
-import hashlib
 import io
 import logging
 import math
@@ -48,10 +47,6 @@ SAMPLE_RATE = 16000
 # No outbound request is shorter than this: the service rejects audio under 0.1 s (the configured
 # proxy answered 502, then upstream 500, for a 38 ms silent piece; transcribe502-20261108).
 MIN_PART_SECONDS = 0.25
-# The same audio failing with a fast 5xx this many times, while other requests succeed, is a
-# rejection of that audio rather than an outage.
-FAST_FAILURE_SECONDS = 5.0
-FAST_FAILURES_TO_GIVE_UP = 3
 MAX_CONTEXT_BIAS = 100
 # Known per-request limits (seconds). OpenAI's diarize model tops out around 1400 s (community
 # reports); 1200 s also keeps 16 kHz FLAC under its 25 MB upload cap. Together's upload cap is 80 MB.
@@ -112,9 +107,6 @@ class OpenAICompatStt:
         self.style: Style = resolve_style(base_url, model, style)
         self.max_seconds = default_max_seconds(self.style, base_url) if max_request_seconds is None else max_request_seconds
         self._context_bias = True
-        self._successes = 0
-        # audio digest → (fast 5xx count, successes seen before the first of them)
-        self._fast_failures: dict[str, tuple[int, int]] = {}
         self._client = httpx.Client(timeout=httpx.Timeout(timeout, connect=15.0), transport=transport)
 
     @property
@@ -227,8 +219,6 @@ class OpenAICompatStt:
             raise ProviderError(f"transcription auth error (HTTP {status}): {detail}", terminal=True, kind="auth")
         if status == 402:
             raise ProviderError(f"transcription billing error: {detail}", terminal=True, kind="billing")
-        if status >= 500 and seconds < FAST_FAILURE_SECONDS:
-            self._fast_failure(request, status, seconds)
         if status in (408, 409, 429) or status >= 500:
             raise ProviderError(f"transcription HTTP {status}: {detail}", kind="transient")
         if status >= 400:
@@ -239,23 +229,7 @@ class OpenAICompatStt:
             raise ProviderError(f"transcription server returned no JSON: {detail}", kind="transient") from exc
         if not isinstance(data, dict):
             raise ProviderError("transcription response is not a JSON object", kind="transient")
-        self._successes += 1
-        self._fast_failures.pop(_digest(request), None)
         return data
-
-    def _fast_failure(self, request: SttRequest, status: int, seconds: float) -> None:
-        """Counts a fast 5xx for this exact audio; gives up on it once it keeps failing while other
-        requests succeed (an outage fails everything, so it stays transient)."""
-        key = _digest(request)
-        count, before = self._fast_failures.get(key, (0, self._successes))
-        count += 1
-        self._fast_failures[key] = (count, before)
-        if count >= FAST_FAILURES_TO_GIVE_UP and self._successes > before:
-            raise ProviderError(
-                f"the transcription service rejected this audio ({request.duration:.2f} s): HTTP {status} within "
-                f"{seconds:.1f} s on {count} attempts while other requests succeeded; retrying it unchanged won't help",
-                terminal=True, kind="request",
-            )
 
 
 # -- response normalization ------------------------------------------------------------------------
@@ -470,7 +444,10 @@ _WORD = re.compile(r"[\w']+")
 
 def dedupe_seam(prev: str, nxt: str, max_words: int = 12) -> str:
     """`nxt` without the words it repeats from the end of `prev` (both requests heard the overlap at a
-    forced cut). Needs two matching words, or one of at least four letters, to trust the match."""
+    forced cut), only when exactly one alignment fits: the responses carry no word timings, so with
+    repeats ("Go now. Go now." | "Go now. Go now. Then stop.") which occurrence was in the overlap is
+    unknown, and every word is kept. A duplicate at a seam beats lost speech. The one alignment needs
+    two words, or one of at least four letters, to be trusted."""
     def norm(text: str) -> list[str]:
         return [w.lower() for w in _WORD.findall(text)]
 
@@ -478,13 +455,16 @@ def dedupe_seam(prev: str, nxt: str, max_words: int = 12) -> str:
     tokens = nxt.split()
     heads = [norm(t) for t in tokens]
     flat = [(i, w) for i, ws in enumerate(heads) for w in ws]
-    for k in range(min(len(tail), len(flat), max_words), 0, -1):
-        if tail[-k:] == [w for _, w in flat[:k]] and (k >= 2 or len(tail[-1]) >= 4):
-            last_token = flat[k - 1][0]
-            if len(heads[last_token]) > sum(1 for i, _ in flat[:k] if i == last_token):
-                continue  # the match would split a token
-            return " ".join(tokens[last_token + 1 :])
-    return nxt
+    fits = [k for k in range(1, min(len(tail), len(flat), max_words) + 1) if tail[-k:] == [w for _, w in flat[:k]]]
+    if len(fits) != 1:
+        return nxt  # nothing shared, or ambiguous: keep it all
+    k = fits[0]
+    if k < 2 and len(tail[-1]) < 4:
+        return nxt
+    last_token = flat[k - 1][0]
+    if len(heads[last_token]) > sum(1 for i, _ in flat[:k] if i == last_token):
+        return nxt  # the match would split a token
+    return " ".join(tokens[last_token + 1 :])
 
 
 def pad_short(request: SttRequest, min_seconds: float = MIN_PART_SECONDS) -> SttRequest:
@@ -495,10 +475,6 @@ def pad_short(request: SttRequest, min_seconds: float = MIN_PART_SECONDS) -> Stt
     pcm = sf.read(io.BytesIO(request.flac), dtype="int16")[0]
     padded = np.concatenate([pcm, np.zeros(max(0, round(min_seconds * SAMPLE_RATE) - len(pcm)), np.int16)])
     return SttRequest(_flac(padded), len(padded) / SAMPLE_RATE, request.blocks, request.language, request.keyterms)
-
-
-def _digest(request: SttRequest) -> str:
-    return hashlib.sha256(request.flac).hexdigest()[:16]
 
 
 def halve_request(request: SttRequest) -> list[tuple[float, SttRequest]]:

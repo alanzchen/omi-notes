@@ -433,25 +433,25 @@ def test_any_geometry_splits_within_bounds_and_keeps_every_sample(seed):
     assert total == round(req.duration * SR)
 
 
-def test_a_part_the_service_keeps_failing_fast_becomes_permanent_with_a_reason():
-    """The upstream answered 500 within ~0.3 s for one part, every attempt, while other requests
-    succeeded: that is a rejection of this audio, not an outage."""
-    bad, good = audio_with_blocks([1.0]), audio_with_blocks([2.0])
+def test_fast_5xx_after_another_success_stays_transient():
+    """ASTRA-IT1-02: 502(A), 200(B), 503(A), 503(A) was called a permanent rejection of A, and the next
+    A succeeded. Other requests succeeding is no evidence against this audio: 5xx stays transient
+    (the worker's bounded retries decide), and nothing claims the audio is bad."""
+    statuses = iter([502, 200, 503, 503, 200])
 
     def handler(request, n):
-        if sent_seconds(request) < 1.5:
-            return httpx.Response(502, text="<!DOCTYPE html>", headers={"cf-ray": "8f00-DFW"})
-        return httpx.Response(200, json={"text": "fine"})
+        status = next(statuses)
+        return httpx.Response(status, json={"text": "synthetic"} if status == 200 else {"error": "temporary outage"})
 
     provider, _ = stt("https://example.test/v1", "gpt-transcribe", handler, style="json")
-    errors = []
-    for _ in range(3):
+    a, b = audio_with_blocks([1.0]), audio_with_blocks([2.0])
+    for i in range(3):
         with pytest.raises(ProviderError) as info:
-            provider.transcribe(bad)
-        errors.append(info.value)
-        provider.transcribe(good)
-    assert [e.terminal for e in errors] == [False, False, True]
-    assert "this audio" in str(errors[-1]) and errors[-1].kind == "request"
+            provider.transcribe(a)
+        assert not info.value.terminal and info.value.kind == "transient" and "this audio" not in str(info.value)
+        if i == 0:
+            provider.transcribe(b)
+    assert provider.transcribe(a)["results"]["utterances"][0]["transcript"] == "synthetic"
 
 
 def test_fast_failures_during_an_outage_stay_transient():
@@ -504,6 +504,10 @@ def test_a_cut_with_no_pause_at_all_is_marked_forced():
     ("losing money on those orange ones.", "On those orange ones. All right.", "All right."),
     ("We went to the", "the store.", "the store."),  # one short common word: not trusted as overlap
     ("Completely different.", "Nothing shared here.", "Nothing shared here."),
+    # ASTRA-IT1-01: more than one alignment fits (repeats): keep every word, a duplicate beats a loss
+    ("Go now. Go now.", "Go now. Go now. Then stop.", "Go now. Go now. Then stop."),
+    ("Stop stop.", "Stop stop stop now.", "Stop stop stop now."),
+    ("We said yes, yes.", "Yes, yes, yes, we did.", "Yes, yes, yes, we did."),
 ])  # fmt: skip
 def test_the_overlap_at_a_forced_seam_is_said_once(prev, nxt, expected):
     assert dedupe_seam(prev, nxt) == expected

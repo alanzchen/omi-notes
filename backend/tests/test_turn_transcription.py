@@ -187,3 +187,23 @@ def test_a_forced_cut_overlaps_the_audio_and_says_the_seam_once(tmp_path, monkey
     utts = result["results"]["utterances"]
     assert [u["transcript"] for u in utts] == ["I'm going to put...", "the sales to size."]
     assert utts[0]["end"] == utts[1]["start"] and utts[-1]["end"] == seconds
+
+
+@pytest.mark.parametrize("first, second", [
+    ("Go now. Go now.", "Go now. Go now. Then stop."),     # a repeated phrase (ASTRA-IT1-01)
+    ("Stop stop.", "Stop stop stop now."),                  # a repeated single word
+])  # fmt: skip
+def test_repeated_words_at_a_forced_seam_are_never_dropped(tmp_path, first, second):
+    """Without word timings, which repeat lies in the overlap is unknown: every word is kept."""
+    seconds = 50
+    pcm = np.random.default_rng(5).normal(0, 3000, seconds * 16000).astype(np.int16)
+    assembled = ConversationAudio(pcm, [MapSegment(0, 0, seconds)], [(0, seconds)], [])
+    calls = []
+    def handler(req):
+        calls.append(req)
+        return httpx.Response(200, json={"text": first if len(calls) == 1 else second})
+    provider = OpenAICompatStt("https://example.test/v1", "", "gpt-transcribe", style="json",
+                               transport=httpx.MockTransport(handler), max_request_seconds=30)
+    result = transcribe_windows(provider, assembled, SttRequest(assembled.flac(), seconds, [(0, seconds)], "en", []),
+                                [Turn(0, seconds, 1)], tmp_path / "stt.json")
+    assert len(calls) == 2 and [u["transcript"] for u in result["results"]["utterances"]] == [first, second]
