@@ -238,3 +238,57 @@ def test_a_unique_textual_match_is_no_proof_of_overlap(tmp_path):
     and 35 s) must stay, even when it is the only suffix/prefix match."""
     texts, calls = run_seams(tmp_path, ["Keep going.", "Keep going. Then stop."])
     assert calls == 2 and texts == ["Keep going.", "Keep going. Then stop."]
+
+
+def test_a_retry_rebuilds_an_assembly_made_by_the_seam_trimmer_without_new_stt_calls(tmp_path, monkeypatch):
+    """ASTRA-IT5-02: the whole-conversation result is cached under a name that didn't change when the
+    seam trimming was removed, so a Retry of a conversation transcribed by 4da7a0c reused the trimmed
+    text. The assembly now has its own version: the result is rebuilt from the cached per-window
+    answers (no new transcription calls), and no note is rewritten until something asks."""
+    import json
+
+    from omi_notes.pipeline import conversations, turn_transcription
+
+    from .helpers import T0, convs, replay
+    from .test_retry import retry
+    from .test_speakers import SPEECH, NoTurnsDiarizer, pipeline
+
+    settings, client, worker = pipeline(tmp_path, stt_diarization="local")
+    pcm = np.random.default_rng(5).normal(0, 3000, 80 * 16000).astype(np.int16)
+    audio = ConversationAudio(pcm, [MapSegment(0, 0, 80)], [(0, 80)], [])
+    monkeypatch.setattr(worker.pipeline, "conversation_audio", lambda row: audio)
+    worker.providers._diarizer = NoTurnsDiarizer()
+    texts = iter(["Keep going.", "", "Keep going. Then stop."])
+    calls = []
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={"text": next(texts)})
+    worker.providers._stt = OpenAICompatStt("https://example.test/v1", "", "gpt-transcribe", style="json",
+                                            max_request_seconds=30, transport=httpx.MockTransport(handler))
+    real = turn_transcription.transcribe_windows
+
+    def trimmer(*args, **kwargs):  # what 4da7a0c's assembler produced: the third answer lost "Keep going."
+        result = real(*args, **kwargs)
+        for u in result["results"]["utterances"]:
+            if u["transcript"] == "Keep going. Then stop.":
+                u["transcript"] = "Then stop."
+        return result
+
+    replay(client, SPEECH)
+    with monkeypatch.context() as m:
+        m.setattr(conversations, "transcribe_windows", trimmer)
+        m.setattr(conversations, "WINDOW_ASSEMBLY_FORMAT", 1)  # the name that assembler wrote under
+        worker.tick(T0 + 200)
+    (row,) = convs(worker)
+    assert row["status"] == "failed" and row["error_kind"] == "speakers_unknown" and len(calls) == 3
+    folder = worker.pipeline.conv_dir(row["id"])
+
+    def assembled():
+        return [json.loads(f.read_text()) for f in folder.glob("stt-*.json") if "created_at" in json.loads(f.read_text())]
+
+    assert [[u["transcript"] for u in a["response"]["results"]["utterances"]] for a in assembled()] == [["Keep going.", "Then stop."]]
+    assert retry(client, row["id"]).status_code == 202
+    worker.tick(T0 + 300)
+    texts_now = [[u["transcript"] for u in a["response"]["results"]["utterances"]] for a in assembled()]
+    assert ["Keep going.", "Keep going. Then stop."] in [[t for t in ts if t] for ts in texts_now], texts_now
+    assert len(calls) == 3, "rebuilt from the cached per-window answers"

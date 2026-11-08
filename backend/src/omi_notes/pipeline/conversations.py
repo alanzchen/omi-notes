@@ -66,6 +66,7 @@ from .segmenter import RingCapture, ring_resolved_until
 from .speakers import SpeakerResult, resolve_speakers
 from . import sources
 from .transcript import ConversationAudio, assemble, detected_language, merge_same_speaker, segments_from_deepgram
+from .turn_transcription import ASSEMBLY_FORMAT as WINDOW_ASSEMBLY_FORMAT
 from .turn_transcription import CACHE_FORMAT as WINDOW_CACHE_FORMAT
 from .turn_transcription import transcribe_windows
 
@@ -497,7 +498,8 @@ class ConversationPipeline:
         if windowed:
             # the whole-conversation response depends on the windowing version and the vocabulary sent too
             keyterms = sha256_hex(canonical_json(list(self.settings.keyterms)).encode())[:8]
-            tag += f"-{_slug(self.providers.diarizer.tag)}-w{WINDOW_CACHE_FORMAT}-k{keyterms}"
+            assembly = f"a{WINDOW_ASSEMBLY_FORMAT}" if WINDOW_ASSEMBLY_FORMAT > 1 else ""
+            tag += f"-{_slug(self.providers.diarizer.tag)}-w{WINDOW_CACHE_FORMAT}{assembly}-k{keyterms}"
         base = f"stt-{stt.name}{tag}-{_slug(stt.model)}-{_slug(self.settings.stt_language)}-{audio_sha[:16]}"
         conv_dir = self.conv_dir(conv_id)
         name = _reusable(conv_dir, base, row["stt_ref"], row["skip_stt"])
@@ -508,7 +510,12 @@ class ConversationPipeline:
             request = SttRequest(flac=audio.flac(), duration=audio.duration, blocks=audio.blocks_out,
                                  language=self.settings.stt_language, keyterms=self.settings.keyterms)
             window_turns = [Turn(0.0, audio.duration, 0)] if unlabeled else turns
-            response = transcribe_windows(stt, audio, request, window_turns, path) if windowed else stt.transcribe(request)
+            if windowed:
+                # per-window answers are named without the assembly version: a new assembly reuses them
+                windows_path = path.with_name(path.name.replace(f"-w{WINDOW_CACHE_FORMAT}{assembly}-", f"-w{WINDOW_CACHE_FORMAT}-", 1))
+                response = transcribe_windows(stt, audio, request, window_turns, windows_path)
+            else:
+                response = stt.transcribe(request)
             cached = {"created_at": now, "provider": stt.name, "model": stt.model, "response": response}
             atomic_write_bytes(path, json.dumps(cached).encode())
         if unlabeled:

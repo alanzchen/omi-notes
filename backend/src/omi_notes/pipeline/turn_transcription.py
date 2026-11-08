@@ -41,6 +41,11 @@ MIN_REQUEST_SECONDS = MIN_PART_SECONDS
 # beats a phrase lost (ASTRA-IT3-01). Times stay at the cut.
 OVERLAP_SECONDS = 1.5
 CACHE_FORMAT = 2
+# How window answers are put together into the conversation's result (part of that result's cache
+# name, not of the per-window caches, so a new version rebuilds the result from cached answers without
+# asking the provider again). 1 trimmed repeated words at forced seams (4da7a0c, until db8fdc4);
+# 2 keeps every answer whole.
+ASSEMBLY_FORMAT = 2
 
 
 def _padded(piece: SttRequest) -> tuple[SttRequest, np.ndarray]:
