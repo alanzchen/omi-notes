@@ -823,14 +823,15 @@ class ConversationPipeline:
         if embedder is None:
             return {}
         try:  # a hint is never worth failing a note for
-            models = self.speakers.models(embedder.model, embedder.model_sha, self.operating)
+            space = self.voice_space(embedder)
             voices = self.speakers.voices_of_labels(conv_id, transcript_sha)
-            if not models or not voices:
+            if space is None or not voices:
                 return {}
+            background, centroids = space
             # only voices made by the model the people's samples are in: other vectors aren't comparable
             vectors = {label: v.vector for label, v in voices.items()
                        if getattr(v, "vector", None) is not None and getattr(v, "model_sha", None) == embedder.model_sha}  # fmt: skip
-            found = possible_names(vectors, self.speakers.labels(conv_id), models, threshold=self.operating.threshold)
+            found = possible_names(vectors, self.speakers.labels(conv_id), centroids, background=background)
             people = {r["id"]: (r["name"], bool(r["me"])) for r in self.speakers.people()}
             return {label: people[pid] for label, pid in found.items() if pid in people}
         except Exception:
@@ -886,6 +887,19 @@ class ConversationPipeline:
                                      "url": self.settings.stt_local_url,
                                      "check": "sidecar/asr/scripts/launchagent.sh status; ~/Library/Logs/omi-notes-asr.log"})  # fmt: skip
             self.db.set_meta("local_stt_alerted", repr(now))
+
+    def voice_space(self, embedder) -> tuple[np.ndarray, dict[str, np.ndarray]] | None:
+        """(background, person → centred centroid) for comparing voices with people (`speakers.space`), or None
+        without enough stored voices or any samples."""
+        from ..speakers.space import centred_centroids
+
+        background = self._background_voice("", embedder)
+        samples: dict[str, list[np.ndarray]] = {}
+        for sample in self.speakers.samples(embedder.model, embedder.model_sha):
+            samples.setdefault(sample.person_id, []).append(sample.vector)
+        if background is None or not samples:
+            return None
+        return background, centred_centroids(samples, background)
 
     def _background_voice(self, conv_id: str, embedder) -> np.ndarray | None:
         """The mean of other conversations' stored voices (same model): what every voice recorded here shares."""
@@ -1615,15 +1629,17 @@ def _slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9.]+", "-", value).strip("-") or "x"
 
 
-POSSIBLE_SLACK = 0.15  # cosine distance beyond the naming threshold still worth a "possibly" hint
+HINT_SCORE = 0.40  # centred cosine to a person's centroid worth a "possibly" hint (their own voice: ~0.5-0.8)
+HINT_GAP = 0.20  # ... and this much above the next person
 
 
-def possible_names(voices: dict[str, np.ndarray], states: dict[str, dict], models: dict, *, threshold: float,
-                   slack: float = POSSIBLE_SLACK) -> dict[str, str]:  # fmt: skip
-    """label → person id for unnamed labels close to a person (distance < threshold + slack) without a
-    confident match: per person only the closest such label, and nobody already named in this conversation
-    or ruled out for that label ("not X", kept unknown). A guess shown as a guess, never a name."""
-    from ..speakers.voices import cosine_distance
+def possible_names(voices: dict[str, np.ndarray], states: dict[str, dict], centroids: dict[str, np.ndarray], *,
+                   background: np.ndarray, min_score: float = HINT_SCORE, gap: float = HINT_GAP) -> dict[str, str]:  # fmt: skip
+    """label → person id for unnamed labels whose voice clearly resembles one person in the centred space
+    (`speakers.space`): the nearest person, at least `min_score`, `gap` above the next; per person only the
+    closest such label, and nobody already named in this conversation or ruled out for that label ("not X",
+    kept unknown). A guess shown as a guess, never a name."""
+    from ..speakers.space import score
 
     named = {s.get("person_id") for s in states.values() if s.get("person_id")}
     best: dict[str, tuple[float, str]] = {}
@@ -1631,14 +1647,14 @@ def possible_names(voices: dict[str, np.ndarray], states: dict[str, dict], model
         state = states.get(label) or {}
         if state.get("person_id") or state.get("source") == "unknown" or label == "unknown":
             continue
-        scored = sorted((cosine_distance(vector, m.centroid), pid) for pid, m in models.items() if m.centroid is not None)
-        if not scored or scored[0][0] >= threshold + slack:
+        scored = sorted(((score(vector, c, background), pid) for pid, c in centroids.items()), reverse=True)
+        if not scored or scored[0][0] < min_score or (len(scored) > 1 and scored[0][0] - scored[1][0] < gap):
             continue
-        distance, pid = scored[0]  # the nearest of everyone; if that one is ruled out, no guess (not the runner-up)
+        value, pid = scored[0]  # the nearest of everyone; if that one is ruled out, no guess (not the runner-up)
         if pid in named or pid in set(state.get("not") or []):
             continue
-        if pid not in best or distance < best[pid][0]:
-            best[pid] = (distance, label)
+        if pid not in best or value > best[pid][0]:
+            best[pid] = (value, label)
     return {label: pid for pid, (_, label) in best.items()}
 
 

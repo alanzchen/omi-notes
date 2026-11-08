@@ -530,16 +530,13 @@ def test_the_summary_is_told_who_a_speaker_may_be():
 
 def test_possible_names_go_to_the_closest_unnamed_label_of_a_known_voice_only():
     from omi_notes.pipeline.conversations import possible_names
-    from omi_notes.speakers.match import PersonModel
 
-    alan = np.eye(8)[0]
-    models = {"p-alan": PersonModel("p-alan", alan), "p-priya": PersonModel("p-priya", np.eye(8)[1])}
-    near = alan * 0.8 + np.eye(8)[2] * 0.6  # cosine 0.8 to Alan: not a confident match, a likely one
-    nearer = alan * 0.9 + np.eye(8)[2] * 0.44
-    voices = {"S1": nearer, "S2": near, "S3": np.eye(8)[5]}
-    out = possible_names(voices, {}, models, threshold=0.5, slack=0.15)
+    background = np.eye(8)[0]
+    cents = {"p-alan": np.eye(8)[1], "p-priya": np.eye(8)[2]}
+    voices = {"S1": background * 2 + np.eye(8)[1], "S2": background * 2 + np.eye(8)[1] + 0.3 * np.eye(8)[3], "S3": background * 2 + np.eye(8)[5]}
+    out = possible_names(voices, {}, cents, background=background)
     assert out == {"S1": "p-alan"}, "the closest unnamed label only; an unlike voice gets nothing"
-    assert possible_names(voices, {"S4": {"person_id": "p-alan"}}, models, threshold=0.5, slack=0.15) == {}, "already named here"
+    assert possible_names(voices, {"S4": {"person_id": "p-alan"}}, cents, background=background) == {}, "already named here"
 
 
 def utt(a, b, speaker, text="x"):
@@ -602,10 +599,10 @@ def test_engine_deaths_count_once_the_engine_worked_for_others_even_in_one_batch
 
 def test_a_possible_name_is_withheld_when_the_nearest_person_is_already_named():
     from omi_notes.pipeline.conversations import possible_names
-    from omi_notes.speakers.match import PersonModel
 
-    models = {"p-alan": PersonModel("p-alan", np.eye(8)[0]), "p-priya": PersonModel("p-priya", np.eye(8)[0] * 0.6 + np.eye(8)[1] * 0.8)}
-    out = possible_names({"S2": np.eye(8)[0]}, {"S1": {"person_id": "p-alan"}}, models, threshold=0.5, slack=0.15)
+    background = np.eye(8)[0]
+    cents = {"p-alan": np.eye(8)[1], "p-priya": np.eye(8)[2]}
+    out = possible_names({"S2": background * 2 + np.eye(8)[1]}, {"S1": {"person_id": "p-alan"}}, cents, background=background)
     assert out == {}, "the voice is Alan's: not suggested as the runner-up"
 
 
@@ -670,3 +667,26 @@ def test_a_phrase_counts_as_already_there_only_when_its_words_are():
     assert _covered({"start": 10.0, "end": 12.0, "transcript": "open the door"}, [left])
     assert _covered({"start": 1.0, "end": 2.0, "transcript": "开门"}, [{"start": 0.5, "end": 2.5, "transcript": "请不要开门。"}])
     assert not _covered({"start": 1.0, "end": 2.0, "transcript": "不要开门"}, [{"start": 0.5, "end": 2.5, "transcript": "请开门"}])
+
+
+def test_hints_compare_voices_after_removing_what_every_recording_shares():
+    from omi_notes.speakers.space import centred_centroids, score
+
+    common = np.eye(16)[0] * 3.0  # every voice from this microphone shares this part
+    alan = [common + np.eye(16)[1] + 0.1 * np.eye(16)[k] for k in range(4, 9)]
+    gigi = [common + np.eye(16)[2] + 0.1 * np.eye(16)[k] for k in range(4, 9)]
+    gigi.append(common + np.eye(16)[1])  # one of her samples is really Alan (a mislabel): the median ignores it
+    background = np.eye(16)[0]
+    cents = centred_centroids({"alan": alan, "gigi": gigi}, background)
+    voice = common + np.eye(16)[1] + 0.05 * np.eye(16)[9]
+    assert score(voice, cents["alan"], background) > 0.8 > score(voice, cents["gigi"], background) + 0.5
+
+
+def test_possible_names_use_the_centred_space_and_need_a_clear_winner():
+    from omi_notes.pipeline.conversations import possible_names
+
+    background = np.eye(8)[0]
+    cents = {"p-alan": np.eye(8)[1], "p-gigi": np.eye(8)[2]}
+    voices = {"S1": np.eye(8)[0] * 3 + np.eye(8)[1], "S2": np.eye(8)[0] * 3 + 0.5 * np.eye(8)[1] + 0.5 * np.eye(8)[2]}
+    out = possible_names(voices, {}, cents, background=background)
+    assert out == {"S1": "p-alan"}, "S2 is as much Gigi as Alan: no guess"
