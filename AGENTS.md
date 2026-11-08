@@ -96,7 +96,7 @@ each release. Reuse the existing app, signing assets, API key and tester group w
 | Upload configuration | `~/.appstoreconnect/omi-notes-upload.json` (`key_id`, `issuer_id`, `key_path`, `app_id`) |
 | Private API key | `~/.appstoreconnect/private_keys/AuthKey_<key_id>.p8`, file mode `0600`; role is **Developer** |
 | Internal Testing group | `b442156a-468f-491b-923c-489bd9548859` |
-| Last verified release | `0.1.0 (41)` (2026-11-07, from `43e4465`; Live Activity since 40), `VALID`, `IN_BETA_TESTING`; query Apple for the next build number |
+| Last verified release | `0.1.0 (42)` (2026-11-07, from `47420ba`; Live Activity since 40), `VALID`, `IN_BETA_TESTING`; query Apple for the next build number |
 
 **Use `ios/Tools/testflight.sh` (manual local signing, one profile per target).** It archives a
 clean `git archive` copy of HEAD (no `Local.xcconfig`, no uncommitted changes), passes
@@ -166,7 +166,7 @@ settings before changing it; repository defaults are not the deployed configurat
 | Index base | `/Users/alan/Library/Application Support/omi-notes/index/production` |
 | Locks | `/Users/alan/Library/Application Support/omi-notes/locks` |
 | Release root | `/Users/alan/.local/share/omi-notes/releases/` |
-| Current backend | release `20261009-181222-8aaddea` (source = commit `8aaddea`; index schema 8; prompt v3), live since 2026-10-09 18:13 CDT. The vault is format 3 since the phone keeps of 2026-10-09 16:46 CDT. The first phone keep raises the vault to format 3 (releases at or after `a8c74d2` start), the first "keep unknown" of a voice to format 4 (only releases at or after `843248c` start); roll back only to a release that reads the vault's current format. The `current` symlink may name an older release; the service plist's absolute path is what runs |
+| Current backend | release `20261107-222827-47420ba` (source = commit `47420ba`, Homebrew Python 3.13.18; index schema 8; prompt v3; adds `PUT /v1/diagnostics/phone-log`, phone logs in `~/Library/Application Support/omi-notes/index/logs/phone/`), live since 2026-11-07 22:32 CST; previous `20261016-140902-7c1e209` (`user-service.sh rollback`). The vault is format 3. The first phone keep raises the vault to format 3 (releases at or after `a8c74d2` start), the first "keep unknown" of a voice to format 4 (only releases at or after `843248c` start); roll back only to a release that reads the vault's current format. The `current` symlink may name an older release; the service plist's absolute path is what runs |
 | Service | User LaunchAgent `com.omi-notes.server` in `gui/504` (Alan's decision; switched 2026-10-03 11:29). The system daemon is retired: booted out, disabled, plist moved to `~/.config/omi-notes/system-daemon-retired/`. Check with `~/.config/omi-notes/user-service.sh status` |
 | Rotating log | `/Users/alan/Library/Application Support/omi-notes/index/logs/omi-notes.log` |
 
