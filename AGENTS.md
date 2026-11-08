@@ -96,7 +96,7 @@ each release. Reuse the existing app, signing assets, API key and tester group w
 | Upload configuration | `~/.appstoreconnect/omi-notes-upload.json` (`key_id`, `issuer_id`, `key_path`, `app_id`) |
 | Private API key | `~/.appstoreconnect/private_keys/AuthKey_<key_id>.p8`, file mode `0600`; role is **Developer** |
 | Internal Testing group | `b442156a-468f-491b-923c-489bd9548859` |
-| Last verified release | `0.1.0 (40)` (2026-11-07, from `0c5e9c5`, first with the Live Activity), `VALID`, `IN_BETA_TESTING`; query Apple for the next build number |
+| Last verified release | `0.1.0 (41)` (2026-11-07, from `43e4465`; Live Activity since 40), `VALID`, `IN_BETA_TESTING`; query Apple for the next build number |
 
 **Use `ios/Tools/testflight.sh` (manual local signing, one profile per target).** It archives a
 clean `git archive` copy of HEAD (no `Local.xcconfig`, no uncommitted changes), passes
