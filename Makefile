@@ -31,6 +31,6 @@ ios-build:
 	cd ios && xcodegen generate && xcodebuild -project OmiNotes.xcodeproj -scheme OmiNotes \
 		-destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
 
-# Needs ASC_KEY_ID / ASC_ISSUER_ID and an App Store Connect app record: see ios/Tools/testflight.sh
+# Manual per-target signing with existing profiles (TEAM_ID, OMI_BUILD_NUMBER, OMI_*_PROFILE): see ios/Tools/testflight.sh
 testflight:
 	ios/Tools/testflight.sh

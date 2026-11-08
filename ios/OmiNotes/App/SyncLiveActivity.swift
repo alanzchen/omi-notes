@@ -13,7 +13,7 @@ final class ActivityKitSyncHost: SyncActivityHost {
         send: { id, state, staleDate in await ActivityKitSyncHost.push(id, state, staleDate: staleDate) },
         finish: { id, final, ending in await ActivityKitSyncHost.finish(id, final, ending) })
 
-    var enabled: Bool { ActivityAuthorizationInfo().areActivitiesEnabled }
+    var enabled: Bool { SyncActivityCoordinator.available && ActivityAuthorizationInfo().areActivitiesEnabled }
 
     /// Running (active or stale) and ended-but-shown cards; dismissed ones are gone.
     func existing() -> [(id: String, running: Bool)] {
@@ -84,6 +84,8 @@ final class DefaultsSyncActivityMemory: SyncActivityMemory {
 @MainActor
 final class SyncActivityCoordinator {
     static let optOutKey = "omi.syncLiveActivityOff"
+    /// This build embeds the extension (Debug, for now). Otherwise nothing here runs.
+    static let available = SyncActivityAvailability.embedded(in: .main)
     private let host = ActivityKitSyncHost()
     private let controller: SyncActivityController
     private weak var model: AppModel?
@@ -93,10 +95,12 @@ final class SyncActivityCoordinator {
     init() {
         controller = SyncActivityController(host: host, memory: DefaultsSyncActivityMemory())
         host.onEnded = { [weak self] id, dismissed in self?.controller.ended(id, dismissed: dismissed) }
+        guard Self.available else { return }
         controller.adopt()  // after a relaunch: the one that exists, never a second
     }
 
     func refresh(_ model: AppModel, foreground: Bool) {
+        guard Self.available else { return }
         self.model = model
         self.foreground = foreground
         #if DEBUG

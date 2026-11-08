@@ -115,12 +115,14 @@ struct TransferDetailView: View {
                     watchSection(t.watch, now: context.date)
                     phoneSection(t.phone)
                     serverSection(t.server)
-                    header("Lock Screen")
-                    Card {
-                        Toggle("Show sync on the Lock Screen", isOn: Binding(get: { !lockScreenOff }, set: { lockScreenOff = !$0 }))
-                            .font(.subheadline).padding(.horizontal, 16).padding(.vertical, 8)
+                    if SyncActivityCoordinator.available {
+                        header("Lock Screen")
+                        Card {
+                            Toggle("Show sync on the Lock Screen", isOn: Binding(get: { !lockScreenOff }, set: { lockScreenOff = !$0 }))
+                                .font(.subheadline).padding(.horizontal, 16).padding(.vertical, 8)
+                        }
+                        note("While audio is waiting to reach your server, a Live Activity shows these stages. It updates while the app runs and is marked out of date otherwise; turning it off or dismissing it doesn't stop uploads.")
                     }
-                    note("While audio is waiting to reach your server, a Live Activity shows these stages. It updates while the app runs and is marked out of date otherwise; turning it off or dismissing it doesn't stop uploads.")
                     Text("Updated \(context.date.formatted(date: .omitted, time: .standard))")
                         .font(.caption).foregroundStyle(Pendant.secondary).padding(.horizontal, 4)
                 }

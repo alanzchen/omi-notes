@@ -46,6 +46,18 @@ extension SyncActivityState {
     }
 }
 
+/// Whether this build ships the Live Activity: the app declares `NSSupportsLiveActivities` and embeds
+/// the extension. A build without it (Release, for now) never touches ActivityKit or shows its switch.
+public enum SyncActivityAvailability {
+    public static let extensionName = "OmiNotesLiveActivity.appex"
+
+    public static func embedded(in bundle: Bundle) -> Bool {
+        guard bundle.object(forInfoDictionaryKey: "NSSupportsLiveActivities") as? Bool == true,
+              let plugIns = bundle.builtInPlugInsURL else { return false }
+        return FileManager.default.fileExists(atPath: plugIns.appendingPathComponent(extensionName).path)
+    }
+}
+
 /// How an ended activity leaves the Lock Screen.
 public enum SyncActivityEnding: Equatable, Sendable {
     case immediate

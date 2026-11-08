@@ -53,7 +53,11 @@ targets:
         PROVISIONING_PROFILE_SPECIFIER: $(OMI_IOS_PROFILE)
       configs:
         Debug:
-          INFOPLIST_PREPROCESSOR_DEFINITIONS: OMI_ALLOW_LOCAL_HTTP=1
+          # The sync Live Activity ships only in Debug until it has its own App ID and has passed
+          # Lock Screen acceptance; Release builds leave out the extension and this key.
+          INFOPLIST_PREPROCESSOR_DEFINITIONS: OMI_ALLOW_LOCAL_HTTP=1 OMI_LIVE_ACTIVITY=1
+        Release:
+          EXCLUDED_SOURCE_FILE_NAMES: OmiNotesLiveActivity.appex  # not embedded
   OmiNotesWatch:
     type: application
     platform: watchOS
@@ -148,6 +152,10 @@ targets:
         APPLICATION_EXTENSION_API_ONLY: YES
         TARGETED_DEVICE_FAMILY: "1"
         PROVISIONING_PROFILE_SPECIFIER: $(OMI_LIVE_ACTIVITY_PROFILE)
+      configs:
+        # not shipped yet (see the app's Release settings): built unsigned there and not embedded
+        Release:
+          CODE_SIGNING_ALLOWED: NO
 schemes:
   OmiNotes:
     build:

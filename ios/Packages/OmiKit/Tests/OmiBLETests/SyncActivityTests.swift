@@ -343,6 +343,30 @@ final class FakeMemory: SyncActivityMemory {
     }
 }
 
+/// A build ships the Live Activity only with both the Info.plist key and the embedded extension.
+@Suite struct SyncActivityAvailabilityTests {
+    func bundle(key: Bool?, appex: Bool) throws -> Bundle {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-avail-\(UUID().uuidString).app")
+        var info: [String: Any] = ["CFBundleIdentifier": "test.omi.\(UUID().uuidString)", "CFBundlePackageType": "APPL"]
+        if let key { info["NSSupportsLiveActivities"] = key }
+        let contents = root.appendingPathComponent("Contents")  // macOS bundle layout on the test host
+        try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+        try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0).write(to: contents.appendingPathComponent("Info.plist"))
+        if appex {
+            try FileManager.default.createDirectory(at: contents.appendingPathComponent("PlugIns/\(SyncActivityAvailability.extensionName)"),
+                                                    withIntermediateDirectories: true)
+        }
+        return try #require(Bundle(url: root))
+    }
+
+    @Test func onlyAnEmbeddedDeclaredExtensionCounts() throws {
+        #expect(SyncActivityAvailability.embedded(in: try bundle(key: true, appex: true)))
+        #expect(!SyncActivityAvailability.embedded(in: try bundle(key: true, appex: false)), "Release: the extension is left out")
+        #expect(!SyncActivityAvailability.embedded(in: try bundle(key: nil, appex: true)), "no NSSupportsLiveActivities")
+        #expect(!SyncActivityAvailability.embedded(in: try bundle(key: false, appex: true)))
+    }
+}
+
 /// The Live Activity's tap opens Devices → Transfers (`omi-notes://transfers`), not a configure sheet.
 @MainActor
 @Suite struct SyncActivityLinkTests {

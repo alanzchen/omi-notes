@@ -64,7 +64,9 @@
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
 	</array>
+#if OMI_LIVE_ACTIVITY
 	<key>NSSupportsLiveActivities</key>
 	<true/>
+#endif
 </dict>
 </plist>
