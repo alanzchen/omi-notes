@@ -90,7 +90,8 @@ def sanitized(d: NoteData) -> NoteData:
               (("discard_reason", d.discard_reason), ("summary_error", d.summary_error),
                ("related", d.related), ("device", d.device))}  # fmt: skip
     voice_names = {label: _link_safe(one_line(name)) for label, name in d.voice_names.items()}
-    return replace(d, notes=notes, segments=segments, voice_names=voice_names, **fields)
+    possible_names = {label: _link_safe(one_line(name)) for label, name in d.possible_names.items()}
+    return replace(d, notes=notes, segments=segments, voice_names=voice_names, possible_names=possible_names, **fields)
 
 
 def _link_safe(name: str) -> str:

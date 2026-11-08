@@ -40,6 +40,7 @@ MAX_SECONDS_PER_LABEL = 60.0
 CENTRE_MIN = 6  # labels needed to estimate the conversation's common part
 FLOOR = 0.5  # in a centred space
 GAP = 0.05
+TIE = 0.02  # closer than this to a cluster that is surely someone else: ambiguous, no join
 
 
 def overlap_spans(utterances: list[dict]) -> list[tuple[float, float]]:
@@ -72,6 +73,8 @@ def _clean(start: float, end: float, overlaps: list[tuple[float, float]]) -> lis
 
 
 def _voiceprint(clips: list[tuple[float, float]], pcm: np.ndarray, embedder) -> np.ndarray | None:
+    if embedder is None:  # no voice model: only overlap anchors can join labels
+        return None
     vectors, weights, total = [], [], 0.0
     for s, e in sorted(clips, key=lambda c: c[1] - c[0], reverse=True):
         if total >= MAX_SECONDS_PER_LABEL:
@@ -189,6 +192,11 @@ def link(response: dict, pcm: np.ndarray, embedder, threshold: float = THRESHOLD
                 continue
             # each must be the other's closest cluster of all, compatible or not
             if any(s(i, k) > v for k in keys if k not in (i, j)) or any(s(j, k) > v for k in keys if k not in (i, j)):
+                continue
+            # and clearly so against a cluster that is someone else for sure (it shares a window with the partner):
+            # a voice as close to two people who were heard apart belongs to neither
+            if any(s(i, k) >= v - TIE for k in keys if k not in (i, j) and clusters[k]["groups"] & clusters[j]["groups"]) or \
+                    any(s(j, k) >= v - TIE for k in keys if k not in (i, j) and clusters[k]["groups"] & clusters[i]["groups"]):  # fmt: skip
                 continue
             best = (i, j, v)
             break

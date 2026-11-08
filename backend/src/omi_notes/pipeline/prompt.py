@@ -168,8 +168,9 @@ def build_user_message(
     if possible_names:
         maybe = "; ".join(f"{label} may be the owner ({name})" if me else f"{label} may be {name}"
                           for label, (name, me) in sorted(possible_names.items(), key=lambda kv: _label_order(kv[0])))  # fmt: skip
-        lines.append(f"- Not confirmed by voice, but likely: {maybe}. When an action item or statement belongs to such "
-                     "a label, attribute it as \"Speaker N (possibly Name)\" rather than leaving it unattributed.")
+        lines.append(f"- Not confirmed by voice, but likely: {maybe}. When an action item or statement belongs to such a "
+                     "label, you may say so with explicit hedging in its context (e.g. \"probably Name, not confirmed by "
+                     "voice\"); never in owner, owner_name or speaker_names, and never owner \"me\" from a guess.")
     if bookmarks:
         marks = ", ".join(offset_label(b - start) for b in bookmarks)
         lines.append(f"- The owner tapped the device to bookmark moments at: {marks}. Give those moments weight.")

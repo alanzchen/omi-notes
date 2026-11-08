@@ -360,7 +360,7 @@ def test_audio_that_keeps_killing_the_sidecar_stops_waiting_and_counts_attempts(
     replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
     for k in range(6):
         state["down"] = False
-        worker.pipeline._last_local_success = 1e18  # other conversations are transcribed fine in between
+        worker.pipeline._local_successes += 1  # other conversations are transcribed fine in between
         worker.tick(T0 + 400 + 120 * k)
     (row,) = convs(worker)
     assert row["attempts"] >= 1, "after a few engine deaths on the same audio it is this conversation's problem"
@@ -490,8 +490,10 @@ def test_overlapping_requests_anchor_the_same_speech_heard_twice_without_voicepr
     response = stt.transcribe(request)
     meta = response["omi_notes"]
     assert len(seen) >= 3 and meta["anchors"], "the shared stretch ties labels of neighbouring requests"
-    words = [u["transcript"] for u in response["results"]["utterances"]]
-    assert len(words) == len(set(words)), "speech in the shared stretch is kept once"
+    kept = sorted((u["start"], u["end"]) for u in response["results"]["utterances"])
+    assert all(b[0] >= a[1] - 0.05 for a, b in zip(kept, kept[1:])), f"speech in the shared stretch is kept once: {kept}"
+    for a, b, _ in turns:  # and none of it is lost
+        assert sum(max(0.0, min(b, y) - max(a, x)) for x, y in kept) >= (b - a) - 0.05, (a, b, kept)
 
     class Blind:  # no usable voiceprint at all: anchors alone must carry the identities
         def embed(self, pcm):
@@ -522,6 +524,7 @@ def test_the_summary_is_told_who_a_speaker_may_be():
                                      owner_name="Alan", bookmarks=[], provisional=False, audio_gaps=[], now=T0,
                                      speaker_names={}, possible_names={"S2": ("Alan", True)})  # fmt: skip
     assert "S2 may be the owner (Alan)" in text
+    assert "never in owner, owner_name or speaker_names" in text, "a guess must not become an identity field"
 
 
 def test_possible_names_go_to_the_closest_unnamed_label_of_a_known_voice_only():
@@ -536,3 +539,87 @@ def test_possible_names_go_to_the_closest_unnamed_label_of_a_known_voice_only():
     out = possible_names(voices, {}, models, threshold=0.5, slack=0.15)
     assert out == {"S1": "p-alan"}, "the closest unnamed label only; an unlike voice gets nothing"
     assert possible_names(voices, {"S4": {"person_id": "p-alan"}}, models, threshold=0.5, slack=0.15) == {}, "already named here"
+
+
+def utt(a, b, speaker, text="x"):
+    return {"start": a, "end": b, "speaker": speaker, "transcript": text}
+
+
+def test_the_seam_between_requests_keeps_speech_once_even_when_their_timings_disagree():
+    from omi_notes.providers.local_asr import seam
+
+    for left, right in (([utt(9, 12, 0, "phrase")], [utt(8, 11, 1, "phrase")]), ([utt(8, 11, 0, "phrase")], [utt(9, 12, 1, "phrase")])):
+        s = seam(left, right, 6.0, 14.0)
+        kept = [u for u in left if (u["start"] + u["end"]) / 2 < s] + [u for u in right if (u["start"] + u["end"]) / 2 >= s]
+        assert [u["transcript"] for u in kept] == ["phrase"], (left, right, s)
+
+
+def test_anchors_need_most_of_both_labels_speech_and_ignore_simultaneous_talk():
+    from omi_notes.providers.local_asr import anchors
+
+    assert anchors([utt(0, 40, 0)], [utt(10, 12, 5)], 0, 40) == [], "a 2 s backchannel is not 40 s of speech"
+    assert anchors([utt(0, 40, 0)], [utt(0, 40, 5)], 0, 40) == [[0, 5]]
+    both = anchors([utt(0, 20, 0), utt(0, 20, 1)], [utt(0, 20, 5), utt(0, 20, 6)], 0, 20)
+    assert both == [], "two people talking at once tie every pairing: no anchor"
+
+
+def test_a_stored_sidecar_result_with_older_request_settings_is_reused_not_retranscribed(client, worker):
+    stt, seen = sidecar(moss_like)
+    worker.providers._local_stt = stt
+    worker.providers._embedder = FakeEmbedder()
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    ref = row["stt_ref"]
+    other, seen2 = sidecar(moss_like, max_seconds=600)  # different request settings: a different cache tag
+    worker.providers._local_stt = other
+    (worker.pipeline.conv_dir(row["id"]) / "transcript.json").unlink()
+    worker.pipeline._set(row["id"], status="closed")
+    worker.tick(T0 + 500)
+    (row,) = convs(worker)
+    assert row["status"] == "done" and row["stt_ref"] == ref and not seen2
+
+
+def test_a_voice_equally_close_to_two_people_of_one_window_joins_neither():
+    a, b = [1.0, 0.0, 0.0], [0.5, float(np.sqrt(0.75)), 0.0]
+    c = list(np.add(a, b) / np.linalg.norm(np.add(a, b)))
+    embedder = CodedEmbedder({1: a, 2: b, 3: c})
+    pcm = np.concatenate([np.full(10 * SR, v, np.int16) for v in (1, 2, 3)])
+    response = pieces_response([(0, 10, 0), (10, 20, 1), (20, 30, 2)], [0.0, 20.0])
+    out = link(response, pcm, embedder)
+    assert out["omi_notes"]["speakers_linked"]["speakers"] == 3
+
+
+def test_engine_deaths_count_once_the_engine_worked_for_others_even_in_one_batch(worker):
+    pipeline = worker.pipeline
+    counts = []
+    for _ in range(3):
+        counts.append(pipeline._engine_died("c1", "sha", T0))
+        pipeline._local_successes += 1  # another conversation transcribed in the same batch
+    assert counts == [0, 1, 2]
+
+
+def test_a_possible_name_is_withheld_when_the_nearest_person_is_already_named():
+    from omi_notes.pipeline.conversations import possible_names
+    from omi_notes.speakers.match import PersonModel
+
+    models = {"p-alan": PersonModel("p-alan", np.eye(8)[0]), "p-priya": PersonModel("p-priya", np.eye(8)[0] * 0.6 + np.eye(8)[1] * 0.8)}
+    out = possible_names({"S2": np.eye(8)[0]}, {"S1": {"person_id": "p-alan"}}, models, threshold=0.5, slack=0.15)
+    assert out == {}, "the voice is Alan's: not suggested as the runner-up"
+
+
+def test_possible_names_are_sanitized_like_names():
+    from zoneinfo import ZoneInfo
+
+    from omi_notes.notes.render import NoteData, sanitized
+
+    d = sanitized(NoteData(id="x", status="completed", start=T0, end=T0 + 1, tz=ZoneInfo("UTC"), speech_seconds=1.0, segments=[], possible_names={"S2": "A <!-- my-notes:start -->\n[[B]]"}))
+    assert "<!--" not in d.possible_names["S2"] and "\n" not in d.possible_names["S2"] and "[[" not in d.possible_names["S2"]
+
+
+def test_without_a_voice_model_overlap_anchors_still_join_labels():
+    response = {"results": {"channels": [{}], "utterances": [utt(0, 10, 0), utt(10, 20, 1), utt(20, 30, 2)]},
+                "omi_notes": {"pieces": 2, "offsets": [0.0, 15.0], "groups": [[0, 0], [1, 1], [2, 1]], "anchors": [[0, 2]]}}
+    out = link(response, np.zeros(30 * SR, np.int16), None)
+    speakers = [u["speaker"] for u in out["results"]["utterances"]]
+    assert speakers[0] == speakers[2] != speakers[1]

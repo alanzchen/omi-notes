@@ -277,8 +277,8 @@ class ConversationPipeline:
         self._move_retries: dict[str, tuple[int, float]] = {}
         self._status_written: tuple[float, str] | None = None
         self._stub_written: dict[str, float] = {}
-        self._engine_deaths: dict[tuple[str, str], tuple[int, float]] = {}  # (conversation, audio) -> (counted, last)
-        self._last_local_success = 0.0
+        self._engine_deaths: dict[tuple[str, str], tuple[int, int]] = {}  # (conversation, audio) -> (counted, successes then)
+        self._local_successes = 0  # sidecar transcriptions that worked, in this process
         self._deaths_in_a_row = 0
 
     # -- paths / days ----------------------------------------------------------------------------
@@ -537,7 +537,7 @@ class ConversationPipeline:
         if len(audio.pcm) == 0:
             raise ProviderError("no decodable audio under this conversation's speech", terminal=True, kind="audio")
         audio_sha = sha256_hex(audio.pcm.tobytes() + canonical_json([list(b) for b in audio.blocks_out]).encode())
-        stt = self._transcriber_for(row, audio_sha)
+        stt, stored = self._transcriber_for(row, audio_sha)
         windowed = getattr(stt, "needs_speaker_windows", False)
         linking = getattr(stt, "links_speakers", False)  # the local sidecar: its own speakers, linked across pieces
         turns = None
@@ -555,7 +555,7 @@ class ConversationPipeline:
         assembly = f"a{WINDOW_ASSEMBLY_FORMAT}" if WINDOW_ASSEMBLY_FORMAT > 1 else ""
         base = self._stt_base(stt, audio_sha)
         conv_dir = self.conv_dir(conv_id)
-        name = _reusable(conv_dir, base, row["stt_ref"], row["skip_stt"])
+        name = stored or _reusable(conv_dir, base, row["stt_ref"], row["skip_stt"])
         path = conv_dir / name
         if path.exists():
             cached = json.loads(path.read_text())
@@ -584,7 +584,8 @@ class ConversationPipeline:
                     if self._deaths_in_a_row >= ENGINE_DEATHS_MAX:  # it was alerted as failing: say it works again
                         Vault.write_json(self.settings.logs_dir / "alerts" / "local-transcription.json",
                                          {"state": "recovered", "recovered_at": iso_utc_epoch(now), "url": self.settings.stt_local_url})  # fmt: skip
-                    self._last_local_success, self._deaths_in_a_row = now, 0
+                    self._local_successes += 1
+                    self._deaths_in_a_row = 0
             cached = {"created_at": now, "provider": stt.name, "model": stt.model, "response": response}
             atomic_write_bytes(path, json.dumps(cached).encode())
         if unlabeled:
@@ -600,10 +601,10 @@ class ConversationPipeline:
             links = path.with_name(f"links-v{LINKS_FORMAT}-{path.name}")
             if links.exists():  # decided once per STT result: a re-run never re-links against other voices
                 response = json.loads(links.read_text())
-            else:  # stored even unlinked (no voice model): installing one later must not change who spoke
-                if self.providers.embedder is not None:
-                    response = link_speakers(response, audio.pcm, self.providers.embedder,
-                                             background=self._background_voice(conv_id, self.providers.embedder))  # fmt: skip
+            else:  # stored once decided: installing a voice model later must not change who spoke
+                embedder = self.providers.embedder  # without one, overlap anchors still join labels
+                response = link_speakers(response, audio.pcm, embedder,
+                                         background=self._background_voice(conv_id, embedder) if embedder else None)  # fmt: skip
                 atomic_write_bytes(links, json.dumps(response).encode())
             # its labels are the transcript's labels (local diarization would only blur its real turns)
             speakers = self._speakers(conv_id, response, audio, audio_sha, mode="provider")
@@ -821,27 +822,29 @@ class ConversationPipeline:
         embedder = self.providers.embedder
         if embedder is None:
             return {}
-        try:
+        try:  # a hint is never worth failing a note for
             models = self.speakers.models(embedder.model, embedder.model_sha, self.operating)
             voices = self.speakers.voices_of_labels(conv_id, transcript_sha)
-        except Exception:  # a hint is never worth failing a note for
+            if not models or not voices:
+                return {}
+            # only voices made by the model the people's samples are in: other vectors aren't comparable
+            vectors = {label: v.vector for label, v in voices.items()
+                       if getattr(v, "vector", None) is not None and getattr(v, "model_sha", None) == embedder.model_sha}  # fmt: skip
+            found = possible_names(vectors, self.speakers.labels(conv_id), models, threshold=self.operating.threshold)
+            people = {r["id"]: (r["name"], bool(r["me"])) for r in self.speakers.people()}
+            return {label: people[pid] for label, pid in found.items() if pid in people}
+        except Exception:
             log.exception("could not compute possible speaker names for %s", conv_id)
             return {}
-        if not models or not voices:
-            return {}
-        vectors = {label: v.vector for label, v in voices.items() if getattr(v, "vector", None) is not None}
-        found = possible_names(vectors, self.speakers.labels(conv_id), models, threshold=self.operating.threshold)
-        people = {r["id"]: (r["name"], bool(r["me"])) for r in self.speakers.people()}
-        return {label: people[pid] for label, pid in found.items() if pid in people}
 
     def _engine_died(self, conv_id: str, audio_sha: str, now: float) -> int:
         """Record that the sidecar died on this audio; returns how many such deaths count against it. A death
         counts only if the engine has transcribed something else since this audio's previous one: an engine
         that fails on everything is an outage (alerted, conversations wait), not the conversation's fault."""
-        counted, last = self._engine_deaths.get((conv_id, audio_sha), (0, 0.0))
-        if self._last_local_success > last:
+        counted, then = self._engine_deaths.get((conv_id, audio_sha), (0, self._local_successes))
+        if self._local_successes > then:  # something else was transcribed since this audio's previous death
             counted += 1
-        self._engine_deaths[(conv_id, audio_sha)] = (counted, now)
+        self._engine_deaths[(conv_id, audio_sha)] = (counted, self._local_successes)
         self._deaths_in_a_row += 1
         if self._deaths_in_a_row >= ENGINE_DEATHS_MAX:
             alert = self.settings.logs_dir / "alerts" / "local-transcription.json"
@@ -904,7 +907,7 @@ class ConversationPipeline:
             tag += f"-{_slug(self.providers.diarizer.tag)}-w{WINDOW_CACHE_FORMAT}{assembly}-k{keyterms}"
         return f"stt-{stt.name}{tag}-{_slug(stt.model)}-{_slug(self.settings.stt_language)}-{audio_sha[:16]}"
 
-    def _transcriber_for(self, row, audio_sha: str):
+    def _transcriber_for(self, row, audio_sha: str) -> tuple[object, str | None]:
         """The provider that already transcribed this audio when its result is still usable (a re-run, e.g.
         after a lost transcript.json, never transcribes again because the sidecar was switched on or is
         down for now), else the one answering now. A forced reprocess excludes the old result."""
@@ -914,10 +917,10 @@ class ConversationPipeline:
             # checked before asking for a live engine: reading a stored result needs no service. Any sidecar
             # result for this exact audio counts, whatever request settings (length, overlap) made it
             if ref.startswith("stt-local-asr-") and f"-{audio_sha[:16]}" in ref:
-                return self.providers.local_stt_reader
+                return self.providers.local_stt_reader, ref  # that exact file, whatever tag it was made with
             if ref.startswith(self._stt_base(self.providers.stt, audio_sha)):
-                return self.providers.stt
-        return self.providers.transcriber()
+                return self.providers.stt, ref
+        return self.providers.transcriber(), None
 
     def _speakers(self, conv_id: str, response: dict, audio: ConversationAudio, audio_sha: str,
                   mode: str | None = None) -> SpeakerResult:  # fmt: skip
@@ -1628,12 +1631,14 @@ def possible_names(voices: dict[str, np.ndarray], states: dict[str, dict], model
         state = states.get(label) or {}
         if state.get("person_id") or state.get("source") == "unknown" or label == "unknown":
             continue
-        scored = sorted((cosine_distance(vector, m.centroid), pid) for pid, m in models.items()
-                        if m.centroid is not None and pid not in named and pid not in set(state.get("not") or []))  # fmt: skip
-        if scored and scored[0][0] < threshold + slack:
-            distance, pid = scored[0]
-            if pid not in best or distance < best[pid][0]:
-                best[pid] = (distance, label)
+        scored = sorted((cosine_distance(vector, m.centroid), pid) for pid, m in models.items() if m.centroid is not None)
+        if not scored or scored[0][0] >= threshold + slack:
+            continue
+        distance, pid = scored[0]  # the nearest of everyone; if that one is ruled out, no guess (not the runner-up)
+        if pid in named or pid in set(state.get("not") or []):
+            continue
+        if pid not in best or distance < best[pid][0]:
+            best[pid] = (distance, label)
     return {label: pid for pid, (_, label) in best.items()}
 
 
