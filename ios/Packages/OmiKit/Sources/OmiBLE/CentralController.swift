@@ -106,7 +106,11 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
     public static let restoreIdentifier = "omi-notes.central"
 
     public let queue: DispatchQueue
-    public weak var delegate: CentralControllerDelegate?
+    /// Pass it to `init` so it hears the backend's first callbacks. One attached later is told the
+    /// current state and handed an accepted connection that is still undelivered.
+    public weak var delegate: CentralControllerDelegate? {
+        didSet { if delegate != nil { replayToDelegate() } }
+    }
     public var rememberedId: UUID?
     public private(set) var suppression: Set<ReconnectSuppression> = []
     public private(set) var isScanning = false
@@ -120,17 +124,29 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
     private var scanningForRemembered = false
     private var prohibited: [PeripheralHandle] = []
 
-    public convenience init(queue: DispatchQueue, rememberedId: UUID?, suppression: Set<ReconnectSuppression>) {
-        self.init(queue: queue, rememberedId: rememberedId, suppression: suppression) { events in
+    public convenience init(queue: DispatchQueue, rememberedId: UUID?, suppression: Set<ReconnectSuppression>,
+                            delegate: CentralControllerDelegate? = nil) {
+        self.init(queue: queue, rememberedId: rememberedId, suppression: suppression, delegate: delegate) { events in
             CoreBluetoothBackend(queue: queue, events: events)
         }
     }
 
-    public init(queue: DispatchQueue, rememberedId: UUID?, suppression: Set<ReconnectSuppression>, backend makeBackend: (CentralBackendEvents) -> CentralBackend) {
+    /// The delegate is attached before the backend exists: a backend may report its state, restored
+    /// peripherals or a connection as soon as it is created.
+    public init(queue: DispatchQueue, rememberedId: UUID?, suppression: Set<ReconnectSuppression>,
+                delegate: CentralControllerDelegate? = nil, backend makeBackend: (CentralBackendEvents) -> CentralBackend) {
         self.queue = queue
         self.rememberedId = rememberedId
         self.suppression = suppression
+        self.delegate = delegate
         backend = makeBackend(self)
+    }
+
+    /// A delegate attached after callbacks were already handled.
+    private func replayToDelegate() {
+        guard let backend else { return }  // during init: nothing has happened yet
+        if backend.state != .unknown { delegate?.centralDidUpdateState(backend.state) }
+        if let p = peripheral, p.connectionState == .connected, deliveredId != p.identifier, mayAccept(p) { deliver(p) }
     }
 
     public var state: CentralState { backend.state }
@@ -227,8 +243,10 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
     }
 
     private func deliver(_ p: PeripheralHandle) {
+        // never delivered to no one: it would count as delivered and never reach a session
+        guard let delegate else { return }
         deliveredId = p.identifier
-        delegate?.centralDidConnect(p.transport())
+        delegate.centralDidConnect(p.transport())
     }
 
     private func cancelProhibited() {

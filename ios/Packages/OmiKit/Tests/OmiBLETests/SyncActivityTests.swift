@@ -14,7 +14,9 @@ final class FakeActivityHost: SyncActivityHost {
     var updates: [(String, SyncActivityState, Date)] = []
     var ended: [(String, SyncActivityState?, SyncActivityEnding)] = []
     func existing() -> [(id: String, running: Bool)] { cards.map { ($0.id, $0.running) } }
+    var startError: Error?
     func start(_ state: SyncActivityState, staleDate: Date) throws -> String {
+        if let startError { throw startError }
         started += 1
         let id = "act-\(started)"
         cards.append((id, true, state.title))
@@ -261,6 +263,35 @@ final class FakeMemory: SyncActivityMemory {
         c.refresh(nil, foreground: false, optedOut: false, now: later.addingTimeInterval(SyncActivityController.renewAfter))
         c.refresh(state(.waiting), foreground: false, optedOut: false, now: later.addingTimeInterval(SyncActivityController.renewAfter))
         #expect(host.updates.count == 2, "in the background nothing is watched: never renewed")
+    }
+
+    /// Build 40 showed no activity and the log said nothing: each refresh now records the gate that
+    /// decided it (logged only when it changes), including why a request failed.
+    @Test func eachRefreshRecordsTheGateThatDecidedIt() {
+        let (host, memory, c) = rig()
+        c.refresh(nil, foreground: true, optedOut: false, now: now)
+        #expect(c.decision == "waiting: no engine snapshot yet")
+        c.refresh(state(.unknown), foreground: true, optedOut: false, now: now)
+        #expect(c.decision?.hasPrefix("waiting: uploads not measured") == true)
+        c.refresh(state(.waiting), foreground: false, optedOut: false, now: now)
+        #expect(c.decision?.contains("foreground") == true)
+        memory.dismissed = true
+        c.refresh(state(.waiting), foreground: true, optedOut: false, now: now)
+        #expect(c.decision?.contains("dismissed") == true)
+        memory.dismissed = false
+        host.startError = NSError(domain: "ActivityKit.ActivityAuthorizationError", code: 3)
+        c.refresh(state(.waiting), foreground: true, optedOut: false, now: now)
+        #expect(c.decision == "request failed: NSError ActivityKit.ActivityAuthorizationError 3" && host.started == 0)
+        host.startError = nil
+        c.refresh(state(.waiting), foreground: true, optedOut: false, now: now)
+        #expect(c.decision == "started" && host.started == 1)
+        c.refresh(state(.waiting), foreground: true, optedOut: false, now: now)
+        #expect(c.decision == "showing")
+        c.refresh(state(.waiting), foreground: true, optedOut: true, now: now)
+        #expect(c.decision == "off: turned off in Devices › Transfers")
+        host.enabled = false
+        c.refresh(state(.waiting), foreground: true, optedOut: false, now: now)
+        #expect(c.decision?.hasPrefix("off: Live Activities aren't allowed") == true)
     }
 
     @Test func disabledOrOptedOutShowsNothingAndEndsWhatIsThere() {

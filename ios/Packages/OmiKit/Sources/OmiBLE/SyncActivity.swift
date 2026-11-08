@@ -154,12 +154,24 @@ public final class SyncActivityController {
     /// `state`: nil while nothing is known (the engine's first snapshot hasn't come, or the app isn't
     /// measuring): nothing is decided then. `foreground`: the app is active (the only time a new
     /// activity starts). `optedOut`: turned off in the app.
+    /// The gate that decided the last refresh, in words for the in-app log (no content).
+    public private(set) var decision: String?
+
+    /// Logs the deciding gate only when it changes (refreshes run every few seconds).
+    private func note(_ d: String) {
+        guard d != decision else { return }
+        decision = d
+        log(.info, "liveactivity", d)
+    }
+
     public func refresh(_ state: SyncActivityState?, foreground: Bool, optedOut: Bool, now: Date) {
         guard host.enabled, !optedOut else {
+            note(optedOut ? "off: turned off in Devices › Transfers" : "off: Live Activities aren't allowed for Omi Notes (iOS Settings)")
             removeAll()
             return
         }
-        guard let s = state, s.stage != .unknown else { return }
+        guard let s = state else { note("waiting: no engine snapshot yet"); return }
+        guard s.stage != .unknown else { note("waiting: uploads not measured yet (the app hasn't become active)"); return }
         let finished = s.stage == .allSent && !s.hasWork  // confirmed: measured, read, nothing left
         if let id = activityId {
             if finished {
@@ -176,21 +188,29 @@ public final class SyncActivityController {
             } else {
                 push(id, s, foreground: foreground, now: now)
             }
+            note(finished ? "ended: everything sent" : s.hasWork ? "showing" : "ended: nothing to follow")
             return
         }
         if finished {
             memory.dismissed = false  // this sync is over: a later one may show again
+            note("not shown: everything sent")
             return
         }
-        guard s.hasWork, foreground, !memory.dismissed else { return }
+        guard s.hasWork else { note("not shown: nothing waiting"); return }
+        guard foreground else { note("not shown: starts only while the app is in the foreground"); return }
+        guard !memory.dismissed else { note("not shown: dismissed earlier (shows again after this sync finishes)"); return }
         if let old = finishedId {  // never two cards
             host.end(old, final: nil, ending: .immediate)
             finishedId = nil
         }
-        if let started = try? host.start(s, staleDate: Self.staleDate(s, now: now)) {
-            activityId = started
+        do {
+            activityId = try host.start(s, staleDate: Self.staleDate(s, now: now))
             lastPushed = s
             lastPushAt = now
+            note("started")
+        } catch {
+            let e = error as NSError
+            note("request failed: \(type(of: error)) \(e.domain) \(e.code)")
         }
     }
 

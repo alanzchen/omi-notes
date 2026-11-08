@@ -296,6 +296,38 @@ final class MismatchCounter: @unchecked Sendable {
         #expect(engine.session == nil)
     }
 
+    /// ASTRA-20261107-01 through the engine: the backend reports powered-on and a restored link as its
+    /// first callbacks, queued on the engine queue as CoreBluetooth delivers them (behind launch
+    /// recovery). The engine hears both and starts exactly one session; a foreground re-kick changes
+    /// nothing.
+    @Test func earlyBluetoothCallbacksGiveOneSessionAfterRecovery() throws {
+        let x = UUID(uuidString: "0000000A-0000-4000-8000-0000000000E2")!
+        let backend = FakeBackend()
+        let p = FakePeripheral(x, state: .connected)
+        p.configure = {
+            $0.values = FakeDeviceTransport.cv1Values()
+            $0.cachedCharacteristics = Set(OmiCharacteristic.allCases)
+            $0.alreadyNotifying = [.audioData]
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-early-\(UUID().uuidString)")
+        var config = EngineConfiguration(dirs: CaptureDirectories(root: root), appVersion: "t", useCoreBluetooth: false, tickInterval: 0.2)
+        let sink = Locked<CentralBackendEvents?>(nil)
+        config.testCentralBackend = { events in
+            sink.value = events
+            backend.state = .poweredOn
+            return backend
+        }
+        let engine = OmiEngine(config: config, settings: try makeSettings(remembered: x), uploadTransport: CountingUploadTransport())
+        let events = try #require(sink.value)
+        engine.queue.async { events.backendWillRestore([p]); events.backendDidUpdateState(.poweredOn) }  // CoreBluetooth's first callbacks
+        engine.queue.sync {}  // launch recovery, then those callbacks
+        #expect(engine.snapshotNow().bluetooth == .poweredOn, "not left at \"Bluetooth is starting\"")
+        let session = try #require(engine.session, "the restored link becomes a session")
+        engine.appDidBecomeActive()
+        engine.queue.sync {}
+        #expect(engine.session === session && p.transportsCreated == 1, "one session, not a second one on foreground")
+    }
+
     @Test func restoredConnectionStartsSessionWhenAllowed() throws {
         let x = UUID(uuidString: "0000000A-0000-4000-8000-00000000000B")!
         let backend = FakeBackend()

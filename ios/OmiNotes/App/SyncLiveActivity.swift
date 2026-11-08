@@ -1,5 +1,6 @@
 import ActivityKit
 import OmiBLE
+import OmiCapture
 import OmiProtocol
 import SwiftUI
 
@@ -95,7 +96,10 @@ final class SyncActivityCoordinator {
     init() {
         controller = SyncActivityController(host: host, memory: DefaultsSyncActivityMemory())
         host.onEnded = { [weak self] id, dismissed in self?.controller.ended(id, dismissed: dismissed) }
-        guard Self.available else { return }
+        guard Self.available else {
+            OmiLog.shared.log(.info, "liveactivity", "off: not in this build (no extension or NSSupportsLiveActivities)")
+            return
+        }
         controller.adopt()  // after a relaunch: the one that exists, never a second
     }
 

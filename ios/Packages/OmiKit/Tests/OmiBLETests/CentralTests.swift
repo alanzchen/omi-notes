@@ -229,3 +229,37 @@ struct CentralHarness {
         #expect(h.session.recorder.stats.totalRecords == 1)
     }
 }
+
+/// ASTRA-20261107-01: the backend can report its state and an already-connected (restored)
+/// peripheral as soon as it exists, before anyone listens. Nothing may be lost or counted as
+/// delivered without a recipient.
+@Suite struct CentralEarlyCallbackTests {
+    let x = UUID(uuidString: "0000000A-0000-4000-8000-0000000000E1")!
+
+    @Test func callbacksBeforeTheDelegateIsAttachedReachIt() {
+        let queue = DispatchQueue(label: "test.central.early")
+        let backend = FakeBackend()
+        let p = FakePeripheral(x, state: .connected)
+        let controller = CentralController(queue: queue, rememberedId: x, suppression: []) { _ in backend }
+        // delivered on the queue after the backend exists but before anyone attached
+        backend.state = .poweredOn
+        queue.sync { controller.backendWillRestore([p]); controller.backendDidUpdateState(.poweredOn) }
+        let delegate = RecordingCentralDelegate()
+        queue.sync { controller.delegate = delegate }
+        #expect(delegate.states == [.poweredOn], "the state reported before attachment is replayed")
+        #expect(delegate.connected.count == 1, "the restored link is handed over once")
+        queue.sync { controller.ensureConnected(); controller.ensureConnected() }
+        #expect(delegate.connected.count == 1 && p.transportsCreated == 1, "foreground re-kicks stay idempotent")
+    }
+
+    @Test func aDelegatePassedToInitHearsTheFirstCallbacks() {
+        let queue = DispatchQueue(label: "test.central.init")
+        let backend = FakeBackend()
+        let p = FakePeripheral(x, state: .connected)
+        let delegate = RecordingCentralDelegate()
+        let controller = queue.sync { CentralController(queue: queue, rememberedId: x, suppression: [], delegate: delegate) { _ in backend } }
+        backend.state = .poweredOn
+        queue.sync { controller.backendWillRestore([p]); controller.backendDidUpdateState(.poweredOn) }  // the very first callbacks
+        #expect(delegate.states == [.poweredOn] && delegate.connected.count == 1)
+    }
+}

@@ -294,13 +294,9 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         if settings.simulatedMode { suppression.insert(.simulatedMode) }
         let remembered = settings.rememberedDeviceId.flatMap { $0 == SimulatedDevice.deviceIdentifier ? nil : $0 }
         if let makeBackend = config.testCentralBackend {
-            let c = CentralController(queue: queue, rememberedId: remembered, suppression: suppression, backend: makeBackend)
-            c.delegate = self
-            central = c
+            central = CentralController(queue: queue, rememberedId: remembered, suppression: suppression, delegate: self, backend: makeBackend)
         } else if config.useCoreBluetooth {
-            let c = CentralController(queue: queue, rememberedId: remembered, suppression: suppression)
-            c.delegate = self
-            central = c
+            central = CentralController(queue: queue, rememberedId: remembered, suppression: suppression, delegate: self)
         }
     }
 
