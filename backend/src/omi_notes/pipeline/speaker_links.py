@@ -38,7 +38,9 @@ MARGIN = 0.05
 MIN_CLIP = 0.5
 MAX_SECONDS_PER_LABEL = 60.0
 CENTRE_MIN = 6  # labels needed to estimate the conversation's common part
-FLOOR = 0.5  # in a centred space
+FLOOR = 0.30  # in a centred space: different people mostly fall below (asr-bench-20261108 longwin, dinner)
+UNCALIBRATED = 0.5  # centred bar when no window holds two labels
+APART_QUANTILE_MIN = 10  # known-different pairs needed before an outlier among them is discounted
 GAP = 0.05
 TIE = 0.02  # closer than this to a cluster that is surely someone else: ambiguous, no join
 
@@ -90,6 +92,19 @@ def _voiceprint(clips: list[tuple[float, float]], pcm: np.ndarray, embedder) -> 
         return None
     mean = np.average(np.stack(vectors), axis=0, weights=weights)
     return mean / (np.linalg.norm(mean) or 1.0)
+
+
+def bar(apart: list[float], *, centred: bool, raw_threshold: float = THRESHOLD) -> float:
+    """The similarity a join must reach, from the known-different pairs (labels of one window). Raw: above the
+    closest such pair (everything sounds alike). Centred: different people mostly fall below 0.3
+    (asr-bench-20261108 longwin); one outlier pair (a provider over-split inside a window) must not hold back
+    every join, so the 90th percentile once there are enough pairs."""
+    if not centred:
+        return max(raw_threshold, max(apart) + GAP) if apart else raw_threshold
+    if not apart:  # one label per window: nothing to calibrate against, stay cautious
+        return UNCALIBRATED
+    level = float(np.percentile(apart, 90)) if len(apart) >= APART_QUANTILE_MIN else max(apart)
+    return max(FLOOR, level + GAP)
 
 
 def _groups(meta: dict, utterances: list[dict]) -> dict[int, int]:
@@ -147,8 +162,7 @@ def link(response: dict, pcm: np.ndarray, embedder, threshold: float = THRESHOLD
     # labels of one window are different people: a link must be closer than any of them (in any space)
     apart = [float(np.dot(prints[a], prints[b])) for i, a in enumerate(order) for b in order[i + 1 :]
              if group_of.get(a) == group_of.get(b) and prints[a] is not None and prints[b] is not None]  # fmt: skip
-    base = threshold if common is None else max(FLOOR, threshold - 0.25)
-    threshold = max(base, max(apart) + GAP) if apart else base
+    threshold = bar(apart, centred=common is not None, raw_threshold=threshold)
     weight = {label: sum(e - s for s, e in clips.get(label, [])) or 1.0 for label in order}
     clusters: dict[int, dict] = {label: {"labels": [label], "groups": {group_of.get(label, -1)}} for label in order}
 

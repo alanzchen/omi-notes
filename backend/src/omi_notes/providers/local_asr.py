@@ -2,7 +2,8 @@
 
 It speaks the `openai_diarized` shape: segments with real start/end and `speaker_id`. Differences from a
 generic OpenAI-compatible server, all deliberate (asr-bench-20261108):
-- requests of up to 1200 s (one MOSS window: its context allows ~20 min) cut at pauses, each reaching 20 s
+- requests of up to 900 s (one MOSS window: it stops itself after ~16.4k output tokens, which dense speech
+  reaches near 20 min) cut at pauses, each reaching 20 s
   into its neighbours so the same speech is heard twice (`anchors` ties the labels there); the sidecar
   re-splits a truncated window itself; never per-speaker 30 s windows;
 - no `language` hint (mixed Mandarin/English) and no `prompt` (a MOSS prompt replaces its instruction);
@@ -102,9 +103,12 @@ def seam(left: list[dict], right: list[dict], lo: float, hi: float, step: float 
 
 
 def _covered(u: dict, others: list[dict]) -> bool:
-    """Whether `u` is already there: another utterance overlaps at least half of it."""
+    """Whether `u` is already there: another utterance overlaps at least half of it in time and carries about
+    as much text (overlap alone can't tell "now" from "please turn left now"; a duplicate beats a loss)."""
     a, b = float(u["start"]), float(u["end"])
-    return any(_shared([(a, b)], [(float(o["start"]), float(o["end"]))]) >= 0.5 * max(b - a, 1e-6) for o in others)
+    size = len(str(u.get("transcript", "")).strip())
+    return any(_shared([(a, b)], [(float(o["start"]), float(o["end"]))]) >= 0.5 * max(b - a, 1e-6)
+               and len(str(o.get("transcript", "")).strip()) >= 0.6 * size for o in others)  # fmt: skip
 
 
 def anchors(left: list[dict], right: list[dict], lo: float, hi: float, least: float = ANCHOR_SECONDS) -> list[list[int]]:
@@ -143,7 +147,7 @@ class LocalAsrStt(OpenAICompatStt):
     HEALTH_TTL = 30.0
     overlap_seconds = OVERLAP_SECONDS
 
-    def __init__(self, base_url: str, model: str = "omi-asr", *, max_request_seconds: float = 1200.0,
+    def __init__(self, base_url: str, model: str = "omi-asr", *, max_request_seconds: float = 900.0,
                  transport: httpx.BaseTransport | None = None, timeout: float = 1200.0) -> None:  # fmt: skip
         super().__init__(base_url, "", model, style="openai_diarized", max_request_seconds=max_request_seconds,
                          timeout=timeout, transport=transport)  # fmt: skip
@@ -209,10 +213,9 @@ class LocalAsrStt(OpenAICompatStt):
             def here(u: dict) -> bool:  # only what lies in this shared stretch (the other side of a request has its own)
                 return u["end"] > lo and u["start"] < hi
 
-            left_extra = [u for u in heard[k] if u not in kept[k] and here(u) and not _covered(u, kept[k + 1])]
-            right_extra = [u for u in heard[k + 1] if u not in kept[k + 1] and here(u) and not _covered(u, kept[k])]
-            kept[k] += left_extra
-            kept[k + 1] += right_extra
+            kept[k] += [u for u in heard[k] if u not in kept[k] and here(u) and not _covered(u, kept[k + 1])]
+            # after the left side's rescues are in: never both copies of one phrase
+            kept[k + 1] += [u for u in heard[k + 1] if u not in kept[k + 1] and here(u) and not _covered(u, kept[k])]
         utterances = sorted((u for mine in kept for u in mine), key=lambda u: (u["start"], u["end"]))
         groups = [list(g) for g in {tuple(g) for g in groups}]
         response = {"results": {"channels": [{"detected_language": language} if language else {}], "utterances": utterances}}

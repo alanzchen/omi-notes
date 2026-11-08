@@ -8,6 +8,7 @@ import json
 from datetime import timedelta
 
 import httpx
+import pytest
 import numpy as np
 import soundfile as sf
 
@@ -623,3 +624,39 @@ def test_without_a_voice_model_overlap_anchors_still_join_labels():
     out = link(response, np.zeros(30 * SR, np.int16), None)
     speakers = [u["speaker"] for u in out["results"]["utterances"]]
     assert speakers[0] == speakers[2] != speakers[1]
+
+
+def test_without_a_shared_pause_a_longer_phrase_is_not_dropped_for_a_shorter_one():
+    stt, _ = sidecar()
+
+    def fake_parts(offset, part):  # left request [0, 12] and right request [8, 20]; no pause in [8, 12]
+        if offset == 0.0:
+            utts = [{"start": 0.0, "end": 8.0, "speaker": 0, "transcript": "first part"},
+                    {"start": 8.0, "end": 12.0, "speaker": 0, "transcript": "please turn left now"}]
+        else:
+            utts = [{"start": 2.0, "end": 4.0, "speaker": 0, "transcript": "now"},
+                    {"start": 4.0, "end": 12.0, "speaker": 0, "transcript": "then straight on"}]
+        return [(offset, {"results": {"channels": [{}], "utterances": utts}})]
+
+    stt._transcribe_part = fake_parts
+    stt.max_seconds, stt.overlap_seconds = 16.0, 2.0
+    request = audio_with_blocks([20])
+    import omi_notes.providers.local_asr as la
+
+    original = la.split_points
+    la.split_points = lambda request, max_seconds: [(10.0, True)]
+    try:
+        text = " ".join(u["transcript"] for u in stt.transcribe(request)["results"]["utterances"])
+    finally:
+        la.split_points = original
+    assert "please turn left" in text and "then straight on" in text, text
+
+
+def test_one_outlier_pair_of_known_different_labels_does_not_block_every_join():
+    from omi_notes.pipeline.speaker_links import bar
+
+    apart = [0.1, -0.2, 0.25, 0.0, 0.3, 0.05, -0.1, 0.2, 0.15, 0.1, 0.77]  # one over-split window: 0.77
+    assert bar(apart, centred=True) < 0.5, "the 90th percentile, not the outlier"
+    assert bar([0.77], centred=True) == pytest.approx(0.82), "too few pairs to call it an outlier"
+    assert bar([], centred=True) == pytest.approx(0.5), "nothing to calibrate against: cautious"
+    assert bar([0.98], centred=False) == pytest.approx(1.03), "raw: above the closest known-different pair"

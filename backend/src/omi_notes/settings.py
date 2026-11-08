@@ -68,7 +68,9 @@ class Settings(BaseSettings):
     # conversations wait for it. Empty = the STT_* provider above.
     stt_local_url: str = ""
     stt_local_model: str = "omi-asr"
-    stt_local_max_request_seconds: float = 1200.0  # one MOSS window (its context allows ~20 min)
+    # one MOSS window: it stops by itself after ~16.4k output tokens, which dense speech reaches at ~20 min
+    # (asr-bench-20261108 longwin), so 15 min leaves room
+    stt_local_max_request_seconds: float = 900.0
     # Where speaker labels come from; transcripts without them fail unless this is "off".
     stt_diarization: Literal["auto", "provider", "local", "off"] = "auto"
     diarization_num_speakers: int = 0  # 0 = decide from DIARIZATION_THRESHOLD
