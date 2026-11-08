@@ -5,8 +5,7 @@ import OmiWatchKit
 
 /// What the transfer screens show, in three separate stages. Each says only what its own source
 /// knows, as of its own time: the Watch's report, this iPhone's uploads, the server's last status.
-/// Recording continues, so the bars cover only what is known now and the time left is a rough
-/// "at this speed" figure, never a promise.
+/// Nothing here is a completion percentage of a continuous recording, or an ETA.
 public struct TransferSummary: Equatable, Sendable {
     // MARK: Watch → iPhone
     public struct Watch: Equatable, Sendable {
@@ -145,7 +144,7 @@ public struct TransferSummary: Equatable, Sendable {
 
     #if DEBUG
     /// Simulator screenshots only (debug builds): SYNTHETIC values, labelled as such on screen.
-    /// `-OmiNotesDebugTransferState backlog|sending|waiting|offline|retrying|kept-aside|all-sent|unknown-watch`
+    /// `-OmiNotesDebugTransferState sending|waiting|offline|retrying|kept-aside|all-sent|unknown-watch`
     public static func debugFixture(_ name: String, now: Date) -> TransferSummary? {
         var watch = Watch(inUse: true, reportAt: now.addingTimeInterval(-120), reportFresh: true, waitingParts: 4, waitingSeconds: 230,
                           receivedOnPhone: 266, lastReceivedAt: now.addingTimeInterval(-95), converting: 0, waitingForServer: 3)
@@ -160,12 +159,6 @@ public struct TransferSummary: Equatable, Sendable {
             phone.state = .sending; phone.rate = 1_240_000; phone.networkBytes = 24_100_000; phone.inFlightUploads = 32
             phone.inFlightSent = 3_900_000; phone.inFlightTotal = 8_100_000; phone.deliveredAudioFiles = 12
             phone.deliveredAudioBytes = 5_200_000; phone.deliveredOtherFiles = 3
-        case "backlog":  // the numbers of the build-41 feedback screenshot (2026-11-08 04:31Z)
-            phone.state = .sending; phone.rate = 111_700; phone.networkBytes = 12_600_000; phone.inFlightUploads = 40
-            phone.inFlightSent = 781_000; phone.inFlightTotal = 4_200_000; phone.deliveredAudioFiles = 295
-            phone.deliveredAudioBytes = 46_600_000; phone.deliveredOtherFiles = 1; phone.queuedFiles = 5_135
-            phone.queuedAudioFiles = 5_120; phone.queuedBytes = 5_390_000_000; phone.queuedAudioSeconds = 201_480
-            phone.queuedAudioUnknown = 8
         case "waiting": break
         case "offline":
             phone.state = .offline("timed out")
@@ -187,30 +180,6 @@ public struct TransferSummary: Equatable, Sendable {
         return TransferSummary(watch: watch, phone: phone, server: server)
     }
     #endif
-
-    /// Seconds to send what is queued now at the current speed; nil unless bytes are moving. A rough
-    /// "at this speed" figure: recording continues and the speed changes, so it is no promise.
-    public var phoneTimeLeft: Double? {
-        guard phone.state == .sending, let rate = phone.rate, rate > 0, phone.queuedBytes > 0 else { return nil }
-        return Double(phone.queuedBytes) / rate
-    }
-
-    /// iPhone → server bar: audio bytes the server confirmed since the app opened, of those plus
-    /// the bytes still queued. nil when nothing is known (not counting, or nothing at all).
-    public var phoneFraction: Double? {
-        guard phone.since != nil else { return nil }
-        let done = Double(phone.deliveredAudioBytes), total = done + Double(phone.queuedBytes)
-        guard total > 0 else { return phone.state == .allSent ? 1 : nil }
-        return done / total
-    }
-
-    /// Watch → iPhone bar: parts received, of those plus the parts the Watch still reports. nil
-    /// without a Watch report.
-    public var watchFraction: Double? {
-        guard watch.inUse == true, watch.reportAt != nil, let waiting = watch.waitingParts else { return nil }
-        let total = watch.receivedOnPhone + waiting
-        return total > 0 ? Double(watch.receivedOnPhone) / Double(total) : 1
-    }
 
     /// "820 B/s", "48.2 KB/s", "1.3 MB/s" (decimal units, like the Files app).
     public static func rateText(_ bytesPerSecond: Double) -> String {

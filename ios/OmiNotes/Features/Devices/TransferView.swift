@@ -22,15 +22,6 @@ enum TransferText {
         return model.transfers(watchInstalled: watchInstalled, now: now)
     }
 
-    /// Simulator screenshots only (debug builds): `-OmiNotesDebugTransferExpanded YES` opens the folds.
-    static var debugExpanded: Bool {
-        #if DEBUG
-        return UserDefaults.standard.bool(forKey: "OmiNotesDebugTransferExpanded")
-        #else
-        return false
-        #endif
-    }
-
     static var synthetic: Bool {
         #if DEBUG
         return UserDefaults.standard.string(forKey: "OmiNotesDebugTransferState") != nil
@@ -39,40 +30,31 @@ enum TransferText {
         #endif
     }
 
-    /// The screen's one status line and the short line under it.
-    static func hero(_ t: TransferSummary) -> (title: String, line: String?, symbol: String, attention: Bool) {
-        let p = t.phone
-        let left = p.queuedFiles > 0 ? "\(p.queuedFiles.formatted()) left" : nil
-        let eta = t.phoneTimeLeft.map { "~" + approximate($0) }
+    static func phoneState(_ p: TransferSummary.Phone) -> (title: String, symbol: String, attention: Bool) {
         switch p.state {
-        case .sending: return ("Uploading", [left, eta].compactMap { $0 }.joined(separator: " · "), "arrow.up.circle.fill", false)
-        case .waiting: return ("Waiting to upload", left, "clock", false)
-        case .retrying: return ("Retrying soon", [plural(p.retryingFiles, "file", "files") + " failed", left].compactMap { $0 }.joined(separator: " · "), "arrow.clockwise", true)
-        case .offline(let why): return ("Can't reach the server", [why, left].compactMap { $0 }.joined(separator: " · "), "wifi.exclamationmark", true)
-        case .paused(let why): return ("Uploads paused", why, "pause.circle", true)
-        case .preparing(let n): return ("Preparing Watch audio", plural(n, "part", "parts"), "gearshape", false)
-        case .keptAside(let n): return ("Kept aside", plural(n, "file", "files") + " not uploaded", "tray.full", true)
-        case .queueUnreadable: return ("Queue unreadable", nil, "questionmark.folder", true)
-        case .allSent: return ("All sent", "Everything queued reached the server", "checkmark.circle", false)
-        case .notConfigured: return ("No server connected", nil, "server.rack", true)
-        case .unknown: return ("Not measured right now", left, "questionmark.circle", false)
+        case .sending: return ("Sending · \(TransferSummary.rateText(p.rate ?? 0))", "arrow.up.circle.fill", false)
+        case .waiting: return (p.queuedFiles > 0 ? "\(plural(p.queuedFiles, "file", "files")) waiting to send" : "Waiting to send", "clock", false)
+        case .retrying: return ("\(plural(p.retryingFiles, "file", "files")) will be tried again automatically", "arrow.clockwise", true)
+        case .offline(let why): return ("Can't reach the server (\(why))", "wifi.exclamationmark", true)
+        case .paused(let why): return ("Uploads paused: \(why)", "pause.circle", true)
+        case .preparing(let n): return ("Preparing \(plural(n, "Watch part", "Watch parts")) for upload", "gearshape", false)
+        case .keptAside(let n): return ("\(plural(n, "file", "files")) kept aside on this iPhone (not uploaded)", "tray.full", true)
+        case .queueUnreadable: return ("Couldn't read the upload queue", "questionmark.folder", true)
+        case .allSent: return ("Everything queued has reached the server", "checkmark.circle", false)
+        case .notConfigured: return ("No server connected", "server.rack", true)
+        case .unknown: return ("Not measured right now", "questionmark.circle", false)
         }
     }
 
-    /// "13 h", "25 min", "< 1 min": a round figure for an estimate.
-    static func approximate(_ seconds: Double) -> String {
-        if seconds < 60 { return "< 1 min" }
-        if seconds < 3600 { return "\(Int((seconds / 60).rounded())) min" }
-        if seconds < 48 * 3600 { return "\(Int((seconds / 3600).rounded())) h" }
-        return "\(Int((seconds / 86_400).rounded())) days"
+    static func watchLine(_ w: TransferSummary.Watch, now: Date) -> String? {
+        guard w.inUse != false else { return nil }
+        guard w.inUse == true else { return "Checking for Apple Watch" }
+        guard let at = w.reportAt else { return "No report from the Watch yet" }
+        let when = w.reportFresh ? "reported \(Fmt.relative(at))" : "last report \(Fmt.relative(at))"
+        if let seconds = w.waitingSeconds, seconds > 0 { return "\(duration(Double(seconds))) on the Watch · \(when)" }
+        if let parts = w.waitingParts, parts > 0 { return "\(plural(parts, "part", "parts")) on the Watch · \(when)" }
+        return "Nothing waiting on the Watch · \(when)"
     }
-
-    static let explanations = [
-        "Watch → iPhone counts parts this iPhone has stored safely, of those plus the parts the Watch last reported. iOS doesn't report a part's progress while it travels, so this bar moves when the Watch reports (every few minutes while recording) and when a part arrives.",
-        "iPhone → Server counts audio your server confirmed since the app was opened, of that plus what is still queued here. Speed comes from the uploads' own progress reports while this screen is open. Time left is the queue at the current speed; recording continues and the speed changes, so it is a rough guide.",
-        "In the background iOS decides when uploads run, so nothing here is live then. Handed to iOS are uploads iOS may still be waiting to run. Each file is confirmed once, when your server says it stored it; files stay on this iPhone until then.",
-        "Audio on the server isn't a note yet: notes appear after the server has transcribed and summarized it.",
-    ]
 }
 
 /// Devices: one quiet card with where audio is right now; tap for the details.
@@ -85,7 +67,7 @@ struct TransferCardView: View {
         // re-evaluated every second: a rate stops showing as soon as bytes stop
         TimelineView(.periodic(from: .now, by: 1)) { context in
             let t = TransferText.summary(model, watchInstalled: watchInstalled, now: context.date)
-            let hero = TransferText.hero(t)
+            let phone = TransferText.phoneState(t.phone)
             Card {
                 Button(action: open) {
                     HStack(spacing: 12) {
@@ -93,8 +75,11 @@ struct TransferCardView: View {
                             .frame(width: 30, height: 30).background(Pendant.iconBackground, in: .rect(cornerRadius: 10))
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Transfers").font(.headline)
-                            Text([hero.title, hero.line].compactMap { $0 }.joined(separator: " · ")).font(.subheadline)
-                                .foregroundStyle(hero.attention ? Pendant.warnForeground : Pendant.secondary).lineLimit(1).minimumScaleFactor(0.8)
+                            Text("To server: \(phone.title)").font(.subheadline)
+                                .foregroundStyle(phone.attention ? Pendant.warnForeground : Pendant.ink).fixedSize(horizontal: false, vertical: true)
+                            if let watch = TransferText.watchLine(t.watch, now: context.date) {
+                                Text("From Watch: \(watch)").font(.footnote).foregroundStyle(Pendant.secondary).fixedSize(horizontal: false, vertical: true)
+                            }
                         }
                         Spacer(minLength: 0)
                         Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(Pendant.chevron)
@@ -109,32 +94,35 @@ struct TransferCardView: View {
     }
 }
 
-/// One status line, one bar per hop, then the counters and explanations folded away. Live only
-/// while open; every number comes from its own source (the Watch's report, this iPhone's uploads,
-/// the server's last status).
+/// Where audio is, stage by stage, with each stage's own source and time. Live only while open.
 struct TransferDetailView: View {
     let model: AppModel
     let watchInstalled: Bool?
     @AppStorage(SyncActivityCoordinator.optOutKey) private var lockScreenOff = false
-    @State private var showDetails = TransferText.debugExpanded
-    @State private var showHow = TransferText.debugExpanded
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
             let t = TransferText.summary(model, watchInstalled: watchInstalled, now: context.date)
             ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 10) {
                     if TransferText.synthetic {
                         Text("SYNTHETIC PREVIEW · DEBUG").font(.system(size: 9.5, weight: .semibold)).tracking(0.8)
                             .foregroundStyle(Pendant.synthetic).padding(.horizontal, 7).padding(.vertical, 2)
                             .background(Pendant.syntheticBackground, in: .rect(cornerRadius: 6)).frame(maxWidth: .infinity)
                     }
-                    hero(t)
-                    if t.watch.inUse != false { watchHop(t, now: context.date) }
-                    phoneHop(t)
-                    serverLine(t.server)
-                    fold("Details", isOn: $showDetails) { details(t, now: context.date) }
-                    fold("How this works", isOn: $showHow) { explanations }
+                    Text("Live while this screen is open. In the background, iOS decides when uploads run, so nothing here claims to be live then.")
+                        .font(.footnote).foregroundStyle(Pendant.secondary).padding(.horizontal, 4)
+                    watchSection(t.watch, now: context.date)
+                    phoneSection(t.phone)
+                    serverSection(t.server)
+                    if SyncActivityCoordinator.available {
+                        header("Lock Screen")
+                        Card {
+                            Toggle("Show sync on the Lock Screen", isOn: Binding(get: { !lockScreenOff }, set: { lockScreenOff = !$0 }))
+                                .font(.subheadline).padding(.horizontal, 16).padding(.vertical, 8)
+                        }
+                        note("While audio is waiting to reach your server, a Live Activity shows these stages. It updates while the app runs and is marked out of date otherwise; turning it off or dismissing it doesn't stop uploads.")
+                    }
                     Text("Updated \(context.date.formatted(date: .omitted, time: .standard))")
                         .font(.caption).foregroundStyle(Pendant.secondary).padding(.horizontal, 4)
                 }
@@ -147,175 +135,155 @@ struct TransferDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
     }
 
-    // MARK: status
-
-    private func hero(_ t: TransferSummary) -> some View {
-        let h = TransferText.hero(t)
-        return Card {
-            VStack(alignment: .leading, spacing: 4) {
-                Label(h.title, systemImage: h.symbol).font(.title3.weight(.semibold))
-                    .foregroundStyle(h.attention ? Pendant.warnForeground : Pendant.ink).lineLimit(1).minimumScaleFactor(0.8)
-                if let line = h.line {
-                    Text(line).font(.subheadline.monospacedDigit()).foregroundStyle(Pendant.secondary).lineLimit(1).minimumScaleFactor(0.8)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 16).padding(.vertical, 14)
-            .accessibilityElement(children: .combine)
-        }
+    private func header(_ text: String) -> some View {
+        Text(text).font(.footnote.weight(.semibold)).foregroundStyle(Pendant.secondary).textCase(.uppercase).tracking(0.4)
+            .padding(.horizontal, 4).padding(.top, 10)
     }
 
-    private func hop(_ title: String, symbol: String, fraction: Double?, line: String) -> some View {
-        Card {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Label(title, systemImage: symbol).font(.subheadline.weight(.semibold)).lineLimit(1)
-                    Spacer(minLength: 8)
-                    if let fraction { Text(fraction.formatted(.percent.precision(.fractionLength(0)))).font(.subheadline.monospacedDigit()).foregroundStyle(Pendant.secondary) }
-                }
-                bar(fraction)
-                Text(line).font(.footnote.monospacedDigit()).foregroundStyle(Pendant.secondary).lineLimit(1).minimumScaleFactor(0.8)
-            }
-            .padding(.horizontal, 16).padding(.vertical, 12)
-            .accessibilityElement(children: .combine)
-        }
-    }
-
-    /// A plain track; empty (no fill) when the fraction isn't known.
-    private func bar(_ fraction: Double?) -> some View {
-        Capsule().fill(Pendant.track).frame(height: 6)
-            .overlay(alignment: .leading) {
-                GeometryReader { g in
-                    Capsule().fill(Pendant.ink).frame(width: max(fraction.map { $0 > 0 ? 6 : 0 } ?? 0, g.size.width * min(max(fraction ?? 0, 0), 1)))
-                }
-            }
-            .accessibilityHidden(true)
-    }
-
-    private func watchHop(_ t: TransferSummary, now: Date) -> some View {
-        let w = t.watch
-        let line: String
-        if w.inUse == nil {
-            line = "Checking for Apple Watch"
-        } else if let parts = w.waitingParts, w.reportAt != nil {
-            line = parts == 0 ? "Nothing left on the Watch" : "\(TransferText.plural(parts, "part", "parts")) left on the Watch"
-        } else {
-            line = "No report from the Watch yet"
-        }
-        return hop("Watch → iPhone", symbol: "applewatch", fraction: t.watchFraction, line: line)
-    }
-
-    private func phoneHop(_ t: TransferSummary) -> some View {
-        let p = t.phone
-        var parts: [String] = []
-        if p.since != nil, p.deliveredAudioBytes > 0 {
-            parts.append("\(Fmt.bytes(p.deliveredAudioBytes)) of \(Fmt.bytes(p.deliveredAudioBytes + p.queuedBytes))")
-        } else if p.queuedBytes > 0 {
-            parts.append("\(Fmt.bytes(p.queuedBytes)) queued")
-        }
-        if let rate = p.rate { parts.append(TransferSummary.rateText(rate)) }
-        let line = parts.isEmpty ? (p.state == .allSent ? "Nothing queued" : "Not measured right now") : parts.joined(separator: " · ")
-        return hop("iPhone → Server", symbol: "arrow.up", fraction: t.phoneFraction, line: line)
-    }
-
-    private func serverLine(_ s: TransferSummary.Server) -> some View {
-        var text = "Server"
-        if s.reachable == false { text += " · not reachable" }
-        if let n = s.chunksPending { text += n == 0 ? " · nothing to process" : " · \(n.formatted()) to process" }
-        if let at = s.lastNoteAt { text += " · last note \(Fmt.relative(at))" }
-        return Text(text).font(.footnote).foregroundStyle(Pendant.secondary).lineLimit(1).minimumScaleFactor(0.8).padding(.horizontal, 4)
-    }
-
-    // MARK: folded
-
-    private func fold(_ title: String, isOn: Binding<Bool>, @ViewBuilder content: () -> some View) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Button { withAnimation(.snappy) { isOn.wrappedValue.toggle() } } label: {
-                HStack {
-                    Text(title).font(.subheadline.weight(.semibold))
-                    Spacer()
-                    Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(Pendant.chevron)
-                        .rotationEffect(.degrees(isOn.wrappedValue ? 90 : 0))
-                }
-                .padding(.horizontal, 4).padding(.top, 6).contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityValue(isOn.wrappedValue ? "Expanded" : "Collapsed")
-            if isOn.wrappedValue { content() }
-        }
-    }
-
-    /// One line per fact: the label on the left, a short value on the right, never wrapped.
     private func row(_ title: String, _ value: String?, attention: Bool = false) -> some View {
-        HStack(spacing: 12) {
-            Text(title).foregroundStyle(Pendant.secondary).lineLimit(1)
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(title).font(.subheadline)
             Spacer(minLength: 8)
-            Text(value ?? "Unknown").monospacedDigit().lineLimit(1).layoutPriority(1)
+            Text(value ?? "Unknown").font(.subheadline).multilineTextAlignment(.trailing)
                 .foregroundStyle(attention ? Pendant.warnForeground : value == nil ? Pendant.secondary : Pendant.ink)
         }
-        .font(.subheadline)
-        .padding(.horizontal, 16).padding(.vertical, 9)
+        .padding(.horizontal, 16).padding(.vertical, 11)
         .accessibilityElement(children: .combine)
     }
 
-    @ViewBuilder private func details(_ t: TransferSummary, now: Date) -> some View {
-        let p = t.phone, w = t.watch, s = t.server
-        let counting = p.since != nil
-        Card {
-            VStack(spacing: 0) {
-                row("Speed", p.rate.map(TransferSummary.rateText) ?? (counting ? "None" : nil))
-                row("Queued files", p.queuedFiles.formatted())
-                row("Queued size", Fmt.bytes(p.queuedBytes))
-                if p.queuedAudioFiles > 0 { row("Queued audio", TransferText.duration(p.queuedAudioSeconds)) }
-                if p.queuedAudioUnknown > 0 { row("Audio of unknown length", TransferText.plural(p.queuedAudioUnknown, "file", "files")) }
-                row("Handed to iOS", counting ? TransferText.plural(p.inFlightUploads, "upload", "uploads") : nil)
-                if counting, p.inFlightTotal > 0 { row("In those uploads", "\(Fmt.bytes(p.inFlightSent)) of \(Fmt.bytes(p.inFlightTotal))") }
-                row(p.since.map { "Sent since \($0.formatted(date: .omitted, time: .shortened))" } ?? "Sent", counting ? Fmt.bytes(p.networkBytes) : nil)
-                row("Confirmed audio", counting ? "\(p.deliveredAudioFiles.formatted()) · \(Fmt.bytes(p.deliveredAudioBytes))" : nil)
-                if p.deliveredOtherFiles > 0 { row("Confirmed other", p.deliveredOtherFiles.formatted()) }
-                if p.retryingAttempts > 0 { row("Failed, will retry", p.retryingAttempts.formatted(), attention: true) }
-                if p.heldAttempts > 0 { row("Stopped attempts", p.heldAttempts.formatted(), attention: true) }
-                if p.keptAside > 0 { row("Kept aside", TransferText.plural(p.keptAside, "file", "files"), attention: true) }
-            }
-            .padding(.vertical, 4)
-        }
-        if w.inUse == true {
+    private func note(_ text: String) -> some View {
+        Text(text).font(.footnote).foregroundStyle(Pendant.secondary).padding(.horizontal, 4).fixedSize(horizontal: false, vertical: true)
+    }
+
+    // MARK: Watch → iPhone
+
+    @ViewBuilder private func watchSection(_ w: TransferSummary.Watch, now: Date) -> some View {
+        header("Apple Watch → this iPhone")
+        if w.inUse == false {
+            Card { row("Apple Watch", "Not in use") }
+        } else if w.inUse == nil {
+            Card { row("Apple Watch", "Checking…") }
+            note("This iPhone hasn't heard from WatchConnectivity yet, so whether a Watch is set up isn't known.")
+        } else {
             Card {
-                VStack(spacing: 0) {
-                    row("Watch report", w.reportAt.map { (w.reportFresh ? "" : "Old · ") + Fmt.relative($0) })
-                    if let seconds = w.waitingSeconds, w.reportAt != nil { row("Audio on the Watch", TransferText.duration(Double(seconds))) }
-                    row("Received from Watch", TransferText.plural(w.receivedOnPhone, "part", "parts"))
-                    row("Last received", w.lastReceivedAt.map { Fmt.relative($0) } ?? "Not since launch")
-                    if w.converting > 0 { row("Preparing", TransferText.plural(w.converting, "part", "parts")) }
-                    row("Watch audio queued", TransferText.plural(w.waitingForServer, "file", "files"))
+                row("On the Watch", w.reportAt == nil ? nil : waitingOnWatch(w))
+                Divider().padding(.leading, 16)
+                row("Watch report", w.reportAt.map { (w.reportFresh ? "" : "Old · ") + Fmt.relative($0) })
+                Divider().padding(.leading, 16)
+                row("Received by this iPhone", TransferText.plural(w.receivedOnPhone, "part", "parts"))
+                Divider().padding(.leading, 16)
+                row("Last received", w.lastReceivedAt.map { Fmt.relative($0) } ?? "None since the app started")
+                if w.converting > 0 {
+                    Divider().padding(.leading, 16)
+                    row("Preparing for upload", TransferText.plural(w.converting, "part", "parts"))
                 }
-                .padding(.vertical, 4)
+                Divider().padding(.leading, 16)
+                row("Watch audio waiting for the server", TransferText.plural(w.waitingForServer, "file", "files"))
             }
-        }
-        Card {
-            VStack(spacing: 0) {
-                row("Server checked", s.checkedAt.map { Fmt.relative($0) })
-                row("Audio to process", s.chunksPending.map { $0.formatted() })
-                row("Conversations to process", s.conversationsPending.map { $0.formatted() })
-                row("Last note", s.lastNoteAt.map { Fmt.relative($0) })
-            }
-            .padding(.vertical, 4)
-        }
-        if SyncActivityCoordinator.available {
-            Card {
-                Toggle("Show sync on the Lock Screen", isOn: Binding(get: { !lockScreenOff }, set: { lockScreenOff = !$0 }))
-                    .font(.subheadline).padding(.horizontal, 16).padding(.vertical, 8)
-            }
+            note("Received means stored safely on this iPhone, not yet on your server. iOS doesn't tell the iPhone how far along a part from the Watch is, so this step has no live speed; it updates when the Watch reports (every few minutes while recording) and when a part arrives.")
         }
     }
 
-    private var explanations: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ForEach(TransferText.explanations, id: \.self) { text in
-                Text(text).font(.footnote).foregroundStyle(Pendant.secondary).fixedSize(horizontal: false, vertical: true)
+    private func waitingOnWatch(_ w: TransferSummary.Watch) -> String? {
+        let parts = w.waitingParts.map { TransferText.plural($0, "part", "parts") }
+        let audio = w.waitingSeconds.map { TransferText.duration(Double($0)) }
+        if w.waitingParts == 0 { return "Nothing waiting" }
+        return [audio, parts].compactMap { $0 }.joined(separator: " · ").nilIfEmpty
+    }
+
+    // MARK: iPhone → server
+
+    @ViewBuilder private func phoneSection(_ p: TransferSummary.Phone) -> some View {
+        let state = TransferText.phoneState(p)
+        header("This iPhone → your server")
+        Card {
+            HStack(spacing: 10) {
+                Image(systemName: state.symbol).foregroundStyle(state.attention ? Pendant.warnForeground : Pendant.iconForeground)
+                    .accessibilityHidden(true)
+                Text(state.title).font(.subheadline.weight(.semibold))
+                    .foregroundStyle(state.attention ? Pendant.warnForeground : Pendant.ink).fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16).padding(.vertical, 12)
+            Divider().padding(.leading, 16)
+            row("Speed now", p.rate.map(TransferSummary.rateText) ?? (p.since == nil ? nil : "No data moving"))
+            Divider().padding(.leading, 16)
+            row("Handed to iOS", inFlight(p))
+            Divider().padding(.leading, 16)
+            row("Queued on this iPhone", queued(p))
+            Divider().padding(.leading, 16)
+            row(p.since.map { "Sent since \($0.formatted(date: .omitted, time: .shortened))" } ?? "Sent", p.since == nil ? nil : Fmt.bytes(p.networkBytes))
+            if p.since != nil {
+                Text("Counted since the app was last opened.").font(.caption).foregroundStyle(Pendant.secondary)
+                    .padding(.horizontal, 16).padding(.bottom, 8)
+            }
+            Divider().padding(.leading, 16)
+            row("Confirmed by the server", p.since == nil ? nil : confirmed(p))
+            if p.retryingAttempts > 0 {
+                Divider().padding(.leading, 16)
+                row("Failed attempts", "\(p.retryingAttempts) · tried again automatically", attention: true)
+            }
+            if p.heldAttempts > 0 {
+                Divider().padding(.leading, 16)
+                row("Stopped attempts", "\(p.heldAttempts) · file kept on this iPhone, not retried", attention: true)
+            }
+            if p.keptAside > 0 {
+                Divider().padding(.leading, 16)
+                row("Kept aside", "\(TransferText.plural(p.keptAside, "file", "files")) · see Server › Diagnostics", attention: true)
             }
         }
-        .padding(.horizontal, 4)
+        note("Speed and sent bytes come from the uploads' own progress reports while the app is open (sent bytes include retries and small metadata files; an upload that continued in the background counts only from its next report). Handed to iOS are uploads iOS may still be waiting to run. Confirmed counts each file once, when your server says it stored it. Queued audio is summed from each file's recorded length; recording continues, so there is no fixed total or finish time.")
+    }
+
+    private func inFlight(_ p: TransferSummary.Phone) -> String? {
+        guard p.since != nil else { return nil }
+        guard p.inFlightUploads > 0 else { return "None" }
+        var text = TransferText.plural(p.inFlightUploads, "upload", "uploads")
+        if p.inFlightTotal > 0 {
+            let known = p.inFlightUploads - p.inFlightUnknownTotals
+            text += " · \(Fmt.bytes(p.inFlightSent)) of \(Fmt.bytes(p.inFlightTotal))"
+            if p.inFlightUnknownTotals > 0 { text += " (\(known) of known size)" }
+        }
+        return text
+    }
+
+    private func queued(_ p: TransferSummary.Phone) -> String {
+        guard p.queuedFiles > 0 else { return "Nothing" }
+        var parts = [TransferText.plural(p.queuedFiles, "file", "files"), Fmt.bytes(p.queuedBytes)]
+        if p.queuedAudioFiles > 0 {
+            let known = p.queuedAudioFiles - p.queuedAudioUnknown
+            if known > 0 { parts.append("\(TransferText.duration(p.queuedAudioSeconds)) of audio") }
+            if p.queuedAudioUnknown > 0 { parts.append("\(p.queuedAudioUnknown) of unknown length") }
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func confirmed(_ p: TransferSummary.Phone) -> String {
+        var text = TransferText.plural(p.deliveredAudioFiles, "audio file", "audio files")
+        if p.deliveredAudioFiles > 0 { text += " (\(Fmt.bytes(p.deliveredAudioBytes)))" }
+        if p.deliveredOtherFiles > 0 { text += " · \(TransferText.plural(p.deliveredOtherFiles, "other file", "other files"))" }
+        return text
+    }
+
+    // MARK: server
+
+    @ViewBuilder private func serverSection(_ s: TransferSummary.Server) -> some View {
+        header("Your server")
+        Card {
+            row("Last checked", s.checkedAt.map { Fmt.relative($0) + (s.reachable == false ? " · not reachable" : "") })
+            Divider().padding(.leading, 16)
+            row("Waiting to be processed", processing(s))
+            Divider().padding(.leading, 16)
+            row("Last note written", s.lastNoteAt.map { Fmt.relative($0) })
+        }
+        note("This is what the server said when last checked. Audio reaching the server isn't a finished note yet: notes appear after the server has transcribed and summarized it.")
+    }
+
+    private func processing(_ s: TransferSummary.Server) -> String? {
+        guard s.chunksPending != nil || s.conversationsPending != nil else { return nil }
+        return [s.chunksPending.map { TransferText.plural($0, "audio file", "audio files") },
+                s.conversationsPending.map { TransferText.plural($0, "conversation", "conversations") }]
+            .compactMap { $0 }.joined(separator: " · ")
     }
 }
 

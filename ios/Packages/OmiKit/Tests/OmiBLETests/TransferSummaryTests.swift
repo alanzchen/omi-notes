@@ -98,27 +98,4 @@ import OmiWatchKit
         #expect(TransferSummary.rateText(48_200) == "48.2 KB/s")
         #expect(TransferSummary.rateText(1_300_000) == "1.3 MB/s")
     }
-
-    // OMI-THROUGHPUT-UI-20261108: the redesigned screen's hero and bars
-
-    @Test func timeLeftOnlyWhileBytesMove() throws {
-        let backlog = try #require(TransferSummary.debugFixture("backlog", now: now))
-        let left = try #require(backlog.phoneTimeLeft)
-        #expect(abs(left / 3600 - 13.4) < 0.1, "5.39 GB at 111.7 KB/s is about 13.4 h")
-        let waiting = try #require(TransferSummary.debugFixture("waiting", now: now))
-        #expect(waiting.phoneTimeLeft == nil, "no speed, no estimate")
-    }
-
-    @Test func barsCoverOnlyWhatIsKnown() throws {
-        let backlog = try #require(TransferSummary.debugFixture("backlog", now: now))
-        let f = try #require(backlog.phoneFraction)
-        #expect(abs(f - 46.6 / (46.6 + 5_390)) < 0.0001)
-        #expect(try #require(TransferSummary.debugFixture("all-sent", now: now)).phoneFraction == 1)
-        let watch = try #require(backlog.watchFraction)
-        #expect(abs(watch - 266.0 / 270) < 0.0001, "received parts of received plus still on the Watch")
-        #expect(try #require(TransferSummary.debugFixture("unknown-watch", now: now)).watchFraction == nil)
-        var notCounting = backlog
-        notCounting.phone.since = nil
-        #expect(notCounting.phoneFraction == nil, "in the background nothing is counted, so no bar")
-    }
 }
