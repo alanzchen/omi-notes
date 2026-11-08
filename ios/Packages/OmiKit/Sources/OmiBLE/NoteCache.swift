@@ -34,18 +34,37 @@ public final class NoteCache: @unchecked Sendable {
     public static let maxDetails = 50
     public static let maxBytes: Int64 = 20 * 1024 * 1024
 
-    /// Saved copies can't be read while the phone is locked. macOS, where OmiKit's tests run, refuses
-    /// this protection class for an ordinary process (EPERM), so there they are written without it.
+    /// Saved copies are encrypted at rest until the phone is first unlocked after a restart ("until
+    /// first unlock", like the rest of the app's data). Complete protection made every save while
+    /// the phone was locked fail (an atomic save creates a new file, which that class forbids then).
+    /// macOS, where OmiKit's tests run, refuses protection classes for an ordinary process (EPERM),
+    /// so there they are written without one.
     static let writeOptions: Data.WritingOptions = {
         #if os(macOS)
         return [.atomic]
         #else
-        return [.atomic, .completeFileProtection]
+        return [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
         #endif
     }()
 
+    private static var directoryAttributes: [FileAttributeKey: Any] {
+        #if os(macOS)
+        return [:]
+        #else
+        return [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
+        #endif
+    }
+
     private let root: URL
     private let lock = NSLock()
+    /// Moves one item an earlier build wrote with complete protection to the current class.
+    var setProtection: (URL) throws -> Void = { url in
+        #if !os(macOS)
+        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                                              ofItemAtPath: url.path)
+        #endif
+    }
+    private var migrated = false
 
     public init(root: URL) { self.root = root }
 
@@ -123,13 +142,31 @@ public final class NoteCache: @unchecked Sendable {
         do {
             let e = JSONEncoder()
             e.dateEncodingStrategy = .secondsSince1970
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            migrateProtection()
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                    attributes: Self.directoryAttributes)
             try e.encode(value).write(to: url, options: Self.writeOptions)
             if read(Scope.self, pointerURL) != scope {
                 try e.encode(scope).write(to: pointerURL, options: Self.writeOptions)
             }
         } catch {
             OmiLog.shared.log(.warning, "cache", "couldn't save a note for offline reading: \(error)")
+        }
+    }
+
+    /// Once per launch: the folder and every file in it to the current protection class. A failure
+    /// (still locked, say) is tried again on the next save; the save itself doesn't depend on it.
+    private func migrateProtection() {
+        guard !migrated, FileManager.default.fileExists(atPath: root.path) else { return }
+        var items = [root]
+        if let walk = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil) {
+            for case let url as URL in walk { items.append(url) }
+        }
+        do {
+            for url in items { try setProtection(url) }
+            migrated = true
+        } catch {
+            OmiLog.shared.log(.info, "cache", "saved copies keep their old protection for now: \((error as NSError).code)")
         }
     }
 

@@ -432,15 +432,39 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         #expect(c.detail("c1", scope: a) == nil && c.lastScope == nil)
     }
 
-    /// The phone writes saved copies with complete file protection (unreadable while it is locked).
-    /// Only the option can be checked here: the simulator reports no protection class (nil) and macOS
-    /// refuses the option, so its effect needs a device.
-    @Test func savedCopiesAreWrittenProtectedOnThePhone() {
+    /// Field log, build 42 (2026-11-08 05:10Z): "no permission to save recent.json" (NSCocoaErrorDomain
+    /// 513). Complete protection can't create a file while the phone is locked, and every atomic save
+    /// creates one. Saved copies use "until first unlock" (still encrypted at rest until the phone
+    /// is first unlocked after a restart, like the rest of the app's data). Only the option can be
+    /// checked here: the simulator reports no class and macOS refuses it, so its effect needs a device.
+    @Test func savedCopiesAreWrittenSoTheyCanBeSavedWhileLocked() {
         #if os(macOS)
         #expect(NoteCache.writeOptions == [.atomic])
         #else
-        #expect(NoteCache.writeOptions == [.atomic, .completeFileProtection])
+        #expect(NoteCache.writeOptions == [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
         #endif
+    }
+
+    /// Folders and files an earlier build wrote with complete protection are moved to the new class
+    /// (once per launch, retried after a failure, e.g. while still locked).
+    @Test func earlierCompleteProtectionIsMigrated() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-cache-\(UUID().uuidString)")
+        let s = NoteCache.Scope(serverURL: "https://a", generation: 1, vaultId: "v1")
+        NoteCache(root: root).saveRecent([], scope: s)
+        var visited: [String] = []
+        var failNext = true
+        let c = NoteCache(root: root)
+        c.setProtection = { url in
+            if failNext { failNext = false; throw CocoaError(.fileWriteNoPermission) }
+            visited.append(url.resolvingSymlinksInPath().path.replacingOccurrences(of: root.resolvingSymlinksInPath().path, with: ""))
+        }
+        c.saveRecent([], scope: s)
+        #expect(visited.isEmpty, "a failed migration (locked) is tried again on the next save")
+        c.saveRecent([], scope: s)
+        #expect(visited.contains("") && visited.contains("/\(s.folder)") && visited.contains("/\(s.folder)/recent.json") && visited.contains("/scope.json"))
+        let count = visited.count
+        c.saveRecent([], scope: s)
+        #expect(visited.count == count, "once per launch")
     }
 
     @Test func theOldestSavedCopiesAreEvicted() throws {
