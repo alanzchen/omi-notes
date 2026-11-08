@@ -17,7 +17,7 @@ Omi pendant → iPhone app (`ios/`) → your server (`backend/`) → Markdown no
 | Omi reference code (read-only) | `/Users/alan/Developer/_ref/omi` (BasedHardware/omi `d4e5a35`) | — |
 
 `make test` runs both suites. For this Mac's TestFlight releases, use the **local signing workflow
-below**; `make testflight` is the separate cloud-signing workflow described in `ios/README.md`.
+below** (`ios/Tools/testflight.sh`, also `make testflight`).
 
 ## Rules
 
@@ -83,57 +83,58 @@ below**; `make testflight` is the separate cloud-signing workflow described in `
 
 ## TestFlight on this Mac
 
-The following setup was verified on **2026-09-27**; inspect current Apple state before each release.
-Reuse the existing app, signing assets, API key and tester group while they remain valid.
+The following setup was verified on **2026-11-07** (build 39); inspect current Apple state before
+each release. Reuse the existing app, signing assets, API key and tester group while they remain valid.
 
 | Item | Existing setup |
 |---|---|
-| App / bundle | Omi Notes / `dev.omi-notes.app` |
+| App / bundle | Omi Notes / `dev.omi-notes.app` (Watch app `….watchkitapp`, complication `….watchkitapp.widgets`) |
 | App Store Connect app ID | `6816608105` |
 | Developer team | `N9YEGD9WDP` |
-| Local signing identity / profile | `Apple Distribution` / `Omi Notes App Store` |
+| Local signing identity | `Apple Distribution` (check its SHA-1 with `security find-identity -v -p codesigning`) |
+| App Store profiles | `Omi Notes App Store`, `Omi Notes Watch App Store`, `Omi Notes Watch Complication App Store` (valid to 2027-09-27) |
 | Upload configuration | `~/.appstoreconnect/omi-notes-upload.json` (`key_id`, `issuer_id`, `key_path`, `app_id`) |
 | Private API key | `~/.appstoreconnect/private_keys/AuthKey_<key_id>.p8`, file mode `0600`; role is **Developer** |
 | Internal Testing group | `b442156a-468f-491b-923c-489bd9548859` |
-| Last verified release | `0.1.0 (3)` (2026-09-27), `VALID`, `IN_BETA_TESTING`; query Apple for the next build number |
+| Last verified release | `0.1.0 (39)` (2026-11-07, from `352dcf3`), `VALID`, `IN_BETA_TESTING`; query Apple for the next build number |
 
-**Use manual local signing and upload the exported IPA.** `ios/Tools/testflight.sh` / `make testflight`
-uses automatic cloud signing and expects an Admin key; it is not the workflow for the current
-Developer key. Do not create a more privileged key just to use that script.
+**Use `ios/Tools/testflight.sh` (manual local signing, one profile per target).** It archives a
+clean `git archive` copy of HEAD (no `Local.xcconfig`, no uncommitted changes), passes
+`OMI_APP_BUNDLE_ID` and `OMI_IOS_PROFILE`/`OMI_WATCH_PROFILE`/`OMI_COMPLICATION_PROFILE` (never a
+global `PRODUCT_BUNDLE_IDENTIFIER` or `PROVISIONING_PROFILE_SPECIFIER`), exports with a three-entry
+profile map, and checks the IPA. It creates nothing on Apple's side and needs no Admin key.
+**The Live Activity is not shipped:** Release builds leave out `OmiNotesLiveActivity.appex` and
+`NSSupportsLiveActivities` (`project.yml`, `Info.plist`) until it has its own App ID and profile and
+has passed Lock Screen acceptance; the script fails if it is embedded.
 
-1. Query App Store Connect for existing builds; choose an unused, increasing build number.
-   Generate the Xcode project with `cd ios && xcodegen generate`. From the repository root, set
-   `OMI_BUILD_NUMBER`, the intended `OMI_MARKETING_VERSION` (currently `0.1.0`), and an absolute
-   `OMI_RELEASE_DIR` under `build/testflight-ready/`, then archive:
+1. Query App Store Connect for existing builds (`build/testflight-ready/asc.py GET
+   "/v1/builds?filter[app]=6816608105&sort=-uploadedDate&limit=5"`) and choose an unused, increasing
+   build number. Commit first: the script refuses a dirty tree. From the repository root:
 
    ```sh
-   xcodebuild archive -project ios/OmiNotes.xcodeproj -scheme OmiNotes \
-     -configuration Release -destination 'generic/platform=iOS' \
-     -archivePath "$OMI_RELEASE_DIR/OmiNotes.xcarchive" \
-     -derivedDataPath build/testflight-ready/DerivedData \
-     DEVELOPMENT_TEAM=N9YEGD9WDP PRODUCT_BUNDLE_IDENTIFIER=dev.omi-notes.app \
-     MARKETING_VERSION="$OMI_MARKETING_VERSION" CURRENT_PROJECT_VERSION="$OMI_BUILD_NUMBER" \
-     CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY='Apple Distribution' \
-     PROVISIONING_PROFILE_SPECIFIER='Omi Notes App Store'
+   TEAM_ID=N9YEGD9WDP OMI_BUILD_NUMBER=<n> \
+   OMI_IOS_PROFILE='Omi Notes App Store' OMI_WATCH_PROFILE='Omi Notes Watch App Store' \
+   OMI_COMPLICATION_PROFILE='Omi Notes Watch Complication App Store' \
+   ios/Tools/testflight.sh
    ```
 
-2. Prepare `ExportOptions.plist` with `destination=export`, `method=app-store-connect`,
-   `signingStyle=manual`, `teamID=N9YEGD9WDP`, `manageAppVersionAndBuildNumber=false`,
-   `uploadSymbols=true`, and `provisioningProfiles={dev.omi-notes.app: Omi Notes App Store}`.
-   Set `signingCertificate` to the verified installed distribution certificate's SHA-1.
-   The successful build-2 plist is a local example, not a permanent certificate reference.
+   Output goes to `build/testflight-ready/OmiNotes-<version>-<n>/` (source copy, archive and export
+   logs, `ExportOptions.plist`, `ipa-check/`, `ipa-sha256.txt`).
+
+2. Inspect the IPA yourself before uploading: in `ipa-check/Payload/OmiNotes.app`, the app, the
+   Watch app and the complication each carry their own bundle id, App Store profile and Apple
+   Distribution signature; the Watch app and complication have the
+   `N9YEGD9WDP.dev.omi-notes.shared` keychain group; there is no `PlugIns/OmiNotesLiveActivity.appex`
+   and no `NSSupportsLiveActivities`; `get-task-allow` is false. Record Xcode's existing
+   "Metadata extraction skipped, no AppIntents.framework dependency found" note separately from
+   compiler warnings.
+
+3. Upload: read `ASC_KEY_ID` and `ASC_ISSUER_ID` from the private upload configuration (identifiers,
+   not the private key), then run the script again with `--upload` on a new build, or upload the
+   inspected IPA directly:
 
    ```sh
-   xcodebuild -exportArchive -archivePath "$OMI_RELEASE_DIR/OmiNotes.xcarchive" \
-     -exportPath "$OMI_RELEASE_DIR/export" \
-     -exportOptionsPlist "$OMI_RELEASE_DIR/ExportOptions.plist"
-   ```
-
-3. After package verification, read `ASC_KEY_ID` and `ASC_ISSUER_ID` from the private upload
-   configuration (these are identifiers, not the private key), then upload:
-
-   ```sh
-   xcrun altool --upload-package "$OMI_RELEASE_DIR/export/OmiNotes.ipa" \
+   xcrun altool --upload-package "<release dir>/export/OmiNotes.ipa" \
      --api-key "$ASC_KEY_ID" --api-issuer "$ASC_ISSUER_ID" --wait
    ```
 
@@ -144,10 +145,11 @@ Developer key. Do not create a more privileged key just to use that script.
    `buildBetaDetail.internalBuildState=IN_BETA_TESTING`; save the evidence and delivery UUID.
    Tell the user the exact version/build to install from TestFlight.
 
-Use the existing authenticated Chrome session if a portal-only step is needed. Apple login,
-two-factor verification and macOS Keychain prompts are completed by the user in the native UI;
-never request passwords/codes in chat or print private keys/JWTs. If Chrome blocks a local upload,
-its ChatGPT extension needs “Allow access to file URLs”; this was enabled during initial setup.
+If signing fails because the login keychain is locked or a password/GUI prompt appears, stop and
+report it. Use the existing authenticated Chrome session if a portal-only step is needed. Apple
+login, two-factor verification and macOS Keychain prompts are completed by the user in the native
+UI; never request passwords/codes in chat or print private keys/JWTs. If Chrome blocks a local
+upload, its ChatGPT extension needs “Allow access to file URLs”; this was enabled during initial setup.
 
 ## Mac Studio backend deployment
 

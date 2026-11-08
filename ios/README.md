@@ -125,31 +125,32 @@ iPhone it belongs to the first time they connect, and nothing else needs pairing
 
 ## TestFlight
 
-> **The existing Mac Studio setup uses manual local signing and a Developer-role API key.** Follow
-> "TestFlight on this Mac" in [`AGENTS.md`](../AGENTS.md) for it; the workflow below needs an Admin
-> key and is only for a fresh cloud-signing setup.
+`make testflight` (or `ios/Tools/testflight.sh`) archives a Release build of the committed tree,
+signs the app, the Watch app and the complication manually with one existing App Store profile each,
+exports and checks the IPA, and with `--upload` sends it to App Store Connect. It creates nothing on
+Apple's side. You need, once:
 
-`make testflight` (or `ios/Tools/testflight.sh`) archives a Release build and uploads it to App Store
-Connect. Signing is automatic and cloud-managed through an App Store Connect API key, so no
-certificates or profiles need to be set up by hand. One-time setup, in App Store Connect:
+1. **App IDs and profiles:** register `OMI_APP_BUNDLE_ID` (default `dev.omi-notes.app`),
+   `….watchkitapp` and `….watchkitapp.widgets` under Identifiers (the Watch app and complication need
+   a keychain-sharing group, `<team>.dev.omi-notes.shared`), install an Apple Distribution
+   certificate, and create an App Store profile for each id.
+2. **App record:** Apps › + › New App (iOS, any available name, bundle ID from `OMI_APP_BUNDLE_ID`).
+   Any SKU.
+3. **For `--upload`:** an App Store Connect API key (any role that can upload) saved as
+   `~/.appstoreconnect/private_keys/AuthKey_<KEY_ID>.p8`, with `ASC_KEY_ID` and `ASC_ISSUER_ID` set.
 
-1. **API key:** Users and Access › Integrations › App Store Connect API › Team Keys › generate a key
-   with the **Admin** role (cloud-managed distribution signing requires it; an App Manager key fails
-   at export). Save `AuthKey_<KEY_ID>.p8` to `~/.appstoreconnect/private_keys/` and note the Key ID
-   and Issuer ID.
-2. **App record:** Apps › + › New App (iOS, any available name, bundle ID from
-   `OMI_APP_BUNDLE_ID`, default `dev.omi-notes.app`; register it under Identifiers first if
-   it isn't offered). Any SKU.
+Then, from the repository root (commit first; the build number must be higher than every earlier
+build of the version):
 
-> **Limitation:** `testflight.sh` predates the Watch app. It passes the app's bundle ID to every
-> target, which the embedded Watch app, complication and Live Activity can't use, and each of
-> those also needs its own App ID and profile for App Store distribution. Expect to adapt it.
+```sh
+TEAM_ID=… OMI_BUILD_NUMBER=… OMI_IOS_PROFILE='…' OMI_WATCH_PROFILE='…' \
+OMI_COMPLICATION_PROFILE='…' ios/Tools/testflight.sh --upload
+```
 
-Then `ASC_KEY_ID=… ASC_ISSUER_ID=… make testflight`. The build number is a UTC timestamp to the second, so every
-upload is newer. After processing, add yourself under TestFlight › Internal Testing. Internal
-testing needs no Beta App Review; external testers do. The app ships with an original icon
-(`Tools/make_app_icon.swift`), a privacy manifest, and `ITSAppUsesNonExemptEncryption = NO`
-(HTTPS only).
+After processing, add the build under TestFlight › Internal Testing. Internal testing needs no Beta
+App Review; external testers do. Release builds leave out the Live Activity (no App ID or profile
+needed for it yet). The app ships with an original icon (`Tools/make_app_icon.swift`), a privacy
+manifest, and `ITSAppUsesNonExemptEncryption = NO` (HTTPS only).
 
 ## Pairing
 
