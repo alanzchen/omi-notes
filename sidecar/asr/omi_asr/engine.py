@@ -80,16 +80,16 @@ class Engine:
             mx.reset_peak_memory()
             t0 = time.perf_counter()
             duration = len(pcm) / plan.SR
-            stats = {"windows": 0, "resplits": 0, "qwen_chunks": 0, "qwen_capped": 0, "units": 0,
-                     "units_outside_lines": 0, "lines_with_moss_text": 0}  # fmt: skip
+            stats = {"windows": 0, "resplits": 0, "truncated_unresolved": 0, "unlabeled_windows": 0, "qwen_chunks": 0,
+                     "qwen_capped": 0, "units": 0, "units_outside_lines": 0, "lines_with_moss_text": 0}  # fmt: skip
             lines: list[dict] = []
             languages: list[str] = []
             for k, (a, b) in enumerate(plan.plan_windows(pcm)):
-                for sub, (lines_w, start) in enumerate(self._moss(moss, pcm, a, b, 0, stats)):
+                for sub, (lines_w, start, stop) in enumerate(self._moss(moss, pcm, a, b, 0, stats)):
                     prefix = "" if (k, sub) == (0, 0) else f"W{k + 1}.{sub + 1}-"
                     for line in lines_w:
                         line["speaker"] = prefix + line["speaker"]
-                    lines.extend(self._text(qwen, aligner, pcm, start, lines_w, context, stats, languages))
+                    lines.extend(self._text(qwen, aligner, pcm, start, stop, lines_w, context, stats, languages, prefix))
             t_total = time.perf_counter() - t0
             self.last_used = time.monotonic()
             lines.sort(key=lambda s: (s["start"], s["end"]))
@@ -104,8 +104,9 @@ class Engine:
                                 peak_mlx_gb=round(mx.get_peak_memory() / 1e9, 2), load_seconds=self.load_seconds),  # fmt: skip
             }
 
-    def _moss(self, moss, pcm: np.ndarray, a: float, b: float, depth: int, stats: dict) -> list[tuple[list[dict], float]]:
-        """MOSS on [a, b] (absolute s): [(lines, window start)], cut again at the middle pause while truncated."""
+    def _moss(self, moss, pcm: np.ndarray, a: float, b: float, depth: int, stats: dict) -> list[tuple[list[dict], float, float]]:
+        """MOSS on [a, b] (absolute s): [(lines, window start, window end)], cut again at the middle pause
+        while truncated."""
         import mlx.core as mx
 
         window = pcm[round(a * plan.SR) : round(b * plan.SR)]
@@ -114,24 +115,26 @@ class Engine:
         r = moss.generate(mx.array(window), max_tokens=cap)
         stats["windows"] += 1
         relative = moss_lines(r.segments)
-        if plan.is_truncated(relative, int(r.generation_tokens), cap, plan.speech_end(window)) and depth < MAX_RESPLIT_DEPTH and seconds > 120:
-            cut = a + plan.middle_cut(window, 0.0, seconds)
-            stats["resplits"] += 1
-            log.warning("MOSS truncated on %.0f s (tokens %d/%d): cutting at %.1f s", seconds, r.generation_tokens, cap, cut)
-            return self._moss(moss, pcm, a, cut, depth + 1, stats) + self._moss(moss, pcm, cut, b, depth + 1, stats)
-        return [(moss_lines(r.segments, offset=a), a)]
+        if plan.is_truncated(relative, int(r.generation_tokens), cap, plan.speech_end(window)):
+            if depth < MAX_RESPLIT_DEPTH and seconds > 120:
+                cut = a + plan.middle_cut(window, 0.0, seconds)
+                stats["resplits"] += 1
+                log.warning("MOSS truncated on %.0f s (tokens %d/%d): cutting at %.1f s", seconds, r.generation_tokens, cap, cut)
+                return self._moss(moss, pcm, a, cut, depth + 1, stats) + self._moss(moss, pcm, cut, b, depth + 1, stats)
+            # Qwen still hears the whole window; its words past MOSS's last line go to the nearest line
+            stats["truncated_unresolved"] += 1
+            log.warning("MOSS still truncated on %.0f s at %.0f s (tokens %d/%d)", seconds, a, r.generation_tokens, cap)
+        return [(moss_lines(r.segments, offset=a), a, b)]
 
-    def _text(self, qwen, aligner, pcm: np.ndarray, start: float, lines: list[dict], context: list[str],
-              stats: dict, languages: list[str]) -> list[dict]:  # fmt: skip
-        """Qwen text on <= 180 s chunks of this window, aligned onto its MOSS lines."""
+    def _text(self, qwen, aligner, pcm: np.ndarray, start: float, stop: float, lines: list[dict], context: list[str],
+              stats: dict, languages: list[str], prefix: str = "") -> list[dict]:  # fmt: skip
+        """Qwen text on <= 180 s chunks of the whole window [start, stop] (speech MOSS left out included),
+        aligned onto its MOSS lines."""
         import mlx.core as mx
 
-        if not lines:
-            return []
-        end = max(s["end"] for s in lines)
         relative = [dict(s, start=s["start"] - start, end=s["end"] - start) for s in lines]
         units = []
-        cuts = plan.chunk_cuts(relative, end - start)
+        cuts = plan.chunk_cuts(relative, stop - start)
         for a, b in zip(cuts, cuts[1:], strict=False):
             chunk = pcm[round((start + a) * plan.SR) : round((start + b) * plan.SR)]
             if len(chunk) < plan.SR // 10:
@@ -145,12 +148,21 @@ class Engine:
                 log.warning("Qwen hit its cap on a %.0f s chunk: keeping MOSS text there", len(chunk) / plan.SR)
                 continue
             text = (r.text or "").strip()
-            if getattr(r, "language", None):
-                languages.append(str(r.language))
+            reported = getattr(r, "language", None)  # mlx-audio 0.6.3 gives a list of names, e.g. ["English"]
+            for name in reported if isinstance(reported, (list, tuple)) else [reported]:
+                if isinstance(name, str) and name.strip() and name.strip().lower() != "none":
+                    languages.append(name.strip())
             if not text:
                 continue
             res = aligner.generate(chunk, text=text, language=ALIGN_LANGUAGE)
             units.extend(spans_for(text, [(it.text, float(it.start_time), float(it.end_time)) for it in res.items], start + a))
+        if not lines:
+            if not units:
+                return []
+            # MOSS found no speaker here but Qwen heard words: keep them under one label rather than drop them
+            stats["unlabeled_windows"] += 1
+            log.warning("MOSS found no lines in %.0f-%.0f s: %d words kept under one label", start, stop, len(units))
+            lines = [{"start": units[0].start, "end": units[-1].end, "speaker": prefix + "S00", "moss_text": ""}]
         merged, s = assign(lines, units)
         for key in ("units", "units_outside_lines", "lines_with_moss_text"):
             stats[key] += s[key]

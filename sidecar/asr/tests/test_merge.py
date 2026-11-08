@@ -26,3 +26,10 @@ def test_a_unit_outside_every_line_goes_to_the_nearest_and_is_counted():
     lines = [{"start": 0.0, "end": 1.0, "speaker": "S01", "moss_text": "a"}, {"start": 10.0, "end": 11.0, "speaker": "S02", "moss_text": "b"}]
     out, stats = assign(lines, [Unit(8.0, 8.4, "late")])
     assert out[1]["text"] == "late" and stats["units_outside_lines"] == 1
+    assert out[1]["start"] == 8.0, "the line now covers the words it was given"
+
+
+def test_a_unit_in_a_gap_goes_to_the_line_with_the_nearer_edge_not_the_nearer_middle():
+    lines = [{"start": 0.0, "end": 100.0, "speaker": "S01", "moss_text": "a"}, {"start": 110.0, "end": 111.0, "speaker": "S02", "moss_text": "b"}]
+    out, _ = assign(lines, [Unit(50.0, 50.5, "x "), Unit(103.8, 104.2, "late")])
+    assert [s["text"] for s in out] == ["x late", "b"] and out[0]["end"] == 104.2

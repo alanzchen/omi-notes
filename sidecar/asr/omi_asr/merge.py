@@ -1,7 +1,8 @@
 """Putting Qwen3-ASR text on MOSS lines (the bench's `align` variant, scripts/hybrid.py `v_align`).
 
 Each aligned unit (a Chinese character or English word with its time from Qwen3-ForcedAligner) goes to
-the MOSS line whose span (+-0.2 s) holds its midpoint, else the nearest line. A line that gets no text
+the MOSS line whose span (+-0.2 s) holds its midpoint, else the line with the nearest edge, which is
+stretched to cover it. A line that gets no text
 keeps MOSS's own (backchannels such as 嗯 / 对 that Qwen skips).
 """
 
@@ -63,9 +64,12 @@ def assign(lines: list[dict], units: list[Unit]) -> tuple[list[dict], dict]:
             break
         m = (u.start + u.end) / 2
         inside = [j for j, s in enumerate(out) if s["start"] - SLACK <= m <= s["end"] + SLACK]
-        if not inside:
+        if inside:
+            j = min(inside, key=lambda j: abs((out[j]["start"] + out[j]["end"]) / 2 - m))
+        else:  # the line with the nearest edge, stretched to cover the unit (its time stays honest)
             outside += 1
-        j = min(inside or range(len(out)), key=lambda j: abs((out[j]["start"] + out[j]["end"]) / 2 - m))
+            j = min(range(len(out)), key=lambda j: max(out[j]["start"] - m, m - out[j]["end"]))
+            out[j]["start"], out[j]["end"] = min(out[j]["start"], u.start), max(out[j]["end"], u.end)
         out[j]["text"] += u.text
     empty = 0
     for s in out:
