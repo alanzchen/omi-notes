@@ -283,6 +283,11 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         backgroundTransport?.onCompletion = { [weak self] id, status, body, error in
             self?.uploader.handleCompletion(identifier: id, statusCode: status, body: body, error: error)
         }
+        // the wake's next window goes to the system before iOS may suspend the app
+        backgroundTransport?.onEventsFinished = { [weak self] finish in
+            guard let self else { finish(); return }
+            self.uploader.refillThen { finish() }
+        }
 
         // 1. Recovery runs first on the serial engine queue: every Bluetooth and upload callback is
         //    delivered on this queue and therefore queued behind it, but launch is not blocked.

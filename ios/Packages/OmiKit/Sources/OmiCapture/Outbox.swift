@@ -107,11 +107,21 @@ public final class Outbox: @unchecked Sendable {
     /// and ran several times per upload completion, so a large backlog kept the engine queue busy
     /// for minutes. This instance's own changes update the listing in place; any other change to a
     /// folder (another writer, a file removed by hand) changes its time and forces a fresh listing.
+    ///
+    /// Only this instance writes these folders in the app (the engine shares one Outbox). Another
+    /// writer is still noticed: a listing is also re-read from disk once it is `maxListingAge` old,
+    /// so a change whose time an own write absorbed (a write racing ours) appears within that bound.
+    /// A folder that can't be read is never cached as empty: the next read tries again.
     private struct Listing {
         var stamp: FolderStamp
         var items: [String: OutboxItem]
         var sorted: [OutboxItem]?
+        /// When the folder was last actually read (system uptime).
+        var scannedAt: TimeInterval
     }
+    static let maxListingAge: TimeInterval = 30
+    /// Injectable for tests: system uptime in seconds.
+    var uptime: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     private var listings: [URL: Listing] = [:]
 
     public init(dirs: CaptureDirectories) { self.dirs = dirs }
@@ -155,9 +165,9 @@ public final class Outbox: @unchecked Sendable {
         FileIO.exists(dirs.outboxSent.appendingPathComponent(kind.fileName))
     }
 
-    public func pending() -> [OutboxItem] { list(dirs.outboxPending) }
-    public func sent() -> [OutboxItem] { list(dirs.outboxSent) }
-    public func quarantined() -> [OutboxItem] { list(dirs.outboxQuarantine) }
+    public func pending() -> [OutboxItem] { list(dirs.outboxPending) ?? [] }
+    public func sent() -> [OutboxItem] { list(dirs.outboxSent) ?? [] }
+    public func quarantined() -> [OutboxItem] { list(dirs.outboxQuarantine) ?? [] }
 
     public func pendingItem(named name: String) -> OutboxItem? {
         let url = dirs.outboxPending.appendingPathComponent(name)
@@ -225,13 +235,20 @@ public final class Outbox: @unchecked Sendable {
     public func deleteSent(_ name: String) {
         lock.lock(); defer { lock.unlock() }
         let fresh = isFreshLocked(dirs.outboxSent)
-        try? FileManager.default.removeItem(at: dirs.outboxSent.appendingPathComponent(name))
-        updateLocked(dirs.outboxSent, wasFresh: fresh) { $0[name] = nil }
+        do {
+            try FileManager.default.removeItem(at: dirs.outboxSent.appendingPathComponent(name))
+            updateLocked(dirs.outboxSent, wasFresh: fresh) { $0[name] = nil }
+        } catch {
+            // still there: keep it listed and counted, so retention tries again
+            listings[dirs.outboxSent] = nil
+            log(.warning, "outbox", "couldn't delete sent \(name): \(error)")
+        }
     }
 
     public func stats() -> OutboxStats {
         var s = OutboxStats()
-        for item in pending() {
+        let pendingList = list(dirs.outboxPending), quarantineList = list(dirs.outboxQuarantine)
+        for item in pendingList ?? [] {
             s.pendingCount += 1
             s.pendingBytes += item.size
             if item.kind.isChunk { s.pendingChunks += 1 }
@@ -240,32 +257,35 @@ public final class Outbox: @unchecked Sendable {
             s.sentCount += 1
             s.sentBytes += item.size
         }
-        s.quarantineCount = quarantined().count
-        s.inventoryReadable = [dirs.outboxPending, dirs.outboxQuarantine].allSatisfy {
-            (try? FileManager.default.contentsOfDirectory(atPath: $0.path)) != nil
-        }
+        s.quarantineCount = quarantineList?.count ?? 0
+        s.inventoryReadable = pendingList != nil && quarantineList != nil  // the inventory these counts came from
         return s
     }
 
-    private func list(_ dir: URL) -> [OutboxItem] {
+    /// nil: the folder couldn't be read (nothing cached; the next call reads it again).
+    private func list(_ dir: URL) -> [OutboxItem]? {
         lock.lock(); defer { lock.unlock() }
         let stamp = FolderStamp(dir)
-        if let stamp, var l = listings[dir], l.stamp == stamp {
+        if let stamp, var l = listings[dir], l.stamp == stamp, uptime() - l.scannedAt < Self.maxListingAge {
             if let sorted = l.sorted { return sorted }
             let sorted = Self.ordered(Array(l.items.values))
             l.sorted = sorted
             listings[dir] = l
             return sorted
         }
-        let items = scan(dir)
-        listings[dir] = stamp.map { Listing(stamp: $0, items: Dictionary(items.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a }), sorted: items) }
+        guard let items = scan(dir) else {
+            listings[dir] = nil
+            return nil
+        }
+        listings[dir] = stamp.map { Listing(stamp: $0, items: Dictionary(items.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a }),
+                                            sorted: items, scannedAt: uptime()) }
         return items
     }
 
     /// The cached listing of `dir` still describes it (call with the lock held, before a change).
     private func isFreshLocked(_ dir: URL) -> Bool {
         guard let l = listings[dir], let stamp = FolderStamp(dir) else { return false }
-        return l.stamp == stamp
+        return l.stamp == stamp && uptime() - l.scannedAt < Self.maxListingAge
     }
 
     /// After this instance changed `dir`: apply the change to a listing that was current before it,
@@ -278,8 +298,10 @@ public final class Outbox: @unchecked Sendable {
         listings[dir] = l
     }
 
-    private func scan(_ dir: URL) -> [OutboxItem] {
-        let items: [OutboxItem] = FileIO.contents(of: dir).compactMap { url in
+    private func scan(_ dir: URL) -> [OutboxItem]? {
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey], options: [.skipsHiddenFiles]) else { return nil }
+        let items: [OutboxItem] = urls.compactMap { url in
             guard let kind = OutboxKind.parse(url.lastPathComponent) else { return nil }
             let v = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
             return OutboxItem(

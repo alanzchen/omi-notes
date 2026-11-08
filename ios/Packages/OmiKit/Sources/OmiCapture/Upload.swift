@@ -246,6 +246,9 @@ public final class Uploader: @unchecked Sendable {
     private var reconcileInProgress = false
     private var reconcileAgain = false
     private var reconcileQueued = false
+    private var delayedReconcile: DispatchWorkItem?
+    /// Waiting for the next completed refill (`refillThen`).
+    private var refillWaiters: [() -> Void] = []
 
     public init(outbox: Outbox, state: UploadStateStore, transport: UploadTransport, queue: DispatchQueue, config: @escaping () -> UploadConfig) {
         self.outbox = outbox
@@ -262,15 +265,16 @@ public final class Uploader: @unchecked Sendable {
     /// Run on launch, foreground, BLE connect, after each new outbox item, and after completions.
     public func reconcile() {
         dispatchPrecondition(condition: .onQueue(queue))
-        guard enabled else { return }
+        guard enabled else { releaseRefillWaiters(); return }
         let cfg = config()
         guard cfg.endpoint != nil else {
             status.configured = false
             onStatusChange?()
+            releaseRefillWaiters()
             return
         }
         status.configured = true
-        if status.pausedReason != nil { onStatusChange?(); return }
+        if status.pausedReason != nil { onStatusChange?(); releaseRefillWaiters(); return }
         if reconcileInProgress { reconcileAgain = true; return }
         reconcileInProgress = true
         let requestedKey = key(for: cfg)
@@ -289,6 +293,8 @@ public final class Uploader: @unchecked Sendable {
                 if self.reconcileAgain {
                     self.reconcileAgain = false
                     self.reconcile()
+                } else {
+                    self.releaseRefillWaiters()
                 }
             }
         }
@@ -458,12 +464,37 @@ public final class Uploader: @unchecked Sendable {
     private func reconcileSoon() {
         guard !reconcileQueued else { return }
         reconcileQueued = true
-        let run: @Sendable () -> Void = { [weak self] in
+        let run = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.reconcileQueued = false
+            self.delayedReconcile = nil
             self.reconcile()
         }
+        delayedReconcile = run
         if completionReconcileDelay > 0 { queue.asyncAfter(deadline: .now() + completionReconcileDelay, execute: run) } else { queue.async(execute: run) }
+    }
+
+    /// Hands off the next window now and calls `done` once that refill has finished (or uploads are
+    /// deliberately off: disabled, unconfigured, paused), at most after `timeout`. The background
+    /// session's "finished events" waits for this before telling iOS it may suspend the app: a
+    /// wake that drained every task must leave the next ones with the system, or nothing would
+    /// wake the app for uploads again.
+    public func refillThen(timeout: TimeInterval = 5, _ done: @escaping () -> Void) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        let once = Once(done)  // whichever comes first: the refill or the timeout
+        refillWaiters.append { once.fire() }
+        delayedReconcile?.cancel()  // this pass replaces the pending delayed one
+        delayedReconcile = nil
+        reconcileQueued = false
+        queue.asyncAfter(deadline: .now() + timeout) { once.fire() }
+        reconcile()
+    }
+
+    private func releaseRefillWaiters() {
+        guard !refillWaiters.isEmpty else { return }
+        let waiters = refillWaiters
+        refillWaiters.removeAll()
+        waiters.forEach { $0() }
     }
 
     /// Token or URL changed (the configuration generation was bumped by the settings store):
@@ -545,6 +576,17 @@ public final class Uploader: @unchecked Sendable {
 }
 
 // MARK: - Background session completion handler
+
+/// Calls its closure at most once (confined to the uploader's queue).
+private final class Once: @unchecked Sendable {
+    private var body: (() -> Void)?
+    init(_ body: @escaping () -> Void) { self.body = body }
+    func fire() {
+        let b = body
+        body = nil
+        b?()
+    }
+}
 
 /// Pairs UIKit's `handleEventsForBackgroundURLSession` completion handler with the session's
 /// `urlSessionDidFinishEvents`, in either order, and calls the handler exactly once on main.
@@ -714,8 +756,13 @@ public final class BackgroundSessionTransport: NSObject, UploadTransport, Upload
         onCompletion?(id, status, body, error)
     }
 
+    /// Runs (on the delegate queue) after a wake's last completion; it must call its argument when
+    /// the app has done what it needs before iOS may suspend it. Unset: finished at once.
+    public var onEventsFinished: ((@escaping @Sendable () -> Void) -> Void)?
+
     public func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
-        eventsLatch.eventsFinished()
+        let latch = eventsLatch
+        if let hook = onEventsFinished { hook { latch.eventsFinished() } } else { latch.eventsFinished() }
     }
 }
 

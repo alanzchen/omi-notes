@@ -406,7 +406,12 @@ public final class PhoneWatchInbox: @unchecked Sendable {
         var st = stat()
         let stamp = stat(doneDir.path, &st) == 0 ? [Int(st.st_mtimespec.tv_sec), Int(st.st_mtimespec.tv_nsec), Int(st.st_ino)] : nil
         if let stamp, let cached = summaryCache, cached.stamp == stamp { return cached.value }
-        let names = Files.names(doneDir, suffix: "").filter { !$0.hasSuffix("-end") }
+        // unreadable: report what was read but never cache it (the next call reads again)
+        guard let listed = try? FileManager.default.contentsOfDirectory(atPath: doneDir.path) else {
+            summaryCache = nil
+            return (0, nil)
+        }
+        let names = listed.filter { !$0.hasPrefix(".") && !$0.hasSuffix("-end") }
         let dates = names.compactMap { (try? FileManager.default.attributesOfItem(atPath: doneDir.appendingPathComponent($0).path))?[.modificationDate] as? Date }
         let value = (names.count, dates.max())
         summaryCache = stamp.map { (stamp: $0, value: value) }

@@ -685,3 +685,131 @@ final class UploaderHarness: @unchecked Sendable {
         #expect(t.outbox.pending().isEmpty && t.outbox.sent().map(\.name) == ["event_c.json"])
     }
 }
+
+/// R41-01 (Astra, build 41): a background wake that drains every task must hand the next window to
+/// the system before iOS is told it may suspend the app; otherwise nothing wakes it for uploads again.
+@Suite struct BackgroundFinishTests {
+    func setUp(_ files: Int) throws -> (UploaderHarness, BackgroundEventsLatch, Locked<[Int]>) {
+        let h = UploaderHarness()
+        let template = try Data(contentsOf: try h.writeChunk(seq: 0, capture: "template").url)
+        try FileManager.default.removeItem(at: h.t.dirs.outboxPending.appendingPathComponent(OutboxKind.chunk(captureId: "template", sequence: 0).fileName))
+        for i in 0..<files {
+            try template.write(to: h.t.dirs.outboxPending.appendingPathComponent(OutboxKind.chunk(captureId: "c\(i / 60)", sequence: i % 60).fileName))
+        }
+        let latch = BackgroundEventsLatch()
+        let seen = Locked<[Int]>([])  // active tasks each time the UIKit handler ran
+        latch.deliver = { handler in handler() }
+        latch.register { [transport = h.transport] in seen.value.append(transport.active.count) }
+        return (h, latch, seen)
+    }
+
+    /// A wake as the session delivers it: every completion, then "finished events", one at a time.
+    func wake(_ h: UploaderHarness, _ latch: BackgroundEventsLatch) {
+        h.uploader.completionReconcileDelay = 1  // production
+        let delegate = OperationQueue()
+        delegate.maxConcurrentOperationCount = 1
+        delegate.underlyingQueue = h.queue
+        for task in h.transport.active {
+            task.done = true
+            let id = task.description
+            delegate.addOperation { h.uploader.handleCompletion(identifier: id, statusCode: 200, body: nil, error: nil) }
+        }
+        delegate.addOperation { h.uploader.refillThen { latch.eventsFinished() } }  // the transport's finish hook
+        delegate.waitUntilAllOperationsAreFinished()
+    }
+
+    @Test func theNextWindowIsHandedOffBeforeIOSMaySuspendTheApp() throws {
+        let (h, latch, seen) = try setUp(450)
+        h.reconcile()
+        #expect(h.transport.active.count == Uploader.window)
+        wake(h, latch)
+        for _ in 0..<4 { h.queue.sync {} }
+        #expect(seen.value == [50], "the handler ran once, with the remaining 50 already started")
+        Thread.sleep(forTimeInterval: 1.2)  // the delayed reconcile was replaced, not run again
+        h.queue.sync {}
+        #expect(h.transport.active.count == 50 && seen.value.count == 1)
+    }
+
+    @Test func aSlowTaskListingIsAwaitedToo() throws {
+        let (h, latch, seen) = try setUp(450)
+        h.reconcile()
+        h.transport.asyncEnumeration = true
+        wake(h, latch)
+        h.queue.sync {}
+        #expect(seen.value.isEmpty, "not before the session has listed its tasks")
+        // the session answers (if the delayed pass had started a listing mid-wake, the newest one counts)
+        for _ in 0..<3 where seen.value.isEmpty {
+            h.queue.sync { h.transport.flushEnumerations() }
+            for _ in 0..<3 { h.queue.sync {} }
+        }
+        #expect(seen.value == [50])
+    }
+
+    @Test func pausedUploadsFinishAtOnce() throws {
+        let (h, latch, seen) = try setUp(10)
+        h.reconcile()
+        h.queue.sync { h.uploader.enabled = false }
+        h.queue.sync { h.uploader.refillThen { latch.eventsFinished() } }
+        #expect(seen.value.count == 1, "nothing to hand off: the handler isn't held back")
+    }
+}
+
+/// R41-02/03/04 (Astra, build 41): the in-memory listings never hide files on disk.
+@Suite struct OutboxListingFaultTests {
+    func setMode(_ url: URL, _ mode: Int16) throws {
+        try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: mode)], ofItemAtPath: url.path)
+    }
+
+    @Test func anUnreadableFolderIsNeverCachedAsEmpty() throws {
+        let t = TestEnv()
+        try Data([1]).write(to: t.dirs.outboxPending.appendingPathComponent("event_a.json"))
+        try setMode(t.dirs.outboxPending, 0o000)
+        #expect(t.outbox.pending().isEmpty && t.outbox.stats().inventoryReadable == false, "unknown, not 'nothing'")
+        try setMode(t.dirs.outboxPending, 0o755)  // readable again; the folder's time didn't change
+        #expect(t.outbox.pending().map(\.name) == ["event_a.json"] && t.outbox.stats().inventoryReadable)
+        _ = try t.outbox.write(Data([2]), kind: .event(eventId: "b"))
+        #expect(Set(t.outbox.pending().map(\.name)) == ["event_a.json", "event_b.json"])
+    }
+
+    @Test func aFailedRetentionDeleteStaysListedAndIsRetried() throws {
+        let t = TestEnv()
+        let a = try t.outbox.write(Data([1]), kind: .event(eventId: "a"))
+        try t.outbox.markSent(a.name)
+        #expect(t.outbox.sent().map(\.name) == [a.name])
+        try setMode(t.dirs.outboxSent, 0o555)
+        t.outbox.deleteSent(a.name)
+        try setMode(t.dirs.outboxSent, 0o755)
+        #expect(t.outbox.sent().map(\.name) == [a.name] && t.outbox.stats().sentCount == 1, "still there, still counted")
+        t.outbox.deleteSent(a.name)
+        #expect(t.outbox.sent().isEmpty)
+    }
+
+    /// Another writer's file whose folder-time change was absorbed (here: the time put back exactly)
+    /// appears once the listing is `maxListingAge` old.
+    @Test func anAbsorbedOutsideChangeAppearsWithinTheBound() throws {
+        let t = TestEnv()
+        var clock: TimeInterval = 1_000
+        t.outbox.uptime = { clock }
+        _ = try t.outbox.write(Data([1]), kind: .event(eventId: "a"))
+        #expect(t.outbox.pending().count == 1)
+        var st = stat()
+        stat(t.dirs.outboxPending.path, &st)
+        let before = st.st_mtimespec
+        try Data([2]).write(to: t.dirs.outboxPending.appendingPathComponent("event_x.json"))
+        var times = [before, before]
+        _ = utimensat(AT_FDCWD, t.dirs.outboxPending.path, &times, 0)
+        #expect(t.outbox.pending().count == 1, "the change was absorbed")
+        clock += Outbox.maxListingAge + 1
+        #expect(Set(t.outbox.pending().map(\.name)) == ["event_a.json", "event_x.json"])
+    }
+}
+
+final class Locked<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v: T
+    init(_ v: T) { self.v = v }
+    var value: T {
+        get { lock.lock(); defer { lock.unlock() }; return v }
+        set { lock.lock(); v = newValue; lock.unlock() }
+    }
+}
