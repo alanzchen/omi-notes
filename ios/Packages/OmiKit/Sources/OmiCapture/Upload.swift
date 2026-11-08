@@ -220,6 +220,9 @@ public final class Uploader: @unchecked Sendable {
     /// bytes stay within `windowBytes`. A wake then moves a bounded batch rather than 32 files.
     public static let window = 400
     public var windowBytes: Int64 = 200_000_000
+    /// After a completion, the next reconcile waits this long so the completions a background wake
+    /// delivers (one at a time, through the session's serial delegate queue) share one pass.
+    public var completionReconcileDelay: TimeInterval = 1
     public var config: () -> UploadConfig
     public var gate: UploadGate?
     /// False until launch recovery has finished (uploads are gated on it).
@@ -242,6 +245,7 @@ public final class Uploader: @unchecked Sendable {
     private var startedKey: String?
     private var reconcileInProgress = false
     private var reconcileAgain = false
+    private var reconcileQueued = false
 
     public init(outbox: Outbox, state: UploadStateStore, transport: UploadTransport, queue: DispatchQueue, config: @escaping () -> UploadConfig) {
         self.outbox = outbox
@@ -366,7 +370,7 @@ public final class Uploader: @unchecked Sendable {
         guard taskKey == currentKey else {
             // Obsolete configuration / epoch: never acknowledges; the file goes to the current server.
             if error == nil, let statusCode { log(.info, "upload", "ignoring \(statusCode) for \(name) from an obsolete configuration") }
-            reconcile()
+            reconcileSoon()
             return
         }
         started.remove(name)
@@ -376,7 +380,7 @@ public final class Uploader: @unchecked Sendable {
             onFinished?(identifier, .cancelled, size)
             status.inFlight = started.count
             onStatusChange?()
-            reconcile()
+            reconcileSoon()
             return
         }
         guard outbox.pendingItem(named: name) != nil else {
@@ -445,7 +449,21 @@ public final class Uploader: @unchecked Sendable {
         onFinished?(identifier, summary.success ? .delivered : observed, size)
         status.inFlight = started.count
         onStatusChange?()
-        if status.pausedReason == nil { reconcile() }
+        if status.pausedReason == nil { reconcileSoon() }
+    }
+
+    /// One reconcile for a run of completions: a background wake delivers hundreds, and a pass per
+    /// completion (each over the whole outbox) outlasted the wake, so iOS suspended the app with
+    /// most completions unhandled and the next launch sent the same files again.
+    private func reconcileSoon() {
+        guard !reconcileQueued else { return }
+        reconcileQueued = true
+        let run: @Sendable () -> Void = { [weak self] in
+            guard let self else { return }
+            self.reconcileQueued = false
+            self.reconcile()
+        }
+        if completionReconcileDelay > 0 { queue.asyncAfter(deadline: .now() + completionReconcileDelay, execute: run) } else { queue.async(execute: run) }
     }
 
     /// Token or URL changed (the configuration generation was bumped by the settings store):

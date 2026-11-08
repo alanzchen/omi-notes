@@ -63,7 +63,16 @@ public struct OutboxItem: Sendable, Equatable {
     public let url: URL
     public let size: Int64
     public let modified: Date
-    public var name: String { kind.fileName }
+    /// `kind.fileName`, computed once (listings sort and match thousands of items by name).
+    public let name: String
+
+    public init(kind: OutboxKind, url: URL, size: Int64, modified: Date) {
+        self.kind = kind
+        self.url = url
+        self.size = size
+        self.modified = modified
+        name = kind.fileName
+    }
 }
 
 public enum OutboxError: Error, Equatable, CustomStringConvertible {
@@ -93,6 +102,18 @@ public final class Outbox: @unchecked Sendable {
     public let dirs: CaptureDirectories
     private let lock = NSLock()
 
+    /// Listings kept in memory, one per folder, valid while the folder's modification time is the
+    /// one recorded with them. Listing thousands of files took ~0.25 s on a Mac (more on a phone)
+    /// and ran several times per upload completion, so a large backlog kept the engine queue busy
+    /// for minutes. This instance's own changes update the listing in place; any other change to a
+    /// folder (another writer, a file removed by hand) changes its time and forces a fresh listing.
+    private struct Listing {
+        var stamp: FolderStamp
+        var items: [String: OutboxItem]
+        var sorted: [OutboxItem]?
+    }
+    private var listings: [URL: Listing] = [:]
+
     public init(dirs: CaptureDirectories) { self.dirs = dirs }
 
     /// Writes atomically into `pending/`. An identity is immutable once published: if a file with
@@ -111,8 +132,11 @@ public final class Outbox: @unchecked Sendable {
             throw OutboxError.identityConflict(name)
         }
         let url = dirs.outboxPending.appendingPathComponent(name)
+        let fresh = isFreshLocked(dirs.outboxPending)
         try FileIO.atomicWrite(data, to: url)
-        return OutboxItem(kind: kind, url: url, size: Int64(data.count), modified: Date())
+        let item = OutboxItem(kind: kind, url: url, size: Int64(data.count), modified: FileIO.modificationDate(url))
+        updateLocked(dirs.outboxPending, wasFresh: fresh) { $0[name] = item }
+        return item
     }
 
     /// Location of an item in any directory (pending first).
@@ -154,9 +178,15 @@ public final class Outbox: @unchecked Sendable {
         let src = dirs.outboxPending.appendingPathComponent(name)
         let dst = dirs.outboxSent.appendingPathComponent(name)
         guard FileIO.exists(src) else { return }
+        let freshPending = isFreshLocked(dirs.outboxPending), freshSent = isFreshLocked(dirs.outboxSent)
         if FileIO.exists(dst) { try? FileManager.default.removeItem(at: dst) }
         try FileManager.default.moveItem(at: src, to: dst)
         try? FileManager.default.setAttributes([.modificationDate: now], ofItemAtPath: dst.path)
+        let size = FileIO.fileSize(dst)
+        updateLocked(dirs.outboxPending, wasFresh: freshPending) { $0[name] = nil }
+        updateLocked(dirs.outboxSent, wasFresh: freshSent) { items in
+            OutboxKind.parse(name).map { items[name] = OutboxItem(kind: $0, url: dst, size: size, modified: FileIO.modificationDate(dst)) }
+        }
     }
 
     /// pending → quarantine with a `.reason` sidecar.
@@ -165,9 +195,14 @@ public final class Outbox: @unchecked Sendable {
         let src = dirs.outboxPending.appendingPathComponent(name)
         let dst = dirs.outboxQuarantine.appendingPathComponent(name)
         guard FileIO.exists(src) else { return }
+        let freshPending = isFreshLocked(dirs.outboxPending), freshQuarantine = isFreshLocked(dirs.outboxQuarantine)
         if FileIO.exists(dst) { try? FileManager.default.removeItem(at: dst) }
         try FileManager.default.moveItem(at: src, to: dst)
         try? Data(reason.utf8).write(to: dst.appendingPathExtension("reason"))
+        updateLocked(dirs.outboxPending, wasFresh: freshPending) { $0[name] = nil }
+        updateLocked(dirs.outboxQuarantine, wasFresh: freshQuarantine) { items in
+            OutboxKind.parse(name).map { items[name] = OutboxItem(kind: $0, url: dst, size: FileIO.fileSize(dst), modified: FileIO.modificationDate(dst)) }
+        }
     }
 
     public func quarantineReason(_ name: String) -> String? {
@@ -182,12 +217,16 @@ public final class Outbox: @unchecked Sendable {
         guard FileIO.exists(src) else { return }
         try FileManager.default.moveItem(at: src, to: dirs.outboxPending.appendingPathComponent(name))
         try? FileManager.default.removeItem(at: src.appendingPathExtension("reason"))
+        listings[dirs.outboxPending] = nil  // debug only: list both again
+        listings[dirs.outboxQuarantine] = nil
     }
 
     /// Only ever called by retention on `sent/` files.
     public func deleteSent(_ name: String) {
         lock.lock(); defer { lock.unlock() }
+        let fresh = isFreshLocked(dirs.outboxSent)
         try? FileManager.default.removeItem(at: dirs.outboxSent.appendingPathComponent(name))
+        updateLocked(dirs.outboxSent, wasFresh: fresh) { $0[name] = nil }
     }
 
     public func stats() -> OutboxStats {
@@ -209,12 +248,64 @@ public final class Outbox: @unchecked Sendable {
     }
 
     private func list(_ dir: URL) -> [OutboxItem] {
-        FileIO.contents(of: dir).compactMap { url in
+        lock.lock(); defer { lock.unlock() }
+        let stamp = FolderStamp(dir)
+        if let stamp, var l = listings[dir], l.stamp == stamp {
+            if let sorted = l.sorted { return sorted }
+            let sorted = Self.ordered(Array(l.items.values))
+            l.sorted = sorted
+            listings[dir] = l
+            return sorted
+        }
+        let items = scan(dir)
+        listings[dir] = stamp.map { Listing(stamp: $0, items: Dictionary(items.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a }), sorted: items) }
+        return items
+    }
+
+    /// The cached listing of `dir` still describes it (call with the lock held, before a change).
+    private func isFreshLocked(_ dir: URL) -> Bool {
+        guard let l = listings[dir], let stamp = FolderStamp(dir) else { return false }
+        return l.stamp == stamp
+    }
+
+    /// After this instance changed `dir`: apply the change to a listing that was current before it,
+    /// and record the folder's new time; otherwise drop the listing (the next read lists again).
+    private func updateLocked(_ dir: URL, wasFresh: Bool, _ change: (inout [String: OutboxItem]) -> Void) {
+        guard wasFresh, var l = listings[dir], let stamp = FolderStamp(dir) else { listings[dir] = nil; return }
+        change(&l.items)
+        l.sorted = nil
+        l.stamp = stamp
+        listings[dir] = l
+    }
+
+    private func scan(_ dir: URL) -> [OutboxItem] {
+        let items: [OutboxItem] = FileIO.contents(of: dir).compactMap { url in
             guard let kind = OutboxKind.parse(url.lastPathComponent) else { return nil }
             let v = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
             return OutboxItem(
                 kind: kind, url: url, size: Int64(v?.fileSize ?? 0), modified: v?.contentModificationDate ?? .distantPast)
         }
-        .sorted { ($0.modified, $0.name) < ($1.modified, $1.name) }
+        return Self.ordered(items)
+    }
+
+    /// Oldest first, then by name.
+    private static func ordered(_ items: [OutboxItem]) -> [OutboxItem] {
+        items.sorted { $0.modified != $1.modified ? $0.modified < $1.modified : $0.name < $1.name }
+    }
+}
+
+/// A folder's modification time (nanoseconds) and inode: it changes whenever an entry is added,
+/// removed or renamed in it.
+struct FolderStamp: Equatable {
+    let seconds: Int
+    let nanoseconds: Int
+    let inode: UInt64
+
+    init?(_ dir: URL) {
+        var st = stat()
+        guard stat(dir.path, &st) == 0 else { return nil }
+        seconds = Int(st.st_mtimespec.tv_sec)
+        nanoseconds = Int(st.st_mtimespec.tv_nsec)
+        inode = UInt64(st.st_ino)
     }
 }

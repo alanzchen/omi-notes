@@ -13,6 +13,7 @@ import OmiProtocol
             transport: h.transport, queue: h.queue, config: { [unowned h] in h.cfg })
         h.uploader.now = { [unowned h] in h.now }
         h.uploader.random = { 0.5 }
+        h.uploader.completionReconcileDelay = 0
     }
 
     @Test func aChunkTheServerStoredIsNotSentAgainAfterARelaunchAndDeliveryFreesItsRetry() throws {

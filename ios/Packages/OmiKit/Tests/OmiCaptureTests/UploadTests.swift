@@ -80,8 +80,11 @@ final class FakeUploadTransport: UploadTransport, @unchecked Sendable {
     var systemListing: UploadTaskOwnership?
     var unlisted: Set<Int> = []
     var now = Date()
+    /// How often the uploader asked for the session's tasks (each ask is followed by a pass over the outbox).
+    var enumerations = 0
 
     func activeTaskIdentifiers(_ completion: @escaping @Sendable (Set<String>) -> Void) {
+        enumerations += 1
         var snapshot = Set(active.map(\.description))
         if var o = systemListing {
             let listed = tasks.filter { !unlisted.contains($0.id) }
@@ -133,7 +136,7 @@ final class FakeUploadTransport: UploadTransport, @unchecked Sendable {
 }
 
 final class UploaderHarness: @unchecked Sendable {
-    let t = TestEnv()
+    let t: TestEnv
     let queue = DispatchQueue(label: "test.uploader")
     let transport = FakeUploadTransport()
     var uploader: Uploader!
@@ -141,16 +144,29 @@ final class UploaderHarness: @unchecked Sendable {
     var cfg = UploadConfig(endpoint: ServerEndpoint(baseURL: URL(string: "https://mac.tailnet.ts.net/")!, token: "secret-token-123"), generation: 1)
 
     init() {
+        t = TestEnv()
+        setUp()
+    }
+
+    /// A relaunch: same folders and upload state, a new uploader and an empty session.
+    init(reusing earlier: UploaderHarness) {
+        t = earlier.t
+        now = earlier.now
+        setUp()
+    }
+
+    private func setUp() {
         uploader = Uploader(
             outbox: t.outbox, state: UploadStateStore(url: t.dirs.state.appendingPathComponent("upload-state.json")),
             transport: transport, queue: queue, config: { [unowned self] in self.cfg })
         uploader.now = { [unowned self] in self.now }
         uploader.random = { 0.5 }
+        uploader.completionReconcileDelay = 0  // tests step the queue themselves
     }
 
     func sync(_ body: () -> Void) {
         queue.sync(execute: body)
-        queue.sync {}  // drain reconcile hops
+        for _ in 0..<3 { queue.sync {} }  // drain reconcile hops (completion → reconcile → listing → start)
     }
 
     func reconcile() { sync { uploader.reconcile() } }
@@ -577,5 +593,95 @@ final class UploaderHarness: @unchecked Sendable {
         #expect(c.n == 0)
         l.eventsFinished()
         #expect(c.n == 1)
+    }
+}
+
+/// Build 40 on a phone with ~5,500 queued files (2026-11-07): every launch sent the same 400 files,
+/// the server answered 200 "already stored", and the phone still listed them as waiting. Each
+/// completion ran a pass over the whole outbox (0.3 s each on a Mac), so a background wake handled
+/// about a dozen of its 400 completions before iOS suspended the app; the rest were lost and the
+/// next launch sent the same files again, for weeks.
+@Suite struct LargeBacklogTests {
+    /// Writes `n` small pending chunks straight into the folder (as an earlier run left them).
+    func backlog(_ h: UploaderHarness, _ n: Int) throws {
+        let template = try Data(contentsOf: try h.writeChunk(seq: 0, capture: "template").url)
+        for i in 0..<n {
+            try template.write(to: h.t.dirs.outboxPending.appendingPathComponent(OutboxKind.chunk(captureId: "old-\(i / 60)", sequence: i % 60).fileName))
+        }
+    }
+
+    /// Completions arrive as a background wake delivers them: through the session's delegate queue, a
+    /// serial OperationQueue on the engine queue, which hands over the next one only after the last
+    /// (so anything the uploader queues runs between them). Waits until everything has settled.
+    func deliverAtOnce(_ h: UploaderHarness, _ tasks: [FakeUploadTransport.Task], status: Int) {
+        h.uploader.completionReconcileDelay = 0.3  // production coalescing (1 s), shortened for the test
+        let delegate = OperationQueue()
+        delegate.maxConcurrentOperationCount = 1
+        delegate.underlyingQueue = h.queue
+        for task in tasks {
+            task.done = true
+            let id = task.description
+            delegate.addOperation { h.uploader.handleCompletion(identifier: id, statusCode: status, body: nil, error: nil) }
+        }
+        delegate.waitUntilAllOperationsAreFinished()
+        Thread.sleep(forTimeInterval: 0.6)
+        for _ in 0..<4 { h.queue.sync {} }  // the delayed reconcile, its listing hop and the starts
+        h.uploader.completionReconcileDelay = 0
+    }
+
+    @Test func aWakeFullOfCompletionsIsHandledInOnePass() throws {
+        let h = UploaderHarness()
+        try backlog(h, 2_000)
+        h.reconcile()
+        let batch = h.transport.active
+        #expect(batch.count == Uploader.window)
+        let before = h.transport.enumerations
+        deliverAtOnce(h, batch, status: 200)
+        #expect(h.transport.enumerations - before <= 3, "one pass for the whole wake, not one per completion (was 400)")
+        let pending = Set(h.t.outbox.pending().map(\.name))
+        #expect(batch.allSatisfy { !pending.contains($0.name) }, "every acknowledged file left pending")
+        #expect(h.transport.active.count == Uploader.window, "and the window was refilled with the next files")
+    }
+
+    /// A launch whose completions were lost (the app was suspended after handling 12): the next
+    /// launch sends those files again, and once their completions arrive they all leave pending.
+    @Test func filesWhoseCompletionsWereLostAreSentAgainAndThenLeave() throws {
+        let first = UploaderHarness()
+        try backlog(first, 1_000)
+        first.reconcile()
+        let batch = first.transport.active
+        deliverAtOnce(first, Array(batch.prefix(12)), status: 201)
+        // relaunch: a new uploader on the same folders; the old tasks are gone from the session
+        let second = UploaderHarness(reusing: first)
+        second.reconcile()
+        let resent = Set(second.transport.active.map(\.name))
+        #expect(batch.dropFirst(12).allSatisfy { resent.contains($0.name) }, "the 388 unhandled ones go again")
+        deliverAtOnce(second, second.transport.active, status: 200)
+        let pending = Set(second.t.outbox.pending().map(\.name))
+        #expect(batch.allSatisfy { !pending.contains($0.name) })
+        withExtendedLifetime(first) {}  // its queue may still hold work that reads it
+    }
+}
+
+/// The outbox keeps its listings in memory: they follow this instance's own changes and notice any
+/// other change to a folder.
+@Suite struct OutboxListingTests {
+    @Test func listingsFollowOwnChangesAndAnyOtherChange() throws {
+        let t = TestEnv()
+        let a = try t.outbox.write(Data([1]), kind: .event(eventId: "a"))
+        _ = try t.outbox.write(Data([2]), kind: .event(eventId: "b"))
+        #expect(t.outbox.pending().map(\.name) == [a.name, "event_b.json"])
+        try t.outbox.markSent(a.name)
+        #expect(t.outbox.pending().map(\.name) == ["event_b.json"] && t.outbox.sent().map(\.name) == [a.name])
+        try t.outbox.quarantine("event_b.json", reason: "test")
+        #expect(t.outbox.pending().isEmpty && t.outbox.quarantined().map(\.name) == ["event_b.json"])
+        // changes made outside this instance (another writer, a file removed by hand)
+        try Data([3]).write(to: t.dirs.outboxPending.appendingPathComponent("event_c.json"))
+        #expect(t.outbox.pending().map(\.name) == ["event_c.json"])
+        try FileManager.default.removeItem(at: t.dirs.outboxSent.appendingPathComponent(a.name))
+        #expect(t.outbox.sent().isEmpty)
+        let other = Outbox(dirs: t.dirs)
+        try other.markSent("event_c.json")
+        #expect(t.outbox.pending().isEmpty && t.outbox.sent().map(\.name) == ["event_c.json"])
     }
 }

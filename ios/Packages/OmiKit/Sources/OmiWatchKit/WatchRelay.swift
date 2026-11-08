@@ -402,8 +402,15 @@ public final class PhoneWatchInbox: @unchecked Sendable {
     /// Segments received and handed on so far (kept as small markers), and when the latest was.
     public func receivedSummary() -> (count: Int, last: Date?) {
         lock.lock(); defer { lock.unlock() }
+        // Thousands of parts: stat each one only when the folder changed (it is read for every snapshot).
+        var st = stat()
+        let stamp = stat(doneDir.path, &st) == 0 ? [Int(st.st_mtimespec.tv_sec), Int(st.st_mtimespec.tv_nsec), Int(st.st_ino)] : nil
+        if let stamp, let cached = summaryCache, cached.stamp == stamp { return cached.value }
         let names = Files.names(doneDir, suffix: "").filter { !$0.hasSuffix("-end") }
         let dates = names.compactMap { (try? FileManager.default.attributesOfItem(atPath: doneDir.appendingPathComponent($0).path))?[.modificationDate] as? Date }
-        return (names.count, dates.max())
+        let value = (names.count, dates.max())
+        summaryCache = stamp.map { (stamp: $0, value: value) }
+        return value
     }
+    private var summaryCache: (stamp: [Int], value: (count: Int, last: Date?))?
 }
