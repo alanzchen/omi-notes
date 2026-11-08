@@ -187,14 +187,15 @@ final class WatchSync: NSObject, WCSessionDelegate {
         /// Parts the iPhone said it doesn't hold (an inventory answer), and which question it answers.
         var missing: [String]
         var inventoryId: String?
-        /// In an inventory answer: the parts the iPhone holds, with their checksums.
-        var inventoryAcks: [WatchInventoryItem]
+        /// Checksum receipts for audio parts: after a part arrived (`receipts`) or in an inventory answer
+        /// (`inventory_acks`). Only these delete audio.
+        var receipts: [WatchInventoryItem]
         init(_ m: [String: Any]) {
             binding = m[WatchWire.binding] as? String
             acks = m[WatchWire.acks] as? [String] ?? []
             missing = m[WatchWire.missing] as? [String] ?? []
             inventoryId = m[WatchWire.inventoryId] as? String
-            inventoryAcks = WatchWire.inventoryItems(from: m[WatchWire.inventoryAcks])
+            receipts = WatchWire.inventoryItems(from: m[WatchWire.receipts]) + WatchWire.inventoryItems(from: m[WatchWire.inventoryAcks])
         }
     }
 
@@ -228,10 +229,10 @@ final class WatchSync: NSObject, WCSessionDelegate {
             binding = b
             UserDefaults.standard.set(b, forKey: "omi.phoneBinding")
         }
-        // an inventory answer deletes only parts whose echoed checksum matches this Watch's copy; plain
-        // acks count only outside an inventory answer (after a whole file reached the iPhone)
+        // audio goes only on a receipt naming this Watch's checksum (an older phone's plain ack keeps it,
+        // to be sent again later); recording ends and telemetry go on plain acks as before
         let held = Dictionary(outbox.segments().map { ($0.segment.id, $0.segment.sha256) }, uniquingKeysWith: { a, _ in a })
-        let retire = WatchWire.retirable(acks: r.acks, inventoryAcks: r.inventoryAcks, inventoryId: r.inventoryId, held: held)
+        let retire = WatchWire.retirable(acks: r.acks, receipts: r.receipts, held: held)
         if !retire.isEmpty {
             watchLog.info("iPhone acknowledged \(retire.count) item(s)")
             outbox.acknowledge(retire)

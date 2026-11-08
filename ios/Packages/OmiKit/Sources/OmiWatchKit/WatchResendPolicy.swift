@@ -105,6 +105,12 @@ public struct WatchResendPolicy: Codable, Equatable, Sendable {
 
     /// A question was sent (it replaces any earlier unanswered one).
     public mutating func askInventory(id: String, ids: [String], now: Date) {
+        // entries saved by an older build have no attempt number: give them one (their wait and count stay)
+        for i in ids where entries[i] != nil && entries[i]?.attempt == nil {
+            let attempt = nextAttempt ?? 1
+            nextAttempt = attempt + 1
+            entries[i]?.attempt = attempt
+        }
         pendingInventory = PendingInventory(id: id, askedAt: now, times: nil,
                                             attempts: Dictionary(uniqueKeysWithValues: ids.compactMap { i in entries[i]?.attempt.map { (i, $0) } }))
         inventoryAskedAt = now

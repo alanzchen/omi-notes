@@ -40,9 +40,11 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
         try? session.updateApplicationContext([WatchWire.binding: phone, "at": Date().timeIntervalSince1970])
     }
 
-    private func acknowledge(_ ids: [String], _ session: WCSession) {
+    /// Plain acks (what a build-42 Watch reads), plus a checksum receipt per audio part (what a current
+    /// Watch needs before it deletes one).
+    private func acknowledge(_ ids: [String], receipts: [WatchInventoryItem] = [], _ session: WCSession) {
         guard !ids.isEmpty else { return }
-        send([WatchWire.acks: ids], session)
+        send(WatchWire.acknowledgement(ids: ids, receipts: receipts), session)
     }
 
     /// An inventory answer: what is held, with each checksum (the only thing the Watch deletes on), and
@@ -92,8 +94,8 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
         OmiLog.shared.log(.info, "watch", "received a file from the Watch (\(file.metadata?[WatchWire.kind] as? String ?? "?"))")
         guard file.metadata?[WatchWire.kind] as? String == WatchWire.segment else { return }
         do {
-            let id = try engine.acceptWatchSegment(file: file.fileURL, manifest: file.metadata?[WatchWire.manifest] as? Data)
-            acknowledge([id], session)
+            let receipt = try engine.acceptWatchSegmentReceipt(file: file.fileURL, manifest: file.metadata?[WatchWire.manifest] as? Data)
+            acknowledge([receipt.id], receipts: [receipt], session)
         } catch {
             // not acknowledged: the Watch keeps it (and resends it, or holds it for its own iPhone)
             OmiLog.shared.log(.warning, "watch", "segment not accepted: \(error.localizedDescription)")

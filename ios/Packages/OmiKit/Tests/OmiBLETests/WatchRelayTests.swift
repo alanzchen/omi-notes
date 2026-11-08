@@ -319,13 +319,11 @@ import OmiCapture
         #expect(WatchWire.inventoryItems(from: question[WatchWire.inventoryItems]) == [item] && question[WatchWire.inventoryId] as? String == "q1")
         let held = ["rec-0": item.sha256, "rec-1": String(repeating: "b", count: 64)]
         // an inventory answer with plain acks (the older phone's shape, or anything without checksums): nothing goes
-        #expect(WatchWire.retirable(acks: ["rec-0"], inventoryAcks: [], inventoryId: "q1", held: held).isEmpty)
+        #expect(WatchWire.retirable(acks: ["rec-0"], receipts: [], held: held).isEmpty)
         // a checksum receipt for the Watch's own bytes: it goes; other bytes or an unknown part: kept
         let receipts = [item, WatchInventoryItem(id: "rec-1", sha256: String(repeating: "c", count: 64)),
                         WatchInventoryItem(id: "gone", sha256: item.sha256)]
-        #expect(WatchWire.retirable(acks: [], inventoryAcks: receipts, inventoryId: "q1", held: held) == ["rec-0"])
-        // a plain ack after a whole file arrived (no question): as before
-        #expect(WatchWire.retirable(acks: ["rec-1"], inventoryAcks: [], inventoryId: nil, held: held) == ["rec-1"])
+        #expect(WatchWire.retirable(acks: [], receipts: receipts, held: held) == ["rec-0"])
     }
 
     /// ASTRA-IT4-02: a failed resend dropped its entry, the retry reused the same handover count, and a
@@ -340,6 +338,43 @@ import OmiCapture
         var relaunched = try JSONDecoder().decode(WatchResendPolicy.self, from: JSONEncoder().encode(p))
         #expect(relaunched.answeredInventory(id: "q", missing: ["x"]).isEmpty, "q asked about an older attempt")
         #expect(!relaunched.due("x", now: t0.addingTimeInterval(1_900)), "no further submission")
+    }
+
+
+    /// ASTRA-IT6-01 (blocker): any message without a question id retired audio on plain acks. A build-42
+    /// phone acks a resend on an empty done marker, an unreadable manifest or a manifest for other bytes,
+    /// and an older inventory answer is plain acks too: the Watch deleted its only correct copy. Segment
+    /// audio now goes only on a receipt naming its checksum; plain acks still retire ends and telemetry.
+    @Test func plainAcksNeverRetireSegmentAudio() throws {
+        let sha = String(repeating: "a", count: 64)
+        let held = ["rec-0": sha]  // segments on the Watch → their checksums
+        // a build-42 phone's ack (any of its early-return cases), or an older inventory answer: kept
+        #expect(WatchWire.retirable(acks: ["rec-0"], receipts: [], held: held).isEmpty)
+        // a receipt for other bytes: kept
+        #expect(WatchWire.retirable(acks: ["rec-0"], receipts: [.init(id: "rec-0", sha256: String(repeating: "b", count: 64))], held: held).isEmpty)
+        // a receipt for the Watch's own bytes: retired
+        #expect(WatchWire.retirable(acks: ["rec-0"], receipts: [.init(id: "rec-0", sha256: sha)], held: held) == ["rec-0"])
+        // recording ends and telemetry batches (not audio): plain acks retire them as before
+        #expect(WatchWire.retirable(acks: ["end-1", "perf-1"], receipts: [], held: held) == ["end-1", "perf-1"])
+        // what a current phone sends after storing a part: the unchanged acks (an older Watch reads them)
+        // plus a receipt with the part's checksum
+        let fields = WatchWire.acknowledgement(ids: ["rec-0", "end-1"], receipts: [.init(id: "rec-0", sha256: sha)])
+        #expect(fields[WatchWire.acks] as? [String] == ["rec-0", "end-1"])
+        #expect(WatchWire.inventoryItems(from: fields[WatchWire.receipts]) == [.init(id: "rec-0", sha256: sha)])
+    }
+
+    /// ASTRA-IT6-02: entries saved by build 42 have no attempt number, so a new question's "missing"
+    /// answer matched nothing and the part waited 30 min–4 h. A question numbers them first.
+    @Test func olderSavedEntriesGetAttemptNumbersWhenAsked() throws {
+        let t0 = Date(timeIntervalSince1970: 1_791_000_000)
+        let legacy = #"{"entries":{"x":{"at":\#(t0.timeIntervalSinceReferenceDate),"times":2,"delivered":true}}}"#
+        var p = try JSONDecoder().decode(WatchResendPolicy.self, from: Data(legacy.utf8))
+        #expect(p.entries["x"]?.attempt == nil && !p.due("x", now: t0.addingTimeInterval(60)))
+        p.askInventory(id: "q", ids: ["x"], now: t0.addingTimeInterval(10))
+        #expect(p.entries["x"]?.attempt != nil && p.entries["x"]?.times == 2 && p.entries["x"]?.at == t0, "numbered; wait and count kept")
+        var relaunched = try JSONDecoder().decode(WatchResendPolicy.self, from: JSONEncoder().encode(p))
+        #expect(relaunched.answeredInventory(id: "q", missing: ["x"]) == ["x"])
+        #expect(relaunched.due("x", now: t0.addingTimeInterval(60)), "sent again at once, within the window")
     }
 
 }

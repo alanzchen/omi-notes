@@ -553,6 +553,12 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     /// Stores a segment the Watch sent (from WatchConnectivity's temporary file, before its callback
     /// returns). Returns the id to acknowledge to the Watch only once it is durable and verified.
     public func acceptWatchSegment(file: URL, manifest: Data?) throws -> String {
+        try acceptWatchSegmentReceipt(file: file, manifest: manifest).id
+    }
+
+    /// Stores a Watch part (or finds these very bytes already held) and returns the receipt the Watch
+    /// deletes it on: its id and checksum.
+    public func acceptWatchSegmentReceipt(file: URL, manifest: Data?) throws -> WatchInventoryItem {
         guard let segment = WatchWire.decode(WatchSegment.self, manifest) else { throw WatchRelayError.damaged("manifest") }
         try watchInbox.accept(file: file, segment: segment)
         queue.async {
@@ -561,7 +567,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             self.processWatch()
             self.writePhoneStatus(trigger: "watch_receipt")
         }
-        return segment.id
+        return WatchInventoryItem(id: segment.id, sha256: segment.sha256)
     }
 
     /// The Watch asks which of its delivered parts this iPhone has: those are acknowledged again, the

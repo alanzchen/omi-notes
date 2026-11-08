@@ -121,12 +121,27 @@ public enum WatchWire {
         [kind: inventory, inventoryId: id, inventoryItems: inventoryItems(items), self.binding: binding]
     }
 
-    /// The parts a message lets the Watch delete. An inventory answer (it names its question): only parts
-    /// whose echoed checksum matches the Watch's own copy (`held`: id → SHA-256); plain acks in it count
-    /// for nothing. Any other message: its plain acks (sent after a whole file arrived).
-    public static func retirable(acks: [String], inventoryAcks: [WatchInventoryItem], inventoryId: String?, held: [String: String]) -> [String] {
-        guard inventoryId != nil else { return acks }
-        return inventoryAcks.filter { held[$0.id] == $0.sha256 }.map(\.id)
+    /// iPhone → Watch, beside the plain `acks`: `[{id, sha256}]` for each audio part it stored (what lets
+    /// a current Watch delete the part; an older Watch reads only `acks`).
+    public static let receipts = "receipts"
+
+    /// What the iPhone sends after storing items: the unchanged plain acks (ids), plus a checksum receipt
+    /// for each audio part.
+    public static func acknowledgement(ids: [String], receipts: [WatchInventoryItem]) -> [String: Any] {
+        var fields: [String: Any] = [acks: ids]
+        if !receipts.isEmpty { fields[self.receipts] = inventoryItems(receipts) }
+        return fields
+    }
+
+    /// The items a message lets the Watch delete. An audio part (in `held`: id → SHA-256 of the Watch's
+    /// copy) only on a receipt with that checksum (`receipts` or `inventory_acks`); a plain ack, from an
+    /// older phone or an older inventory answer, never deletes audio. Other items (recording ends,
+    /// telemetry batches) on their plain acks, as before.
+    public static func retirable(acks: [String], receipts: [WatchInventoryItem], held: [String: String]) -> [String] {
+        let proven = receipts.filter { held[$0.id] == $0.sha256 }.map(\.id)
+        let other = acks.filter { held[$0] == nil }
+        var seen = Set<String>()
+        return (proven + other).filter { seen.insert($0).inserted }
     }
 
     public static func inventoryItems(_ items: [WatchInventoryItem]) -> [[String: String]] {
