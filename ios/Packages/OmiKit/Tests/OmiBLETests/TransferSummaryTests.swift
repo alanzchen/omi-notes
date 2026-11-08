@@ -156,4 +156,18 @@ import OmiWatchKit
         t.server.conversationsPending = nil
         #expect(t.serverWorkLeft == nil, "unknown when the server didn't say")
     }
+
+    /// ASTRA-IT3-03: one count present as 0 and the other absent became "nothing to process".
+    /// Done only when both are explicitly 0; a known count above 0 is an "at least".
+    @Test func aMissingServerCountIsNeverZero() throws {
+        var t = try #require(TransferSummary.debugFixture("all-sent", now: now))
+        t.server.chunksPending = 0; t.server.conversationsPending = nil
+        #expect(t.serverWorkLeft == nil && t.serverWork == nil)
+        t.server.chunksPending = nil; t.server.conversationsPending = 0
+        #expect(t.serverWorkLeft == nil && t.serverWork == nil)
+        t.server.chunksPending = 4; t.server.conversationsPending = nil
+        #expect(t.serverWork?.left == 4 && t.serverWork?.atLeast == true && t.serverWorkLeft == nil)
+        t.server.chunksPending = 0; t.server.conversationsPending = 0
+        #expect(t.serverWork?.left == 0 && t.serverWork?.atLeast == false && t.serverWorkLeft == 0)
+    }
 }
