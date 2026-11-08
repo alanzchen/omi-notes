@@ -231,4 +231,37 @@ import OmiProtocol
         try await until { m.status(of: .ledBrightness) == .saved(20) }
         #expect(m.status(of: .ledBrightness) == .saved(20))
     }
+
+    /// ASTRA-IT1-03: ManagePendantView owns the model; leaving the screen before the change settles, or
+    /// while a write is in flight, must still write the last value chosen (one write after the other).
+    @Test func theLastValueIsWrittenEvenAfterTheScreenCloses() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-debounce-\(UUID().uuidString)")
+        let engine = OmiEngine(config: EngineConfiguration(dirs: CaptureDirectories(root: root), appVersion: "t", useCoreBluetooth: false),
+                               settings: SettingsStore(defaults: UserDefaults(suiteName: "omi-debounce-\(UUID().uuidString)")!, tokens: InMemoryTokenStore()),
+                               uploadTransport: CountingUploadTransport())
+        var writes: [Int] = []
+        var model: PendantControlsModel? = PendantControlsModel(engine: engine)
+        model!.settleDelay = .milliseconds(100)
+        model!.write = { _, value, done in writes.append(value); done(.success(value)) }
+        model!.change(.ledBrightness, to: 17)
+        model = nil  // the screen closes before the change settles
+        try await until { writes == [17] }
+        #expect(writes == [17])
+
+        var midWrites: [Int] = []
+        var completion: (@Sendable (Result<Int, Error>) -> Void)?
+        var second: PendantControlsModel? = PendantControlsModel(engine: engine)
+        second!.settleDelay = .milliseconds(100)
+        second!.write = { _, value, done in midWrites.append(value); completion = done }
+        second!.change(.ledBrightness, to: 40)
+        try await until { midWrites == [40] }
+        second!.change(.ledBrightness, to: 17)  // chosen while 40 is being written
+        second = nil                            // and the screen closes
+        var finish = completion
+        completion = nil
+        finish?(.success(40))
+        finish = nil  // the transport releases the finished callback
+        try await until { midWrites == [40, 17] }
+        #expect(midWrites == [40, 17])
+    }
 }

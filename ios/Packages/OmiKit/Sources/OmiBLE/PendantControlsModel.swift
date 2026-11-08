@@ -43,19 +43,20 @@ public final class PendantControlsModel {
         status[setting] = .saving(value)
         wanted[setting] = value
         settling[setting]?.cancel()
-        settling[setting] = Task { [weak self, settleDelay] in
+        // The pending change holds this model until its write is done: closing the screen (which owns
+        // the model) never drops the value chosen last.
+        settling[setting] = Task { [settleDelay] in
             try? await Task.sleep(for: settleDelay)
             guard !Task.isCancelled else { return }
-            self?.flush(setting)
+            self.flush(setting)
         }
     }
 
     private func flush(_ setting: PendantSetting) {
         guard !writing.contains(setting), let value = wanted.removeValue(forKey: setting) else { return }
         writing.insert(setting)
-        write(setting, value) { [weak self] result in
-            Task { @MainActor in
-                guard let self else { return }
+        write(setting, value) { result in
+            Task { @MainActor in  // holds the model until a value chosen meanwhile is written too
                 self.writing.remove(setting)
                 if let next = self.wanted[setting] {  // chosen meanwhile: that one is what counts
                     self.status[setting] = .saving(next)
