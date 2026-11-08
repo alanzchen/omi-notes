@@ -6,8 +6,9 @@ import OmiProtocol
 public protocol RingTransport: AnyObject {
     /// Read `30295782` → `handleStatusRead`.
     func ringReadStatus()
-    /// Subscribe to `30295781` → `handleNotificationsEnabled`.
-    func ringEnableNotifications()
+    /// Subscribe to `30295781` → `handleNotificationsEnabled`. `resubscribe`: write the subscription
+    /// again (off, then on) even if iOS reports it on.
+    func ringEnableNotifications(resubscribe: Bool)
     /// Write to `30295781` (with response) → `handleWriteResult`.
     func ringWrite(_ command: Data)
 }
@@ -77,6 +78,8 @@ public final class RingSyncEngine {
     public let cursors: RingCursorStore
     public weak var transport: RingTransport?
     public var timeouts = Timeouts()
+    /// An INFO went unanswered on this link.
+    private var infoUnanswered = false
     public var onStateChange: ((RingSyncState) -> Void)?
     public var onStatus: ((RingProtocol.Status) -> Void)?
     public var onSupportDetermined: ((OfflineStorageSupport) -> Void)?
@@ -148,7 +151,7 @@ public final class RingSyncEngine {
             onStatus?(s)
             phase = .awaitingNotifyEnable
             arm(timeouts.status)
-            transport?.ringEnableNotifications()
+            transport?.ringEnableNotifications(resubscribe: infoUnanswered)
         }
     }
 
@@ -231,6 +234,7 @@ public final class RingSyncEngine {
     }
 
     public func handleDisconnect() {
+        infoUnanswered = false  // a new link subscribes afresh
         switch phase {
         case .awaitingReadBegin, .receiving:
             interrupt("disconnected", sendStop: false)
@@ -265,7 +269,11 @@ public final class RingSyncEngine {
         switch phase {
         case .awaitingStatus: fail("storage status read timed out")
         case .awaitingNotifyEnable: fail("storage notification subscribe timed out")
-        case .awaitingInfo: fail("no INFO response")
+        case .awaitingInfo:
+            // The firmware answers INFO within seconds when it sees the subscription (storage.c), so
+            // silence means it doesn't: the next attempt on this link writes the subscription again.
+            fail(infoUnanswered ? "no INFO response (after re-subscribing)" : "no INFO response")
+            infoUnanswered = true
         case .awaitingReadBegin: interrupt("no data after READ", sendStop: true)
         case .receiving: interrupt("data stalled", sendStop: true)
         default: self.deadline = nil
@@ -276,6 +284,7 @@ public final class RingSyncEngine {
 
     private func handleInfo(_ i: RingProtocol.Info) {
         guard let ctx else { return }
+        infoUnanswered = false
         info = i
         onSupportDetermined?(.supported)
         if cursor.observe(info: i) {

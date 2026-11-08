@@ -6,10 +6,14 @@ import OmiProtocol
 final class FakeRingTransport: RingTransport {
     var statusReads = 0
     var notifyEnables = 0
+    var resubscribes = 0
     var writes: [Data] = []
     var onWrite: ((Data) -> Void)?
     func ringReadStatus() { statusReads += 1 }
-    func ringEnableNotifications() { notifyEnables += 1 }
+    func ringEnableNotifications(resubscribe: Bool) {
+        notifyEnables += 1
+        if resubscribe { resubscribes += 1 }
+    }
     func ringWrite(_ command: Data) {
         writes.append(command)
         onWrite?(command)

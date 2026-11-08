@@ -416,7 +416,12 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
         })
     }
 
-    public func ringEnableNotifications() {
+    public func ringEnableNotifications(resubscribe: Bool) {
+        if resubscribe {
+            // iOS may report a restored subscription as on while the pendant doesn't have it
+            log(.info, "ring", "re-subscribing to storage notifications")
+            enqueue(.notify(.storageControl, false) { _ in })
+        }
         enqueue(.notify(.storageControl, true) { [weak self] error in self?.ring.handleNotificationsEnabled(error: error) })
     }
 

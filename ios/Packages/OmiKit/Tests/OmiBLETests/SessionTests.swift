@@ -175,6 +175,27 @@ struct SessionHarness {
         #expect(calls.suffix(from: info + 1) == ["read ledDimRatio", "read micGain"])
     }
 
+    /// Field log, build 42 (2026-11-08 04:58–05:00Z, a link restored by iOS): four "no INFO response"
+    /// in a row. Firmware 3.0.21 answers INFO within ~5 s (INFO, or ACK "not ready") when the phone
+    /// is subscribed (storage.c `storage_notify`); silence means the pendant saw no subscription,
+    /// while iOS reported the restored one as on. The retry writes the subscription again (off, on).
+    @Test func anUnansweredInfoResubscribesBeforeTheRetry() throws {
+        let h = SessionHarness()
+        h.connectFully()
+        let first = try #require(h.transport.calls.lastIndex(of: "write storageControl 10"))
+        h.clock.advance(16)
+        h.session.tick()  // INFO times out
+        h.clock.advance(1)
+        h.session.tick()  // retry scheduled
+        h.clock.advance(31)
+        h.session.tick()  // retry
+        let after = Array(h.transport.calls[(first + 1)...])
+        let off = try #require(after.firstIndex(of: "notify storageControl false"))
+        let on = try #require(after.lastIndex(of: "notify storageControl true"))
+        let info = try #require(after.lastIndex(of: "write storageControl 10"))
+        #expect(off < on && on < info)
+    }
+
     @Test func unsupportedCodecRefusesToRecord() {
         let h = SessionHarness(values: FakeDeviceTransport.cv1Values(codec: 1))
         h.connectFully()
