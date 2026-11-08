@@ -471,3 +471,39 @@ def test_a_failed_transcription_logs_its_status_ray_and_response_head(caplog):
         provider.transcribe(audio_with_blocks([1.0]))
     line = next(r.getMessage() for r in caplog.records if "transcription HTTP" in r.getMessage())
     assert "500" in line and "8f00abc-DFW" in line and "cloudflare" in line and "upstream boom" in line and "1.000 s" in line
+
+
+# -- split window (Alan: "a sentence cut in two is bad"; split-window-20261108) --------------------
+
+from omi_notes.providers.openai_stt import dedupe_seam, split_points  # noqa: E402
+
+
+def speech_with_quiet_runs(seconds: float, quiet: list[tuple[float, float]]) -> SttRequest:
+    """One VAD block of speech-like noise with short quiet runs inside it (VAD merges such pauses)."""
+    pcm = np.random.default_rng(1).normal(0, 3000, int(seconds * SR)).astype(np.int16)
+    for a, b in quiet:
+        pcm[int(a * SR):int(b * SR)] = 0
+    return SttRequest(flac(pcm), seconds, [(0.0, seconds)], "en", [])
+
+
+def test_the_longest_pause_in_the_window_wins_over_the_latest():
+    req = speech_with_quiet_runs(50, [(21.0, 21.6), (25.0, 25.15)])
+    (cut, forced), *_ = split_points(req, max_seconds=30)
+    assert 21.0 < cut < 21.6 and not forced
+
+
+def test_a_cut_with_no_pause_at_all_is_marked_forced():
+    req = speech_with_quiet_runs(50, [])
+    (cut, forced), *_ = split_points(req, max_seconds=30)
+    assert forced and 27 <= cut <= 30
+
+
+@pytest.mark.parametrize("prev, nxt, expected", [
+    ("I'm going to put...", "To put the sales to size.", "the sales to size."),
+    ("you wanted to visualize. So, for example.", "So, for example, here, this big box.", "here, this big box."),
+    ("losing money on those orange ones.", "On those orange ones. All right.", "All right."),
+    ("We went to the", "the store.", "the store."),  # one short common word: not trusted as overlap
+    ("Completely different.", "Nothing shared here.", "Nothing shared here."),
+])  # fmt: skip
+def test_the_overlap_at_a_forced_seam_is_said_once(prev, nxt, expected):
+    assert dedupe_seam(prev, nxt) == expected

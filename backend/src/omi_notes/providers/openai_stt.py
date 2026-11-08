@@ -120,7 +120,7 @@ class OpenAICompatStt:
     @property
     def cache_tag(self) -> str:
         """Part of the STT cache key: a different request style is a different transcription."""
-        return f"json-turns-v1-{self.max_seconds:g}" if self.style == "json" else self.style
+        return f"json-turns-v2-{self.max_seconds:g}" if self.style == "json" else self.style
 
     @property
     def needs_speaker_windows(self) -> bool:
@@ -398,35 +398,93 @@ def _pieces(request: SttRequest, pcm: np.ndarray, cuts: list[float]) -> list[tup
     return out
 
 
-def split_request(request: SttRequest, max_seconds: float, min_seconds: float = MIN_PART_SECONDS) -> list[tuple[float, SttRequest]]:
-    """Pieces of at least `min_seconds` and at most `max_seconds`, each cut at the latest pause that
-    keeps both sides within those bounds (the middle of a silent spacer between speech blocks, or
-    silence before/after them). Only speech longer than the limit is cut inside, at its quietest
-    moment. Cuts fall on whole samples, so the bounds hold for the samples actually sent."""
+# A cut goes in the longest pause within the last third of the allowed length (sentences tend to end
+# in longer pauses): a gap between VAD speech blocks, or a quiet run inside a block (VAD merges short
+# pauses into speech). Shorter than PAUSE_SECONDS anywhere there: the cut is forced, inside speech.
+CUT_WINDOW = 1 / 3
+PAUSE_SECONDS = 0.1
+_FRAME = SAMPLE_RATE // 50  # 20 ms
+
+
+def _quiet_runs(pcm: np.ndarray, lo: int, hi: int, threshold: float) -> list[tuple[int, int]]:
+    """Runs of 20 ms frames in [lo, hi) quieter than `threshold` (mean square), in samples."""
+    n = (hi - lo) // _FRAME
+    if n <= 0:
+        return []
+    energy = (pcm[lo : lo + n * _FRAME].astype(np.float64).reshape(n, _FRAME) ** 2).mean(axis=1)
+    quiet = np.concatenate([[False], energy < threshold, [False]])
+    edges = np.flatnonzero(quiet[1:] != quiet[:-1])
+    return [(lo + a * _FRAME, lo + b * _FRAME) for a, b in zip(edges[::2], edges[1::2], strict=False)]
+
+
+def split_points(request: SttRequest, max_seconds: float, min_seconds: float = MIN_PART_SECONDS) -> list[tuple[float, bool]]:
+    """Where to cut (seconds, on whole samples) and whether each cut is forced (no pause found).
+    Every piece is at least `min_seconds` and at most `max_seconds` long."""
     pcm, _ = sf.read(io.BytesIO(request.flac), dtype="int16")
     total = len(pcm)
     if total <= max_seconds * SAMPLE_RATE:
-        return [(0.0, request)]
+        return []
     duration = total / SAMPLE_RATE
     blocks = sorted(request.blocks) or [(0.0, duration)]
     gaps = [(0.0, blocks[0][0]), *((x[1], y[0]) for x, y in zip(blocks, blocks[1:], strict=False)), (blocks[-1][1], duration)]
-    gaps = [(a, b) for a, b in gaps if b > a]
+    gaps = [(round(a * SAMPLE_RATE), round(b * SAMPLE_RATE)) for a, b in gaps if b > a]
+    speech = np.concatenate([pcm[round(a * SAMPLE_RATE) : round(b * SAMPLE_RATE)] for a, b in blocks]).astype(np.float64)
+    frames = speech[: len(speech) // _FRAME * _FRAME].reshape(-1, _FRAME)
+    threshold = 0.1 * float(np.median((frames**2).mean(axis=1))) if len(frames) else 0.0
     longest, shortest = int(max_seconds * SAMPLE_RATE), math.ceil(min_seconds * SAMPLE_RATE)
-    cuts: list[float] = []
+    points: list[tuple[float, bool]] = []
     start = 0
     while total - start > longest:
-        lo, hi = start + shortest, min(start + longest, total - shortest)
-        lo_s, hi_s = lo / SAMPLE_RATE, hi / SAMPLE_RATE
-        # latest pause that fits: its middle if inside the window, else the window's nearest edge
-        candidates = [min(max((a + b) / 2, lo_s), hi_s) for a, b in gaps if a < hi_s and b > lo_s]
-        if candidates:
-            cut = max(candidates)
+        hi = min(start + longest, total - shortest)
+        lo = max(start + shortest, min(hi, start + int(longest * (1 - CUT_WINDOW))))
+        pauses = [(a, b) for a, b in gaps if a < hi and b > lo]
+        for a, b in blocks:
+            sa, sb = max(lo, round(a * SAMPLE_RATE)), min(hi, round(b * SAMPLE_RATE))
+            if sb > sa and threshold > 0:
+                pauses += _quiet_runs(pcm, sa, sb, threshold)
+        # the longest pause (its length within the window), the later one on a tie; cut in its middle
+        best = max(pauses, key=lambda g: (min(g[1], hi) - max(g[0], lo), g[1]), default=None)
+        if best is not None and min(best[1], hi) - max(best[0], lo) >= PAUSE_SECONDS * SAMPLE_RATE:
+            cut, forced = (max(best[0], lo) + min(best[1], hi)) // 2, False
         else:  # inside speech: the quietest moment near the end of the window
-            cut = _quietest(pcm, max(lo_s, hi_s - 0.1 * max_seconds), hi_s)
-        cut_sample = min(max(round(cut * SAMPLE_RATE), lo), hi)
-        cuts.append(cut_sample / SAMPLE_RATE)
-        start = cut_sample
-    return _pieces(request, pcm, cuts)
+            lo_s, hi_s = lo / SAMPLE_RATE, hi / SAMPLE_RATE
+            cut = round(_quietest(pcm, max(lo_s, hi_s - 0.1 * max_seconds), hi_s) * SAMPLE_RATE)
+            forced = True
+        cut = min(max(cut, lo), hi)
+        points.append((cut / SAMPLE_RATE, forced))
+        start = cut
+    return points
+
+
+def split_request(request: SttRequest, max_seconds: float, min_seconds: float = MIN_PART_SECONDS) -> list[tuple[float, SttRequest]]:
+    """Pieces of at least `min_seconds` and at most `max_seconds`, cut at the points above."""
+    points = split_points(request, max_seconds, min_seconds)
+    if not points:
+        return [(0.0, request)]
+    pcm, _ = sf.read(io.BytesIO(request.flac), dtype="int16")
+    return _pieces(request, pcm, [cut for cut, _ in points])
+
+
+_WORD = re.compile(r"[\w']+")
+
+
+def dedupe_seam(prev: str, nxt: str, max_words: int = 12) -> str:
+    """`nxt` without the words it repeats from the end of `prev` (both requests heard the overlap at a
+    forced cut). Needs two matching words, or one of at least four letters, to trust the match."""
+    def norm(text: str) -> list[str]:
+        return [w.lower() for w in _WORD.findall(text)]
+
+    tail = norm(prev)[-max_words:]
+    tokens = nxt.split()
+    heads = [norm(t) for t in tokens]
+    flat = [(i, w) for i, ws in enumerate(heads) for w in ws]
+    for k in range(min(len(tail), len(flat), max_words), 0, -1):
+        if tail[-k:] == [w for _, w in flat[:k]] and (k >= 2 or len(tail[-1]) >= 4):
+            last_token = flat[k - 1][0]
+            if len(heads[last_token]) > sum(1 for i, _ in flat[:k] if i == last_token):
+                continue  # the match would split a token
+            return " ".join(tokens[last_token + 1 :])
+    return nxt
 
 
 def pad_short(request: SttRequest, min_seconds: float = MIN_PART_SECONDS) -> SttRequest:

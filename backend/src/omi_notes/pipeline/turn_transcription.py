@@ -29,12 +29,15 @@ import soundfile as sf
 
 from ..audio.diarize import Turn
 from ..providers import ProviderError, SttRequest
-from ..providers.openai_stt import MIN_PART_SECONDS, _flac, pad_short, split_request
+from ..providers.openai_stt import MIN_PART_SECONDS, _flac, dedupe_seam, pad_short, split_points
 from ..spool import atomic_write_bytes
 
 SR = 16000
 # Requests shorter than this are padded with trailing silence (the service minimum is 0.1 s).
 MIN_REQUEST_SECONDS = MIN_PART_SECONDS
+# A forced cut (no pause near the limit) sends the next request this much earlier audio too; the words
+# both requests heard are kept once (`dedupe_seam`). Times stay at the cut.
+OVERLAP_SECONDS = 1.5
 CACHE_FORMAT = 2
 
 
@@ -89,8 +92,18 @@ def transcribe_windows(provider, audio, request: SttRequest, turns: list[Turn], 
         blocks = [(max(a, start) - start, min(b, end) - start) for a, b in request.blocks if b > start and a < end]
         part = SttRequest(_flac(audio.pcm[first:last]), end - start, blocks, request.language, request.keyterms)
         limit = getattr(provider, "max_seconds", 0.0)
-        parts = split_request(part, limit) if limit and part.duration > limit else [(0.0, part)]
-        for offset, piece in parts:
+        budget = min(OVERLAP_SECONDS, limit / 4) if limit else 0.0  # an overlapped piece stays within the limit
+        points = split_points(part, limit - budget) if limit and part.duration > limit else []
+        edges = [(0.0, False), *points, (end - start, False)]
+        previous_text = None
+        for (offset, forced), (stop, _) in zip(edges, edges[1:]):
+            lead = min(budget, offset) if forced else 0.0
+            a_sample, b_sample = first + round((offset - lead) * SR), first + round(stop * SR)
+            lead = (first + round(offset * SR) - a_sample) / SR
+            piece_blocks = [(max(a, offset - lead) - (offset - lead), min(b, stop) - (offset - lead))
+                            for a, b in blocks if b > offset - lead and a < stop]  # fmt: skip
+            piece = SttRequest(_flac(audio.pcm[a_sample:b_sample]), (b_sample - a_sample) / SR, piece_blocks,
+                               request.language, request.keyterms)  # fmt: skip
             sent, pcm = _padded(piece)
             path = _cache_path(cache_path, provider, sent, pcm)
             if path.exists():
@@ -100,9 +113,15 @@ def transcribe_windows(provider, audio, request: SttRequest, turns: list[Turn], 
                 atomic_write_bytes(path, json.dumps(response).encode())
             channels = channels or response["results"].get("channels", [])
             real = piece.duration  # times beyond it would come from the padding
-            for utt in response["results"]["utterances"]:
-                a = min(max(0.0, float(utt["start"])), real)
+            for k, utt in enumerate(response["results"]["utterances"]):
+                a = min(max(lead, float(utt["start"])), real)
                 b = min(max(a, float(utt["end"])), real)
-                utterances.append(dict(utt, start=start + offset + a, end=start + offset + b, speaker=window.speaker))
+                text = utt.get("transcript")
+                if k == 0 and lead and previous_text is not None and isinstance(text, str):
+                    text = dedupe_seam(previous_text, text)
+                    utt = dict(utt, transcript=text)
+                utterances.append(dict(utt, start=start + offset + a - lead, end=start + offset + b - lead, speaker=window.speaker))
+            texts = [u.get("transcript") for u in response["results"]["utterances"] if isinstance(u.get("transcript"), str)]
+            previous_text = texts[-1] if texts else previous_text
     return {"results": {"channels": channels, "utterances": utterances},
             "omi_notes": {"timing_source": "local_speaker_windows", "overlap_spans": overlaps}}

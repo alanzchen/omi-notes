@@ -38,7 +38,10 @@ def test_missing_or_invalid_turns_fail_instead_of_becoming_silence(turns):
         speaker_windows(turns, 10)
 
 
-def test_a_partial_failure_reuses_the_successful_window_and_keeps_all_samples(tmp_path):
+def test_a_partial_failure_reuses_the_successful_window_and_keeps_all_samples(tmp_path, monkeypatch):
+    from omi_notes.pipeline import turn_transcription as tt
+
+    monkeypatch.setattr(tt, "OVERLAP_SECONDS", 0.0)  # coverage only: each sample sent once
     assembled, request = audio()
     seen = []
     def handler(req):
@@ -159,3 +162,28 @@ def test_the_incident_conversation_transcribes_every_sample_once(tmp_path):
     transcribe_windows(provider, assembled, request, [Turn(0, 43.268, 1)], tmp_path / "stt.json")
     assert all(len(s) / 16000 >= 0.25 for s in seen) and all(len(s) / 16000 <= 30 for s in seen)
     np.testing.assert_array_equal(np.concatenate(seen), assembled.pcm)
+
+
+def test_a_forced_cut_overlaps_the_audio_and_says_the_seam_once(tmp_path, monkeypatch):
+    """No pause anywhere near the limit: the next request starts 1.5 s early, and the words both
+    requests heard are kept once; times stay contiguous and within the window."""
+    from omi_notes.pipeline import turn_transcription as tt
+
+    seconds = 50
+    pcm = np.random.default_rng(5).normal(0, 3000, seconds * 16000).astype(np.int16)
+    assembled = ConversationAudio(pcm, [MapSegment(0, 0, seconds)], [(0, seconds)], [])
+    request = SttRequest(assembled.flac(), seconds, [(0, seconds)], "en", [])
+    seen = []
+    def handler(req):
+        seen.append(sf.read(io.BytesIO(form(req)["file"][0][2]), dtype="int16")[0])
+        return httpx.Response(200, json={"text": "I'm going to put..." if len(seen) == 1 else "To put the sales to size."})
+    provider = OpenAICompatStt("https://example.test/v1", "", "gpt-transcribe", style="json",
+                               transport=httpx.MockTransport(handler), max_request_seconds=30)
+    result = transcribe_windows(provider, assembled, request, [Turn(0, seconds, 1)], tmp_path / "stt.json")
+    first, second = seen
+    lead = round(tt.OVERLAP_SECONDS * 16000)
+    np.testing.assert_array_equal(second[:lead], first[-lead:])  # the overlap is real audio, sent twice
+    np.testing.assert_array_equal(np.concatenate([first, second[lead:]]), pcm)
+    utts = result["results"]["utterances"]
+    assert [u["transcript"] for u in utts] == ["I'm going to put...", "the sales to size."]
+    assert utts[0]["end"] == utts[1]["start"] and utts[-1]["end"] == seconds
