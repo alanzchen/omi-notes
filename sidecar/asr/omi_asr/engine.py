@@ -17,7 +17,7 @@ import time
 import numpy as np
 
 from . import plan
-from .merge import assign, moss_lines, spans_for
+from .merge import SLACK, assign, moss_lines, spans_for
 
 log = logging.getLogger("omi_asr")
 
@@ -27,6 +27,7 @@ ALIGNER = os.environ.get("OMI_ASR_ALIGNER", "mlx-community/Qwen3-ForcedAligner-0
 ALIGN_LANGUAGE = os.environ.get("OMI_ASR_ALIGN_LANGUAGE", "Chinese")  # the bench's setting for mixed zh/en
 IDLE_UNLOAD_SECONDS = float(os.environ.get("OMI_ASR_IDLE_UNLOAD", "900"))
 MAX_RESPLIT_DEPTH = 3
+UNKNOWN = "UNKNOWN"  # words no MOSS line holds (Omi renders the speaker as unknown and learns no voice from it)
 
 
 class Engine:
@@ -93,17 +94,17 @@ class Engine:
             t0 = time.perf_counter()
             duration = len(pcm) / plan.SR
             stats = {"windows": 0, "resplits": 0, "truncated_unresolved": 0, "unlabeled_windows": 0, "qwen_chunks": 0,
-                     "qwen_capped": 0, "units": 0, "units_outside_lines": 0, "lines_with_moss_text": 0}  # fmt: skip
+                     "qwen_split": 0, "qwen_capped": 0, "units": 0, "units_outside_lines": 0, "lines_with_moss_text": 0}  # fmt: skip
             lines: list[dict] = []
             languages: list[str] = []
             windows: list[dict] = []  # where MOSS ran: its labels restart in each (the backend links them by voice)
             for k, (a, b) in enumerate(plan.plan_windows(pcm)):
-                for sub, (lines_w, start, stop) in enumerate(self._moss(moss, pcm, a, b, 0, stats)):
+                for sub, (lines_w, start, stop, truncated) in enumerate(self._moss(moss, pcm, a, b, 0, stats)):
                     prefix = "" if (k, sub) == (0, 0) else f"W{k + 1}.{sub + 1}-"
                     windows.append({"start": round(start, 3), "end": round(stop, 3), "label_prefix": prefix})
                     for line in lines_w:
                         line["speaker"] = prefix + line["speaker"]
-                    lines.extend(self._text(qwen, aligner, pcm, start, stop, lines_w, context, stats, languages, prefix))
+                    lines.extend(self._text(qwen, aligner, pcm, start, stop, lines_w, context, stats, languages, prefix, truncated))
             t_total = time.perf_counter() - t0
             self.last_used = time.monotonic()
             lines.sort(key=lambda s: (s["start"], s["end"]))
@@ -119,9 +120,9 @@ class Engine:
                                 peak_mlx_gb=round(mx.get_peak_memory() / 1e9, 2), load_seconds=self.load_seconds),  # fmt: skip
             }
 
-    def _moss(self, moss, pcm: np.ndarray, a: float, b: float, depth: int, stats: dict) -> list[tuple[list[dict], float, float]]:
-        """MOSS on [a, b] (absolute s): [(lines, window start, window end)], cut again at the middle pause
-        while truncated."""
+    def _moss(self, moss, pcm: np.ndarray, a: float, b: float, depth: int, stats: dict) -> list[tuple[list[dict], float, float, bool]]:
+        """MOSS on [a, b] (absolute s): [(lines, window start, window end, still truncated)], cut again at the
+        middle pause while truncated."""
         import mlx.core as mx
 
         window = pcm[round(a * plan.SR) : round(b * plan.SR)]
@@ -136,49 +137,74 @@ class Engine:
                 stats["resplits"] += 1
                 log.warning("MOSS truncated on %.0f s (tokens %d/%d): cutting at %.1f s", seconds, r.generation_tokens, cap, cut)
                 return self._moss(moss, pcm, a, cut, depth + 1, stats) + self._moss(moss, pcm, cut, b, depth + 1, stats)
-            # Qwen still hears the whole window; its words past MOSS's last line go to the nearest line
+            # Qwen still hears the whole window; its words past MOSS's last line are kept as unattributed
             stats["truncated_unresolved"] += 1
             log.warning("MOSS still truncated on %.0f s at %.0f s (tokens %d/%d)", seconds, a, r.generation_tokens, cap)
-        return [(moss_lines(r.segments, offset=a), a, b)]
+            return [(moss_lines(r.segments, offset=a), a, b, True)]
+        return [(moss_lines(r.segments, offset=a), a, b, False)]
 
-    def _text(self, qwen, aligner, pcm: np.ndarray, start: float, stop: float, lines: list[dict], context: list[str],
-              stats: dict, languages: list[str], prefix: str = "") -> list[dict]:  # fmt: skip
-        """Qwen text on <= 180 s chunks of the whole window [start, stop] (speech MOSS left out included),
-        aligned onto its MOSS lines."""
+    def _qwen(self, qwen, aligner, pcm: np.ndarray, a: float, b: float, context: list[str], stats: dict,
+              languages: list[str], capped: list[tuple[float, float]], split: bool = True) -> list:  # fmt: skip
+        """Aligned units for [a, b] (absolute s). A chunk where Qwen runs into its cap (a repetition loop) is
+        tried once more as two halves; a half that still hits it goes into `capped` (MOSS's text there)."""
         import mlx.core as mx
 
+        chunk = pcm[round(a * plan.SR) : round(b * plan.SR)]
+        if len(chunk) < plan.SR // 10:
+            return []
+        padded = np.pad(chunk, (0, plan.SR - len(chunk))) if len(chunk) < plan.SR else chunk
+        cap = plan.qwen_max_tokens(len(chunk) / plan.SR)
+        r = qwen.generate(mx.array(padded), hotwords=context or None, max_tokens=cap)
+        stats["qwen_chunks"] += 1
+        if int(getattr(r, "generation_tokens", 0) or 0) >= cap:
+            if split and b - a > 20:
+                stats["qwen_split"] += 1
+                mid = a + plan.middle_cut(chunk, 0.0, b - a)
+                log.warning("Qwen hit its cap on a %.0f s chunk: trying its halves", b - a)
+                return (self._qwen(qwen, aligner, pcm, a, mid, context, stats, languages, capped, split=False)
+                        + self._qwen(qwen, aligner, pcm, mid, b, context, stats, languages, capped, split=False))  # fmt: skip
+            stats["qwen_capped"] += 1
+            capped.append((a, b))
+            log.warning("Qwen hit its cap on a %.0f s chunk: keeping MOSS text there", b - a)
+            return []
+        text = (r.text or "").strip()
+        reported = getattr(r, "language", None)  # mlx-audio 0.6.3 gives a list of names, e.g. ["English"]
+        for name in reported if isinstance(reported, (list, tuple)) else [reported]:
+            if isinstance(name, str) and name.strip() and name.strip().lower() != "none":
+                languages.append(name.strip())
+        if not text:
+            return []
+        res = aligner.generate(chunk, text=text, language=ALIGN_LANGUAGE)
+        return spans_for(text, [(it.text, float(it.start_time), float(it.end_time)) for it in res.items], a)
+
+    def _text(self, qwen, aligner, pcm: np.ndarray, start: float, stop: float, lines: list[dict], context: list[str],
+              stats: dict, languages: list[str], prefix: str = "", truncated: bool = False) -> list[dict]:  # fmt: skip
+        """Qwen text on <= 180 s chunks of the whole window [start, stop] (speech MOSS left out included),
+        aligned onto its MOSS lines. Words MOSS gave no speaker for (no lines at all, or past where a
+        truncated MOSS stopped) go on `UNKNOWN` lines: kept, attributed to nobody."""
         relative = [dict(s, start=s["start"] - start, end=s["end"] - start) for s in lines]
-        units = []
+        units: list = []
+        capped: list[tuple[float, float]] = []
         cuts = plan.chunk_cuts(relative, stop - start)
         for a, b in zip(cuts, cuts[1:], strict=False):
-            chunk = pcm[round((start + a) * plan.SR) : round((start + b) * plan.SR)]
-            if len(chunk) < plan.SR // 10:
-                continue
-            padded = np.pad(chunk, (0, plan.SR - len(chunk))) if len(chunk) < plan.SR else chunk
-            cap = plan.qwen_max_tokens(len(chunk) / plan.SR)
-            r = qwen.generate(mx.array(padded), hotwords=context or None, max_tokens=cap)
-            stats["qwen_chunks"] += 1
-            if int(getattr(r, "generation_tokens", 0) or 0) >= cap:  # a repetition loop: keep MOSS's text here
-                stats["qwen_capped"] += 1
-                log.warning("Qwen hit its cap on a %.0f s chunk: keeping MOSS text there", len(chunk) / plan.SR)
-                continue
-            text = (r.text or "").strip()
-            reported = getattr(r, "language", None)  # mlx-audio 0.6.3 gives a list of names, e.g. ["English"]
-            for name in reported if isinstance(reported, (list, tuple)) else [reported]:
-                if isinstance(name, str) and name.strip() and name.strip().lower() != "none":
-                    languages.append(name.strip())
-            if not text:
-                continue
-            res = aligner.generate(chunk, text=text, language=ALIGN_LANGUAGE)
-            units.extend(spans_for(text, [(it.text, float(it.start_time), float(it.end_time)) for it in res.items], start + a))
+            units.extend(self._qwen(qwen, aligner, pcm, start + a, start + b, context, stats, languages, capped))
+        lines = [dict(line) for line in lines]
         if not lines:
             if not units:
                 return []
-            # MOSS found no speaker here but Qwen heard words: keep them under one label rather than drop them
             stats["unlabeled_windows"] += 1
-            log.warning("MOSS found no lines in %.0f-%.0f s: %d words kept under one label", start, stop, len(units))
-            lines = [{"start": units[0].start, "end": units[-1].end, "speaker": prefix + "S00", "moss_text": ""}]
+            log.warning("MOSS found no lines in %.0f-%.0f s: %d words kept as unattributed", start, stop, len(units))
+            lines = [{"start": units[0].start, "end": units[-1].end, "speaker": UNKNOWN, "moss_text": ""}]
+        elif truncated:
+            last = max(line["end"] for line in lines)
+            tail = [u for u in units if (u.start + u.end) / 2 > last + SLACK]
+            if tail:
+                lines.append({"start": tail[0].start, "end": tail[-1].end, "speaker": UNKNOWN, "moss_text": ""})
         merged, s = assign(lines, units)
+        for line in merged:  # a line under a span Qwen couldn't do: MOSS's words, whatever else landed on it
+            mid = (line["start"] + line["end"]) / 2
+            if line.get("moss_text") and any(a <= mid < b for a, b in capped):
+                line["text"] = line["moss_text"]
         for key in ("units", "units_outside_lines", "lines_with_moss_text"):
             stats[key] += s[key]
         return merged

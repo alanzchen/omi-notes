@@ -90,3 +90,59 @@ def test_a_request_stuck_past_its_deadline_fails_health_and_the_watchdog_exits()
     assert r.status_code == 503 and "stuck" in r.json()["reason"]
     guard.check()
     assert exits == [70]
+
+
+class SlowEngine(FakeEngine):
+    def __init__(self):
+        super().__init__()
+        import threading
+        self.release = threading.Event()
+        self.started = threading.Event()
+
+    def transcribe(self, pcm, context):
+        self.started.set()
+        self.release.wait(5)
+        self.release.clear()
+        return super().transcribe(pcm, context)
+
+
+def test_the_deadline_always_belongs_to_the_request_running_now():
+    import threading
+    import time as _t
+
+    engine = SlowEngine()
+    app = server.create_app(engine)
+    guard = app.state.guard
+    pcm = np.zeros(16000, np.float32)
+    first = threading.Thread(target=guard.run, args=(pcm, []))
+    first.start()
+    engine.started.wait(2)
+    engine.started.clear()
+    running = guard.deadline
+    second = threading.Thread(target=guard.run, args=(pcm, []))
+    second.start()
+    _t.sleep(0.2)
+    assert guard.deadline == running, "a queued request must not move the running one's deadline"
+    engine.release.set()
+    engine.started.wait(2)
+    assert guard.deadline is not None and guard.deadline != running, "the second request now owns it"
+    engine.release.set()
+    first.join(2)
+    second.join(2)
+    assert guard.deadline is None
+
+
+def test_an_engine_failure_answers_503_fails_health_and_restarts_the_service():
+    class Failing(FakeEngine):
+        def transcribe(self, pcm, context):
+            raise RuntimeError("[METAL] Command buffer execution failed")
+
+    exits = []
+    app = server.create_app(Failing(), exit=exits.append)
+    client = TestClient(app)
+    r = client.post("/v1/audio/transcriptions", files={"file": ("a.flac", flac(), "audio/flac")})
+    assert r.status_code == 503
+    h = client.get("/health")
+    assert h.status_code == 503 and "engine failed" in h.json()["reason"]
+    app.state.guard.check()
+    assert exits == [70]

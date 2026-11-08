@@ -61,15 +61,17 @@ def test_speech_after_mosss_last_line_still_reaches_qwen_and_the_truncation_is_f
     out = e.transcribe(speech(60), [])
     assert sum(qwen.seconds) == pytest.approx(60, abs=0.1), "Qwen hears the whole window, not just MOSS's lines"
     assert len(out["text"].split()) == 30
-    assert out["segments"][-1]["end"] >= 55, "the line holding the late words covers them"
     assert out["omi_asr"]["truncated_unresolved"] == 1
+    late = [x for x in out["segments"] if x["speaker_id"] == "UNKNOWN"]
+    assert late and late[-1]["end"] >= 55, "words past where MOSS stopped are kept, attributed to nobody"
+    assert max(x["end"] for x in out["segments"] if x["speaker_id"] == "S01") <= 21, "not given to the last speaker"
 
 
 def test_a_window_where_moss_found_no_lines_keeps_qwens_text_under_one_flagged_label():
     e, _ = engine([])
     out = e.transcribe(speech(30), [])
     assert len(out["text"].split()) == 15
-    assert len({s["speaker_id"] for s in out["segments"]}) == 1
+    assert {s["speaker_id"] for s in out["segments"]} == {"UNKNOWN"}, "no speaker is invented"
     assert out["omi_asr"]["unlabeled_windows"] == 1
 
 
@@ -111,3 +113,39 @@ def test_the_self_test_loads_the_models_and_runs_qwen_briefly_without_moss():
     e.models = (NoMoss(), qwen, FakeAligner())
     e.self_test()
     assert qwen.seconds == [1.0]
+
+
+class CappingQwen(FakeQwen):
+    """Runs into its token cap (a repetition loop) on anything longer than `limit` seconds."""
+
+    def __init__(self, limit):
+        super().__init__()
+        self.limit = limit
+
+    def generate(self, audio, hotwords=None, max_tokens=0, **_):
+        r = super().generate(audio, hotwords, max_tokens)
+        if audio.shape[0] / SR > self.limit:
+            r.generation_tokens = max_tokens
+        return r
+
+
+def lines_every(seconds, total, label="S01"):
+    return [{"start": float(t), "end": float(t) + seconds - 0.5, "speaker_id": label, "text": f"[{t}][{label}] moss{t}"}
+            for t in range(0, int(total), int(seconds))]  # fmt: skip
+
+
+def test_a_capped_qwen_chunk_is_retried_in_halves_before_falling_back():
+    e = Engine()
+    qwen = CappingQwen(limit=100)
+    e.models = (FakeMoss(lines_every(10, 150)), qwen, FakeAligner())
+    out = e.transcribe(speech(150), [])
+    assert out["omi_asr"]["qwen_capped"] == 0 and out["omi_asr"]["qwen_split"] == 1
+    assert "moss" not in out["text"]
+
+
+def test_lines_under_a_chunk_qwen_cannot_do_keep_mosss_text_even_if_some_units_landed():
+    e = Engine()
+    e.models = (FakeMoss(lines_every(10, 60)), CappingQwen(limit=0), FakeAligner())
+    out = e.transcribe(speech(60), [])
+    assert out["omi_asr"]["qwen_capped"] >= 1
+    assert [x["text"] for x in out["segments"]] == [f"moss{t}" for t in range(0, 60, 10)]

@@ -44,19 +44,19 @@ class Guard:
     def __init__(self, engine: Engine, exit=os._exit) -> None:
         self.engine, self.exit = engine, exit
         self.self_test_state = "pending"
-        self.busy_since: float | None = None
+        self.failed: str | None = None  # an engine error: the process is restarted
+        self.busy_since: float | None = None  # monotonic, of the operation holding `op`
         self.deadline: float | None = None
-        self.lock = threading.Lock()
+        self.op = threading.Lock()  # one engine operation at a time; its holder owns the deadline
 
     def self_test(self) -> None:
         try:
-            with self.lock:  # under the deadline too: a hang at startup is caught
-                self.busy_since = time.time()
+            with self.op:  # under the deadline too: a hang at startup is caught
+                self.busy_since = time.monotonic()
                 self.deadline = self.busy_since + DEADLINE_BASE
-            try:
-                self.engine.self_test()
-            finally:
-                with self.lock:
+                try:
+                    self.engine.self_test()
+                finally:
                     self.busy_since = self.deadline = None
             self.self_test_state = "ok"
             log.info("self-test passed")
@@ -65,27 +65,33 @@ class Guard:
             log.error("self-test failed: %s", self.self_test_state)
 
     def run(self, pcm: np.ndarray, context: list[str]) -> dict:
-        with self.lock:
-            self.busy_since = time.time()
+        with self.op:
+            self.busy_since = time.monotonic()
             self.deadline = self.busy_since + DEADLINE_BASE + len(pcm) / plan.SR
-        try:
-            return self.engine.transcribe(pcm, context)
-        finally:
-            with self.lock:
+            try:
+                return self.engine.transcribe(pcm, context)
+            except Exception as exc:  # the audio was decoded already: this is the engine, not the input
+                self.failed = f"{type(exc).__name__}: {exc}"[:300]
+                log.error("engine failed: %s", self.failed)
+                raise
+            finally:
                 self.busy_since = self.deadline = None
 
     def problem(self) -> str | None:
         if self.self_test_state.startswith("failed"):
             return f"startup self-test {self.self_test_state}"
-        deadline = self.deadline
-        if deadline is not None and time.time() > deadline:
-            return f"a transcription is stuck (running {time.time() - (self.busy_since or 0):.0f} s)"
+        if self.failed:
+            return f"engine failed: {self.failed}"
+        deadline, since = self.deadline, self.busy_since
+        if deadline is not None and time.monotonic() > deadline:
+            return f"a transcription is stuck (running {time.monotonic() - (since or 0):.0f} s)"
         return None
 
     def check(self) -> None:
-        """Watchdog: a stuck transcription holds the models' lock for good; start over."""
+        """Watchdog: a stuck transcription holds the models' lock for good, and an engine error (a Metal
+        failure, memory) may leave MLX unusable; either way, start over in a fresh process."""
         problem = self.problem()
-        if problem and problem.startswith("a transcription is stuck"):
+        if problem and (problem.startswith("a transcription is stuck") or problem.startswith("engine failed")):
             log.critical("%s: exiting so launchd restarts the service", problem)
             self.exit(WATCHDOG_EXIT)
 
@@ -160,7 +166,10 @@ def create_app(engine: Engine | None = None, *, self_test: bool = False, exit=os
             raise HTTPException(400, "empty audio")
         if len(pcm) / plan.SR > MAX_SECONDS:
             raise HTTPException(413, f"audio longer than {MAX_SECONDS:.0f} s")
-        result = await run_in_threadpool(guard.run, pcm, terms(context, prompt))
+        try:
+            result = await run_in_threadpool(guard.run, pcm, terms(context, prompt))
+        except Exception as exc:  # recorded by the guard; the client waits for the restarted service
+            raise HTTPException(503, f"transcription engine failed: {exc}"[:300]) from exc
         log.info("transcribed %.0f s in %.1f s (rtf %.3f, %d segments)", result["duration"], result["omi_asr"]["seconds"],
                  result["omi_asr"]["rtf"], len(result["segments"]))  # fmt: skip
         return result

@@ -18,6 +18,7 @@ class Unit:
     start: float  # absolute seconds
     end: float
     text: str  # the piece of Qwen's text this unit stands for (punctuation and spacing kept)
+    chunk_start: bool = False  # the first unit of a Qwen chunk (its text never carried the space before it)
 
 
 def moss_lines(raw_segments: list[dict], offset: float = 0.0) -> list[dict]:
@@ -45,14 +46,24 @@ def spans_for(text: str, items: list[tuple[str, float, float]], offset: float) -
         if k >= 0:
             cur = k + len(unit)
     units = []
+    first = next((k for k in starts if k is not None), None)
     for i, (unit, a, b) in enumerate(items):
         if starts[i] is None:
             piece = unit
         else:
             nxt = next((starts[j] for j in range(i + 1, len(starts)) if starts[j] is not None), len(text))
-            piece = text[starts[i] : nxt]
-        units.append(Unit(offset + a, offset + b, piece))
+            # what precedes the first aligned unit ("-" of "-5", an opening quote) belongs to it
+            piece = text[0 if starts[i] == first else starts[i] : nxt]
+        units.append(Unit(offset + a, offset + b, piece, chunk_start=i == 0))
     return units
+
+
+def _joined(left: str, right: str) -> str:
+    """`left + right`, with a space where two chunks' Latin words would otherwise run together."""
+    if left and right and not left[-1].isspace() and not right[0].isspace() and left[-1].isascii() and right[0].isascii() \
+            and (left[-1].isalnum() or left[-1] in ".,;:!?") and right[0].isalnum():  # fmt: skip
+        return left + " " + right
+    return left + right
 
 
 def assign(lines: list[dict], units: list[Unit]) -> tuple[list[dict], dict]:
@@ -70,7 +81,7 @@ def assign(lines: list[dict], units: list[Unit]) -> tuple[list[dict], dict]:
             outside += 1
             j = min(range(len(out)), key=lambda j: max(out[j]["start"] - m, m - out[j]["end"]))
             out[j]["start"], out[j]["end"] = min(out[j]["start"], u.start), max(out[j]["end"], u.end)
-        out[j]["text"] += u.text
+        out[j]["text"] = _joined(out[j]["text"], u.text) if u.chunk_start else out[j]["text"] + u.text
     empty = 0
     for s in out:
         s["text"] = s["text"].strip()

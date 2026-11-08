@@ -33,3 +33,18 @@ def test_a_unit_in_a_gap_goes_to_the_line_with_the_nearer_edge_not_the_nearer_mi
     lines = [{"start": 0.0, "end": 100.0, "speaker": "S01", "moss_text": "a"}, {"start": 110.0, "end": 111.0, "speaker": "S02", "moss_text": "b"}]
     out, _ = assign(lines, [Unit(50.0, 50.5, "x "), Unit(103.8, 104.2, "late")])
     assert [s["text"] for s in out] == ["x late", "b"] and out[0]["end"] == 104.2
+
+
+def test_text_before_the_first_aligned_unit_is_kept():
+    units = spans_for("-5 degrees today", [("5", 0.0, 0.2), ("degrees", 0.3, 0.6), ("today", 0.7, 1.0)], offset=0.0)
+    assert "".join(u.text for u in units) == "-5 degrees today"
+
+
+def test_words_from_two_chunks_on_one_line_are_spaced():
+    lines = [{"start": 0.0, "end": 10.0, "speaker": "S01", "moss_text": "x"}]
+    out, _ = assign(lines, [Unit(1.0, 1.5, "first ", True), Unit(2.0, 2.5, "chunk"), Unit(6.0, 6.5, "second ", True), Unit(7.0, 7.5, "chunk")])
+    assert out[0]["text"] == "first chunk second chunk"
+    out, _ = assign(lines, [Unit(1.0, 1.5, "U."), Unit(1.5, 1.8, "S.")])
+    assert out[0]["text"] == "U.S.", "inside a chunk the text's own spacing stands"
+    out, _ = assign(lines, [Unit(1.0, 1.5, "你好", True), Unit(6.0, 6.5, "世界", True)])
+    assert out[0]["text"] == "你好世界", "no space between CJK"
