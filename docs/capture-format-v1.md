@@ -560,8 +560,9 @@ attempt fails for another reason, that failure is listed as usual. The decision 
 ### `POST /v1/conversations/{id}/dismiss` (servers with `dismiss`)
 
 For any `failed` conversation with no retry pending: the owner sets that failure aside. Same body as
-a retry; `200` (also for a repeat of the same request id) with
-`{"dismissed": {"conversation_id": "…", "request_id": "…", "resolved_at": "…"}}`; `409`
+a retry; `200` with `{"dismissed": {"conversation_id": "…", "request_id": "…", "failure_id": "…",
+"resolved_at": "…"}}`. A repeated request id returns its original decision (the failure it dismissed)
+and changes nothing, even after a newer failure or a rebuild; `409`
 `not_failed` / `retry_in_progress` / `busy`, `404`, `503` read-only. Nothing is queued and nothing is
 deleted: the conversation stays `failed` with its audio, it leaves `/v1/issues` and the failed
 counts, and Retry stays possible. If a later retry fails again, that new failure is listed as usual.

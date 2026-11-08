@@ -64,3 +64,22 @@ def test_a_retry_after_dismissing_that_fails_again_is_shown_again(client, worker
     (after,) = convs(worker)
     assert after["status"] == "failed" and after["failure_id"] != row["failure_id"]
     assert [i["conversation_id"] for i in failed_issues(client)] == [row["id"]], "a new failure isn't hidden"
+
+
+def test_an_old_dismiss_request_never_dismisses_a_newer_failure(client, worker, settings):
+    """ASTRA-IT1-04: dismiss F1 with A, then B; a retry fails as F2; replaying A must answer A's
+    original decision (about F1) and leave F2 listed, also after a rebuild."""
+    row = failed_summary(client, worker)
+    a, b = str(uuid.uuid4()), str(uuid.uuid4())
+    assert dismiss(client, row["id"], a).status_code == 200
+    assert dismiss(client, row["id"], b).status_code == 200
+    assert retry(client, row["id"]).status_code == 202
+    worker.tick(T0 + 500)
+    (after,) = convs(worker)
+    assert after["failure_id"] != row["failure_id"]
+    replay = dismiss(client, row["id"], a)
+    assert replay.status_code == 200 and replay.json()["dismissed"]["failure_id"] == row["failure_id"]
+    assert [i["conversation_id"] for i in failed_issues(client)] == [row["id"]], "F2 stays listed"
+    client, worker = reopen(settings)
+    assert dismiss(client, row["id"], b).json()["dismissed"]["failure_id"] == row["failure_id"]
+    assert [i["conversation_id"] for i in failed_issues(client)] == [row["id"]], "and after a rebuild"

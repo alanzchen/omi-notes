@@ -24,7 +24,9 @@ A dismiss (`POST /v1/conversations/{id}/dismiss`) is only the owner's decision, 
 `resolution: {kind: "dismissed", op, resolved_at, failure: {stage, kind, id}}` is committed into the
 failed conversation's record (vault format 3). That failure leaves the issues and the failed count;
 the conversation stays failed with its audio pinned, Retry stays possible, and a later failure (a new
-`failure_id`) shows again. A repeated request id is answered again.
+`failure_id`) shows again. Every dismiss request id is kept in `resolution.requests` with the failure
+it dismissed (the last 50), so a repeat answers its original decision and never dismisses a newer
+failure, also after a rebuild.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ FORMAT = 1
 KINDS = ("retry", "keep")
 KEPT = "kept_speaker_unknown"
 DISMISSED = "dismissed"
+DISMISS_HISTORY = 50  # dismiss requests remembered per conversation (with the failure each dismissed)
 TERMINAL = ("done", "failed", "stopped", "superseded")
 REQUIRED = ("id", "kind", "conversation_id", "state")
 STATES = ("accepted", *TERMINAL)
@@ -177,9 +180,10 @@ def dismiss(pipeline, conv_id: str, request_id: str, *, read_only: str | None) -
         row = _row(db, conv_id)
         if row is None:
             raise ApiError(404, "not_found", "unknown conversation")
-        current = _resolution(row)
-        if current.get("kind") == DISMISSED and current.get("op") == request_id:
-            return 200, _dismissed_view(conv_id, current)
+        earlier = _dismiss_requests(_resolution(row))
+        if request_id in earlier:
+            # a repeat: the original decision (about the failure it dismissed), never applied to another
+            return 200, _dismissed_view(conv_id, request_id, earlier[request_id])
         token = pipeline.claim(conv_id)
         if token is None:
             raise ApiError(409, *BUSY)
@@ -190,12 +194,29 @@ def dismiss(pipeline, conv_id: str, request_id: str, *, read_only: str | None) -
             if row["status"] != "failed":
                 raise ApiError(409, "not_failed", "only a failed conversation can be dismissed")
             vault.raise_format(3)  # `resolution` in the record
-            decision = {"kind": DISMISSED, "op": request_id, "resolved_at": time.time(),
+            now = time.time()
+            requests = _dismiss_requests(_resolution(row))
+            requests[request_id] = {"failure_id": row["failure_id"], "at": now}
+            requests = dict(list(requests.items())[-DISMISS_HISTORY:])
+            decision = {"kind": DISMISSED, "op": request_id, "resolved_at": now, "requests": requests,
                         "failure": {"stage": row["failed_stage"], "kind": row["error_kind"], "id": row["failure_id"]}}
             pipeline._commit(conv_id, resolution=json.dumps(decision, sort_keys=True))
         finally:
             pipeline.release(conv_id, token)
-    return 200, _dismissed_view(conv_id, decision)
+    return 200, _dismissed_view(conv_id, request_id, requests[request_id])
+
+
+def _dismiss_requests(resolution: dict) -> dict:
+    """Every dismiss request recorded for this conversation → the failure it dismissed and when, in
+    order (the latest decision's own request included, also from a record written before this)."""
+    if resolution.get("kind") != DISMISSED:
+        return {}
+    out = {k: v for k, v in (resolution.get("requests") or {}).items()
+           if isinstance(k, str) and isinstance(v, dict)}  # fmt: skip
+    op, failure = resolution.get("op"), resolution.get("failure") or {}
+    if isinstance(op, str) and op not in out:
+        out[op] = {"failure_id": failure.get("id"), "at": resolution.get("resolved_at")}
+    return out
 
 
 def _resolution(row) -> dict:
@@ -206,9 +227,10 @@ def _resolution(row) -> dict:
     return res if isinstance(res, dict) else {}
 
 
-def _dismissed_view(conv_id: str, decision: dict) -> dict:
-    return {"dismissed": {"conversation_id": conv_id, "request_id": decision.get("op"),
-                          "resolved_at": iso_utc_epoch(decision["resolved_at"]) if isinstance(decision.get("resolved_at"), (int, float)) else None}}
+def _dismissed_view(conv_id: str, request_id: str, entry: dict) -> dict:
+    at = entry.get("at")
+    return {"dismissed": {"conversation_id": conv_id, "request_id": request_id, "failure_id": entry.get("failure_id"),
+                          "resolved_at": iso_utc_epoch(at) if isinstance(at, (int, float)) else None}}
 
 
 def _check_retryable(row) -> None:
