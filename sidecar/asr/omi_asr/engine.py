@@ -49,6 +49,19 @@ class IncompleteTranscription(RuntimeError):
     """Qwen failed on some audio and MOSS has no words there either: rather an error than silence."""
 
 
+def _check_fallback(pcm: np.ndarray, capped: list[tuple[float, float]], lines: list[dict]) -> None:
+    """The speech of every span Qwen failed on needs MOSS words over it, or it would vanish: a line with
+    text actually overlapping the span (no timing slack), and no more than a small share of its speech left
+    uncovered (noise between lines is tolerated)."""
+    for a, b in capped:
+        spans = [(line["start"], line["end"]) for line in lines if line.get("moss_text")]
+        missing, loud = _uncovered_speech(pcm, a, b, spans)
+        if loud < 0.2:
+            continue
+        if not any(x < b and y > a for x, y in spans) or missing > max(UNCOVERED_MAX, UNCOVERED_SHARE * loud):
+            raise IncompleteTranscription(f"Qwen failed on {a:.1f}-{b:.1f} s and MOSS has no words for {missing:.0f} s of its speech")
+
+
 UNKNOWN = "UNKNOWN"  # words no MOSS line holds (Omi renders the speaker as unknown and learns no voice from it)
 
 
@@ -211,11 +224,7 @@ class Engine:
         for a, b in zip(cuts, cuts[1:], strict=False):
             units.extend(self._qwen(qwen, aligner, pcm, start + a, start + b, context, stats, languages, capped))
         lines = [dict(line) for line in lines]
-        for a, b in capped:  # the speech of every failed span needs MOSS words over it, or it would vanish
-            missing, loud = _uncovered_speech(pcm, a, b, [(line["start"], line["end"]) for line in lines if line.get("moss_text")])
-            # partial gaps are tolerated (noise between lines); speech with no MOSS words at all never is
-            if missing > max(UNCOVERED_MAX, UNCOVERED_SHARE * loud) or (loud >= 0.2 and missing >= loud - 1e-6):
-                raise IncompleteTranscription(f"Qwen failed on {a:.0f}-{b:.0f} s and MOSS has no words for {missing:.0f} s of its speech")
+        _check_fallback(pcm, capped, lines)
         if not lines:
             if not units:
                 return []

@@ -197,3 +197,13 @@ def test_a_short_failed_span_with_no_moss_words_is_still_an_error():
     e.models = (FakeMoss([]), CappingQwen(limit=0), FakeAligner())
     with pytest.raises(IncompleteTranscription):
         e.transcribe(speech(0.8), [])
+
+
+def test_a_failed_tail_just_after_a_line_is_not_covered_by_timing_slack():
+    from omi_asr.engine import _check_fallback, IncompleteTranscription
+
+    pcm = speech(181)
+    lines = [{"start": 100.0, "end": 180.0, "speaker": "S01", "moss_text": "words"}]
+    with pytest.raises(IncompleteTranscription):
+        _check_fallback(pcm, [(180.0, 180.8)], lines)
+    _check_fallback(pcm, [(100.0, 180.0)], lines)  # a span MOSS words lie over is fine
