@@ -199,7 +199,9 @@ battery) and every interruption condition have not been validated.
   as uninterrupted capture on a real Watch). It sends them over WatchConnectivity whenever the
   iPhone is reachable; when that happens is up to the system, so keep the iPhone nearby, ideally
   with Omi Notes open. A part is deleted from the Watch only after the iPhone has stored it and
-  checked its hash. Away from the iPhone the Watch keeps waiting audio up to a configured backlog
+  checked its hash. While delivered parts wait for that acknowledgement, the Watch asks the iPhone
+  (at most every 15 minutes) which of them it already has; those are acknowledged without being
+  sent again, and the missing ones are sent again at once. Away from the iPhone the Watch keeps waiting audio up to a configured backlog
   cap (600 MB, about 40 hours at 32 kbit/s; not a measured recording time) or until it is nearly
   full, then pauses until it can send; it never deletes waiting audio.
 - **To the server.** The iPhone queues each part like pendant audio. A server that advertises

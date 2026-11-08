@@ -162,3 +162,61 @@ import OmiCapture
         #expect(again.segments().map(\.segment.id) == [mc.id] && WatchOutbox(root: root.appendingPathComponent("outbox")).segments().map(\.segment.id) == [mc.id])
     }
 }
+
+/// OMI-NIGHTLY-2026-11-08: the Watch's backlog sat at ~820 parts "delivered, awaiting
+/// acknowledgement" (Watch gauges: outstanding_files 4, awaiting_ack ≈ outbox_parts), each resent only
+/// after 30 min–4 h and then acknowledged at once (phone log: acks == resends). The Watch now asks
+/// which of its waiting parts the iPhone already has; the answer acknowledges those (no audio sent
+/// again) and names the missing ones, which go again at once. Nothing is deleted without an ack.
+@Suite struct WatchInventoryTests {
+    func inbox() throws -> (PhoneWatchInbox, WatchRelayProcessor, Outbox, URL) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-inv-\(UUID().uuidString)")
+        let dirs = CaptureDirectories(root: root)
+        try dirs.create()
+        let outbox = Outbox(dirs: dirs)
+        let inbox = PhoneWatchInbox(root: root.appendingPathComponent("watch"), binding: "phone-A")
+        return (inbox, WatchRelayProcessor(inbox: inbox, outbox: outbox, appVersion: "t", timezone: "UTC"), outbox, root)
+    }
+
+    @Test func thePhoneAcknowledgesWhatItHasAndNamesWhatIsMissing() throws {
+        let (inbox, relay, _, root) = try inbox()
+        let tmp = root.appendingPathComponent("tmp"); try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let rec = UUID().uuidString.lowercased()
+        let s0 = try WatchRelayTests.segmentFile(seconds: 1, in: tmp, name: "s0"), s1 = try WatchRelayTests.segmentFile(seconds: 1, in: tmp, name: "s1")
+        let m0 = WatchRelayTests().manifest(s0, recording: rec, index: 0, binding: "phone-A", start: 0)
+        let m1 = WatchRelayTests().manifest(s1, recording: rec, index: 1, binding: "phone-A", start: 1_000_000)
+        try inbox.accept(file: s0, segment: m0)
+        _ = relay.process()                      // converted: only its done marker remains
+        try inbox.accept(file: s1, segment: m1)  // received, not converted yet
+        let answer = try inbox.answer(inventory: [m0.id, m1.id, "\(rec)-2"], binding: "phone-A")
+        #expect(Set(answer.acks) == [m0.id, m1.id] && answer.missing == ["\(rec)-2"])
+        #expect(throws: WatchRelayError.wrongPhone) { try inbox.answer(inventory: [m0.id], binding: "phone-B") }
+        #expect(WatchWire.inventory == "inventory" && WatchWire.missing == "missing", "wire keys both builds read")
+    }
+
+    @Test func theWatchAsksAboutDeliveredPartsAndResendsTheMissingAtOnce() throws {
+        let t0 = Date(timeIntervalSince1970: 1_791_000_000)
+        var p = WatchResendPolicy()
+        for (i, id) in ["a", "b", "c"].enumerated() {
+            p.handedOver(id, now: t0.addingTimeInterval(Double(i)))
+            p.delivered(id, now: t0.addingTimeInterval(Double(i) + 1))
+        }
+        p.handedOver("in-flight", now: t0)  // not delivered yet: not asked about
+        #expect(p.inventory(limit: 2) == ["a", "b"], "delivered ones, oldest first, bounded")
+        #expect(p.inventoryDue(now: t0.addingTimeInterval(10)), "never asked: due")
+        p.askedInventory(now: t0.addingTimeInterval(10))
+        #expect(!p.inventoryDue(now: t0.addingTimeInterval(10 + 60)), "not again within the interval")
+        #expect(p.inventoryDue(now: t0.addingTimeInterval(10 + WatchResendPolicy.inventoryInterval)))
+        #expect(!p.due("b", now: t0.addingTimeInterval(60)))
+        p.missing(["b"])
+        #expect(p.due("b", now: t0.addingTimeInterval(60)), "the iPhone doesn't have it: due at once")
+        p.acknowledged(["a", "c"])
+        #expect(p.inventory(limit: 10).isEmpty)
+        var none = WatchResendPolicy()
+        none.handedOver("x", now: t0)
+        #expect(!none.inventoryDue(now: t0.addingTimeInterval(9_999)), "nothing delivered and unacknowledged: nothing to ask")
+        // the saved state of an older build (no inventory time) still decodes
+        let old = try JSONSerialization.data(withJSONObject: ["entries": [:] as [String: Any]])
+        #expect((try? JSONDecoder().decode(WatchResendPolicy.self, from: old)) != nil)
+    }
+}

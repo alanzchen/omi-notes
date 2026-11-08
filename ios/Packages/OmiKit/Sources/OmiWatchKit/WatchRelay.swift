@@ -96,6 +96,9 @@ public struct WatchReport: Codable, Equatable, Sendable {
 public enum WatchWire {
     public static let kind = "kind", manifest = "manifest", acks = "acks", rejects = "rejects", binding = "binding"
     public static let segment = "segment", end = "end", report = "report", perf = "perf"
+    /// Watch → iPhone: `inventory` (ids of delivered parts still waiting for an ack, kind `inventory`);
+    /// iPhone → Watch: `missing` (those it doesn't have), beside the usual `acks` for the ones it has.
+    public static let inventory = "inventory", missing = "missing"
 
     public static func encode<T: Encodable>(_ v: T) -> Data {
         let e = JSONEncoder()
@@ -302,6 +305,20 @@ public final class PhoneWatchInbox: @unchecked Sendable {
         let audio = inboxDir.appendingPathComponent("\(segment.id).m4a")
         try Files.durableCopy(file, to: audio)
         try Files.durableWrite(WatchWire.encode(segment), to: inboxDir.appendingPathComponent("\(segment.id).json"))
+    }
+
+    /// Which of the Watch's waiting parts this iPhone has durably (received or already converted): those
+    /// are acknowledged again; the rest are missing. Another iPhone's question is refused.
+    public func answer(inventory ids: [String], binding asked: String?) throws -> (acks: [String], missing: [String]) {
+        guard let binding = binding() else { throw WatchRelayError.identityUnreadable }
+        guard asked == binding else { throw WatchRelayError.wrongPhone }
+        lock.lock(); defer { lock.unlock() }
+        var acks: [String] = [], missing: [String] = []
+        for id in ids where !id.isEmpty && !id.contains("/") {
+            let has = isDone(id) || FileManager.default.fileExists(atPath: inboxDir.appendingPathComponent("\(id).json").path)
+            if has { acks.append(id) } else { missing.append(id) }
+        }
+        return (acks, missing)
     }
 
     public func accept(end: WatchRecordingEnd) throws {

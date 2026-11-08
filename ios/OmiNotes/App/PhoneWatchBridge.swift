@@ -40,9 +40,10 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
         try? session.updateApplicationContext([WatchWire.binding: phone, "at": Date().timeIntervalSince1970])
     }
 
-    private func acknowledge(_ ids: [String], _ session: WCSession) {
-        guard !ids.isEmpty, let phone = engine.settings.phoneInstallId else { return }
-        let message: [String: Any] = [WatchWire.acks: ids, WatchWire.binding: phone]
+    private func acknowledge(_ ids: [String], missing: [String] = [], _ session: WCSession) {
+        guard !ids.isEmpty || !missing.isEmpty, let phone = engine.settings.phoneInstallId else { return }
+        var message: [String: Any] = [WatchWire.acks: ids, WatchWire.binding: phone]
+        if !missing.isEmpty { message[WatchWire.missing] = missing }
         session.transferUserInfo(message)  // delivered even if the Watch app isn't running now
         if session.isReachable { session.sendMessage(message, replyHandler: nil, errorHandler: nil) }
     }
@@ -90,6 +91,17 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
     }
 
     func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        if userInfo[WatchWire.kind] as? String == WatchWire.inventory {
+            // which waiting parts are already here: acknowledge them again, name the missing ones
+            do {
+                let answer = try engine.answerWatchInventory(userInfo[WatchWire.inventory] as? [String] ?? [],
+                                                             binding: userInfo[WatchWire.binding] as? String)
+                acknowledge(answer.acks, missing: answer.missing, session)
+            } catch {
+                OmiLog.shared.log(.warning, "watch", "inventory not answered: \(error.localizedDescription)")
+            }
+            return
+        }
         if userInfo[WatchWire.kind] as? String == WatchWire.perf {
             do {
                 acknowledge([try engine.acceptWatchPerf(userInfo[WatchWire.manifest] as? Data)], session)

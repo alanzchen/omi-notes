@@ -114,6 +114,8 @@ final class WatchSync: NSObject, WCSessionDelegate {
     /// Files handed to WatchConnectivity at once, at most: after a day away from the iPhone, the
     /// backlog goes over a few at a time, oldest first, instead of queueing every file at once.
     static let maxInFlight = 4
+    /// Delivered parts asked about per inventory question (oldest first).
+    static let inventoryBatch = 300
 
     /// Hands what is waiting (for this iPhone) to WatchConnectivity, skipping what is in flight.
     func pump() {
@@ -147,6 +149,16 @@ final class WatchSync: NSObject, WCSessionDelegate {
             markSent(end.id, now: now)
             session.transferUserInfo([WatchWire.kind: WatchWire.end, "id": end.id, WatchWire.manifest: WatchWire.encode(end)])
         }
+        // delivered parts waiting for an acknowledgement: ask which ones the iPhone already has
+        // (durable user info, answered even while Omi Notes isn't open on the iPhone)
+        if resend.inventoryDue(now: now) {
+            let segments = Set(outbox.segments().map(\.segment.id))  // audio only: ends and telemetry are small
+            let ids = Array(resend.inventory(limit: .max).filter(segments.contains).prefix(Self.inventoryBatch))
+            session.transferUserInfo([WatchWire.kind: WatchWire.inventory, WatchWire.inventory: ids, WatchWire.binding: binding])
+            resend.askedInventory(now: now)
+            count("inventory_asked", ids.count)
+            watchLog.info("asked the iPhone about \(ids.count) delivered part(s)")
+        }
         // telemetry last, two batches at a time (small user-info transfers, after the audio)
         var perfRoom = 2 - session.outstandingUserInfoTransfers.filter { $0.userInfo[WatchWire.kind] as? String == WatchWire.perf }.count
         for id in perf.ids() where !inFlight.contains(id) && resend.due(id, now: now) {
@@ -164,9 +176,12 @@ final class WatchSync: NSObject, WCSessionDelegate {
     struct Received: Sendable {
         var binding: String?
         var acks: [String]
+        /// Parts the iPhone said it doesn't have (an inventory answer): sent again at once.
+        var missing: [String]
         init(_ m: [String: Any]) {
             binding = m[WatchWire.binding] as? String
             acks = m[WatchWire.acks] as? [String] ?? []
+            missing = m[WatchWire.missing] as? [String] ?? []
         }
     }
 
@@ -178,7 +193,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
             let r = Received(reply)
             // the iPhone can't read its identity yet (not unlocked since it restarted): asking again at
             // once would loop; it announces itself after unlocking, and the recheck asks again
-            guard r.binding != nil || !r.acks.isEmpty else { return }
+            guard r.binding != nil || !r.acks.isEmpty || !r.missing.isEmpty else { return }
             Task { @MainActor in self.handle(r) }
         }, errorHandler: nil)
     }
@@ -208,6 +223,11 @@ final class WatchSync: NSObject, WCSessionDelegate {
             count("acks", r.acks.count)
             lastAckAt = Date()
             UserDefaults.standard.set(lastAckAt, forKey: "omi.lastAckAt")
+        }
+        if !r.missing.isEmpty, r.binding == binding {
+            watchLog.info("iPhone is missing \(r.missing.count) part(s): sending them again")
+            resend.missing(r.missing)
+            count("inventory_missing", r.missing.count)
         }
         pump()
     }

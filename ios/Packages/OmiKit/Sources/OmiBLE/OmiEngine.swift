@@ -557,6 +557,14 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         return segment.id
     }
 
+    /// The Watch asks which of its delivered parts this iPhone has: those are acknowledged again, the
+    /// missing ones named (the Watch sends them at once). Nothing on either side is deleted here.
+    public func answerWatchInventory(_ ids: [String], binding: String?) throws -> (acks: [String], missing: [String]) {
+        let answer = try watchInbox.answer(inventory: ids, binding: binding)
+        log(.info, "watch", "Watch asked about \(ids.count) waiting part(s): \(answer.acks.count) already here, \(answer.missing.count) missing")
+        return answer
+    }
+
     public func acceptWatchEnd(_ data: Data?) throws -> String {
         guard let end = WatchWire.decode(WatchRecordingEnd.self, data) else { throw WatchRelayError.damaged("end") }
         try watchInbox.accept(end: end)
