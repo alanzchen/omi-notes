@@ -815,6 +815,25 @@ class ConversationPipeline:
     def voice_names(self, conv_id: str) -> dict[str, tuple[str, bool]]:
         return {label: (v["name"], v["me"]) for label, v in self.speakers.names(conv_id).items()}
 
+    def possible_voice_names(self, conv_id: str, transcript_sha: str | None) -> dict[str, tuple[str, bool]]:
+        """Unnamed labels whose stored voice is close to a known person's (see `possible_names`): label →
+        (name, me). Empty without a voice model or people."""
+        embedder = self.providers.embedder
+        if embedder is None:
+            return {}
+        try:
+            models = self.speakers.models(embedder.model, embedder.model_sha, self.operating)
+            voices = self.speakers.voices_of_labels(conv_id, transcript_sha)
+        except Exception:  # a hint is never worth failing a note for
+            log.exception("could not compute possible speaker names for %s", conv_id)
+            return {}
+        if not models or not voices:
+            return {}
+        vectors = {label: v.vector for label, v in voices.items() if getattr(v, "vector", None) is not None}
+        found = possible_names(vectors, self.speakers.labels(conv_id), models, threshold=self.operating.threshold)
+        people = {r["id"]: (r["name"], bool(r["me"])) for r in self.speakers.people()}
+        return {label: people[pid] for label, pid in found.items() if pid in people}
+
     def _engine_died(self, conv_id: str, audio_sha: str, now: float) -> int:
         """Record that the sidecar died on this audio; returns how many such deaths count against it. A death
         counts only if the engine has transcribed something else since this audio's previous one: an engine
@@ -892,10 +911,12 @@ class ConversationPipeline:
         ref = row["stt_ref"]
         excluded = set(json.loads(row["skip_stt"])) if row["skip_stt"] else set()
         if ref and ref not in excluded and (self.conv_dir(row["id"]) / ref).exists():
-            # checked before asking for a live engine: reading a stored result needs no service
-            for cached in (self.providers.local_stt_reader, self.providers.stt):
-                if ref.startswith(self._stt_base(cached, audio_sha)):
-                    return cached
+            # checked before asking for a live engine: reading a stored result needs no service. Any sidecar
+            # result for this exact audio counts, whatever request settings (length, overlap) made it
+            if ref.startswith("stt-local-asr-") and f"-{audio_sha[:16]}" in ref:
+                return self.providers.local_stt_reader
+            if ref.startswith(self._stt_base(self.providers.stt, audio_sha)):
+                return self.providers.stt
         return self.providers.transcriber()
 
     def _speakers(self, conv_id: str, response: dict, audio: ConversationAudio, audio_sha: str,
@@ -955,8 +976,12 @@ class ConversationPipeline:
                 raise CacheMiss(f"no cached LLM result for {row['id']}")
             return max((_load_llm_cache(p) for p in candidates), key=lambda c: c["created_at"])
         names = self.voice_names(row["id"])
-        # The names the summary was written with are part of its cache key.
-        speakers_sha = sha256_hex(canonical_json(sorted((k, v[0], v[1]) for k, v in names.items())).encode())[:8]
+        possible = self.possible_voice_names(row["id"], row["transcript_sha"])
+        # The names the summary was written with (and the guesses it was given) are part of its cache key.
+        keyed = sorted((k, v[0], v[1]) for k, v in names.items())
+        if possible:
+            keyed += sorted(("~" + k, v[0], v[1]) for k, v in possible.items())
+        speakers_sha = sha256_hex(canonical_json(keyed).encode())[:8]
         base = f"llm-{_slug(self.providers.llm_model)}-p{prompt.PROMPT_VERSION}-{row['transcript_sha'][:16]}-s{speakers_sha}"
         name = _reusable(conv_dir, base, row["llm_ref"], row["skip_llm"])
         path = conv_dir / name
@@ -967,7 +992,7 @@ class ConversationPipeline:
             timezone_name=self.timezone, language=language,
             owner_name=self.owner_name, bookmarks=self.bookmarks(row),
             provisional=bool(row["provisional"]), audio_gaps=json.loads(row["gaps_json"]), now=now,
-            speaker_names=names,
+            speaker_names=names, possible_names=possible,
         )  # fmt: skip
         result = self.providers.llm.summarize(
             LlmRequest(system=prompt.SYSTEM_PROMPT, user=user, schema=NOTES_JSON_SCHEMA, segments=segments)
@@ -1057,6 +1082,7 @@ class ConversationPipeline:
             speaker_labels_consistent=transcript.get("speaker_labels_consistent", True),
             speakers_unknown=transcript.get("speaker_source") == "unlabeled",
             voice_names={label: name for label, (name, _) in self.voice_names(conv_id).items()},
+            possible_names={label: name for label, (name, _) in self.possible_voice_names(conv_id, row["transcript_sha"]).items()},
         )  # fmt: skip
         content_sha = sha256_hex(render_note(data, "").encode())
         revision = row["revision"] if row["content_sha"] == content_sha and row["revision"] else row["revision"] + 1
@@ -1584,6 +1610,31 @@ def _action_text(item, owner_name: str) -> str:
 
 def _slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9.]+", "-", value).strip("-") or "x"
+
+
+POSSIBLE_SLACK = 0.15  # cosine distance beyond the naming threshold still worth a "possibly" hint
+
+
+def possible_names(voices: dict[str, np.ndarray], states: dict[str, dict], models: dict, *, threshold: float,
+                   slack: float = POSSIBLE_SLACK) -> dict[str, str]:  # fmt: skip
+    """label → person id for unnamed labels close to a person (distance < threshold + slack) without a
+    confident match: per person only the closest such label, and nobody already named in this conversation
+    or ruled out for that label ("not X", kept unknown). A guess shown as a guess, never a name."""
+    from ..speakers.voices import cosine_distance
+
+    named = {s.get("person_id") for s in states.values() if s.get("person_id")}
+    best: dict[str, tuple[float, str]] = {}
+    for label, vector in voices.items():
+        state = states.get(label) or {}
+        if state.get("person_id") or state.get("source") == "unknown" or label == "unknown":
+            continue
+        scored = sorted((cosine_distance(vector, m.centroid), pid) for pid, m in models.items()
+                        if m.centroid is not None and pid not in named and pid not in set(state.get("not") or []))  # fmt: skip
+        if scored and scored[0][0] < threshold + slack:
+            distance, pid = scored[0]
+            if pid not in best or distance < best[pid][0]:
+                best[pid] = (distance, label)
+    return {label: pid for pid, (_, label) in best.items()}
 
 
 def _reusable(directory: Path, base: str, ref: str | None, skip: str | None) -> str:

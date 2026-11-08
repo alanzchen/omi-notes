@@ -1,22 +1,26 @@
-"""Linking a split transcript's speaker labels across pieces with voiceprints (local ASR path).
+"""Speaker identities for a whole conversation from labels that restart per window (local ASR path).
 
-The provider labels speakers per request piece (up to 15 min), and `merge_pieces` numbers each piece's
-labels apart. For every label, the voiceprint of its clean speech (not overlapped by another speaker,
-clips of at least 0.5 s, the longest first up to a minute) is compared with the speakers found so far:
-it joins the closest one when the cosine is at least `threshold` and beats the runner-up by `margin`,
-otherwise it is a new speaker. Two labels of the same piece never join (the provider told them apart), and a
-label whose closest speaker is already in its piece stays new rather than joining the runner-up.
+The sidecar labels speakers per request window (up to 20 min; longer audio is several windows, which
+overlap by ~40 s at a pause, and a truncated MOSS window may be re-split inside one). `link` turns the
+(window, label) units into conversation-level speakers by constrained agglomerative clustering:
+- cannot-link: two labels of the same window are different people (the provider told them apart);
+- must-link: labels covering the same speech in two windows' shared stretch (`omi_notes.anchors`, from
+  `providers.local_asr.anchors`) join first, with no voiceprint needed;
+- then, repeatedly, the two most alike compatible clusters join while above the bar, and only when each is
+  the other's closest cluster of all (one closest to a cluster it may not join is never given to the
+  runner-up).
+Each label's voiceprint is the WeSpeaker embedding of its clean speech (not overlapped by another
+speaker, clips of at least 0.5 s, the longest first up to a minute).
 
 Raw voiceprints of one recording share a large common part (room, microphone, distance): in a noisy
-64-minute conversation every label was 0.93-0.99 from every other, and the margin rule (rightly) linked
-nothing, leaving 24 speakers. So the comparison is made after removing that common part: with at least
-`centre_min` labels, the conversation's own mean voiceprint; with fewer, the mean of stored voices from
-other conversations (`background`); with neither, raw. The bar is then set by the conversation itself:
-labels of one piece are different people (the provider told them apart), so a link needs a cosine above
-the closest such pair by `gap` (and at least `floor`). A provider that over-split one voice inside a piece
-only raises the bar: mistakes fall on the side of too many speakers, never a false merge. Measured
-(asr-backfill-20261108): a 42-minute lecture, different people <= 0.33 against 0.91-0.93 for the same
-voice; the noisy conversation, <= 0.74 against up to 0.94.
+64-minute conversation every label was 0.93-0.99 from every other. So they are compared after removing
+it: with at least `centre_min` labels, the conversation's own mean voiceprint; with fewer, the mean of
+stored voices from other conversations (`background`); with neither, raw. The bar comes from the
+conversation itself: a join must be closer than any two labels of one window (known different people) by
+`gap`, and at least 0.5 centred / 0.85 raw. A provider that over-split one voice inside a window only
+raises the bar: mistakes fall on the side of too many speakers, never a false merge. Measured
+(asr-backfill-20261108): a 42-minute lecture, different people <= 0.33 against 0.89-0.93 for the same
+voice (8 labels -> 3 speakers); the noisy conversation, <= 0.77 against up to 0.94.
 """
 
 from __future__ import annotations
@@ -85,17 +89,36 @@ def _voiceprint(clips: list[tuple[float, float]], pcm: np.ndarray, embedder) -> 
     return mean / (np.linalg.norm(mean) or 1.0)
 
 
+def _groups(meta: dict, utterances: list[dict]) -> dict[int, int]:
+    """label → the window (group) it was heard in: `omi_notes.groups` when the provider says (overlapping
+    windows), else by each label's first utterance middle against the piece offsets."""
+    if meta.get("groups"):
+        return {int(label): int(group) for label, group in meta["groups"]}
+    offsets = sorted(float(o) for o in meta.get("offsets") or [])
+    out: dict[int, int] = {}
+    for u in utterances:
+        if u.get("speaker") is not None:
+            # by the utterance's middle: offsets are rounded to the millisecond, a start can fall just before its own
+            out.setdefault(u["speaker"], max(0, bisect.bisect_right(offsets, (float(u["start"]) + float(u["end"])) / 2) - 1))
+    return out
+
+
 def link(response: dict, pcm: np.ndarray, embedder, threshold: float = THRESHOLD, margin: float = MARGIN, *,
          background: np.ndarray | None = None, centre_min: int = CENTRE_MIN) -> dict:  # fmt: skip
-    """The response with speakers numbered across pieces (and `omi_notes.speakers_linked`), or unchanged
-    when it wasn't split or has no labels."""
+    """The response with speakers numbered for the whole conversation (and `omi_notes.speakers_linked`), or
+    unchanged when it was heard in one window or has no labels.
+
+    Constrained agglomerative clustering over (window, label) units: labels the provider heard in the same
+    window never join (cannot-link); labels tied by the same speech in two overlapping windows
+    (`omi_notes.anchors`) join first (must-link, no voiceprint needed); then, repeatedly, the two most alike
+    compatible clusters join while above the bar and each is the other's closest cluster of all (a cluster
+    closest to one it may not join is not given to the runner-up)."""
     meta = response.get("omi_notes") or {}
-    offsets = sorted(float(o) for o in meta.get("offsets") or [])
     utterances = (response.get("results") or {}).get("utterances") or []
-    if len(offsets) < 2 or not any(u.get("speaker") is not None for u in utterances):
+    group_of = _groups(meta, utterances)
+    if len(set(group_of.values())) < 2:
         return response
     overlaps = overlap_spans(utterances)
-    piece_of: dict[int, int] = {}
     clips: dict[int, list[tuple[float, float]]] = {}
     first: dict[int, float] = {}
     for u in utterances:
@@ -103,8 +126,6 @@ def link(response: dict, pcm: np.ndarray, embedder, threshold: float = THRESHOLD
         if label is None:
             continue
         start, end = float(u["start"]), float(u["end"])
-        # by the utterance's middle: offsets are rounded to the millisecond, a start can fall just before its own
-        piece_of.setdefault(label, max(0, bisect.bisect_right(offsets, (start + end) / 2) - 1))
         first[label] = min(first.get(label, start), start)
         clips.setdefault(label, []).extend(_clean(start, end, overlaps))
     order = sorted(first, key=first.get)
@@ -120,39 +141,67 @@ def link(response: dict, pcm: np.ndarray, embedder, threshold: float = THRESHOLD
             if v is not None:
                 v = v - common
                 prints[label] = v / (np.linalg.norm(v) or 1.0)
-        # labels of one piece are different people: a link must be closer than any of them
-        apart = [float(np.dot(prints[a], prints[b])) for i, a in enumerate(order) for b in order[i + 1 :]
-                 if piece_of[a] == piece_of[b] and prints[a] is not None and prints[b] is not None]  # fmt: skip
-        threshold = max(FLOOR, max(apart) + GAP) if apart else max(FLOOR, threshold - 0.25)
-    speakers: list[dict] = []  # {vector, weight, pieces}
-    mapping: dict[int, int] = {}
-    links = []
-    for label in order:
-        vector = prints[label]
-        piece = piece_of[label]
-        # every speaker counts for closest and runner-up, including those this piece already has: a label
-        # closest to one of them is another of the provider's labels for that voice, not the runner-up
-        scores = sorted(((float(np.dot(vector, sp["vector"])), k) for k, sp in enumerate(speakers)
-                         if vector is not None and sp["vector"] is not None), reverse=True)  # fmt: skip
-        best, best_cos = (scores[0][1], scores[0][0]) if scores else (None, -1.0)
-        second = scores[1][0] if len(scores) > 1 else -1.0
-        joined = (best is not None and piece not in speakers[best]["pieces"] and best_cos >= threshold
-                  and best_cos - second >= margin)  # fmt: skip
-        if joined:
-            sp = speakers[best]
-            w = sum(e - s for s, e in clips.get(label, [])) or 1.0
-            mixed = sp["vector"] * sp["weight"] + vector * w
-            sp["vector"], sp["weight"] = mixed / (np.linalg.norm(mixed) or 1.0), sp["weight"] + w
-            sp["pieces"].add(piece)
-            mapping[label] = best
-        else:
-            speakers.append({"vector": vector, "weight": sum(e - s for s, e in clips.get(label, [])) or 1.0, "pieces": {piece}})
-            mapping[label] = len(speakers) - 1
-        links.append({"label": label, "piece": piece, "speaker": mapping[label], "cosine": round(best_cos, 3),
-                      "runner_up": round(second, 3), "joined": joined})  # fmt: skip
+    # labels of one window are different people: a link must be closer than any of them (in any space)
+    apart = [float(np.dot(prints[a], prints[b])) for i, a in enumerate(order) for b in order[i + 1 :]
+             if group_of.get(a) == group_of.get(b) and prints[a] is not None and prints[b] is not None]  # fmt: skip
+    base = threshold if common is None else max(FLOOR, threshold - 0.25)
+    threshold = max(base, max(apart) + GAP) if apart else base
+    weight = {label: sum(e - s for s, e in clips.get(label, [])) or 1.0 for label in order}
+    clusters: dict[int, dict] = {label: {"labels": [label], "groups": {group_of.get(label, -1)}} for label in order}
+
+    def centroid(c: dict) -> np.ndarray | None:
+        vs = [(prints[lab], weight[lab]) for lab in c["labels"] if prints[lab] is not None]
+        if not vs:
+            return None
+        mean = sum(v * w for v, w in vs)
+        return mean / (np.linalg.norm(mean) or 1.0)
+
+    def merge(a: int, b: int) -> None:
+        clusters[a]["labels"] += clusters[b]["labels"]
+        clusters[a]["groups"] |= clusters[b]["groups"]
+        del clusters[b]
+
+    def find(label: int) -> int:
+        return next(k for k, c in clusters.items() if label in c["labels"])
+
+    used_anchors = []
+    for a, b in meta.get("anchors") or []:  # must-link: the same speech, heard in two windows
+        if int(a) not in first or int(b) not in first:  # one side kept no speech of its own (all in the shared stretch)
+            continue
+        ka, kb = find(int(a)), find(int(b))
+        if ka != kb and not clusters[ka]["groups"] & clusters[kb]["groups"]:
+            merge(min(ka, kb), max(ka, kb))
+            used_anchors.append([int(a), int(b)])
+    merges = []
+    while True:
+        cents = {k: centroid(c) for k, c in clusters.items()}
+        keys = [k for k in clusters if cents[k] is not None]
+        sim = {(i, j): float(np.dot(cents[i], cents[j])) for i in keys for j in keys if i < j}
+
+        def s(i: int, j: int) -> float:
+            return sim[(min(i, j), max(i, j))]
+
+        best = None
+        for (i, j), v in sorted(sim.items(), key=lambda kv: -kv[1]):
+            if v < threshold:
+                break
+            if clusters[i]["groups"] & clusters[j]["groups"]:
+                continue
+            # each must be the other's closest cluster of all, compatible or not
+            if any(s(i, k) > v for k in keys if k not in (i, j)) or any(s(j, k) > v for k in keys if k not in (i, j)):
+                continue
+            best = (i, j, v)
+            break
+        if best is None:
+            break
+        merges.append([best[0], best[1], round(best[2], 3)])
+        merge(best[0], best[1])
+    numbered = sorted(clusters.values(), key=lambda c: min(first[lab] for lab in c["labels"]))
+    mapping = {lab: n for n, c in enumerate(numbered) for lab in c["labels"]}
     linked = [dict(u, speaker=mapping[u["speaker"]]) if u.get("speaker") is not None else u for u in utterances]
     out = dict(response, results=dict(response.get("results") or {}, utterances=linked))
-    out["omi_notes"] = dict(meta, speakers_linked={"labels": len(first), "speakers": len(speakers), "space": space,
-                                                   "threshold": round(threshold, 3), "links": links})  # fmt: skip
-    log.info("linked %d piece labels into %d speakers", len(first), len(speakers))
+    out["omi_notes"] = dict(meta, speakers_linked={"labels": len(order), "speakers": len(numbered), "space": space,
+                                                   "threshold": round(threshold, 3), "anchors": used_anchors,
+                                                   "merges": merges})  # fmt: skip
+    log.info("clustered %d window labels into %d speakers (%d anchored)", len(order), len(numbered), len(used_anchors))
     return out

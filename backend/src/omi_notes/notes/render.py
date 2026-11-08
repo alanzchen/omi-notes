@@ -60,6 +60,8 @@ class NoteData:
     speakers_unknown: bool = False
     # Speaker labels recognized by voice → the person's People note name (docs/speaker-learning.md).
     voice_names: dict[str, str] = field(default_factory=dict)
+    # Unnamed labels whose voice is close to a known person, without a confident match: shown as a guess.
+    possible_names: dict[str, str] = field(default_factory=dict)
 
 
 def neutralize(text: str) -> str:
@@ -104,15 +106,22 @@ def _iso(epoch: float | None, tz: ZoneInfo) -> str | None:
     return None if epoch is None else _local(epoch, tz).isoformat(timespec="seconds")
 
 
-def speaker_label(label: str, notes: ConversationNotes | None, voice_names: dict[str, str] | None = None) -> str:
+def speaker_label(label: str, notes: ConversationNotes | None, voice_names: dict[str, str] | None = None,
+                  possible_names: dict[str, str] | None = None, language: str = "en") -> str:  # fmt: skip
     """`S2` → `Priya` when recognized by voice, `Priya (Speaker 2)` when the summary named it (a
-    hint from the transcript), else `Speaker 2`."""
+    hint from the transcript), `Speaker 2 (possibly Priya)` when the voice is close to hers without a
+    confident match, else `Speaker 2`."""
     if voice_names and label in voice_names:
         return voice_names[label]
     number = label[1:] if label.startswith("S") and label[1:].isdigit() else label
     generic = f"Speaker {number}"
     name = notes.speaker_names.get(label) if notes else None
-    return f"{name} ({generic})" if name else generic
+    if name:
+        return f"{name} ({generic})"
+    if possible_names and label in possible_names:
+        maybe = "可能是" if language.split("-")[0].lower() == "zh" else "possibly"
+        return f"{generic} ({maybe} {possible_names[label]})"
+    return generic
 
 
 def title_of(d: NoteData) -> str:
@@ -134,7 +143,7 @@ def _clock(epoch: float, tz: ZoneInfo) -> str:
 
 
 def _transcript_line(seg: dict, d: NoteData) -> str:
-    return f"**{_clock(seg['start'], d.tz)} · {speaker_label(seg['speaker'], d.notes, d.voice_names)}:** {seg['text']}"
+    return f"**{_clock(seg['start'], d.tz)} · {speaker_label(seg['speaker'], d.notes, d.voice_names, d.possible_names, d.language)}:** {seg['text']}"
 
 
 def _duration_text(seconds: float) -> str:

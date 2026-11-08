@@ -145,6 +145,7 @@ def build_user_message(
     audio_gaps: list[list[float]],
     now: float,
     speaker_names: dict[str, tuple[str, bool]] | None = None,
+    possible_names: dict[str, tuple[str, bool]] | None = None,
 ) -> str:
     words = sum(len(seg["text"].split()) for seg in segments)
     started_local = datetime.fromtimestamp(start, tz)
@@ -164,6 +165,11 @@ def build_user_message(
         known = "; ".join(f"{label} = the owner ({name})" if me else f"{label} = {name}"
                           for label, (name, me) in sorted(speaker_names.items(), key=lambda kv: _label_order(kv[0])))  # fmt: skip
         lines.append(f"- Speakers recognized by voice: {known}. Use these names for those labels.")
+    if possible_names:
+        maybe = "; ".join(f"{label} may be the owner ({name})" if me else f"{label} may be {name}"
+                          for label, (name, me) in sorted(possible_names.items(), key=lambda kv: _label_order(kv[0])))  # fmt: skip
+        lines.append(f"- Not confirmed by voice, but likely: {maybe}. When an action item or statement belongs to such "
+                     "a label, attribute it as \"Speaker N (possibly Name)\" rather than leaving it unattributed.")
     if bookmarks:
         marks = ", ".join(offset_label(b - start) for b in bookmarks)
         lines.append(f"- The owner tapped the device to bookmark moments at: {marks}. Give those moments weight.")
