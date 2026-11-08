@@ -265,6 +265,29 @@ final class FakeMemory: SyncActivityMemory {
         #expect(host.updates.count == 2, "in the background nothing is watched: never renewed")
     }
 
+    /// Field log, build 42 (2026-11-08 05:04–05:10Z): each time the app left the foreground the
+    /// uploads stopped being measured, the activity froze on its live rate (stale in 90 s) and the
+    /// log flapped "showing" / "waiting" while uploads went on. In the background it now keeps showing
+    /// the last known numbers, without a rate, until done or stale.
+    @Test func inTheBackgroundItKeepsShowingTheLastKnownNumbers() throws {
+        let (host, _, c) = rig()
+        c.refresh(state(.sending, rate: 1_000_000), foreground: true, optedOut: false, now: now)
+        let later = now.addingTimeInterval(5)
+        c.refresh(state(.unknown, files: nil, seconds: nil), foreground: false, optedOut: false, now: later)
+        #expect(host.ended.isEmpty && c.activityId == "act-1", "never ended for going to the background")
+        let (_, shown, stale) = try #require(host.updates.last)
+        #expect(shown.rate == nil, "no frozen live rate")
+        #expect(shown.queuedFiles == 4 && shown.queuedAudioSeconds == 600 && shown.asOf == now, "the last measured numbers, as of then")
+        #expect(shown.title.contains("background") && shown.hasWork)
+        #expect(stale == later.addingTimeInterval(SyncActivityController.queueStale))
+        #expect(c.decision == "showing")
+        let pushes = host.updates.count
+        c.refresh(state(.unknown, files: nil, seconds: nil), foreground: false, optedOut: false, now: later.addingTimeInterval(30))
+        #expect(host.updates.count == pushes && c.decision == "showing", "no repeats, no flapping")
+        c.refresh(state(.sending, rate: 2_000_000), foreground: true, optedOut: false, now: later.addingTimeInterval(60))
+        #expect(host.updates.last?.1.rate == 2_000_000 && c.decision == "showing", "live again in front")
+    }
+
     /// Build 40 showed no activity and the log said nothing: each refresh now records the gate that
     /// decided it (logged only when it changes), including why a request failed.
     @Test func eachRefreshRecordsTheGateThatDecidedIt() {

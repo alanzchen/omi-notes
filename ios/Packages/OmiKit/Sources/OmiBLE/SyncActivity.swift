@@ -103,6 +103,8 @@ public final class SyncActivityController {
     /// A finished card stays this long (then the system removes it); a new sync or turning it off
     /// removes it at once.
     public static let finishedCardFor: TimeInterval = 10 * 60
+    /// The title while the app is in the background (the numbers are the last measured ones).
+    public static let backgroundTitle = "Uploading in the background"
 
     private let host: SyncActivityHost
     private let memory: SyncActivityMemory
@@ -171,7 +173,25 @@ public final class SyncActivityController {
             return
         }
         guard let s = state else { note("waiting: no engine snapshot yet"); return }
-        guard s.stage != .unknown else { note("waiting: uploads not measured yet (the app hasn't become active)"); return }
+        guard s.stage != .unknown else {
+            // In the background nothing is measured, but uploads go on: a shown activity keeps the last
+            // known numbers (without a live rate, which would freeze) until done or stale.
+            if let id = activityId, let last = lastPushed {
+                if !last.title.hasPrefix(Self.backgroundTitle) {
+                    var held = last
+                    held.title = Self.backgroundTitle
+                    held.stage = last.stage == .sending ? .waiting : last.stage
+                    held.rate = nil
+                    host.update(id, held, staleDate: Self.staleDate(held, now: now))
+                    lastPushed = held
+                    lastPushAt = now
+                }
+                note("showing")
+            } else {
+                note("waiting: uploads not measured yet (the app hasn't become active)")
+            }
+            return
+        }
         let finished = s.stage == .allSent && !s.hasWork  // confirmed: measured, read, nothing left
         if let id = activityId {
             if finished {
