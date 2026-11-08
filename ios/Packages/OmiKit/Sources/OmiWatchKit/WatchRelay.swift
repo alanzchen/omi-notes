@@ -93,12 +93,33 @@ public struct WatchReport: Codable, Equatable, Sendable {
 }
 
 /// WatchConnectivity payload keys (property-list values only).
+/// One part the Watch asks about: its id and the SHA-256 of its bytes (an acknowledgement must be
+/// for these bytes, not merely this id).
+public struct WatchInventoryItem: Codable, Equatable, Sendable {
+    public var id: String
+    public var sha256: String
+    public init(id: String, sha256: String) {
+        self.id = id
+        self.sha256 = sha256
+    }
+}
+
 public enum WatchWire {
     public static let kind = "kind", manifest = "manifest", acks = "acks", rejects = "rejects", binding = "binding"
     public static let segment = "segment", end = "end", report = "report", perf = "perf"
-    /// Watch → iPhone: `inventory` (ids of delivered parts still waiting for an ack, kind `inventory`);
-    /// iPhone → Watch: `missing` (those it doesn't have), beside the usual `acks` for the ones it has.
-    public static let inventory = "inventory", missing = "missing"
+    /// Watch → iPhone (kind `inventory`): `inventory_items` (`[{id, sha256}]` of delivered parts still
+    /// waiting for an ack) and `inventory_id`; `inventory` (their ids) is informational. iPhone → Watch:
+    /// `missing` (those it doesn't hold with that checksum) and the same `inventory_id`, beside the usual
+    /// `acks` for the ones it holds. Older builds ignore all of these.
+    public static let inventory = "inventory", missing = "missing", inventoryItems = "inventory_items", inventoryId = "inventory_id"
+
+    public static func inventoryItems(_ items: [WatchInventoryItem]) -> [[String: String]] {
+        items.map { ["id": $0.id, "sha256": $0.sha256] }
+    }
+
+    public static func inventoryItems(from value: Any?) -> [WatchInventoryItem] {
+        (value as? [[String: String]] ?? []).compactMap { d in d["id"].flatMap { id in d["sha256"].map { WatchInventoryItem(id: id, sha256: $0) } } }
+    }
 
     public static func encode<T: Encodable>(_ v: T) -> Data {
         let e = JSONEncoder()
@@ -281,6 +302,8 @@ public final class PhoneWatchInbox: @unchecked Sendable {
     private var inboxDir: URL { root.appendingPathComponent("inbox", isDirectory: true) }
     private var endsDir: URL { root.appendingPathComponent("ends", isDirectory: true) }
     private var doneDir: URL { root.appendingPathComponent("done", isDirectory: true) }
+    private var receiptsDir: URL { root.appendingPathComponent("receipts", isDirectory: true) }
+    private var quarantineDir: URL { root.appendingPathComponent("quarantine", isDirectory: true) }
 
     public convenience init(root: URL, binding: String) {
         self.init(root: root, currentBinding: { binding })
@@ -289,7 +312,7 @@ public final class PhoneWatchInbox: @unchecked Sendable {
     public init(root: URL, currentBinding: @escaping () -> String?) {
         self.root = root
         self.binding = currentBinding
-        for d in [inboxDir, endsDir, doneDir] { try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
+        for d in [inboxDir, endsDir, doneDir, receiptsDir] { try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
     }
 
     /// Stores a received segment (copied from WatchConnectivity's temporary file before the
@@ -298,7 +321,13 @@ public final class PhoneWatchInbox: @unchecked Sendable {
         guard let binding = binding() else { throw WatchRelayError.identityUnreadable }
         guard segment.binding == binding else { throw WatchRelayError.wrongPhone }
         lock.lock(); defer { lock.unlock() }
-        if isDone(segment.id) || FileManager.default.fileExists(atPath: inboxDir.appendingPathComponent("\(segment.id).json").path) { return }
+        // acknowledged again only if these very bytes are already held here; other bytes under the same
+        // id are refused (never acknowledged); anything else (no copy, a damaged one, a receipt from
+        // before receipts had checksums) is stored again and acknowledged once durable
+        if holds(segment.id, sha256: segment.sha256, binding: binding) { return }
+        if let held = heldChecksum(segment.id), held != segment.sha256 {
+            throw WatchRelayError.damaged("different bytes are already stored under \(segment.id)")
+        }
         let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? Int) ?? -1
         guard size == segment.bytes else { throw WatchRelayError.damaged("size \(size) ≠ \(segment.bytes)") }
         guard try Files.sha256(file) == segment.sha256 else { throw WatchRelayError.damaged("SHA-256") }
@@ -307,16 +336,50 @@ public final class PhoneWatchInbox: @unchecked Sendable {
         try Files.durableWrite(WatchWire.encode(segment), to: inboxDir.appendingPathComponent("\(segment.id).json"))
     }
 
-    /// Which of the Watch's waiting parts this iPhone has durably (received or already converted): those
-    /// are acknowledged again; the rest are missing. Another iPhone's question is refused.
-    public func answer(inventory ids: [String], binding asked: String?) throws -> (acks: [String], missing: [String]) {
+    /// What a conversion leaves behind: the bytes it converted (checksum, size) for this iPhone.
+    struct Receipt: Codable {
+        var sha256: String
+        var bytes: Int
+        var binding: String
+    }
+
+    /// This iPhone durably holds these bytes under `id` (caller holds the lock): converted with a
+    /// matching receipt, or a readable copy in the inbox or kept aside whose audio still hashes to it.
+    private func holds(_ id: String, sha256: String, binding: String) -> Bool {
+        if let r = try? JSONDecoder().decode(Receipt.self, from: Data(contentsOf: receiptsDir.appendingPathComponent("\(id).json"))) {
+            return r.sha256 == sha256 && r.binding == binding
+        }
+        for dir in [inboxDir, quarantineDir] {
+            guard let s = WatchWire.decode(WatchSegment.self, try? Data(contentsOf: dir.appendingPathComponent("\(id).json"))),
+                  s.id == id, s.binding == binding, s.sha256 == sha256 else { continue }
+            let audio = dir.appendingPathComponent("\(id).m4a")
+            let size = (try? FileManager.default.attributesOfItem(atPath: audio.path)[.size] as? Int) ?? -1
+            if size == s.bytes, (try? Files.sha256(audio)) == sha256 { return true }
+        }
+        return false
+    }
+
+    /// The checksum of bytes recorded under `id` (receipt or readable manifest), if any (caller holds the lock).
+    private func heldChecksum(_ id: String) -> String? {
+        if let r = try? JSONDecoder().decode(Receipt.self, from: Data(contentsOf: receiptsDir.appendingPathComponent("\(id).json"))) { return r.sha256 }
+        for dir in [inboxDir, quarantineDir] {
+            if let s = WatchWire.decode(WatchSegment.self, try? Data(contentsOf: dir.appendingPathComponent("\(id).json"))), s.id == id {
+                return s.sha256
+            }
+        }
+        return nil
+    }
+
+    /// Which of the Watch's waiting parts this iPhone holds, bytes and all (see `holds`): those are
+    /// acknowledged again; every other one is missing (sent again), never acknowledged on a filename.
+    /// Another iPhone's question is refused.
+    public func answer(items: [WatchInventoryItem], binding asked: String?) throws -> (acks: [String], missing: [String]) {
         guard let binding = binding() else { throw WatchRelayError.identityUnreadable }
         guard asked == binding else { throw WatchRelayError.wrongPhone }
         lock.lock(); defer { lock.unlock() }
         var acks: [String] = [], missing: [String] = []
-        for id in ids where !id.isEmpty && !id.contains("/") {
-            let has = isDone(id) || FileManager.default.fileExists(atPath: inboxDir.appendingPathComponent("\(id).json").path)
-            if has { acks.append(id) } else { missing.append(id) }
+        for item in items where !item.id.isEmpty && !item.id.contains("/") && item.sha256.count == 64 {
+            if holds(item.id, sha256: item.sha256, binding: binding) { acks.append(item.id) } else { missing.append(item.id) }
         }
         return (acks, missing)
     }
@@ -353,6 +416,9 @@ public final class PhoneWatchInbox: @unchecked Sendable {
     /// The segment is now in the upload outbox: keep only a small marker (for idempotency).
     public func markConverted(_ segment: WatchSegment, chunkEndUs: Int64) throws {
         lock.lock(); defer { lock.unlock() }
+        // the receipt (which bytes were converted) first: it is what a later acknowledgement relies on
+        try Files.durableWrite(try JSONEncoder().encode(Receipt(sha256: segment.sha256, bytes: segment.bytes, binding: segment.binding)),
+                               to: receiptsDir.appendingPathComponent("\(segment.id).json"))
         try Files.durableWrite(Data(String(chunkEndUs).utf8), to: doneDir.appendingPathComponent(segment.id))
         for url in [inboxDir.appendingPathComponent("\(segment.id).m4a"), inboxDir.appendingPathComponent("\(segment.id).json")] {
             _ = try? FileManager.default.removeItem(at: url)
@@ -368,11 +434,14 @@ public final class PhoneWatchInbox: @unchecked Sendable {
     /// A segment that couldn't be converted is set aside (kept), not retried forever or deleted.
     public func quarantine(_ segment: WatchSegment, reason: String) {
         lock.lock(); defer { lock.unlock() }
-        let q = root.appendingPathComponent("quarantine", isDirectory: true)
+        let q = quarantineDir
         try? FileManager.default.createDirectory(at: q, withIntermediateDirectories: true)
         for ext in ["m4a", "json"] {
             let from = inboxDir.appendingPathComponent("\(segment.id).\(ext)")
-            try? FileManager.default.moveItem(at: from, to: q.appendingPathComponent("\(segment.id).\(ext)"))
+            guard FileManager.default.fileExists(atPath: from.path) else { continue }
+            let to = q.appendingPathComponent("\(segment.id).\(ext)")
+            _ = try? FileManager.default.replaceItemAt(to, withItemAt: from)  // a newer copy replaces an older one
+            if FileManager.default.fileExists(atPath: from.path) { try? FileManager.default.moveItem(at: from, to: to) }
         }
         try? Data(reason.utf8).write(to: q.appendingPathComponent("\(segment.id).reason"))
         // counted as handled so the recording can still be sealed

@@ -14,9 +14,11 @@ import Foundation
 /// The state is saved (it is small), so a restart doesn't resend everything delivered at once.
 ///
 /// Inventory: while delivered items wait for an acknowledgement, the Watch asks the iPhone which of
-/// them it already has (at most every `inventoryInterval`). Its answer acknowledges those (they leave
-/// as usual) and names the missing ones, which are due again at once: a lost acknowledgement no
-/// longer costs 30 min–4 h per item.
+/// them it already holds (bytes and checksum). Its answer acknowledges those (they leave as usual) and
+/// names the missing ones, which are due again at once: a lost acknowledgement no longer costs
+/// 30 min–4 h per item. One question is outstanding at a time (saved; replaced after
+/// `inventoryRetire` if never answered), at most one every `inventoryInterval`. An answer counts once,
+/// for its own question, and "missing" only for items not handed over again since it was asked.
 public struct WatchResendPolicy: Codable, Equatable, Sendable {
     public struct Entry: Codable, Equatable, Sendable {
         public var at: Date
@@ -28,10 +30,19 @@ public struct WatchResendPolicy: Codable, Equatable, Sendable {
     public static let awaitingAckWait: TimeInterval = 30 * 60, awaitingAckMax: TimeInterval = 4 * 3600
 
     public static let inventoryInterval: TimeInterval = 15 * 60
+    public static let inventoryRetire: TimeInterval = 6 * 3600
+
+    /// The question waiting for its answer: its id, when, and each item's handover count then.
+    public struct PendingInventory: Codable, Equatable, Sendable {
+        public var id: String
+        public var askedAt: Date
+        public var times: [String: Int]
+    }
 
     public private(set) var entries: [String: Entry] = [:]
     /// When the Watch last asked which delivered items the iPhone has (absent in older saved state).
     public private(set) var inventoryAskedAt: Date?
+    public private(set) var pendingInventory: PendingInventory?
 
     public init() {}
 
@@ -77,13 +88,28 @@ public struct WatchResendPolicy: Codable, Equatable, Sendable {
     }
 
     public func inventoryDue(now: Date) -> Bool {
-        awaitingAck > 0 && inventoryAskedAt.map { now.timeIntervalSince($0) >= Self.inventoryInterval } ?? true
+        guard awaitingAck > 0 else { return false }
+        if let pending = pendingInventory { return now.timeIntervalSince(pending.askedAt) >= Self.inventoryRetire }
+        return inventoryAskedAt.map { now.timeIntervalSince($0) >= Self.inventoryInterval } ?? true
     }
 
-    public mutating func askedInventory(now: Date) { inventoryAskedAt = now }
+    /// A question was sent (it replaces any earlier unanswered one).
+    public mutating func askInventory(id: String, ids: [String], now: Date) {
+        pendingInventory = PendingInventory(id: id, askedAt: now, times: Dictionary(uniqueKeysWithValues: ids.compactMap { i in entries[i].map { (i, $0.times) } }))
+        inventoryAskedAt = now
+    }
 
-    /// The iPhone doesn't have these: due again at once (still kept until acknowledged).
-    public mutating func missing(_ ids: [String]) {
-        for id in ids where entries[id]?.delivered == true { entries[id] = nil }
+    /// The answer to question `id`: its missing items that are still as they were when asked become due
+    /// at once (returned). Any other or repeated answer changes nothing.
+    public mutating func answeredInventory(id: String, missing: [String]) -> [String] {
+        guard let pending = pendingInventory, pending.id == id else { return [] }
+        pendingInventory = nil
+        var due: [String] = []
+        for item in missing {
+            guard let e = entries[item], e.delivered, let asked = pending.times[item], e.times == asked else { continue }
+            entries[item] = nil
+            due.append(item)
+        }
+        return due
     }
 }

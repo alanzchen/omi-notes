@@ -559,9 +559,9 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
 
     /// The Watch asks which of its delivered parts this iPhone has: those are acknowledged again, the
     /// missing ones named (the Watch sends them at once). Nothing on either side is deleted here.
-    public func answerWatchInventory(_ ids: [String], binding: String?) throws -> (acks: [String], missing: [String]) {
-        let answer = try watchInbox.answer(inventory: ids, binding: binding)
-        log(.info, "watch", "Watch asked about \(ids.count) waiting part(s): \(answer.acks.count) already here, \(answer.missing.count) missing")
+    public func answerWatchInventory(_ items: [WatchInventoryItem], binding: String?) throws -> (acks: [String], missing: [String]) {
+        let answer = try watchInbox.answer(items: items, binding: binding)
+        log(.info, "watch", "Watch asked about \(items.count) waiting part(s): \(answer.acks.count) already here, \(answer.missing.count) missing")
         return answer
     }
 

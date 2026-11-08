@@ -178,20 +178,74 @@ import OmiCapture
         return (inbox, WatchRelayProcessor(inbox: inbox, outbox: outbox, appVersion: "t", timezone: "UTC"), outbox, root)
     }
 
-    @Test func thePhoneAcknowledgesWhatItHasAndNamesWhatIsMissing() throws {
-        let (inbox, relay, _, root) = try inbox()
+    func part(_ inbox: PhoneWatchInbox, _ root: URL, index: Int, recording: String, seconds: Double = 1) throws -> (WatchSegment, URL) {
         let tmp = root.appendingPathComponent("tmp"); try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let file = try WatchRelayTests.segmentFile(seconds: seconds + Double(index) * 0.1, in: tmp, name: "s\(index)-\(UUID().uuidString)")
+        return (WatchRelayTests().manifest(file, recording: recording, index: index, binding: "phone-A", start: Int64(index) * 1_000_000), file)
+    }
+
+    @Test func thePhoneAcknowledgesOnlyAudioItHoldsWithTheSameChecksum() throws {
+        let (inbox, relay, _, root) = try inbox()
         let rec = UUID().uuidString.lowercased()
-        let s0 = try WatchRelayTests.segmentFile(seconds: 1, in: tmp, name: "s0"), s1 = try WatchRelayTests.segmentFile(seconds: 1, in: tmp, name: "s1")
-        let m0 = WatchRelayTests().manifest(s0, recording: rec, index: 0, binding: "phone-A", start: 0)
-        let m1 = WatchRelayTests().manifest(s1, recording: rec, index: 1, binding: "phone-A", start: 1_000_000)
-        try inbox.accept(file: s0, segment: m0)
-        _ = relay.process()                      // converted: only its done marker remains
-        try inbox.accept(file: s1, segment: m1)  // received, not converted yet
-        let answer = try inbox.answer(inventory: [m0.id, m1.id, "\(rec)-2"], binding: "phone-A")
+        let (m0, f0) = try part(inbox, root, index: 0, recording: rec)
+        let (m1, f1) = try part(inbox, root, index: 1, recording: rec)
+        try inbox.accept(file: f0, segment: m0)
+        _ = relay.process()                      // converted: a receipt with its checksum remains
+        try inbox.accept(file: f1, segment: m1)  // received, not converted yet
+        let answer = try inbox.answer(items: [.init(id: m0.id, sha256: m0.sha256), .init(id: m1.id, sha256: m1.sha256),
+                                              .init(id: "\(rec)-2", sha256: String(repeating: "a", count: 64))], binding: "phone-A")
         #expect(Set(answer.acks) == [m0.id, m1.id] && answer.missing == ["\(rec)-2"])
-        #expect(throws: WatchRelayError.wrongPhone) { try inbox.answer(inventory: [m0.id], binding: "phone-B") }
+        let other = String(repeating: "b", count: 64)
+        let conflict = try inbox.answer(items: [.init(id: m0.id, sha256: other), .init(id: m1.id, sha256: other)], binding: "phone-A")
+        #expect(conflict.acks.isEmpty && Set(conflict.missing) == [m0.id, m1.id], "same id, other bytes: never acknowledged")
+        #expect(throws: WatchRelayError.wrongPhone) { try inbox.answer(items: [.init(id: m0.id, sha256: m0.sha256)], binding: "phone-B") }
         #expect(WatchWire.inventory == "inventory" && WatchWire.missing == "missing", "wire keys both builds read")
+    }
+
+    /// ASTRA-IT2-01 (blocker): a filename was taken as proof of audio, and the Watch deleted its only
+    /// copy. Unreadable, absent, quarantined-without-audio and legacy receipts are "missing" now.
+    @Test func noAcknowledgementWithoutMatchingAudio() throws {
+        let (inbox, relay, outbox, root) = try inbox()
+        let rec = UUID().uuidString.lowercased()
+        let phone = root.appendingPathComponent("watch")
+        func ask(_ m: WatchSegment) throws -> (acks: [String], missing: [String]) {
+            try inbox.answer(items: [.init(id: m.id, sha256: m.sha256)], binding: "phone-A")
+        }
+        // an unreadable manifest with no audio
+        let (m0, _) = try part(inbox, root, index: 0, recording: rec)
+        try Data("broken-json".utf8).write(to: phone.appendingPathComponent("inbox/\(m0.id).json"))
+        #expect(try ask(m0) == ([], [m0.id]))
+        // a manifest whose audio is gone
+        let (m1, _) = try part(inbox, root, index: 1, recording: rec)
+        try WatchWire.encode(m1).write(to: phone.appendingPathComponent("inbox/\(m1.id).json"))
+        #expect(try ask(m1) == ([], [m1.id]))
+        // the converter failed on it: an empty done marker, no output, no audio kept
+        #expect(relay.process() == 0 && outbox.pending().isEmpty)
+        #expect(try ask(m1) == ([], [m1.id]))
+        // a legacy done marker (converted before receipts existed): ambiguous, so missing …
+        let (m2, f2) = try part(inbox, root, index: 2, recording: rec)
+        try Data("123".utf8).write(to: phone.appendingPathComponent("done/\(m2.id)"))
+        #expect(try ask(m2) == ([], [m2.id]))
+        // … and its resend is stored again (acknowledged only once it is durably here), not waved through
+        try inbox.accept(file: f2, segment: m2)
+        #expect(inbox.pending().map(\.segment.id).contains(m2.id))
+        #expect(try ask(m2) == ([m2.id], []))
+        // a resend whose bytes differ from what is already here is refused, not acknowledged
+        let (m3, f3) = try part(inbox, root, index: 3, recording: rec)
+        try inbox.accept(file: f3, segment: m3)
+        var other = m3; other.sha256 = String(repeating: "c", count: 64)
+        #expect(throws: (any Error).self) { try inbox.accept(file: f3, segment: other) }
+    }
+
+    @Test func aKeptAsideCopyCountsOnlyIfItsAudioMatches() throws {
+        let (inbox, _, _, root) = try inbox()
+        let rec = UUID().uuidString.lowercased()
+        let (m, f) = try part(inbox, root, index: 0, recording: rec)
+        try inbox.accept(file: f, segment: m)
+        inbox.quarantine(m, reason: "synthetic")   // kept aside with its audio
+        #expect(try inbox.answer(items: [.init(id: m.id, sha256: m.sha256)], binding: "phone-A").acks == [m.id])
+        try FileManager.default.removeItem(at: root.appendingPathComponent("watch/quarantine/\(m.id).m4a"))
+        #expect(try inbox.answer(items: [.init(id: m.id, sha256: m.sha256)], binding: "phone-A").missing == [m.id])
     }
 
     @Test func theWatchAsksAboutDeliveredPartsAndResendsTheMissingAtOnce() throws {
@@ -204,19 +258,53 @@ import OmiCapture
         p.handedOver("in-flight", now: t0)  // not delivered yet: not asked about
         #expect(p.inventory(limit: 2) == ["a", "b"], "delivered ones, oldest first, bounded")
         #expect(p.inventoryDue(now: t0.addingTimeInterval(10)), "never asked: due")
-        p.askedInventory(now: t0.addingTimeInterval(10))
+        p.askInventory(id: "q1", ids: ["a", "b", "c"], now: t0.addingTimeInterval(10))
+        #expect(!p.due("b", now: t0.addingTimeInterval(60)))
+        #expect(p.answeredInventory(id: "q1", missing: ["b"]) == ["b"])
+        #expect(p.due("b", now: t0.addingTimeInterval(60)), "the iPhone doesn't have it: due at once")
         #expect(!p.inventoryDue(now: t0.addingTimeInterval(10 + 60)), "not again within the interval")
         #expect(p.inventoryDue(now: t0.addingTimeInterval(10 + WatchResendPolicy.inventoryInterval)))
-        #expect(!p.due("b", now: t0.addingTimeInterval(60)))
-        p.missing(["b"])
-        #expect(p.due("b", now: t0.addingTimeInterval(60)), "the iPhone doesn't have it: due at once")
         p.acknowledged(["a", "c"])
         #expect(p.inventory(limit: 10).isEmpty)
         var none = WatchResendPolicy()
         none.handedOver("x", now: t0)
         #expect(!none.inventoryDue(now: t0.addingTimeInterval(9_999)), "nothing delivered and unacknowledged: nothing to ask")
-        // the saved state of an older build (no inventory time) still decodes
+        // the saved state of an older build (no inventory fields) still decodes
         let old = try JSONSerialization.data(withJSONObject: ["entries": [:] as [String: Any]])
         #expect((try? JSONDecoder().decode(WatchResendPolicy.self, from: old)) != nil)
+    }
+
+    /// ASTRA-IT2-02: the phone answers twice (message and durable user info). A late copy of an old
+    /// "missing" answer resent a part that had just been delivered again. An answer now counts once,
+    /// for its own question, and only for parts not handed over since.
+    @Test func anInventoryAnswerCountsOnceAndOnlyForItsQuestion() throws {
+        let t0 = Date(timeIntervalSince1970: 1_791_000_000)
+        var p = WatchResendPolicy()
+        p.handedOver("x", now: t0); p.delivered("x", now: t0)
+        p.handedOver("y", now: t0); p.delivered("y", now: t0)
+        p.askInventory(id: "q1", ids: ["x", "y"], now: t0)
+        #expect(p.answeredInventory(id: "other", missing: ["x"]).isEmpty, "not this question's answer")
+        p.handedOver("y", now: t0.addingTimeInterval(5))   // y went again meanwhile (another path)
+        p.delivered("y", now: t0.addingTimeInterval(6))
+        #expect(p.answeredInventory(id: "q1", missing: ["x", "y"]) == ["x"], "y was handed over since the question")
+        p.handedOver("x", now: t0.addingTimeInterval(10))  // the resend of x …
+        p.delivered("x", now: t0.addingTimeInterval(11))   // … is delivered
+        #expect(p.answeredInventory(id: "q1", missing: ["x"]).isEmpty, "the duplicate copy of the answer changes nothing")
+        #expect(!p.due("x", now: t0.addingTimeInterval(60)), "no second resend")
+    }
+
+    /// ASTRA-IT2-03: unanswered questions piled up while the iPhone was away. One is outstanding at a
+    /// time (saved across relaunches); it is replaced only after `inventoryRetire`.
+    @Test func oneInventoryQuestionIsOutstandingAtATime() throws {
+        let t0 = Date(timeIntervalSince1970: 1_791_000_000)
+        var p = WatchResendPolicy()
+        p.handedOver("x", now: t0); p.delivered("x", now: t0)
+        p.askInventory(id: "q1", ids: ["x"], now: t0)
+        for hours in 1..<6 {
+            let relaunched = try JSONDecoder().decode(WatchResendPolicy.self, from: JSONEncoder().encode(p))
+            #expect(!relaunched.inventoryDue(now: t0.addingTimeInterval(Double(hours) * 3600)), "still waiting for q1 (\(hours) h)")
+        }
+        #expect(p.inventoryDue(now: t0.addingTimeInterval(WatchResendPolicy.inventoryRetire)), "replaced after the retire time")
+        #expect(p.pendingInventory?.id == "q1")
     }
 }

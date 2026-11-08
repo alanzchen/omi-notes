@@ -152,12 +152,21 @@ final class WatchSync: NSObject, WCSessionDelegate {
         // delivered parts waiting for an acknowledgement: ask which ones the iPhone already has
         // (durable user info, answered even while Omi Notes isn't open on the iPhone)
         if resend.inventoryDue(now: now) {
-            let segments = Set(outbox.segments().map(\.segment.id))  // audio only: ends and telemetry are small
-            let ids = Array(resend.inventory(limit: .max).filter(segments.contains).prefix(Self.inventoryBatch))
-            session.transferUserInfo([WatchWire.kind: WatchWire.inventory, WatchWire.inventory: ids, WatchWire.binding: binding])
-            resend.askedInventory(now: now)
-            count("inventory_asked", ids.count)
-            watchLog.info("asked the iPhone about \(ids.count) delivered part(s)")
+            // audio only (ends and telemetry are small), each with its checksum: an ack must be for these bytes
+            let checksums = Dictionary(outbox.segments().map { ($0.segment.id, $0.segment.sha256) }, uniquingKeysWith: { a, _ in a })
+            let items = resend.inventory(limit: .max).compactMap { id in checksums[id].map { WatchInventoryItem(id: id, sha256: $0) } }
+                .prefix(Self.inventoryBatch)
+            if !items.isEmpty {
+                // one question at a time: an older unanswered one still queued is withdrawn first
+                for t in session.outstandingUserInfoTransfers where t.userInfo[WatchWire.kind] as? String == WatchWire.inventory { t.cancel() }
+                let question = UUID().uuidString.lowercased()
+                session.transferUserInfo([WatchWire.kind: WatchWire.inventory, WatchWire.inventoryId: question,
+                                          WatchWire.inventoryItems: WatchWire.inventoryItems(Array(items)),
+                                          WatchWire.inventory: items.map(\.id), WatchWire.binding: binding])
+                resend.askInventory(id: question, ids: items.map(\.id), now: now)
+                count("inventory_asked", items.count)
+                watchLog.info("asked the iPhone about \(items.count) delivered part(s)")
+            }
         }
         // telemetry last, two batches at a time (small user-info transfers, after the audio)
         var perfRoom = 2 - session.outstandingUserInfoTransfers.filter { $0.userInfo[WatchWire.kind] as? String == WatchWire.perf }.count
@@ -176,12 +185,14 @@ final class WatchSync: NSObject, WCSessionDelegate {
     struct Received: Sendable {
         var binding: String?
         var acks: [String]
-        /// Parts the iPhone said it doesn't have (an inventory answer): sent again at once.
+        /// Parts the iPhone said it doesn't hold (an inventory answer), and which question it answers.
         var missing: [String]
+        var inventoryId: String?
         init(_ m: [String: Any]) {
             binding = m[WatchWire.binding] as? String
             acks = m[WatchWire.acks] as? [String] ?? []
             missing = m[WatchWire.missing] as? [String] ?? []
+            inventoryId = m[WatchWire.inventoryId] as? String
         }
     }
 
@@ -193,7 +204,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
             let r = Received(reply)
             // the iPhone can't read its identity yet (not unlocked since it restarted): asking again at
             // once would loop; it announces itself after unlocking, and the recheck asks again
-            guard r.binding != nil || !r.acks.isEmpty || !r.missing.isEmpty else { return }
+            guard r.binding != nil || !r.acks.isEmpty || r.inventoryId != nil else { return }
             Task { @MainActor in self.handle(r) }
         }, errorHandler: nil)
     }
@@ -224,10 +235,13 @@ final class WatchSync: NSObject, WCSessionDelegate {
             lastAckAt = Date()
             UserDefaults.standard.set(lastAckAt, forKey: "omi.lastAckAt")
         }
-        if !r.missing.isEmpty, r.binding == binding {
-            watchLog.info("iPhone is missing \(r.missing.count) part(s): sending them again")
-            resend.missing(r.missing)
-            count("inventory_missing", r.missing.count)
+        if let question = r.inventoryId, r.binding == binding {
+            // counted once, for its own question; parts handed over since then are left alone
+            let due = resend.answeredInventory(id: question, missing: r.missing)
+            if !due.isEmpty {
+                watchLog.info("iPhone is missing \(due.count) part(s): sending them again")
+                count("inventory_missing", due.count)
+            }
         }
         pump()
     }
