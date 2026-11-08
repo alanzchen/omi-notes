@@ -220,19 +220,11 @@ public struct TransferSummary: Equatable, Sendable {
         return watch.reportFresh && watch.waitingParts == 0 && watch.converting == 0 && watch.waitingForServer == 0
     }
 
-    /// Audio files plus conversations the server last said it still has to process: exact only when
-    /// it gave both counts; with one missing, an "at least" from the other if that is above 0; nil
-    /// otherwise (a missing count is never zero).
-    public var serverWork: (left: Int, atLeast: Bool)? {
-        switch (server.chunksPending, server.conversationsPending) {
-        case let (c?, v?): return (c + v, false)
-        case let (n?, nil) where n > 0, let (nil, n?) where n > 0: return (n, true)
-        default: return nil
-        }
+    /// Audio files plus conversations the server last said it still has to process; nil if it didn't say.
+    public var serverWorkLeft: Int? {
+        guard server.chunksPending != nil || server.conversationsPending != nil else { return nil }
+        return (server.chunksPending ?? 0) + (server.conversationsPending ?? 0)
     }
-
-    /// The exact count of work left on the server; nil unless the server gave both counts.
-    public var serverWorkLeft: Int? { serverWork.flatMap { $0.atLeast ? nil : $0.left } }
 
     /// "820 B/s", "48.2 KB/s", "1.3 MB/s" (decimal units, like the Files app).
     public static func rateText(_ bytesPerSecond: Double) -> String {

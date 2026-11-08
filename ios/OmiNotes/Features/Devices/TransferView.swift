@@ -228,9 +228,7 @@ struct TransferDetailView: View {
     private func serverLine(_ s: TransferSummary.Server, summary: TransferSummary) -> some View {
         var text = "Server"
         if s.reachable == false { text += " · not reachable" }
-        if let work = summary.serverWork {
-            text += work.left == 0 ? " · nothing to process" : " · \(work.atLeast ? "at least " : "")\(work.left.formatted()) to process"
-        }
+        if let left = summary.serverWorkLeft { text += left == 0 ? " · nothing to process" : " · \(left.formatted()) to process" }
         if let at = s.checkedAt { text += " · checked \(Fmt.relative(at))" }
         return Text(text).font(.footnote).foregroundStyle(Pendant.secondary).lineLimit(1).minimumScaleFactor(0.8).padding(.horizontal, 4)
     }
