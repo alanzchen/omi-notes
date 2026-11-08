@@ -63,6 +63,12 @@ class Settings(BaseSettings):
     stt_request_style: Literal["auto", "openai_diarized", "mistral", "together", "verbose", "json"] = "auto"
     # Longest audio per request; unset = the style's known limit, 0 = unlimited.
     stt_max_request_seconds: float | None = None
+    # The local ASR sidecar (sidecar/asr): when set (e.g. http://127.0.0.1:18793/v1) it transcribes first,
+    # in pieces of up to STT_LOCAL_MAX_REQUEST_SECONDS with its own speakers, and the STT_* provider
+    # above is used whenever it is down. Empty = off.
+    stt_local_url: str = ""
+    stt_local_model: str = "omi-asr"
+    stt_local_max_request_seconds: float = 900.0
     # Where speaker labels come from; transcripts without them fail unless this is "off".
     stt_diarization: Literal["auto", "provider", "local", "off"] = "auto"
     diarization_num_speakers: int = 0  # 0 = decide from DIARIZATION_THRESHOLD

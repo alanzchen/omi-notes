@@ -66,6 +66,8 @@ from .segmenter import RingCapture, ring_resolved_until
 from .speakers import SpeakerResult, resolve_speakers
 from . import sources
 from .transcript import ConversationAudio, assemble, detected_language, merge_same_speaker, segments_from_deepgram
+from .speaker_links import link as link_speakers
+from .speaker_links import overlap_spans
 from .turn_transcription import ASSEMBLY_FORMAT as WINDOW_ASSEMBLY_FORMAT
 from .turn_transcription import CACHE_FORMAT as WINDOW_CACHE_FORMAT
 from .turn_transcription import transcribe_windows
@@ -111,6 +113,7 @@ class Providers:
 
     settings: Settings
     _stt: SttProvider | None = None
+    _local_stt: object = None  # LocalAsrStt when STT_LOCAL_URL is set
     _llm: LlmProvider | None = None
     _diarizer: object = None  # LocalDiarizer, or False once known to be unavailable
     _embedder: object = None  # speaker embedder, or False once known to be unavailable
@@ -137,6 +140,26 @@ class Providers:
 
                 self._stt = DeepgramStt(self.settings.deepgram_api_key, self.settings.stt_model)
         return self._stt
+
+    @property
+    def local_stt(self):
+        """The local ASR sidecar (`STT_LOCAL_URL`), or None when it isn't configured."""
+        if self._local_stt is None and self.settings.stt_local_url:
+            from ..providers.local_asr import LocalAsrStt
+
+            self._local_stt = LocalAsrStt(self.settings.stt_local_url, self.settings.stt_local_model,
+                                          max_request_seconds=self.settings.stt_local_max_request_seconds)  # fmt: skip
+        return self._local_stt
+
+    def transcriber(self):
+        """The provider for this attempt: the local sidecar while it answers its health check, else STT_*."""
+        local = self.local_stt
+        if local is not None:
+            if local.healthy():
+                return local
+            log.warning("local ASR sidecar at %s is not answering: using the %s provider", self.settings.stt_local_url,
+                        self.settings.stt_provider)  # fmt: skip
+        return self.stt
 
     @property
     def local_diarization_problem(self) -> str | None:
@@ -480,8 +503,9 @@ class ConversationPipeline:
         if len(audio.pcm) == 0:
             raise ProviderError("no decodable audio under this conversation's speech", terminal=True, kind="audio")
         audio_sha = sha256_hex(audio.pcm.tobytes() + canonical_json([list(b) for b in audio.blocks_out]).encode())
-        stt = self.providers.stt
+        stt = self.providers.transcriber()
         windowed = getattr(stt, "needs_speaker_windows", False)
+        linking = getattr(stt, "links_speakers", False)  # the local sidecar: its own speakers, linked across pieces
         turns = None
         if windowed:
             if self.settings.stt_diarization not in ("auto", "local"):
@@ -522,6 +546,12 @@ class ConversationPipeline:
             speakers = SpeakerResult(cached["response"], "unlabeled", False)
         elif windowed:
             speakers = SpeakerResult(cached["response"], "local", True)
+        elif linking:
+            response = cached["response"]
+            if self.providers.embedder is not None:
+                response = link_speakers(response, audio.pcm, self.providers.embedder)
+            # its labels are the transcript's labels (local diarization would only blur its real turns)
+            speakers = self._speakers(conv_id, response, audio, audio_sha, mode="provider")
         else:
             speakers = self._speakers(conv_id, cached["response"], audio, audio_sha)
         segments = merge_same_speaker(segments_from_deepgram(speakers.response, audio.timemap))
@@ -532,11 +562,16 @@ class ConversationPipeline:
             raise ProviderError("words were transcribed, but local speaker separation found no speakers; "
                                 "no note is made so no speaker is invented (the audio and its text are kept)",
                                 terminal=True, kind="speakers_unknown")  # fmt: skip
-        overlaps = cached["response"].get("omi_notes", {}).get("overlap_spans", []) if windowed else []
+        if windowed:
+            overlaps = cached["response"].get("omi_notes", {}).get("overlap_spans", [])
+        elif linking:  # overlapped speech carries two voices: never a voiceprint
+            overlaps = overlap_spans((speakers.response.get("results") or {}).get("utterances") or [])
+        else:
+            overlaps = []
         clips = {} if unlabeled else select_clips(label_turns(speakers.response, local_turns=turns),
                                                   usable_spans(audio.blocks_out, self._losses_out(row, audio) + overlaps))
         language = self.settings.stt_language
-        if language == "multi":
+        if language == "multi" or linking:  # the local sidecar gets no language hint: use what it heard
             language = detected_language(cached["response"]) or language
         transcript = {
             "segments": segments,
@@ -725,11 +760,13 @@ class ConversationPipeline:
     def voice_names(self, conv_id: str) -> dict[str, tuple[str, bool]]:
         return {label: (v["name"], v["me"]) for label, v in self.speakers.names(conv_id).items()}
 
-    def _speakers(self, conv_id: str, response: dict, audio: ConversationAudio, audio_sha: str) -> SpeakerResult:
-        """Speaker labels per STT_DIARIZATION (see `pipeline.speakers`). Local diarization runs on
-        the submitted PCM (same clock as the provider's timestamps) and is cached."""
+    def _speakers(self, conv_id: str, response: dict, audio: ConversationAudio, audio_sha: str,
+                  mode: str | None = None) -> SpeakerResult:  # fmt: skip
+        """Speaker labels per STT_DIARIZATION (see `pipeline.speakers`), or `mode` when given. Local
+        diarization runs on the submitted PCM (same clock as the provider's timestamps) and is cached."""
 
-        return resolve_speakers(response, self.settings.stt_diarization, lambda: self._local_turns(conv_id, audio, audio_sha))
+        return resolve_speakers(response, mode or self.settings.stt_diarization,
+                                lambda: self._local_turns(conv_id, audio, audio_sha))  # fmt: skip
 
     def _local_turns(self, conv_id: str, audio: ConversationAudio, audio_sha: str) -> list[Turn] | None:
         diarizer = self.providers.diarizer

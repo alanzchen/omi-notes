@@ -63,7 +63,8 @@ def _missing(detail: str) -> ProviderError:
 def resolve_speakers(response: dict, mode: str, local: LocalTurns) -> SpeakerResult:
     utterances = (response.get("results") or {}).get("utterances") or []
     provider = has_speakers(response)
-    split = pieces(response) > 1
+    # labels linked across pieces by voiceprint (`speaker_links`) are one consistent set
+    split = pieces(response) > 1 and not (response.get("omi_notes") or {}).get("speakers_linked")
 
     def run_local() -> tuple[list[Turn] | None, str]:
         try:
