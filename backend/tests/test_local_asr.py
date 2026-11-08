@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import json
+from datetime import timedelta
 
 import httpx
 import numpy as np
@@ -15,7 +16,7 @@ from omi_notes.pipeline.speakers import resolve_speakers
 from omi_notes.providers.local_asr import LocalAsrStt
 
 from .conftest import AUTH
-from .helpers import T0, convs, replay
+from .helpers import STARTED, T0, convs, replay
 from .test_openai_stt import audio_with_blocks, form
 from .test_speaker_learning import ALAN, PRIYA, RAVI, FakeEmbedder, voice
 
@@ -425,3 +426,21 @@ def test_without_a_voice_model_the_unlinked_result_is_kept_too(client, worker):
     worker.tick(T0 + 400)
     (row,) = convs(worker)
     assert list(worker.pipeline.conv_dir(row["id"]).glob("links-v1-*.json")), "installing a model later must not relink it"
+
+
+def test_a_new_conversation_is_transcribed_before_an_old_ones_reprocess(client, worker):
+    order = []
+
+    def recording(request, n):
+        order.append(seconds_of(request))
+        return moss_like(request, n)
+
+    worker.providers._local_stt, _ = sidecar(recording)
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (old,) = convs(worker)
+    worker.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1, force_restt = 1 WHERE id=?", (old["id"],))
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(4, PRIYA, 9), np.zeros(2 * SR, np.int16)]), start=STARTED + timedelta(seconds=1000))
+    order.clear()
+    worker.tick(T0 + 1400)
+    assert len(order) == 2 and order[0] < order[1], "the new (shorter) recording went first"

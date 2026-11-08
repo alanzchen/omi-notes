@@ -334,7 +334,10 @@ class ConversationPipeline:
                WHERE ((status IN ('closed','transcribing','summarizing') OR (needs_render=1 AND status IN ('done','discarded','failed')))
                       AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
                   OR (reprocess_request > reprocess_handled AND status <> 'open')
-               ORDER BY start LIMIT ?""",
+               -- new conversations before re-runs of finished ones (a reprocess or the ASR backfill): a long
+               -- re-transcription of an old recording must not hold back what was just recorded
+               ORDER BY (reprocess_request > reprocess_handled OR (status IN ('closed','transcribing') AND stt_ref IS NOT NULL)), start
+               LIMIT ?""",
             (now, limit),
         )
         for row in rows:
