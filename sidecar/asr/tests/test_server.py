@@ -58,3 +58,32 @@ def test_it_refuses_to_bind_beyond_loopback(monkeypatch):
     monkeypatch.setenv("OMI_ASR_HOST", "0.0.0.0")
     with pytest.raises(SystemExit):
         server.main()
+
+
+class BrokenEngine(FakeEngine):
+    def transcribe(self, pcm, context):
+        raise RuntimeError("metal device lost")
+
+
+def test_a_failed_startup_self_test_makes_health_fail():
+    app = server.create_app(BrokenEngine())
+    app.state.guard.self_test()
+    r = TestClient(app).get("/health")
+    assert r.status_code == 503 and "self-test" in r.json()["reason"]
+
+
+def test_a_passing_self_test_is_reported():
+    app = server.create_app(FakeEngine())
+    app.state.guard.self_test()
+    assert TestClient(app).get("/health").json()["self_test"] == "ok"
+
+
+def test_a_request_stuck_past_its_deadline_fails_health_and_the_watchdog_exits():
+    exits = []
+    app = server.create_app(FakeEngine(), exit=exits.append)
+    guard = app.state.guard
+    guard.busy_since, guard.deadline = 0.0, 1.0  # a 1 s budget that started at the epoch
+    r = TestClient(app).get("/health")
+    assert r.status_code == 503 and "stuck" in r.json()["reason"]
+    guard.check()
+    assert exits == [70]

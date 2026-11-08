@@ -5,7 +5,12 @@ model, language (ignored: the models detect it), response_format (ignored: alway
 `context` (terms, comma or newline separated; Layer-1 context plugs in here; `prompt` is accepted as the
 same, never sent to MOSS), max_tokens (ignored: budgets are computed per window).
 Answer: {text, language, duration, segments: [{start, end, speaker_id, text}], omi_asr: {...}}, the shape
-Omi's `openai_diarized` style reads. GET /health → {ok, version, models_loaded}.
+Omi's `openai_diarized` style reads. GET /health → {ok, version, models_loaded, self_test}; 503 with a
+`reason` when the startup self-test failed or a transcription is stuck past its deadline.
+
+The service is Omi's only transcription engine, so it guards itself: at startup it transcribes a few
+seconds of synthetic audio (models load, MLX runs), and a watchdog exits the process (launchd's KeepAlive
+starts a fresh one) when a request runs past 300 s + its audio length (normal is ~0.1x).
 """
 
 from __future__ import annotations
@@ -15,10 +20,13 @@ import contextlib
 import io
 import logging
 import os
+import threading
+import time
 
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import VERSION, plan
@@ -26,6 +34,56 @@ from .engine import Engine
 
 log = logging.getLogger("omi_asr")
 MAX_SECONDS = float(os.environ.get("OMI_ASR_MAX_SECONDS", str(2 * 3600)))
+DEADLINE_BASE = 300.0
+WATCHDOG_EXIT = 70
+
+
+class Guard:
+    """Self-test state and the deadline of the request in progress."""
+
+    def __init__(self, engine: Engine, exit=os._exit) -> None:
+        self.engine, self.exit = engine, exit
+        self.self_test_state = "pending"
+        self.busy_since: float | None = None
+        self.deadline: float | None = None
+        self.lock = threading.Lock()
+
+    def self_test(self) -> None:
+        t = np.arange(3 * plan.SR) / plan.SR
+        tone = (0.1 * np.sin(2 * np.pi * 180 * t) * (np.sin(2 * np.pi * 3 * t) > 0)).astype(np.float32)
+        try:
+            result = self.run(tone, [])  # under the deadline too: a hang at startup is caught
+            assert isinstance(result.get("segments"), list)
+            self.self_test_state = "ok"
+            log.info("self-test passed")
+        except Exception as exc:  # anything at all: the engine can't serve
+            self.self_test_state = f"failed: {type(exc).__name__}: {exc}"[:300]
+            log.error("self-test failed: %s", self.self_test_state)
+
+    def run(self, pcm: np.ndarray, context: list[str]) -> dict:
+        with self.lock:
+            self.busy_since = time.time()
+            self.deadline = self.busy_since + DEADLINE_BASE + len(pcm) / plan.SR
+        try:
+            return self.engine.transcribe(pcm, context)
+        finally:
+            with self.lock:
+                self.busy_since = self.deadline = None
+
+    def problem(self) -> str | None:
+        if self.self_test_state.startswith("failed"):
+            return f"startup self-test {self.self_test_state}"
+        deadline = self.deadline
+        if deadline is not None and time.time() > deadline:
+            return f"a transcription is stuck (running {time.time() - (self.busy_since or 0):.0f} s)"
+        return None
+
+    def check(self) -> None:
+        """Watchdog: a stuck transcription holds the models' lock for good; start over."""
+        problem = self.problem()
+        if problem and problem.startswith("a transcription is stuck"):
+            log.critical("%s: exiting so launchd restarts the service", problem)
+            self.exit(WATCHDOG_EXIT)
 
 
 def decode(data: bytes) -> np.ndarray:
@@ -50,8 +108,9 @@ def terms(*values: str | None) -> list[str]:
     return out[:50]
 
 
-def create_app(engine: Engine | None = None) -> FastAPI:
+def create_app(engine: Engine | None = None, *, self_test: bool = False, exit=os._exit) -> FastAPI:
     engine = engine or Engine()
+    guard = Guard(engine, exit=exit)
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -60,15 +119,29 @@ def create_app(engine: Engine | None = None) -> FastAPI:
                 await asyncio.sleep(60)
                 await run_in_threadpool(engine.unload_if_idle)
 
-        task = asyncio.get_running_loop().create_task(idle_watch())
+        async def watchdog() -> None:
+            while True:
+                await asyncio.sleep(15)
+                guard.check()
+
+        loop = asyncio.get_running_loop()
+        tasks = [loop.create_task(idle_watch()), loop.create_task(watchdog())]
+        if self_test:
+            threading.Thread(target=guard.self_test, name="self-test", daemon=True).start()
         yield
-        task.cancel()
+        for task in tasks:
+            task.cancel()
 
     app = FastAPI(title="omi-asr", version=VERSION, lifespan=lifespan)
+    app.state.guard = guard
 
     @app.get("/health")
-    def health() -> dict:
-        return {"ok": True, "version": VERSION, "models_loaded": engine.loaded}
+    def health() -> JSONResponse:
+        problem = guard.problem()
+        body = {"ok": problem is None, "version": VERSION, "models_loaded": engine.loaded, "self_test": guard.self_test_state}
+        if problem:
+            body["reason"] = problem
+        return JSONResponse(body, status_code=503 if problem else 200)
 
     @app.post("/v1/audio/transcriptions")
     async def transcriptions(file: UploadFile = File(...), model: str = Form("omi-asr"), language: str | None = Form(None),
@@ -83,7 +156,7 @@ def create_app(engine: Engine | None = None) -> FastAPI:
             raise HTTPException(400, "empty audio")
         if len(pcm) / plan.SR > MAX_SECONDS:
             raise HTTPException(413, f"audio longer than {MAX_SECONDS:.0f} s")
-        result = await run_in_threadpool(engine.transcribe, pcm, terms(context, prompt))
+        result = await run_in_threadpool(guard.run, pcm, terms(context, prompt))
         log.info("transcribed %.0f s in %.1f s (rtf %.3f, %d segments)", result["duration"], result["omi_asr"]["seconds"],
                  result["omi_asr"]["rtf"], len(result["segments"]))  # fmt: skip
         return result
@@ -98,7 +171,8 @@ def main() -> None:
     host = os.environ.get("OMI_ASR_HOST", "127.0.0.1")
     if host not in ("127.0.0.1", "::1", "localhost"):
         raise SystemExit("omi-asr binds to loopback only")
-    uvicorn.run(create_app(), host=host, port=int(os.environ.get("OMI_ASR_PORT", "18793")), log_level="info")
+    self_test = os.environ.get("OMI_ASR_SELF_TEST", "1") != "0"
+    uvicorn.run(create_app(self_test=self_test), host=host, port=int(os.environ.get("OMI_ASR_PORT", "18793")), log_level="info")
 
 
 if __name__ == "__main__":
