@@ -197,13 +197,23 @@ server (`features` contains `watch_performance`).
 The phone's diagnostic log tail, so a stalled phone can be read on the server without a TestFlight
 log export. Body (JSON, at most 64 KB and 2,000 lines): `{"device_id": "phone-<install id>",
 "app_version": "0.1.0 (42)", "lines": [{"at": "<ISO-8601 UTC>", "level": "info"|"warning"|...,
-"category": "upload", "message": "..."}]}`. Answer `{"stored": n}`; 422 `invalid_log` for a malformed
-body. The phone sends only `upload`, `watch`, `ble`, `liveactivity`, `engine` and `app` lines plus any
-warning or error, with tokens and pairing secrets redacted and messages cut to 300 characters; lines
-after the last acknowledged one, at most 400 / ~48 KB per request and one request per 5 minutes, and
-only when `/v1/status` lists `phone_log` (an older server is never asked). The server appends one line
-per entry to `<logs dir>/phone/<device id>.log` (beside its own log, never in the vault), rotating
-at 5 MB to a single `.log.1`. Nothing in note processing reads it.
+"category": "upload", "message": "..."}]}`. `device_id` is `phone-` plus the app's lowercase install
+UUID, validated as such (never rewritten). Answer `{"stored": n}`; 422 `invalid_log` for a malformed
+body, another `device_id`, or a field that isn't a string (an unknown `level` reads as `info`).
+
+The phone sends only `upload`, `watch`, `ble`, `liveactivity`, `engine` and `app` lines plus any
+warning or error. Tokens and pairing secrets are redacted, also when percent-encoding hides them, and
+lines an older build wrote are sanitized again before they leave. A rejected link is logged as a
+reason, never as its URL. Messages are cut to 500 characters. It sends lines after the last
+acknowledged one: at most 400 per request, with the encoded body at most 60,000 bytes (the oldest
+lines that fit), one request per 5 minutes, and only when `/v1/status` lists `phone_log` (an older
+server is never asked). On a 413 it halves the batch, oldest half first, and skips a single line that
+is still refused.
+
+The server appends one line per entry to `<logs dir>/phone/<device id>.log` (beside its own log,
+never in the vault) and creates no file for an empty batch. It rotates each file at 5 MB to a single
+`.log.1`. Across all phones it keeps at most 50 MB and nothing older than 30 days, removing the
+oldest other phones' files first. Nothing in note processing reads it.
 
 ### `GET /v1/watch/performance?days=14`
 

@@ -134,6 +134,56 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         #expect(logPuts().count == 1)
     }
 
+    /// R42-02: a batch the server refuses as too large is halved (oldest half first), never resent
+    /// unchanged; a single line it still refuses is skipped so it can't block the log forever.
+    @Test func aTooLargeLogBatchIsHalvedNotRepeated() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let url = root.appendingPathComponent("diagnostic-log.jsonl")
+        let rows = (0..<8).map { PhoneLogLine(at: "2026-11-07T21:00:0\($0).000Z", level: "warning", category: "upload", message: "line \($0)") }
+        try Data(rows.map { String(data: try JSONEncoder().encode($0), encoding: .utf8)! + "\n" }.joined().utf8).write(to: url)
+        AppServerStub.reset()
+        AppServerStub.routes["/v1/status"] = [(200, #"{"ok":true,"vault_id":"vault-a","features":["phone_log"]}"#)]
+        AppServerStub.routes["/v1/conversations/recent"] = [(200, #"{"conversations":[],"next_cursor":null}"#)]
+        let tooLarge = (413, #"{"error":"too_large","detail":"body too large"}"#)
+        AppServerStub.routes["/v1/diagnostics/phone-log"] = [tooLarge, tooLarge, (200, #"{"stored":2}"#)]
+        let settings = SettingsStore(defaults: UserDefaults(suiteName: "omi-plog-\(UUID().uuidString)")!, tokens: InMemoryTokenStore())
+        try settings.setServer(url: URL(string: "https://mac.ts.net")!, token: "tok")
+        var config = EngineConfiguration(dirs: CaptureDirectories(root: root), appVersion: "t", useCoreBluetooth: false)
+        config.diagnosticLogURL = url
+        let m = AppModel(engine: OmiEngine(config: config, settings: settings, uploadTransport: CountingUploadTransport()),
+                         noteCache: NoteCache(root: root.appendingPathComponent("cache")))
+        let c = URLSessionConfiguration.ephemeral
+        c.protocolClasses = [AppServerStub.self]
+        m.session = URLSession(configuration: c)
+        await m.refreshServer()
+        for _ in 0..<60 where m.engine.settings.phoneLogCursor == nil { try await Task.sleep(for: .milliseconds(50)) }
+        let sizes = AppServerStub.requests.filter { $0.path == "/v1/diagnostics/phone-log" }
+            .compactMap { (try? JSONSerialization.jsonObject(with: $0.body) as? [String: Any])?["lines"] as? [Any] }.map(\.count)
+        #expect(sizes == [8, 4, 2], "halved after each 413")
+        #expect(m.engine.settings.phoneLogCursor == rows[1].at, "the cursor covers only what was stored")
+
+        AppServerStub.routes["/v1/diagnostics/phone-log"] = [tooLarge]
+        settings.phoneLogCursor = rows[6].at  // one line left to send
+        m.uploadPhoneLogIfDue(api: APIClient(endpoint: try #require(settings.serverConfig().endpoint), session: m.session),
+                              now: Date().addingTimeInterval(600))
+        for _ in 0..<60 where m.engine.settings.phoneLogCursor != rows[7].at { try await Task.sleep(for: .milliseconds(50)) }
+        #expect(m.engine.settings.phoneLogCursor == rows[7].at, "one line still refused is skipped, not retried forever")
+    }
+
+    /// R42-01: a rejected link is logged as a reason, never as its raw (possibly encoded) URL.
+    @Test func aRejectedLinkIsLoggedWithoutItsURL() throws {
+        let (m, _) = try model()
+        let secret = "SYNTH-\(UUID().uuidString)"
+        #expect(!m.handleOpenURL(URL(string: "omi-notes://configure?%74oken=\(secret)")!))
+        #expect(!m.handleOpenURL(URL(string: "omi-notes://elsewhere?token=\(secret)")!))
+        let logged = OmiLog.shared.recent().map(\.message).filter { $0.hasPrefix("ignored") }.suffix(2)
+        #expect(logged.count == 2)
+        for message in logged {
+            #expect(!message.contains("omi-notes://") && !OmiLog.percentDecoded(message).contains(secret), "\(message)")
+        }
+    }
+
     @Test func aLostResponseIsAskedAgainWithTheSameRequestId() async throws {
         let (m, root) = try model()
         await m.refreshServer()

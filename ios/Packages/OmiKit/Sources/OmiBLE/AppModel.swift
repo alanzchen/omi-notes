@@ -189,13 +189,30 @@ public final class AppModel {
         if let at = phoneLogSentAt, now.timeIntervalSince(at) < Self.phoneLogInterval { return }
         let settings = engine.settings
         let lines = PhoneLogTail.lines(at: url, after: settings.phoneLogCursor)
-        guard let last = lines.last?.at else { return }
+        guard !lines.isEmpty else { return }
         phoneLogSending = true
         phoneLogSentAt = now
         let version = engine.config.appVersion
         Task {
-            let ok = (try? await api.putPhoneLog(deviceId: "phone-\(device)", appVersion: version, lines: lines)) != nil
-            if ok { settings.phoneLogCursor = last }
+            // A batch the server refuses as too large is halved, oldest half first (the rest goes next
+            // time); a single line it still refuses is skipped rather than resent forever.
+            var batch = lines
+            while let first = batch.first {
+                do {
+                    let sent = try await api.putPhoneLog(deviceId: "phone-\(device)", appVersion: version, lines: batch)
+                    if let at = sent.last?.at { settings.phoneLogCursor = at }
+                    break
+                } catch APIError.http(413, _) {
+                    if batch.count == 1 {
+                        settings.phoneLogCursor = first.at
+                        OmiLog.shared.log(.warning, "app", "skipped a diagnostic line the server refused as too large")
+                        break
+                    }
+                    batch = Array(batch.prefix(batch.count / 2))
+                } catch {
+                    break
+                }
+            }
             phoneLogSending = false
         }
     }
@@ -392,7 +409,10 @@ public final class AppModel {
             return true
         }
         guard let link = ConfigureLink.parse(url) else {
-            OmiLog.shared.log(.warning, "app", "ignored URL \(OmiLog.redact(url.absoluteString))")
+            // a reason only: the link may carry a pairing token, encoded in ways no redactor foresees
+            let reason = url.scheme != "omi-notes" ? "not an omi-notes link"
+                : url.host == "configure" ? "a configure link without a valid server and token" : "an unknown omi-notes link"
+            OmiLog.shared.log(.warning, "app", "ignored a link: \(reason)")
             return false
         }
         pendingConfigure = link

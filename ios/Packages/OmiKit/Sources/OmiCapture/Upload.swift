@@ -877,12 +877,13 @@ public struct APIClient: Sendable {
     }
 
     /// The phone's diagnostic log tail (servers with `phone_log`).
-    public func putPhoneLog(deviceId: String, appVersion: String?, lines: [PhoneLogLine]) async throws -> Int {
-        struct Body: Encodable { let device_id: String; let app_version: String?; let lines: [PhoneLogLine] }
+    /// Sends the oldest of `lines` that fit the body bound; returns the lines the server stored.
+    public func putPhoneLog(deviceId: String, appVersion: String?, lines: [PhoneLogLine]) async throws -> [PhoneLogLine] {
         struct Stored: Decodable { let stored: Int }
-        let body = try JSONEncoder().encode(Body(device_id: deviceId, app_version: appVersion, lines: lines))
-        let r: Stored = try await send("PUT", "/v1/diagnostics/phone-log", body: body)
-        return r.stored
+        let (body, sent) = PhoneLogTail.body(deviceId: deviceId, appVersion: appVersion, lines: lines)
+        guard !sent.isEmpty else { return [] }
+        let _: Stored = try await send("PUT", "/v1/diagnostics/phone-log", body: body)
+        return sent
     }
 
     public func healthz() async throws -> Bool {

@@ -34,9 +34,24 @@ public final class OmiLog: @unchecked Sendable {
 
     /// Also keeps diagnostic lines (`isDiagnostic`) in a small rolling file, so a launch that ends
     /// before anyone looks still leaves its lines for the phone-log upload. App only.
+    /// Starts keeping diagnostic lines in `url`, first re-sanitizing what an older build wrote there
+    /// (it may hold raw, percent-encoded links).
     public func persist(to url: URL) {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
         persistURL = url
+        lock.unlock()
+        guard let data = try? Data(contentsOf: url) else { return }
+        let decoder = JSONDecoder(), encoder = JSONEncoder()
+        var changed = false
+        let rows = data.split(separator: 0x0A).compactMap { raw -> Data? in
+            guard var line = try? decoder.decode(PhoneLogLine.self, from: Data(raw)) else { changed = true; return nil }
+            let clean = sanitize(line.message)
+            if clean != line.message { line.message = clean; changed = true }
+            return try? encoder.encode(line)
+        }
+        guard changed else { return }
+        lock.lock(); defer { lock.unlock() }
+        try? Data(rows.map { $0 + Data([0x0A]) }.joined()).write(to: url, options: .atomic)
     }
 
     /// What may leave the phone: upload, Watch, Bluetooth, Live Activity, engine and app lines, and
@@ -82,8 +97,7 @@ public final class OmiLog: @unchecked Sendable {
         lock.lock()
         let secretsCopy = secrets
         lock.unlock()
-        var text = Self.redact(message)
-        for s in secretsCopy { text = text.replacingOccurrences(of: s, with: "‹redacted›") }
+        let text = Self.sanitize(message, secrets: secretsCopy)
         lock.lock()
         let line = LogLine(id: nextId, date: Date(), level: level, category: category, message: text)
         nextId += 1
@@ -110,20 +124,86 @@ public final class OmiLog: @unchecked Sendable {
         lines.removeAll()
     }
 
-    /// Masks `token=…` query values and `Bearer …` credentials.
-    public static func redact(_ s: String) -> String {
-        var out = s
-        let patterns = [
-            #"(?i)(token=)[^&\s"']+"#,
-            #"(?i)(bearer\s+)[A-Za-z0-9\-\._~\+/=]+"#,
-        ]
-        for p in patterns {
-            if let re = try? NSRegularExpression(pattern: p) {
-                out = re.stringByReplacingMatches(
-                    in: out, range: NSRange(out.startIndex..., in: out), withTemplate: "$1‹redacted›")
+    /// `message` as it may be logged or leave the phone: `redact` plus every registered secret.
+    public func sanitize(_ message: String) -> String {
+        lock.lock()
+        let secretsCopy = secrets
+        lock.unlock()
+        return Self.sanitize(message, secrets: secretsCopy)
+    }
+
+    static func sanitize(_ message: String, secrets: [String]) -> String {
+        var text = redact(message)
+        for s in secrets where !s.isEmpty {
+            text = text.replacingOccurrences(of: s, with: "‹redacted›")
+            if decodedFully(text).contains(s) {  // hidden by percent-encoding: keep the decoded form, masked
+                text = redact(decodedFully(text)).replacingOccurrences(of: s, with: "‹redacted›")
             }
         }
+        return text
+    }
+
+    /// Masks credential query values (`token=…`, `access_token=…`, `secret=…`, `password=…`,
+    /// `api_key=…`) and `Bearer …` credentials, also when percent-encoding (even nested, or next to
+    /// malformed escapes) hides the name or the value: then the decoded text is what gets masked.
+    public static func redact(_ s: String) -> String {
+        let plain = mask(s)
+        let decoded = decodedFully(s)
+        guard decoded != s else { return plain }
+        let maskedDecoded = mask(decoded)
+        return maskedDecoded == decoded ? plain : maskedDecoded
+    }
+
+    private static let patterns: [NSRegularExpression] = [
+        #"(?i)((?:token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_\-]*=)[^&\s"'#]+"#,
+        #"(?i)((?:token|secret|password)"?\s*:\s*"?)[^"&\s,}]+"#,
+        #"(?i)(bearer\s+)[A-Za-z0-9\-\._~\+/=]+"#,
+    ].compactMap { try? NSRegularExpression(pattern: $0) }
+
+    private static func mask(_ s: String) -> String {
+        var out = s
+        for re in patterns {
+            out = re.stringByReplacingMatches(in: out, range: NSRange(out.startIndex..., in: out), withTemplate: "$1‹redacted›")
+        }
         return out
+    }
+
+    /// One pass of %XX decoding that keeps malformed escapes as they are (unlike
+    /// `removingPercentEncoding`, which gives up on the whole string).
+    public static func percentDecoded(_ s: String) -> String {
+        let bytes = Array(s.utf8)
+        var out: [UInt8] = []
+        out.reserveCapacity(bytes.count)
+        var i = 0
+        func hex(_ b: UInt8) -> UInt8? {
+            switch b {
+            case 0x30...0x39: return b - 0x30
+            case 0x41...0x46: return b - 0x37
+            case 0x61...0x66: return b - 0x57
+            default: return nil
+            }
+        }
+        while i < bytes.count {
+            if bytes[i] == 0x25, i + 2 < bytes.count, let h = hex(bytes[i + 1]), let l = hex(bytes[i + 2]) {
+                out.append(h << 4 | l)
+                i += 3
+            } else {
+                out.append(bytes[i])
+                i += 1
+            }
+        }
+        return String(decoding: out, as: UTF8.self)
+    }
+
+    /// Decoded until nothing changes (nested encodings), at most a few rounds.
+    static func decodedFully(_ s: String) -> String {
+        var cur = s
+        for _ in 0..<4 {
+            let next = percentDecoded(cur)
+            if next == cur { break }
+            cur = next
+        }
+        return cur
     }
 }
 
@@ -142,20 +222,43 @@ public struct PhoneLogLine: Codable, Sendable, Equatable {
 }
 
 public enum PhoneLogTail {
-    /// Persisted lines newer than `after` (an `at` value), at most `limit` lines and about `maxBytes`,
-    /// keeping the newest when there are more.
-    public static func lines(at url: URL, after cursor: String?, limit: Int = 400, maxBytes: Int = 48_000) -> [PhoneLogLine] {
+    /// The encoded request body's bound (the server refuses more than 64 KiB).
+    public static let maxBodyBytes = 60_000
+    /// The server keeps at most this many characters of a message.
+    public static let maxMessage = 500
+
+    /// Persisted lines newer than `after` (an `at` value), at most `limit` lines whose encoded size
+    /// stays within `maxBytes`, keeping the newest when there are more. Each message is sanitized
+    /// again (an older build may have written it) and shortened as the server would.
+    public static func lines(at url: URL, after cursor: String?, limit: Int = 400, maxBytes: Int = maxBodyBytes - 1_000,
+                             sanitize: (String) -> String = OmiLog.shared.sanitize) -> [PhoneLogLine] {
         guard let data = try? Data(contentsOf: url) else { return [] }
-        let decoder = JSONDecoder()
+        let decoder = JSONDecoder(), encoder = JSONEncoder()
         var all = data.split(separator: 0x0A).compactMap { try? decoder.decode(PhoneLogLine.self, from: Data($0)) }
         if let cursor { all = all.filter { $0.at > cursor } }
         var out: [PhoneLogLine] = [], bytes = 0
-        for line in all.reversed() {
-            bytes += line.message.utf8.count + 64
+        for var line in all.reversed() {
+            line.message = String(sanitize(line.message).prefix(maxMessage))
+            bytes += ((try? encoder.encode(line).count) ?? maxBytes) + 1
             guard out.count < limit, bytes <= maxBytes else { break }
             out.append(line)
         }
         return out.reversed()
+    }
+
+    /// The upload's exact JSON body and the lines in it: the oldest lines that fit within `maxBytes`
+    /// (so a cursor set to the last one skips nothing).
+    public static func body(deviceId: String, appVersion: String?, lines: [PhoneLogLine], maxBytes: Int = maxBodyBytes) -> (Data, [PhoneLogLine]) {
+        struct Body: Encodable { let device_id: String; let app_version: String?; let lines: [PhoneLogLine] }
+        let encoder = JSONEncoder()
+        func encode(_ n: Int) -> Data { (try? encoder.encode(Body(device_id: deviceId, app_version: appVersion, lines: Array(lines.prefix(n))))) ?? Data() }
+        var n = lines.count
+        var data = encode(n)
+        while n > 0, data.count > maxBytes {
+            n = max(0, min(n - 1, n * maxBytes / max(data.count, 1)))
+            data = encode(n)
+        }
+        return (data, Array(lines.prefix(n)))
     }
 }
 
