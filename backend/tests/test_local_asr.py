@@ -465,7 +465,7 @@ def overlap_sidecar(voices_at, full_pcm, max_seconds, overlap):
             lo, hi = max(a, start), min(b, start + seconds)
             if hi - lo > 0.3:
                 names.setdefault(who, f"S{len(names) + 1:02d}")
-                segments.append({"start": lo - start, "end": hi - start, "speaker_id": names[who], "text": f"{who}@{lo:.0f}"})
+                segments.append({"start": lo - start, "end": hi - start, "speaker_id": names[who], "text": f"{who}@{a:.0f}"})
         return httpx.Response(200, json={"segments": segments})
 
     stt, seen = sidecar(handler, max_seconds=max_seconds)
@@ -660,3 +660,13 @@ def test_one_outlier_pair_of_known_different_labels_does_not_block_every_join():
     assert bar([0.77], centred=True) == pytest.approx(0.82), "too few pairs to call it an outlier"
     assert bar([], centred=True) == pytest.approx(0.5), "nothing to calibrate against: cautious"
     assert bar([0.98], centred=False) == pytest.approx(1.03), "raw: above the closest known-different pair"
+
+
+def test_a_phrase_counts_as_already_there_only_when_its_words_are():
+    from omi_notes.providers.local_asr import _covered
+
+    left = {"start": 8.0, "end": 12.0, "transcript": "Do not open the door."}
+    assert not _covered(left, [{"start": 10.0, "end": 12.0, "transcript": "open the door"}]), "the negation would be lost"
+    assert _covered({"start": 10.0, "end": 12.0, "transcript": "open the door"}, [left])
+    assert _covered({"start": 1.0, "end": 2.0, "transcript": "开门"}, [{"start": 0.5, "end": 2.5, "transcript": "请不要开门。"}])
+    assert not _covered({"start": 1.0, "end": 2.0, "transcript": "不要开门"}, [{"start": 0.5, "end": 2.5, "transcript": "请开门"}])

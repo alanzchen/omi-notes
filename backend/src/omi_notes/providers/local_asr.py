@@ -26,6 +26,7 @@ import httpx
 
 from . import SttRequest
 import io
+import re
 
 import numpy as np
 import soundfile as sf
@@ -102,13 +103,27 @@ def seam(left: list[dict], right: list[dict], lo: float, hi: float, step: float 
     return max(points, key=lambda t: (round(clearance(t), 3), -abs(t - mid)))
 
 
+def _tokens(text: str) -> list[str]:
+    """Words for comparison: lower case, punctuation dropped; CJK characters one by one."""
+    out: list[str] = []
+    for word in re.findall(r"[\w']+", text.lower()):
+        out += list(word) if any("\u3000" <= ch <= "\u9fff" or "\uac00" <= ch <= "\ud7af" for ch in word) else [word]
+    return out
+
+
+def _contains(whole: list[str], part: list[str]) -> bool:
+    n = len(part)
+    return n == 0 or any(whole[i : i + n] == part for i in range(len(whole) - n + 1))
+
+
 def _covered(u: dict, others: list[dict]) -> bool:
-    """Whether `u` is already there: another utterance overlaps at least half of it in time and carries about
-    as much text (overlap alone can't tell "now" from "please turn left now"; a duplicate beats a loss)."""
+    """Whether `u` is already there: another utterance overlapping half of it in time holds all of its words
+    in order ("open the door" is in "do not open the door", not the other way round). Anything else is kept:
+    a duplicate beats a loss."""
     a, b = float(u["start"]), float(u["end"])
-    size = len(str(u.get("transcript", "")).strip())
+    words = _tokens(str(u.get("transcript", "")))
     return any(_shared([(a, b)], [(float(o["start"]), float(o["end"]))]) >= 0.5 * max(b - a, 1e-6)
-               and len(str(o.get("transcript", "")).strip()) >= 0.6 * size for o in others)  # fmt: skip
+               and _contains(_tokens(str(o.get("transcript", ""))), words) for o in others)  # fmt: skip
 
 
 def anchors(left: list[dict], right: list[dict], lo: float, hi: float, least: float = ANCHOR_SECONDS) -> list[list[int]]:
