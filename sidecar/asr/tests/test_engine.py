@@ -149,3 +149,32 @@ def test_lines_under_a_chunk_qwen_cannot_do_keep_mosss_text_even_if_some_units_l
     out = e.transcribe(speech(60), [])
     assert out["omi_asr"]["qwen_capped"] >= 1
     assert [x["text"] for x in out["segments"]] == [f"moss{t}" for t in range(0, 60, 10)]
+
+
+def test_a_long_line_partly_under_a_failed_span_keeps_mosss_whole_text():
+    # one MOSS line over 0-240 s; Qwen fails beyond 180 s (forced chunk cut there), the line's middle is not in it
+    class LateCap(FakeQwen):
+        def __init__(self):
+            super().__init__()
+            self.offset = 0.0
+
+        def generate(self, audio, hotwords=None, max_tokens=0, **_):
+            r = super().generate(audio, hotwords, max_tokens)
+            if audio.shape[0] / SR < 70:  # the 60 s tail and its halves
+                r.generation_tokens = max_tokens
+            return r
+
+    e = Engine()
+    e.models = (FakeMoss([{"start": 0.0, "end": 239.5, "speaker_id": "S01", "text": "[0][S01] whole moss line"}]), LateCap(), FakeAligner())
+    out = e.transcribe(speech(240), [])
+    assert out["omi_asr"]["qwen_capped"] >= 1
+    assert out["segments"][0]["text"] == "whole moss line", "nothing of the failed tail may silently vanish"
+
+
+def test_words_qwen_could_not_produce_where_moss_has_none_are_an_error_not_silence():
+    from omi_asr.engine import IncompleteTranscription
+
+    e = Engine()
+    e.models = (FakeMoss([]), CappingQwen(limit=0), FakeAligner())
+    with pytest.raises(IncompleteTranscription):
+        e.transcribe(speech(30), [])

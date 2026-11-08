@@ -146,3 +146,20 @@ def test_an_engine_failure_answers_503_fails_health_and_restarts_the_service():
     assert h.status_code == 503 and "engine failed" in h.json()["reason"]
     app.state.guard.check()
     assert exits == [70]
+
+
+def test_an_incomplete_transcription_is_a_422_and_not_an_engine_failure():
+    from omi_asr.engine import IncompleteTranscription
+
+    class Incomplete(FakeEngine):
+        def transcribe(self, pcm, context):
+            raise IncompleteTranscription("Qwen failed on 0-30 s and MOSS has no text there")
+
+    exits = []
+    app = server.create_app(Incomplete(), exit=exits.append)
+    client = TestClient(app)
+    r = client.post("/v1/audio/transcriptions", files={"file": ("a.flac", flac(), "audio/flac")})
+    assert r.status_code == 422
+    assert client.get("/health").status_code == 200
+    app.state.guard.check()
+    assert exits == []

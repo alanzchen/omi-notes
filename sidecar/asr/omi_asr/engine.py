@@ -27,6 +27,10 @@ ALIGNER = os.environ.get("OMI_ASR_ALIGNER", "mlx-community/Qwen3-ForcedAligner-0
 ALIGN_LANGUAGE = os.environ.get("OMI_ASR_ALIGN_LANGUAGE", "Chinese")  # the bench's setting for mixed zh/en
 IDLE_UNLOAD_SECONDS = float(os.environ.get("OMI_ASR_IDLE_UNLOAD", "900"))
 MAX_RESPLIT_DEPTH = 3
+class IncompleteTranscription(RuntimeError):
+    """Qwen failed on some audio and MOSS has no words there either: rather an error than silence."""
+
+
 UNKNOWN = "UNKNOWN"  # words no MOSS line holds (Omi renders the speaker as unknown and learns no voice from it)
 
 
@@ -189,6 +193,9 @@ class Engine:
         for a, b in zip(cuts, cuts[1:], strict=False):
             units.extend(self._qwen(qwen, aligner, pcm, start + a, start + b, context, stats, languages, capped))
         lines = [dict(line) for line in lines]
+        for a, b in capped:  # every failed span needs MOSS words over it, or the words there would vanish
+            if not any(line.get("moss_text") and line["start"] < b and line["end"] > a for line in lines):
+                raise IncompleteTranscription(f"Qwen failed on {a:.0f}-{b:.0f} s and MOSS has no words there")
         if not lines:
             if not units:
                 return []
@@ -201,9 +208,8 @@ class Engine:
             if tail:
                 lines.append({"start": tail[0].start, "end": tail[-1].end, "speaker": UNKNOWN, "moss_text": ""})
         merged, s = assign(lines, units)
-        for line in merged:  # a line under a span Qwen couldn't do: MOSS's words, whatever else landed on it
-            mid = (line["start"] + line["end"]) / 2
-            if line.get("moss_text") and any(a <= mid < b for a, b in capped):
+        for line in merged:  # a line touching a span Qwen couldn't do: MOSS's whole line, whatever else landed on it
+            if line.get("moss_text") and any(line["start"] < b and line["end"] > a for a, b in capped):
                 line["text"] = line["moss_text"]
         for key in ("units", "units_outside_lines", "lines_with_moss_text"):
             stats[key] += s[key]

@@ -30,7 +30,7 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import VERSION, plan
-from .engine import Engine
+from .engine import Engine, IncompleteTranscription
 
 log = logging.getLogger("omi_asr")
 MAX_SECONDS = float(os.environ.get("OMI_ASR_MAX_SECONDS", str(2 * 3600)))
@@ -70,6 +70,8 @@ class Guard:
             self.deadline = self.busy_since + DEADLINE_BASE + len(pcm) / plan.SR
             try:
                 return self.engine.transcribe(pcm, context)
+            except IncompleteTranscription:  # this audio's problem, not the engine's
+                raise
             except Exception as exc:  # the audio was decoded already: this is the engine, not the input
                 self.failed = f"{type(exc).__name__}: {exc}"[:300]
                 log.error("engine failed: %s", self.failed)
@@ -168,6 +170,8 @@ def create_app(engine: Engine | None = None, *, self_test: bool = False, exit=os
             raise HTTPException(413, f"audio longer than {MAX_SECONDS:.0f} s")
         try:
             result = await run_in_threadpool(guard.run, pcm, terms(context, prompt))
+        except IncompleteTranscription as exc:  # never an empty answer for audio that has words
+            raise HTTPException(422, f"incomplete transcription: {exc}") from exc
         except Exception as exc:  # recorded by the guard; the client waits for the restarted service
             raise HTTPException(503, f"transcription engine failed: {exc}"[:300]) from exc
         log.info("transcribed %.0f s in %.1f s (rtf %.3f, %d segments)", result["duration"], result["omi_asr"]["seconds"],
