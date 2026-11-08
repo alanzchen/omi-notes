@@ -25,7 +25,9 @@ A loopback-only service that transcribes with diarization on this Mac (MLX). It 
     the shape Omi's `openai_diarized` style reads, plus `windows: [{start, end, label_prefix}]`: where MOSS ran
     (labels restart in each; the backend links them by voice).
   - Speaker ids are per request.
-- `GET /health` answers `{ok, version, models_loaded}`.
+- `GET /health` answers `{ok, version, models_loaded, self_test}`, or 503 with a `reason` when the startup
+  self-test failed or a request is stuck past 300 s + its audio length (a watchdog then exits the process
+  so launchd restarts it).
   - Models load on the first request (about 10 s) and are released after
     `OMI_ASR_IDLE_UNLOAD` seconds idle (default 900).
 
@@ -62,5 +64,5 @@ The backend uses the sidecar only when `STT_LOCAL_URL` is set (for example `http
 - **Requests:** at most `STT_LOCAL_MAX_REQUEST_SECONDS` long (default 900), split at speech-block gaps.
 - **Speakers:** the sidecar's labels are used as-is, not local diarization, and are linked across
   pieces by WeSpeaker voiceprints (`pipeline/speaker_links.py`).
-- **Fallback:** while `/health` fails, the configured `STT_*` provider transcribes as before.
-  Remove the setting to go back.
+- **No fallback:** while `/health` fails, conversations wait for the sidecar (attempts untouched) and are
+  transcribed when it is back; after 10 minutes down the server reports an issue and writes an alert file.
