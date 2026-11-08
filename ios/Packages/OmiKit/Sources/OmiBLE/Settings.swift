@@ -100,6 +100,7 @@ public final class SettingsStore: @unchecked Sendable {
         static let recordingPaused = "omi.recordingPaused"
         static let autoCollectOff = "omi.autoCollectOff"
         static let installId = "omi.phoneInstallId"
+        static let phoneLogCursor = "omi.phoneLogCursor"
     }
 
     public init(defaults: UserDefaults = .standard, tokens: TokenStore = KeychainTokenStore()) {
@@ -223,6 +224,12 @@ public final class SettingsStore: @unchecked Sendable {
     /// This install's identity, which the Watch binds its recordings to. Nil while it can't be read
     /// (before the first unlock): a replacement then would leave every recording bound to the real
     /// one held on the Watch for good.
+    /// The newest diagnostic line the server has acknowledged (its `at`).
+    public var phoneLogCursor: String? {
+        get { defaults.string(forKey: Key.phoneLogCursor) }
+        set { defaults.set(newValue, forKey: Key.phoneLogCursor) }
+    }
+
     public var phoneInstallId: String? {
         if let id = defaults.string(forKey: Key.installId) { return id }
         guard unlockedSinceBoot else { return nil }

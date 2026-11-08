@@ -23,9 +23,12 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         let trace = Bundle.main.url(forResource: "simulated_trace", withExtension: "omitrace")
             .flatMap { try? Data(contentsOf: $0) }
             .flatMap(SimulatedTrace.parse)
-        let config = EngineConfiguration(
+        var config = EngineConfiguration(
             dirs: .appDefault(), appVersion: "\(bundleVersion) (\(build))", timezone: TimeZone.current.identifier,
             simulatedTrace: trace)
+        config.diagnosticLogURL = config.dirs.state.appendingPathComponent("diagnostic-log.jsonl")
+        try? config.dirs.create()
+        if let url = config.diagnosticLogURL { OmiLog.shared.persist(to: url) }  // before the engine logs anything
         let settings = SettingsStore()
         // launched in the background before the first unlock: settings read as empty until then
         settings.unlockedSinceBoot = application.isProtectedDataAvailable

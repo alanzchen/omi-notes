@@ -175,6 +175,31 @@ public final class AppModel {
 
     func isCurrent(_ config: UploadConfig) -> Bool { engine.settings.serverConfig() == config }
 
+    // MARK: Phone log
+
+    static let phoneLogInterval: TimeInterval = 300
+    private var phoneLogSentAt: Date?
+    private var phoneLogSending = false
+
+    /// Sends the diagnostic lines logged since the last upload (at most every 5 minutes, at most 400
+    /// lines / ~48 KB) to a server that advertises `phone_log`, so a stall can be read on the server.
+    /// Best effort: any failure just waits for the next refresh; an older server is never asked.
+    func uploadPhoneLogIfDue(api: APIClient, now: Date = Date()) {
+        guard !phoneLogSending, let url = engine.config.diagnosticLogURL, let device = engine.settings.phoneInstallId else { return }
+        if let at = phoneLogSentAt, now.timeIntervalSince(at) < Self.phoneLogInterval { return }
+        let settings = engine.settings
+        let lines = PhoneLogTail.lines(at: url, after: settings.phoneLogCursor)
+        guard let last = lines.last?.at else { return }
+        phoneLogSending = true
+        phoneLogSentAt = now
+        let version = engine.config.appVersion
+        Task {
+            let ok = (try? await api.putPhoneLog(deviceId: "phone-\(device)", appVersion: version, lines: lines)) != nil
+            if ok { settings.phoneLogCursor = last }
+            phoneLogSending = false
+        }
+    }
+
     public func refreshServer() async {
         #if DEBUG
         if debugServerFixture { serverStatusAt = Date(); return }
@@ -221,6 +246,7 @@ public final class AppModel {
         serverStatusAt = Date()
         engine.noteServerWatchAAC(status.features?.contains("watch_aac") == true, generation: config.generation)
         rememberValueNotesScope(config)
+        if status.supportsPhoneLog { uploadPhoneLogIfDue(api: api) }
         let epoch = cacheEpoch
         guard data == dataEpoch else { return }  // a vault change just reset everything
         async let issuesTask: [ServerIssue]? = status.supportsIssues ? try? api.issues() : []

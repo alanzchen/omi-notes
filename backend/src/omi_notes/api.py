@@ -17,7 +17,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.requests import ClientDisconnect
 
-from . import PROTOCOL_VERSION, __version__, operations, priority, recording, search, views, watch_perf
+from . import PROTOCOL_VERSION, __version__, operations, phone_log, priority, recording, search, views, watch_perf
 from .audio import aac
 from .envelope import MAX_BODY_BYTES
 from .ingest import ApiError, Ingest, capture_status
@@ -182,7 +182,7 @@ def create_app(
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes
-            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star", "watch_performance"] + (["watch_aac"] if aac.available() else []),
+            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star", "watch_performance", "phone_log"] + (["watch_aac"] if aac.available() else []),
             "vault_id": vault.vault_id,
         }
 
@@ -212,6 +212,16 @@ def create_app(
         raw = await read_json(request)
         status_code, payload = await run_in_threadpool(ingest.put_event, event_id, raw)
         return JSONResponse(payload, status_code=status_code)
+
+    @app.put("/v1/diagnostics/phone-log")
+    async def put_phone_log(request: Request) -> dict:
+        """The phone's diagnostic log tail, appended beside the server log (not the vault)."""
+        raw = await read_body(request, 64 * 1024)
+        try:
+            stored = await run_in_threadpool(phone_log.append, settings.logs_dir, json.loads(raw))
+        except (ValueError, phone_log.PhoneLogError) as e:
+            raise ApiError(422, "invalid_log", str(e)) from e
+        return {"stored": stored}
 
     @app.get("/v1/watch/performance")
     def watch_performance(days: int = 14) -> dict:

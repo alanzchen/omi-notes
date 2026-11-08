@@ -1,4 +1,5 @@
 import Foundation
+import OmiProtocol
 import os
 #if canImport(Darwin)
 import Darwin
@@ -26,8 +27,49 @@ public final class OmiLog: @unchecked Sendable {
     private let capacity = 1500
     private let logger = Logger(subsystem: "omi-notes", category: "app")
     private var secrets: [String] = []
+    private var persistURL: URL?
+    private let fileLock = NSLock()
 
     public init() {}
+
+    /// Also keeps diagnostic lines (`isDiagnostic`) in a small rolling file, so a launch that ends
+    /// before anyone looks still leaves its lines for the phone-log upload. App only.
+    public func persist(to url: URL) {
+        lock.lock(); defer { lock.unlock() }
+        persistURL = url
+    }
+
+    /// What may leave the phone: upload, Watch, Bluetooth, Live Activity, engine and app lines, and
+    /// any warning or error. Note, transcript and audio content isn't logged in the first place.
+    public static func isDiagnostic(_ level: LogLine.Level, _ category: String) -> Bool {
+        level == .warning || level == .error || ["upload", "watch", "ble", "liveactivity", "app", "engine"].contains(category)
+    }
+
+    static let persistMaxBytes = 512_000
+
+    private func persistLine(_ line: LogLine, to url: URL) {
+        let record = PhoneLogLine(at: ISO8601UTC.format(line.date), level: line.level.rawValue, category: line.category,
+                                  message: String(line.message.prefix(300)))
+        guard var data = try? JSONEncoder().encode(record) else { return }
+        data.append(0x0A)
+        fileLock.lock(); defer { fileLock.unlock() }
+        guard let h = FileHandle(forWritingAtPath: url.path) else {
+            try? data.write(to: url, options: .atomic)
+            return
+        }
+        let end = (try? h.seekToEnd()) ?? 0
+        if end > UInt64(Self.persistMaxBytes) {  // keep the newer half
+            try? h.close()
+            if let all = try? Data(contentsOf: url) {
+                var tail = all.suffix(Self.persistMaxBytes / 2)
+                if let nl = tail.firstIndex(of: 0x0A) { tail = tail[(nl + 1)...] }
+                try? (Data(tail) + data).write(to: url, options: .atomic)
+            }
+            return
+        }
+        try? h.write(contentsOf: data)
+        try? h.close()
+    }
 
     /// Registers a secret (the server token) to be masked wherever it appears.
     public func registerSecret(_ secret: String?) {
@@ -47,7 +89,9 @@ public final class OmiLog: @unchecked Sendable {
         nextId += 1
         lines.append(line)
         if lines.count > capacity { lines.removeFirst(lines.count - capacity) }
+        let persistTo = persistURL
         lock.unlock()
+        if let persistTo, Self.isDiagnostic(level, category) { persistLine(line, to: persistTo) }
         switch level {
         case .debug: logger.debug("[\(category, privacy: .public)] \(text, privacy: .public)")
         case .info: logger.info("[\(category, privacy: .public)] \(text, privacy: .public)")
@@ -80,6 +124,38 @@ public final class OmiLog: @unchecked Sendable {
             }
         }
         return out
+    }
+}
+
+/// One persisted diagnostic line (also the phone-log upload's line shape).
+public struct PhoneLogLine: Codable, Sendable, Equatable {
+    public var at: String
+    public var level: String
+    public var category: String
+    public var message: String
+    public init(at: String, level: String, category: String, message: String) {
+        self.at = at
+        self.level = level
+        self.category = category
+        self.message = message
+    }
+}
+
+public enum PhoneLogTail {
+    /// Persisted lines newer than `after` (an `at` value), at most `limit` lines and about `maxBytes`,
+    /// keeping the newest when there are more.
+    public static func lines(at url: URL, after cursor: String?, limit: Int = 400, maxBytes: Int = 48_000) -> [PhoneLogLine] {
+        guard let data = try? Data(contentsOf: url) else { return [] }
+        let decoder = JSONDecoder()
+        var all = data.split(separator: 0x0A).compactMap { try? decoder.decode(PhoneLogLine.self, from: Data($0)) }
+        if let cursor { all = all.filter { $0.at > cursor } }
+        var out: [PhoneLogLine] = [], bytes = 0
+        for line in all.reversed() {
+            bytes += line.message.utf8.count + 64
+            guard out.count < limit, bytes <= maxBytes else { break }
+            out.append(line)
+        }
+        return out.reversed()
     }
 }
 

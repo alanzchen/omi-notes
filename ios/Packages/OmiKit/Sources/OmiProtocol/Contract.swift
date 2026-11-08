@@ -441,6 +441,8 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
     /// Value assessments, highlights and the owner's priority choice.
     public var supportsValueNotes: Bool { features?.contains("value_notes") == true }
     public var supportsSearch: Bool { features?.contains("search") == true }
+    /// Accepts the phone's diagnostic log tail (`PUT /v1/diagnostics/phone-log`).
+    public var supportsPhoneLog: Bool { features?.contains("phone_log") == true }
     /// Button code 3: a double tap stars the conversation it belongs to.
     public var supportsPendantStar: Bool { features?.contains("pendant_star") == true }
     public var supportsStats: Bool { features?.contains("stats") == true }

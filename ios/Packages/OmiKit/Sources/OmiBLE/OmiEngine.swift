@@ -121,6 +121,8 @@ public struct EngineConfiguration: Sendable {
     /// Test hook: a central backend (fake) instead of CoreBluetooth.
     public var testCentralBackend: (@Sendable (CentralBackendEvents) -> CentralBackend)?
     public var storagePolicy = StorageGuardPolicy()
+    /// Where the app keeps its rolling diagnostic log for the phone-log upload (nil: not kept; tests).
+    public var diagnosticLogURL: URL?
 
     public init(dirs: CaptureDirectories, clock: CaptureClock = SystemClock(), appVersion: String?, timezone: String? = TimeZone.current.identifier, simulatedTrace: SimulatedTrace? = nil, useCoreBluetooth: Bool = true, tickInterval: TimeInterval = 1) {
         self.dirs = dirs

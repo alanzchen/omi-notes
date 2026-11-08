@@ -90,6 +90,50 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
             .compactMap { (try? JSONSerialization.jsonObject(with: $0.body)) as? [String: String] }.compactMap { $0["request_id"] }
     }
 
+    /// The diagnostic log tail goes to a server that advertises `phone_log` (and only then), after the
+    /// last acknowledged line, at most every 5 minutes.
+    @Test func theDiagnosticLogGoesOnlyToAServerThatTakesIt() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let url = root.appendingPathComponent("diagnostic-log.jsonl")
+        let rows = (0..<3).map { PhoneLogLine(at: "2026-11-07T21:00:0\($0).000Z", level: "info", category: "upload", message: "line \($0)") }
+        try Data(rows.map { String(data: try JSONEncoder().encode($0), encoding: .utf8)! + "\n" }.joined().utf8).write(to: url)
+        func model(features: String) throws -> AppModel {
+            AppServerStub.reset()
+            AppServerStub.routes["/v1/status"] = [(200, #"{"ok":true,"vault_id":"vault-a","features":[\#(features)]}"#)]
+            AppServerStub.routes["/v1/conversations/recent"] = [(200, #"{"conversations":[],"next_cursor":null}"#)]
+            AppServerStub.routes["/v1/diagnostics/phone-log"] = [(200, #"{"stored":3}"#)]
+            let settings = SettingsStore(defaults: UserDefaults(suiteName: "omi-plog-\(UUID().uuidString)")!, tokens: InMemoryTokenStore())
+            try settings.setServer(url: URL(string: "https://mac.ts.net")!, token: "tok")
+            var config = EngineConfiguration(dirs: CaptureDirectories(root: root), appVersion: "t", useCoreBluetooth: false)
+            config.diagnosticLogURL = url
+            let m = AppModel(engine: OmiEngine(config: config, settings: settings, uploadTransport: CountingUploadTransport()),
+                             noteCache: NoteCache(root: root.appendingPathComponent("cache")))
+            let c = URLSessionConfiguration.ephemeral
+            c.protocolClasses = [AppServerStub.self]
+            m.session = URLSession(configuration: c)
+            return m
+        }
+        func logPuts() -> [Data] { AppServerStub.requests.filter { $0.path == "/v1/diagnostics/phone-log" }.map(\.body) }
+
+        let old = try model(features: #""issues""#)
+        await old.refreshServer()
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(logPuts().isEmpty, "an older server is never asked")
+
+        let m = try model(features: #""issues","phone_log""#)
+        await m.refreshServer()
+        for _ in 0..<40 where m.engine.settings.phoneLogCursor == nil { try await Task.sleep(for: .milliseconds(50)) }
+        let body = try #require(logPuts().first)
+        let sent = try #require(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+        #expect((sent["lines"] as? [[String: String]])?.map { $0["message"] } == ["line 0", "line 1", "line 2"])
+        #expect((sent["device_id"] as? String)?.hasPrefix("phone-") == true)
+        #expect(m.engine.settings.phoneLogCursor == rows[2].at)
+        await m.refreshServer()  // within 5 minutes: nothing more
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(logPuts().count == 1)
+    }
+
     @Test func aLostResponseIsAskedAgainWithTheSameRequestId() async throws {
         let (m, root) = try model()
         await m.refreshServer()

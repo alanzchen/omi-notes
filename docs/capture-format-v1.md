@@ -192,6 +192,19 @@ server (`features` contains `watch_performance`).
   discarded and the next batch reports the count in `dropped_batches`.
 - Callback counts are not hardware wake-ups, and the battery is the whole Watch's.
 
+### `PUT /v1/diagnostics/phone-log` (servers with `phone_log`)
+
+The phone's diagnostic log tail, so a stalled phone can be read on the server without a TestFlight
+log export. Body (JSON, at most 64 KB and 2,000 lines): `{"device_id": "phone-<install id>",
+"app_version": "0.1.0 (42)", "lines": [{"at": "<ISO-8601 UTC>", "level": "info"|"warning"|...,
+"category": "upload", "message": "..."}]}`. Answer `{"stored": n}`; 422 `invalid_log` for a malformed
+body. The phone sends only `upload`, `watch`, `ble`, `liveactivity`, `engine` and `app` lines plus any
+warning or error, with tokens and pairing secrets redacted and messages cut to 300 characters; lines
+after the last acknowledged one, at most 400 / ~48 KB per request and one request per 5 minutes, and
+only when `/v1/status` lists `phone_log` (an older server is never asked). The server appends one line
+per entry to `<logs dir>/phone/<device id>.log` (beside its own log, never in the vault), rotating
+at 5 MB to a single `.log.1`. Nothing in note processing reads it.
+
 ### `GET /v1/watch/performance?days=14`
 
 Per-recording summaries computed from stored samples (newest first, `days` 1–90), with

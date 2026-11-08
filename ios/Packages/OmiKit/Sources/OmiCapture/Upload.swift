@@ -876,6 +876,15 @@ public struct APIClient: Sendable {
         }
     }
 
+    /// The phone's diagnostic log tail (servers with `phone_log`).
+    public func putPhoneLog(deviceId: String, appVersion: String?, lines: [PhoneLogLine]) async throws -> Int {
+        struct Body: Encodable { let device_id: String; let app_version: String?; let lines: [PhoneLogLine] }
+        struct Stored: Decodable { let stored: Int }
+        let body = try JSONEncoder().encode(Body(device_id: deviceId, app_version: appVersion, lines: lines))
+        let r: Stored = try await send("PUT", "/v1/diagnostics/phone-log", body: body)
+        return r.stored
+    }
+
     public func healthz() async throws -> Bool {
         guard let url = endpoint.url("/healthz") else { throw APIError.notConfigured }
         let (_, resp) = try await session.data(from: url)
