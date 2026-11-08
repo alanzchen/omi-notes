@@ -146,7 +146,7 @@ import OmiCapture
         try out.add(segmentFile: b, segment: mb)
         try out.add(end: WatchRecordingEnd(recordingId: "r", deviceId: "watch-1", binding: "p", lastIndex: 1, endOffsetUs: 2_000_000, endedAt: Date(), reason: .userStopped))
         #expect(out.pendingCount == 3)
-        out.acknowledge([ma.id])
+        #expect(out.retire(receipts: [.init(id: ma.id, sha256: ma.sha256)]) == [ma.id])
         #expect(out.segments().map(\.segment.id) == [mb.id] && out.ends().count == 1, "only the acknowledged one is gone")
         // a relaunch sees the same pending state
         let again = WatchOutbox(root: root.appendingPathComponent("outbox"))
@@ -158,8 +158,50 @@ import OmiCapture
         let mc = manifest(c, recording: "r", index: 2, binding: "p", start: 2_000_000)
         try again.add(segmentFile: c, segment: mc)
         #expect(again.segments().map(\.segment.id) == [mb.id, mc.id] && again.manifestReads == 2, "kept current without rereading")
-        again.acknowledge([mb.id])
+        _ = again.retire(receipts: [.init(id: mb.id, sha256: mb.sha256)])
         #expect(again.segments().map(\.segment.id) == [mc.id] && WatchOutbox(root: root.appendingPathComponent("outbox")).segments().map(\.segment.id) == [mc.id])
+    }
+}
+
+/// ASTRA-IT8-01 (blocker): an audio part whose manifest is missing or unreadable wasn't in the readable
+/// index, so it looked like "not audio" and a plain ack (a build-42 phone's, say) unlinked its only copy.
+/// Plain acks now reach recording ends only; audio goes only on a receipt matching its own readable
+/// manifest's checksum; unknown or unreadable metadata keeps the audio.
+@Suite struct WatchStorageRetirementTests {
+    func outbox() throws -> (WatchOutbox, URL, WatchSegment, URL) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-wret-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let out = WatchOutbox(root: root.appendingPathComponent("outbox"))
+        let f = try WatchRelayTests.segmentFile(seconds: 1, in: root, name: "a")
+        let m = WatchRelayTests().manifest(f, recording: "r", index: 0, binding: "p", start: 0)
+        try out.add(segmentFile: f, segment: m)
+        return (out, root.appendingPathComponent("outbox/segments"), m, root)
+    }
+
+    @Test(arguments: ["missing", "broken"])
+    func aPlainAckNeverUnlinksAudioWhoseManifestIsGone(variant: String) throws {
+        let (_, dir, m, root) = try outbox()
+        let manifest = dir.appendingPathComponent("\(m.id).json"), audio = dir.appendingPathComponent("\(m.id).m4a")
+        if variant == "missing" { try FileManager.default.removeItem(at: manifest) } else { try Data("broken-json".utf8).write(to: manifest) }
+        let relaunched = WatchOutbox(root: root.appendingPathComponent("outbox"))  // reads the index again: the part isn't in it
+        #expect(relaunched.segments().isEmpty)
+        relaunched.acknowledgeEnds([m.id])                                       // a build-42 phone's plain ack
+        #expect(relaunched.retire(receipts: [.init(id: m.id, sha256: m.sha256)]).isEmpty, "no readable manifest: no proof")
+        #expect(FileManager.default.fileExists(atPath: audio.path), "the only copy stays")
+    }
+
+    @Test func onlyAMatchingReceiptRetiresAudioAndPlainAcksStillRetireEnds() throws {
+        let (out, dir, m, _) = try outbox()
+        let audio = dir.appendingPathComponent("\(m.id).m4a")
+        try out.add(end: WatchRecordingEnd(recordingId: "r", deviceId: "watch-1", binding: "p", lastIndex: 0, endOffsetUs: 1_000_000, endedAt: Date(), reason: .userStopped))
+        out.acknowledgeEnds([m.id])  // a plain ack for the audio part: nothing
+        #expect(out.retire(receipts: [.init(id: m.id, sha256: String(repeating: "0", count: 64))]).isEmpty, "other bytes: kept")
+        #expect(out.retire(receipts: [.init(id: "r-9", sha256: m.sha256)]).isEmpty, "other id: kept")
+        #expect(FileManager.default.fileExists(atPath: audio.path) && out.segments().count == 1)
+        #expect(out.retire(receipts: [.init(id: m.id, sha256: m.sha256)]) == [m.id])
+        #expect(!FileManager.default.fileExists(atPath: audio.path) && out.segments().isEmpty)
+        out.acknowledgeEnds(["r-end"])
+        #expect(out.ends().isEmpty, "recording ends still go on their plain ack")
     }
 }
 
@@ -317,13 +359,7 @@ import OmiCapture
         let question = WatchWire.inventoryQuestion(id: "q1", items: [item], binding: "phone-A")
         #expect(question[WatchWire.inventory] == nil, "no id-only list an older phone could answer by filename")
         #expect(WatchWire.inventoryItems(from: question[WatchWire.inventoryItems]) == [item] && question[WatchWire.inventoryId] as? String == "q1")
-        let held = ["rec-0": item.sha256, "rec-1": String(repeating: "b", count: 64)]
-        // an inventory answer with plain acks (the older phone's shape, or anything without checksums): nothing goes
-        #expect(WatchWire.retirable(acks: ["rec-0"], receipts: [], held: held).isEmpty)
-        // a checksum receipt for the Watch's own bytes: it goes; other bytes or an unknown part: kept
-        let receipts = [item, WatchInventoryItem(id: "rec-1", sha256: String(repeating: "c", count: 64)),
-                        WatchInventoryItem(id: "gone", sha256: item.sha256)]
-        #expect(WatchWire.retirable(acks: [], receipts: receipts, held: held) == ["rec-0"])
+        // what deletes audio, and what doesn't, is the storage layer's rule (WatchStorageRetirementTests)
     }
 
     /// ASTRA-IT4-02: a failed resend dropped its entry, the retry reused the same handover count, and a
@@ -347,15 +383,7 @@ import OmiCapture
     /// audio now goes only on a receipt naming its checksum; plain acks still retire ends and telemetry.
     @Test func plainAcksNeverRetireSegmentAudio() throws {
         let sha = String(repeating: "a", count: 64)
-        let held = ["rec-0": sha]  // segments on the Watch → their checksums
-        // a build-42 phone's ack (any of its early-return cases), or an older inventory answer: kept
-        #expect(WatchWire.retirable(acks: ["rec-0"], receipts: [], held: held).isEmpty)
-        // a receipt for other bytes: kept
-        #expect(WatchWire.retirable(acks: ["rec-0"], receipts: [.init(id: "rec-0", sha256: String(repeating: "b", count: 64))], held: held).isEmpty)
-        // a receipt for the Watch's own bytes: retired
-        #expect(WatchWire.retirable(acks: ["rec-0"], receipts: [.init(id: "rec-0", sha256: sha)], held: held) == ["rec-0"])
-        // recording ends and telemetry batches (not audio): plain acks retire them as before
-        #expect(WatchWire.retirable(acks: ["end-1", "perf-1"], receipts: [], held: held) == ["end-1", "perf-1"])
+        // (what deletes audio is the storage layer's rule: WatchStorageRetirementTests)
         // what a current phone sends after storing a part: the unchanged acks (an older Watch reads them)
         // plus a receipt with the part's checksum
         let fields = WatchWire.acknowledgement(ids: ["rec-0", "end-1"], receipts: [.init(id: "rec-0", sha256: sha)])

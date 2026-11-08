@@ -229,16 +229,18 @@ final class WatchSync: NSObject, WCSessionDelegate {
             binding = b
             UserDefaults.standard.set(b, forKey: "omi.phoneBinding")
         }
-        // audio goes only on a receipt naming this Watch's checksum (an older phone's plain ack keeps it,
-        // to be sent again later); recording ends and telemetry go on plain acks as before
-        let held = Dictionary(outbox.segments().map { ($0.segment.id, $0.segment.sha256) }, uniquingKeysWith: { a, _ in a })
-        let retire = WatchWire.retirable(acks: r.acks, receipts: r.receipts, held: held)
-        if !retire.isEmpty {
-            watchLog.info("iPhone acknowledged \(retire.count) item(s)")
-            outbox.acknowledge(retire)
-            perf.acknowledge(retire)
-            resend.acknowledged(retire)
-            count("acks", retire.count)
+        // audio goes only on a receipt matching the part's own manifest (the storage layer checks it);
+        // plain acks reach recording ends and telemetry only, never anything under segments/
+        let retired = outbox.retire(receipts: r.receipts)
+        let ends = outbox.acknowledgeEnds(r.acks)
+        perf.acknowledge(r.acks)
+        // done: what was removed, and plain acks for anything that holds no audio (telemetry batches);
+        // an audio part a plain ack named stays due for its normal resend
+        let done = retired + ends + r.acks.filter { !ends.contains($0) && !retired.contains($0) && !outbox.holdsAudio($0) }
+        if !done.isEmpty {
+            watchLog.info("iPhone acknowledged \(done.count) item(s)")
+            resend.acknowledged(done)
+            count("acks", done.count)
             lastAckAt = Date()
             UserDefaults.standard.set(lastAckAt, forKey: "omi.lastAckAt")
         }

@@ -133,17 +133,6 @@ public enum WatchWire {
         return fields
     }
 
-    /// The items a message lets the Watch delete. An audio part (in `held`: id → SHA-256 of the Watch's
-    /// copy) only on a receipt with that checksum (`receipts` or `inventory_acks`); a plain ack, from an
-    /// older phone or an older inventory answer, never deletes audio. Other items (recording ends,
-    /// telemetry batches) on their plain acks, as before.
-    public static func retirable(acks: [String], receipts: [WatchInventoryItem], held: [String: String]) -> [String] {
-        let proven = receipts.filter { held[$0.id] == $0.sha256 }.map(\.id)
-        let other = acks.filter { held[$0] == nil }
-        var seen = Set<String>()
-        return (proven + other).filter { seen.insert($0).inserted }
-    }
-
     public static func inventoryItems(_ items: [WatchInventoryItem]) -> [[String: String]] {
         items.map { ["id": $0.id, "sha256": $0.sha256] }
     }
@@ -297,17 +286,44 @@ public final class WatchOutbox: @unchecked Sendable {
         return Array((endIndex ?? [:]).values)
     }
 
-    /// The phone has these (segment or end ids): only now are they removed from the Watch.
-    public func acknowledge(_ ids: [String]) {
+    /// Plain acks (ids): they remove recording-end markers only, never anything under `segments/`.
+    /// Returns the ends removed.
+    @discardableResult
+    public func acknowledgeEnds(_ ids: [String]) -> [String] {
         lock.lock(); defer { lock.unlock() }
-        for id in ids {
-            for url in [segmentsDir.appendingPathComponent("\(id).m4a"), segmentsDir.appendingPathComponent("\(id).json"),
-                        endsDir.appendingPathComponent("\(id).json")] {
-                _ = try? FileManager.default.removeItem(at: url)
-            }
-            segmentIndex?[id] = nil
+        var removed: [String] = []
+        for id in ids where !id.contains("/") {
+            let url = endsDir.appendingPathComponent("\(id).json")
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            _ = try? FileManager.default.removeItem(at: url)
             endIndex?[id] = nil
+            removed.append(id)
         }
+        return removed
+    }
+
+    /// Checksum receipts from the phone: a part's audio and manifest go only when its own manifest,
+    /// read from disk now, names this id and this checksum. A missing or unreadable manifest, another
+    /// checksum or an unknown id keeps the audio. Returns the parts removed.
+    @discardableResult
+    public func retire(receipts: [WatchInventoryItem]) -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        var removed: [String] = []
+        for receipt in receipts where !receipt.id.contains("/") {
+            let manifest = segmentsDir.appendingPathComponent("\(receipt.id).json")
+            guard let s = WatchWire.decode(WatchSegment.self, try? Data(contentsOf: manifest)),
+                  s.id == receipt.id, s.sha256 == receipt.sha256 else { continue }
+            _ = try? FileManager.default.removeItem(at: segmentsDir.appendingPathComponent("\(receipt.id).m4a"))
+            _ = try? FileManager.default.removeItem(at: manifest)
+            segmentIndex?[receipt.id] = nil
+            removed.append(receipt.id)
+        }
+        return removed
+    }
+
+    /// Whether audio is still kept under this id (manifest readable or not).
+    public func holdsAudio(_ id: String) -> Bool {
+        !id.contains("/") && FileManager.default.fileExists(atPath: segmentsDir.appendingPathComponent("\(id).m4a").path)
     }
 
     public var pendingCount: Int { segments().count + ends().count }
