@@ -1,24 +1,25 @@
 #!/usr/bin/env bash
 # Archive a Release build of HEAD, sign each target with its existing App Store profile (manual
 # signing), export the IPA, check it, and with --upload send it to App Store Connect. Nothing is
-# created on Apple's side: the App IDs, the Apple Distribution certificate and the three profiles
+# created on Apple's side: the App IDs, the Apple Distribution certificate and the four profiles
 # must already exist and be installed.
 #
 #   TEAM_ID=ABCDE12345 OMI_BUILD_NUMBER=39 \
 #   OMI_IOS_PROFILE='Omi Notes App Store' \
 #   OMI_WATCH_PROFILE='Omi Notes Watch App Store' \
 #   OMI_COMPLICATION_PROFILE='Omi Notes Watch Complication App Store' \
+#   OMI_LIVE_ACTIVITY_PROFILE='Omi Notes Live Activity App Store' \
 #   ios/Tools/testflight.sh [--upload]
 #
-# Optional: OMI_APP_BUNDLE_ID and OMI_MARKETING_VERSION (default: Config/Base.xcconfig; the Watch app
-# and complication derive their ids from the bundle id), SIGNING_CERTIFICATE (SHA-1 of the Apple
+# Optional: OMI_APP_BUNDLE_ID and OMI_MARKETING_VERSION (default: Config/Base.xcconfig; the Watch app,
+# complication and Live Activity derive their ids from the bundle id), SIGNING_CERTIFICATE (SHA-1 of the Apple
 # Distribution identity; default: the only one installed), OMI_RELEASE_DIR (default:
 # build/testflight-ready/OmiNotes-<version>-<build>). --upload needs ASC_KEY_ID and ASC_ISSUER_ID
 # with ~/.appstoreconnect/private_keys/AuthKey_<ASC_KEY_ID>.p8. An upload doesn't reach testers by
 # itself: add the processed build to a TestFlight group afterwards.
 #
 # The build comes from a clean copy of the committed tree, so a personal Config/Local.xcconfig and
-# uncommitted changes never reach it. The Live Activity is left out of Release builds (project.yml).
+# uncommitted changes never reach it.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
@@ -31,6 +32,7 @@ UPLOAD=no
 : "${OMI_IOS_PROFILE:?set OMI_IOS_PROFILE (App Store profile of the app)}"
 : "${OMI_WATCH_PROFILE:?set OMI_WATCH_PROFILE (App Store profile of the Watch app)}"
 : "${OMI_COMPLICATION_PROFILE:?set OMI_COMPLICATION_PROFILE (App Store profile of the complication)}"
+: "${OMI_LIVE_ACTIVITY_PROFILE:?set OMI_LIVE_ACTIVITY_PROFILE (App Store profile of the Live Activity)}"
 base() { sed -nE "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*([^[:space:]/]+).*/\1/p" ios/Config/Base.xcconfig | tail -1; }
 BUNDLE_ID=${OMI_APP_BUNDLE_ID:-$(base OMI_APP_BUNDLE_ID)}
 VERSION=${OMI_MARKETING_VERSION:-$(base MARKETING_VERSION)}
@@ -58,7 +60,7 @@ xcodebuild archive \
     MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$OMI_BUILD_NUMBER" \
     CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="Apple Distribution" \
     OMI_IOS_PROFILE="$OMI_IOS_PROFILE" OMI_WATCH_PROFILE="$OMI_WATCH_PROFILE" \
-    OMI_COMPLICATION_PROFILE="$OMI_COMPLICATION_PROFILE" \
+    OMI_COMPLICATION_PROFILE="$OMI_COMPLICATION_PROFILE" OMI_LIVE_ACTIVITY_PROFILE="$OMI_LIVE_ACTIVITY_PROFILE" \
     > "$REL/archive.log" 2>&1 || { tail -30 "$REL/archive.log" >&2; exit 1; }
 
 cat > "$REL/ExportOptions.plist" <<EOF
@@ -78,6 +80,7 @@ cat > "$REL/ExportOptions.plist" <<EOF
         <key>${BUNDLE_ID}</key><string>${OMI_IOS_PROFILE}</string>
         <key>${BUNDLE_ID}.watchkitapp</key><string>${OMI_WATCH_PROFILE}</string>
         <key>${BUNDLE_ID}.watchkitapp.widgets</key><string>${OMI_COMPLICATION_PROFILE}</string>
+        <key>${BUNDLE_ID}.liveactivity</key><string>${OMI_LIVE_ACTIVITY_PROFILE}</string>
     </dict>
 </dict>
 </plist>
@@ -85,7 +88,7 @@ EOF
 xcodebuild -exportArchive -archivePath "$REL/OmiNotes.xcarchive" -exportPath "$REL/export" \
     -exportOptionsPlist "$REL/ExportOptions.plist" > "$REL/export.log" 2>&1 || { tail -30 "$REL/export.log" >&2; exit 1; }
 
-# The IPA: version, the three signed bundles and their ids, and no Live Activity.
+# The IPA: version, the four signed bundles and their ids, and the Live Activity declared.
 IPA="$REL/export/OmiNotes.ipa"
 rm -rf "$REL/ipa-check" && mkdir -p "$REL/ipa-check" && unzip -q "$IPA" -d "$REL/ipa-check"
 APP="$REL/ipa-check/Payload/OmiNotes.app"
@@ -95,12 +98,13 @@ check "app version" "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionSt
 check "app id" "$(id "$APP")" "$BUNDLE_ID"
 check "Watch app id" "$(id "$APP/Watch/OmiNotesWatch.app")" "$BUNDLE_ID.watchkitapp"
 check "complication id" "$(id "$APP/Watch/OmiNotesWatch.app/PlugIns/OmiNotesComplication.appex")" "$BUNDLE_ID.watchkitapp.widgets"
-[[ ! -e $APP/PlugIns/OmiNotesLiveActivity.appex ]] || { echo "IPA check failed: the Live Activity is embedded" >&2; exit 1; }
-for b in "$APP" "$APP/Watch/OmiNotesWatch.app" "$APP/Watch/OmiNotesWatch.app/PlugIns/OmiNotesComplication.appex"; do
+check "Live Activity id" "$(id "$APP/PlugIns/OmiNotesLiveActivity.appex")" "$BUNDLE_ID.liveactivity"
+check "NSSupportsLiveActivities" "$(/usr/libexec/PlistBuddy -c 'Print :NSSupportsLiveActivities' "$APP/Info.plist")" "true"
+for b in "$APP" "$APP/Watch/OmiNotesWatch.app" "$APP/Watch/OmiNotesWatch.app/PlugIns/OmiNotesComplication.appex" "$APP/PlugIns/OmiNotesLiveActivity.appex"; do
     codesign --verify --deep --strict "$b" || { echo "IPA check failed: signature of $b" >&2; exit 1; }
 done
 shasum -a 256 "$IPA" | tee "$REL/ipa-sha256.txt"
-echo "IPA checked: $VERSION ($OMI_BUILD_NUMBER), app + Watch app + complication signed, no Live Activity."
+echo "IPA checked: $VERSION ($OMI_BUILD_NUMBER), app + Watch app + complication + Live Activity signed."
 
 if [[ $UPLOAD == yes ]]; then
     : "${ASC_KEY_ID:?set ASC_KEY_ID}"; : "${ASC_ISSUER_ID:?set ASC_ISSUER_ID}"

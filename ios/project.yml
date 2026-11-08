@@ -53,11 +53,11 @@ targets:
         PROVISIONING_PROFILE_SPECIFIER: $(OMI_IOS_PROFILE)
       configs:
         Debug:
-          # The sync Live Activity ships only in Debug until it has its own App ID and has passed
-          # Lock Screen acceptance; Release builds leave out the extension and this key.
+          # OMI_LIVE_ACTIVITY declares NSSupportsLiveActivities (the extension is embedded in both
+          # configurations); without it the app never touches ActivityKit (SyncActivityAvailability).
           INFOPLIST_PREPROCESSOR_DEFINITIONS: OMI_ALLOW_LOCAL_HTTP=1 OMI_LIVE_ACTIVITY=1
         Release:
-          EXCLUDED_SOURCE_FILE_NAMES: OmiNotesLiveActivity.appex  # not embedded
+          INFOPLIST_PREPROCESSOR_DEFINITIONS: OMI_LIVE_ACTIVITY=1
   OmiNotesWatch:
     type: application
     platform: watchOS
@@ -142,7 +142,7 @@ targets:
       - sdk: ActivityKit.framework
     settings:
       base:
-        # needs its own registered App ID and App Store profile before a release (not yet registered)
+        # registered App ID (Omi Notes Live Activity); App Store profile via OMI_LIVE_ACTIVITY_PROFILE
         PRODUCT_BUNDLE_IDENTIFIER: $(OMI_APP_BUNDLE_ID).liveactivity
         PRODUCT_NAME: OmiNotesLiveActivity
         INFOPLIST_FILE: OmiNotesLiveActivity/Info.plist
@@ -152,10 +152,6 @@ targets:
         APPLICATION_EXTENSION_API_ONLY: YES
         TARGETED_DEVICE_FAMILY: "1"
         PROVISIONING_PROFILE_SPECIFIER: $(OMI_LIVE_ACTIVITY_PROFILE)
-      configs:
-        # not shipped yet (see the app's Release settings): built unsigned there and not embedded
-        Release:
-          CODE_SIGNING_ALLOWED: NO
 schemes:
   OmiNotes:
     build:

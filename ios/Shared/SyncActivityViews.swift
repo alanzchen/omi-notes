@@ -47,27 +47,29 @@ struct SyncStageIcon: View {
 struct SyncLines: View {
     let state: SyncActivityState
     let stale: Bool
+    /// The expanded Dynamic Island's bottom region: its trailing region already shows the rate, and its
+    /// height is limited, so no rate line and one line each for the batch and the detail.
     var compact = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             if let q = SyncWords.queued(state) { Text("iPhone → server: \(q)").font(.caption).lineLimit(1).minimumScaleFactor(0.75) }
-            if !stale, let r = state.rate { Text("Sending now at \(SyncWords.rate(r))").font(.caption).foregroundStyle(SyncPalette.secondary) }
+            if !stale, !compact, let r = state.rate { Text("Sending now at \(SyncWords.rate(r))").font(.caption).foregroundStyle(SyncPalette.secondary) }
             if !stale, let batch = SyncWords.batch(state) {
                 if let f = batch.fraction {
                     ProgressView(value: f) { Text(batch.text).font(.caption2) }.tint(SyncPalette.ink).frame(maxWidth: .infinity)
                 } else {
-                    Text(batch.text).font(.caption2).foregroundStyle(SyncPalette.secondary).lineLimit(2)
+                    Text(batch.text).font(.caption2).foregroundStyle(SyncPalette.secondary).lineLimit(compact ? 1 : 2)
                 }
             }
             if let w = state.watchWaitingSeconds, w > 0 {
                 Text("Watch: \(SyncWords.duration(Double(w))) waiting\(state.watchReportAt.map { " · reported \($0.formatted(date: .omitted, time: .shortened))" } ?? "")")
                     .font(.caption).foregroundStyle(SyncPalette.secondary).lineLimit(1).minimumScaleFactor(0.75)
             }
-            if let d = state.detail { Text(d).font(.caption).foregroundStyle(SyncPalette.secondary).lineLimit(2) }
+            if let d = state.detail { Text(d).font(.caption).foregroundStyle(SyncPalette.secondary).lineLimit(compact ? 1 : 2) }
             if stale {
-                Text("As of \(state.asOf.formatted(date: .omitted, time: .shortened)) · open Omi Notes to update")
-                    .font(.caption2).foregroundStyle(SyncPalette.secondary)
+                Text("As of \(state.asOf.formatted(date: .omitted, time: .shortened))\(compact ? "" : " · open Omi Notes to update")")
+                    .font(.caption2).foregroundStyle(SyncPalette.secondary).lineLimit(1)
             }
         }
     }
