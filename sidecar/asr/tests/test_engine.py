@@ -76,3 +76,27 @@ def test_a_window_where_moss_found_no_lines_keeps_qwens_text_under_one_flagged_l
 def test_the_language_is_a_plain_name_even_though_qwen_reports_a_list():
     e, _ = engine([{"start": 0.0, "end": 30.0, "speaker_id": "S01", "text": "x"}])
     assert e.transcribe(speech(30), [])["language"] == "English"
+
+
+class SplittingMoss:
+    """Truncated on anything over 150 s (the token cap is hit); one speaker per half otherwise."""
+
+    def generate(self, audio, max_tokens):
+        seconds = audio.shape[0] / SR
+        if seconds > 150:
+            return SimpleNamespace(segments=[{"start": 0.0, "end": 10.0, "speaker_id": "S01", "text": "x"}],
+                                   generation_tokens=max_tokens, prompt_tokens=10)  # fmt: skip
+        return SimpleNamespace(segments=[{"start": 0.0, "end": seconds - 1, "speaker_id": "S01", "text": "x"}],
+                               generation_tokens=100, prompt_tokens=10)  # fmt: skip
+
+
+def test_the_windows_moss_ran_on_are_reported_with_their_label_prefixes():
+    e = Engine()
+    e.models = (SplittingMoss(), FakeQwen(), FakeAligner())
+    out = e.transcribe(speech(200), [])
+    assert out["omi_asr"]["resplits"] == 1
+    windows = out["windows"]
+    assert [w["label_prefix"] for w in windows] == ["", "W1.2-"]
+    assert windows[0]["start"] == 0.0 and windows[-1]["end"] == pytest.approx(200, abs=0.01)
+    assert windows[0]["end"] == windows[1]["start"]
+    assert {s["speaker_id"] for s in out["segments"]} == {"S01", "W1.2-S01"}

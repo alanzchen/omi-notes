@@ -22,7 +22,8 @@ A loopback-only service that transcribes with diarization on this Mac (MLX). It 
   optional `context` (comma- or newline-separated terms; `prompt` is accepted as an alias), plus
   `model`, `language`, `response_format` and `max_tokens`. Those last four are accepted and ignored.
   - It answers `{text, language, duration, segments: [{start, end, speaker_id, text}], omi_asr: {…stats}}`,
-    the shape Omi's `openai_diarized` style reads.
+    the shape Omi's `openai_diarized` style reads, plus `windows: [{start, end, label_prefix}]`: where MOSS ran
+    (labels restart in each; the backend links them by voice).
   - Speaker ids are per request.
 - `GET /health` answers `{ok, version, models_loaded}`.
   - Models load on the first request (about 10 s) and are released after

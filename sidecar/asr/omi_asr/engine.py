@@ -72,7 +72,8 @@ class Engine:
     # -- pipeline --------------------------------------------------------------------------------
 
     def transcribe(self, pcm: np.ndarray, context: list[str]) -> dict:
-        """16 kHz float32 mono → {text, language, duration, segments[{start, end, speaker_id, text}], omi_asr}."""
+        """16 kHz float32 mono → {text, language, duration, segments[{start, end, speaker_id, text}],
+        windows[{start, end, label_prefix}], omi_asr}."""
         with self.lock:
             import mlx.core as mx
 
@@ -84,9 +85,11 @@ class Engine:
                      "qwen_capped": 0, "units": 0, "units_outside_lines": 0, "lines_with_moss_text": 0}  # fmt: skip
             lines: list[dict] = []
             languages: list[str] = []
+            windows: list[dict] = []  # where MOSS ran: its labels restart in each (the backend links them by voice)
             for k, (a, b) in enumerate(plan.plan_windows(pcm)):
                 for sub, (lines_w, start, stop) in enumerate(self._moss(moss, pcm, a, b, 0, stats)):
                     prefix = "" if (k, sub) == (0, 0) else f"W{k + 1}.{sub + 1}-"
+                    windows.append({"start": round(start, 3), "end": round(stop, 3), "label_prefix": prefix})
                     for line in lines_w:
                         line["speaker"] = prefix + line["speaker"]
                     lines.extend(self._text(qwen, aligner, pcm, start, stop, lines_w, context, stats, languages, prefix))
@@ -100,6 +103,7 @@ class Engine:
                 "language": max(set(languages), key=languages.count) if languages else None,
                 "duration": round(duration, 3),
                 "segments": segments,
+                "windows": windows,
                 "omi_asr": dict(stats, seconds=round(t_total, 2), rtf=round(t_total / max(duration, 1e-6), 4),
                                 peak_mlx_gb=round(mx.get_peak_memory() / 1e9, 2), load_seconds=self.load_seconds),  # fmt: skip
             }

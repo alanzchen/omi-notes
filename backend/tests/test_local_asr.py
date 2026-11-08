@@ -195,3 +195,31 @@ def test_a_conversation_from_the_sidecar_keeps_its_transcript_while_the_sidecar_
 def test_a_long_piece_gets_a_bounded_timeout_not_an_hour():
     stt, _ = sidecar()
     assert stt._client.timeout.read <= 1200
+
+
+def test_labels_of_a_moss_resplit_inside_one_request_are_linked_by_voice():
+    # one request; MOSS was re-split at 20 s and its labels restarted: S01/S02 then W1.2-S01/W1.2-S02,
+    # with the numbering swapped in the second half
+    pcm = np.concatenate([voice(10, ALAN, 1), voice(10, PRIYA, 2), voice(10, PRIYA, 3), voice(10, ALAN, 4)])
+
+    def handler(request, n):
+        return httpx.Response(200, json={
+            "language": "English", "duration": 40.0,
+            "windows": [{"start": 0.0, "end": 20.0, "label_prefix": ""}, {"start": 20.0, "end": 40.0, "label_prefix": "W1.2-"}],
+            "segments": [{"start": 0.5, "end": 9.5, "speaker_id": "S01", "text": "alan one"},
+                         {"start": 10.5, "end": 19.5, "speaker_id": "S02", "text": "priya one"},
+                         {"start": 20.5, "end": 29.5, "speaker_id": "W1.2-S01", "text": "priya two"},
+                         {"start": 30.5, "end": 39.5, "speaker_id": "W1.2-S02", "text": "alan two"}]})  # fmt: skip
+
+    stt, _ = sidecar(handler)
+    buf = io.BytesIO()
+    sf.write(buf, pcm, SR, format="FLAC")
+    from omi_notes.providers import SttRequest
+
+    response = stt.transcribe(SttRequest(flac=buf.getvalue(), duration=40.0, blocks=[(0.0, 40.0)], language="en", keyterms=[]))
+    utterances = response["results"]["utterances"]
+    assert [round(u["start"], 1) for u in utterances] == [0.5, 10.5, 20.5, 30.5], "times stay where they were"
+    assert response["omi_notes"]["pieces"] == 2
+    linked = link(response, pcm, FakeEmbedder())
+    speakers = [u["speaker"] for u in linked["results"]["utterances"]]
+    assert speakers[0] == speakers[3] and speakers[1] == speakers[2] and speakers[0] != speakers[1]

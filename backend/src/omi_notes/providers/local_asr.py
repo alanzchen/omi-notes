@@ -6,8 +6,10 @@ generic OpenAI-compatible server, all deliberate (asr-bench-20261108):
   truncated window itself), never per-speaker 30 s windows;
 - no `language` hint (mixed Mandarin/English) and no `prompt` (a MOSS prompt replaces its instruction);
   the keyterms go as `context`, which the sidecar gives Qwen as hotwords;
-- its labels restart in every piece: the pipeline links them across pieces with voiceprints
-  (`pipeline.speaker_links`) and uses them as the provider's labels.
+- its labels restart in every piece, and inside a piece in every window MOSS was re-split into (the
+  answer's `windows`, label prefixes `W<k>.<n>-`): each such window becomes a piece of its own here, so
+  the pipeline links them all with voiceprints (`pipeline.speaker_links`) and uses them as the
+  provider's labels.
 A 900 s piece takes about 80 s (RTF 0.09, plus ~10 s to load the models); the 20 min timeout leaves room
 for MOSS re-splitting a truncated window without letting a hung sidecar hold the worker for an hour.
 `healthy()` asks `/health` (cached 30 s): while the sidecar is down, the pipeline uses the configured
@@ -21,7 +23,7 @@ import time
 import httpx
 
 from . import SttRequest
-from .openai_stt import OpenAICompatStt
+from .openai_stt import OpenAICompatStt, _TooLarge, normalize_response, pad_short
 
 
 class LocalAsrStt(OpenAICompatStt):
@@ -45,6 +47,27 @@ class LocalAsrStt(OpenAICompatStt):
         if request.keyterms:
             fields["context"] = ", ".join(request.keyterms)
         return fields
+
+    def _transcribe_part(self, offset: float, part: SttRequest) -> list[tuple[float, dict]]:
+        try:
+            data = self._post(pad_short(part))
+        except _TooLarge:  # the generic path halves it
+            return super()._transcribe_part(offset, part)
+        windows = sorted(data.get("windows") or [], key=lambda w: float(w["start"]))
+        if len(windows) < 2:
+            return [(offset, normalize_response(data))]
+        # each segment belongs to the window whose label prefix it carries (the first window's is empty)
+        groups: dict[int, list[dict]] = {}
+        for seg in data.get("segments") or []:
+            label = str(seg.get("speaker_id") or "")
+            k = next((i for i, w in enumerate(windows) if w.get("label_prefix") and label.startswith(w["label_prefix"])), 0)
+            groups.setdefault(k, []).append(seg)
+        out = []
+        for k, segments in sorted(groups.items()):
+            start = float(windows[k]["start"])
+            shifted = [dict(seg, start=float(seg["start"]) - start, end=float(seg["end"]) - start) for seg in segments]
+            out.append((offset + start, normalize_response(dict(data, segments=shifted))))
+        return out
 
     def healthy(self) -> bool:
         now = time.monotonic()
