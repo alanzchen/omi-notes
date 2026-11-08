@@ -277,7 +277,9 @@ class ConversationPipeline:
         self._move_retries: dict[str, tuple[int, float]] = {}
         self._status_written: tuple[float, str] | None = None
         self._stub_written: dict[str, float] = {}
-        self._engine_deaths: dict[str, int] = {}
+        self._engine_deaths: dict[tuple[str, str], tuple[int, float]] = {}  # (conversation, audio) -> (counted, last)
+        self._last_local_success = 0.0
+        self._deaths_in_a_row = 0
 
     # -- paths / days ----------------------------------------------------------------------------
 
@@ -399,6 +401,8 @@ class ConversationPipeline:
         (`skip_stt`/`skip_llm`), so it writes new result files; the old ones are removed once no
         record references them. The compare-and-swap on the counter means a request arriving
         meanwhile is never lost: it is applied too, or left pending for the next pass."""
+        for key in [k for k in self._engine_deaths if k[0] == row["id"]]:  # an explicit retry starts the count over
+            del self._engine_deaths[key]
         while True:
             if row["enrollment_id"]:  # a voice-enrollment reading is never transcribed: nothing to redo
                 cur = self.db.execute(
@@ -567,12 +571,17 @@ class ConversationPipeline:
                     # the sidecar went away mid-request: wait for it like any other conversation, unless this
                     # very audio has taken it down again and again (then it is this conversation's failure)
                     if linking and not exc.terminal and not stt.healthy(refresh=True):
-                        self._engine_deaths[conv_id] = self._engine_deaths.get(conv_id, 0) + 1
-                        if self._engine_deaths[conv_id] < ENGINE_DEATHS_MAX:
+                        if self._engine_died(conv_id, audio_sha, now) < ENGINE_DEATHS_MAX:
                             raise ProviderError(LOCAL_STT_DOWN, kind="stt_unavailable", waiting=True) from exc
-                        log.error("conversation %s: the sidecar failed on its audio %d times", conv_id, self._engine_deaths[conv_id])
+                        log.error("conversation %s: the sidecar failed on its audio %d times while it worked for others",
+                                  conv_id, ENGINE_DEATHS_MAX)  # fmt: skip
                     raise
-                self._engine_deaths.pop(conv_id, None)
+                if linking:
+                    self._engine_deaths.pop((conv_id, audio_sha), None)
+                    if self._deaths_in_a_row >= ENGINE_DEATHS_MAX:  # it was alerted as failing: say it works again
+                        Vault.write_json(self.settings.logs_dir / "alerts" / "local-transcription.json",
+                                         {"state": "recovered", "recovered_at": iso_utc_epoch(now), "url": self.settings.stt_local_url})  # fmt: skip
+                    self._last_local_success, self._deaths_in_a_row = now, 0
             cached = {"created_at": now, "provider": stt.name, "model": stt.model, "response": response}
             atomic_write_bytes(path, json.dumps(cached).encode())
         if unlabeled:
@@ -588,9 +597,10 @@ class ConversationPipeline:
             links = path.with_name(f"links-v{LINKS_FORMAT}-{path.name}")
             if links.exists():  # decided once per STT result: a re-run never re-links against other voices
                 response = json.loads(links.read_text())
-            elif self.providers.embedder is not None:
-                response = link_speakers(response, audio.pcm, self.providers.embedder,
-                                         background=self._background_voice(conv_id, self.providers.embedder))  # fmt: skip
+            else:  # stored even unlinked (no voice model): installing one later must not change who spoke
+                if self.providers.embedder is not None:
+                    response = link_speakers(response, audio.pcm, self.providers.embedder,
+                                             background=self._background_voice(conv_id, self.providers.embedder))  # fmt: skip
                 atomic_write_bytes(links, json.dumps(response).encode())
             # its labels are the transcript's labels (local diarization would only blur its real turns)
             speakers = self._speakers(conv_id, response, audio, audio_sha, mode="provider")
@@ -801,6 +811,24 @@ class ConversationPipeline:
 
     def voice_names(self, conv_id: str) -> dict[str, tuple[str, bool]]:
         return {label: (v["name"], v["me"]) for label, v in self.speakers.names(conv_id).items()}
+
+    def _engine_died(self, conv_id: str, audio_sha: str, now: float) -> int:
+        """Record that the sidecar died on this audio; returns how many such deaths count against it. A death
+        counts only if the engine has transcribed something else since this audio's previous one: an engine
+        that fails on everything is an outage (alerted, conversations wait), not the conversation's fault."""
+        counted, last = self._engine_deaths.get((conv_id, audio_sha), (0, 0.0))
+        if self._last_local_success > last:
+            counted += 1
+        self._engine_deaths[(conv_id, audio_sha)] = (counted, now)
+        self._deaths_in_a_row += 1
+        if self._deaths_in_a_row >= ENGINE_DEATHS_MAX:
+            alert = self.settings.logs_dir / "alerts" / "local-transcription.json"
+            alert.parent.mkdir(parents=True, exist_ok=True)
+            log.error("the local transcription engine failed %d times in a row with no success between", self._deaths_in_a_row)
+            Vault.write_json(alert, {"state": "failing", "failures_in_a_row": self._deaths_in_a_row, "at": iso_utc_epoch(now),
+                                     "url": self.settings.stt_local_url,
+                                     "check": "~/Library/Logs/omi-notes-asr.log (engine failed)"})  # fmt: skip
+        return counted
 
     def watch_local_stt(self, now: float) -> None:
         """Health of the local sidecar, kept in the index for the API: when it went down, and once it has

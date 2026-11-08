@@ -360,9 +360,32 @@ def test_audio_that_keeps_killing_the_sidecar_stops_waiting_and_counts_attempts(
     replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
     for k in range(6):
         state["down"] = False
+        worker.pipeline._last_local_success = 1e18  # other conversations are transcribed fine in between
         worker.tick(T0 + 400 + 120 * k)
     (row,) = convs(worker)
     assert row["attempts"] >= 1, "after a few engine deaths on the same audio it is this conversation's problem"
+
+
+def test_an_engine_that_fails_on_everything_is_an_outage_not_this_conversations_failure(client, worker, settings):
+    state = {"down": False}
+
+    def transport(request):
+        if request.url.path == "/health":
+            return httpx.Response(503 if state["down"] else 200, json={})
+        state["down"] = True
+        return httpx.Response(503, json={"detail": "transcription engine failed"})
+
+    stt = LocalAsrStt("http://127.0.0.1:18793/v1", transport=httpx.MockTransport(transport))
+    stt.HEALTH_TTL = 0.0
+    worker.providers._local_stt = stt
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    for k in range(6):  # nothing succeeds anywhere in between
+        state["down"] = False
+        worker.tick(T0 + 400 + 120 * k)
+    (row,) = convs(worker)
+    assert row["attempts"] == 0 and row["error_kind"] == "stt_unavailable"
+    alert = json.loads((settings.logs_dir / "alerts" / "local-transcription.json").read_text())
+    assert alert["state"] == "failing"
 
 
 def test_a_rerun_keeps_the_speaker_links_it_made_even_if_other_voices_changed(client, worker):
@@ -392,3 +415,13 @@ def test_stale_health_reads_as_unknown(worker, settings):
     worker.pipeline.watch_local_stt(T0)
     assert views.local_transcription(worker.db, configured, T0 + 10)["available"] is True
     assert views.local_transcription(worker.db, configured, T0 + 600)["available"] is None, "nobody has looked for 10 min"
+
+
+def test_without_a_voice_model_the_unlinked_result_is_kept_too(client, worker):
+    stt, _ = sidecar(moss_like, max_seconds=5)
+    worker.providers._local_stt = stt
+    worker.providers._embedder = False
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(12, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    assert list(worker.pipeline.conv_dir(row["id"]).glob("links-v1-*.json")), "installing a model later must not relink it"
