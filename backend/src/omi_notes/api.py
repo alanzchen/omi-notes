@@ -182,7 +182,7 @@ def create_app(
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes
-            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star", "watch_performance", "phone_log"] + (["watch_aac"] if aac.available() else []),
+            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star", "watch_performance", "phone_log", "dismiss"] + (["watch_aac"] if aac.available() else []),
             "vault_id": vault.vault_id,
         }
 
@@ -312,6 +312,18 @@ def create_app(
             operations.accept, pipeline, conv_id, body.get("request_id"), read_only=read_only_reason(db)
         )
         return JSONResponse({"operation": op}, status_code=status_code)
+
+    @app.post("/v1/conversations/{conv_id}/dismiss")
+    async def dismiss(conv_id: str, request: Request) -> JSONResponse:
+        """Set a failed conversation aside from the phone (a durable decision; docs/vault.md, "Operations")."""
+        body = await read_json(request)
+        if not isinstance(body, dict):
+            raise ApiError(422, "invalid_body", "expected a JSON object")
+        pipeline = app.state.speakers.pipeline
+        status_code, payload = await run_in_threadpool(
+            operations.dismiss, pipeline, conv_id, body.get("request_id"), read_only=read_only_reason(db)
+        )
+        return JSONResponse(payload, status_code=status_code)
 
     @app.post("/v1/conversations/{conv_id}/keep")
     async def keep(conv_id: str, request: Request) -> JSONResponse:

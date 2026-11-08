@@ -208,6 +208,7 @@ struct IssueRow: View {
                 } else if model.canRetry, issue.canRetryFromPhone {
                     RetryControl(model: model, conversationId: id)
                 }
+                if model.canDismiss, issue.canDismissFromPhone { DismissControl(model: model, conversationId: id) }
             }
             if issue.code == "chunks_failed", model.canRetry {
                 Button("Try these audio files again") { Task { await model.retryFailedAudio() } }
@@ -326,6 +327,31 @@ struct RetryControl: View {
             if action == .keep { await model.keep(conversationId: conversationId) } else { await model.retry(conversationId: conversationId) }
             sending = false
         }
+    }
+}
+
+/// Sets a failed conversation aside: it leaves the list of problems; the audio stays on the server
+/// and the conversation can still be retried from its page.
+struct DismissControl: View {
+    let model: AppModel
+    let conversationId: String
+    @State private var confirming = false
+    @State private var sending = false
+
+    var body: some View {
+        Button(sending ? "Dismissing…" : "Dismiss", role: .destructive) { confirming = true }
+            .buttonStyle(.borderless).controlSize(.small).disabled(sending)
+            .confirmationDialog("Dismiss this problem?", isPresented: $confirming, titleVisibility: .visible) {
+                Button("Dismiss") {
+                    sending = true
+                    Task {
+                        await model.dismiss(conversationId: conversationId)
+                        sending = false
+                    }
+                }
+            } message: {
+                Text("It leaves the server's list of problems. Nothing is deleted: the audio stays on your server, and you can still retry it from the conversation.")
+            }
     }
 }
 

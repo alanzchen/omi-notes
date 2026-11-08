@@ -33,6 +33,8 @@ public final class AppModel {
     /// When `serverStatus` was received (a failed refresh leaves it alone).
     public private(set) var serverStatusAt: Date?
     public private(set) var issues: [ServerIssue] = []
+    /// A conversation's issues leave the list at once (the next refresh confirms it).
+    func dropIssues(for conversationId: String) { issues.removeAll { $0.conversationId == conversationId } }
     public internal(set) var recent: [ConversationSummary] = []
     public private(set) var recentError: String?
     /// When the list last came from the server (nil: never, for this server).

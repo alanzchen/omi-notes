@@ -13,6 +13,30 @@ extension AppModel {
 
     public var canRetry: Bool { serverStatus?.supportsRetry == true && retryServerKey != nil }
     public var canKeep: Bool { serverStatus?.supportsKeep == true && retryServerKey != nil }
+    public var canDismiss: Bool { serverStatus?.supportsDismiss == true }
+
+    /// Set a failed conversation aside: it leaves the issues, keeps its audio on the server, and can
+    /// still be retried from its page. Returns whether the server recorded it.
+    @discardableResult
+    public func dismiss(conversationId: String) async -> Bool {
+        let config = engine.settings.serverConfig()
+        guard let endpoint = config.endpoint, config == answeredForConfig else { return false }
+        let api = APIClient(endpoint: endpoint, session: session)
+        do {
+            // a repeat (after a lost answer) records the same decision again: harmless
+            try await api.dismiss(conversationId: conversationId, requestId: UUID().uuidString.lowercased())
+        } catch APIError.http(let code, let detail) where (400..<500).contains(code) {
+            retryMessages[conversationId] = Self.retryRefusal(detail)
+            return false
+        } catch {
+            retryMessages[conversationId] = "Couldn't dismiss it (\(Self.describe(error))). Try again in a moment."
+            return false
+        }
+        retryMessages[conversationId] = nil
+        dropIssues(for: conversationId)
+        await refreshServer()
+        return true
+    }
 
     /// Ask the server to redo a failed conversation's failed stage. The request id is saved before
     /// sending and reused until the server answers, so tapping again after a timeout never starts

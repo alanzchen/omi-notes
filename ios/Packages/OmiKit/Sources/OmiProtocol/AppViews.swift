@@ -218,11 +218,14 @@ public struct ServerIssue: Decodable, Equatable, Sendable, Identifiable, Hashabl
     public var retryable: Bool?
     /// The phone can keep it as is (a no-speaker result kept as a transcript); missing means false.
     public var canKeep: Bool?
+    /// The phone can set this failure aside (servers with `dismiss`); missing means false.
+    public var canDismiss: Bool?
 
     public var id: String { "\(code):\(conversationId ?? "")" }
     public var needsAction: Bool { severity != "delayed" }
     public var canRetryFromPhone: Bool { retryable != false }
     public var canKeepFromPhone: Bool { canKeep == true }
+    public var canDismissFromPhone: Bool { canDismiss == true }
     /// Plain guidance for the main screens; an older server's command-bearing step is left to Diagnostics.
     public var phoneStep: String? { nextStep.flatMap { $0.contains("`") ? nil : $0 } }
     /// What the server's operator does (Diagnostics).
@@ -231,6 +234,7 @@ public struct ServerIssue: Decodable, Equatable, Sendable, Identifiable, Hashabl
     enum CodingKeys: String, CodingKey {
         case code, severity, message, detail, count, title, retryable
         case canKeep = "can_keep"
+        case canDismiss = "can_dismiss"
         case serverStep = "server_step"
         case nextStep = "next_step"
         case conversationId = "conversation_id"

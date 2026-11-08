@@ -523,8 +523,10 @@ operator's step; its commands name this deployment's `omi-notes` and environment
 shows it under Diagnostics). `retryable` (conversation issues) is false when a retry from the phone
 can't help until something changes on the server (for example `speakers_unknown`). `can_keep` is
 true for a `speakers_unknown` failure with no operation pending: the phone offers
-`POST /v1/conversations/{id}/keep`. These fields are optional for older servers: a missing
-`retryable` means true, a missing `can_keep` false.
+`POST /v1/conversations/{id}/keep`. `can_dismiss` is true for a failed conversation with no retry
+pending (servers with `dismiss`): the phone offers `POST /v1/conversations/{id}/dismiss`. These
+fields are optional for older servers: a missing `retryable` means true, a missing `can_keep` or
+`can_dismiss` false.
 
 ### `POST /v1/conversations/{id}/retry`
 
@@ -554,6 +556,15 @@ stay failures to fix). The operation has `kind: "keep"`; once `done` the convers
 a transcript-only note (cached text reused, no summary, no speaker labels or voiceprints), it leaves
 `/v1/issues` and the failed counts, and its detail carries `resolution`. Nothing is deleted. If the
 attempt fails for another reason, that failure is listed as usual. The decision is permanent.
+
+### `POST /v1/conversations/{id}/dismiss` (servers with `dismiss`)
+
+For any `failed` conversation with no retry pending: the owner sets that failure aside. Same body as
+a retry; `200` (also for a repeat of the same request id) with
+`{"dismissed": {"conversation_id": "…", "request_id": "…", "resolved_at": "…"}}`; `409`
+`not_failed` / `retry_in_progress` / `busy`, `404`, `503` read-only. Nothing is queued and nothing is
+deleted: the conversation stays `failed` with its audio, it leaves `/v1/issues` and the failed
+counts, and Retry stays possible. If a later retry fails again, that new failure is listed as usual.
 
 ### Value and the owner's choice (`value_notes`)
 

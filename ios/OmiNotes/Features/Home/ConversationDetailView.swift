@@ -146,8 +146,9 @@ struct ConversationDetailView: View {
         } else if model.canRetry, issue?.canRetryFromPhone != false {
             Section {
                 RetryControl(model: model, conversationId: d.id)
+                if model.canDismiss, issue?.canDismissFromPhone == true { DismissControl(model: model, conversationId: d.id) }
             } footer: {
-                Text("Redoes the step that failed. If a service's key or account is the problem, fix that on the server first.")
+                Text("Redoes the step that failed. If a service's key or account is the problem, fix that on the server first. Dismissing only removes it from the list of problems.")
             }
         }
     }

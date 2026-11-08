@@ -434,6 +434,8 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
     public var supportsRetry: Bool { features?.contains("retry") == true }
     /// `POST /v1/conversations/{id}/keep` (keep a no-speaker result as a transcript).
     public var supportsKeep: Bool { features?.contains("keep") == true }
+    /// A failed conversation can be set aside from the phone (`POST /v1/conversations/{id}/dismiss`).
+    public var supportsDismiss: Bool { features?.contains("dismiss") == true }
     /// Clip text, suggestion scope, durable "keep unknown" and undo for naming voices.
     public var supportsNameVoice: Bool { features?.contains("name_voice") == true }
     /// A note's recording can be played (`/v1/conversations/{id}/recording`).

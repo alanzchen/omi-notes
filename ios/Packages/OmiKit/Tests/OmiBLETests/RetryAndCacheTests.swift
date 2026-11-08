@@ -214,6 +214,28 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
             .compactMap { (try? JSONSerialization.jsonObject(with: $0.body)) as? [String: String] }.compactMap { $0["request_id"] }
     }
 
+    /// OMI-SPLITTER-502: a failure that keeps failing could only be retried. The owner can now set it
+    /// aside (servers with `dismiss`); the issue leaves the list at once and after the next refresh.
+    @Test func aFailedConversationCanBeDismissed() async throws {
+        let (m, _) = try model()
+        let dismissStatus = Self.status.replacingOccurrences(of: #""retry","#, with: #""retry","dismiss","#)
+        AppServerStub.routes["/v1/status"] = [(200, dismissStatus)]
+        AppServerStub.routes["/v1/issues"] = [(200, #"{"issues":[{"code":"conversation_failed","severity":"action","message":"m","can_dismiss":true,"conversation_id":"conv-1"}]}"#)]
+        await m.refreshServer()
+        #expect(m.canDismiss && m.issues.first?.canDismissFromPhone == true)
+        AppServerStub.routes["/v1/conversations/conv-1/dismiss"] = [(200, #"{"dismissed":{"conversation_id":"conv-1","request_id":"r","resolved_at":null}}"#)]
+        AppServerStub.routes["/v1/issues"] = [(200, #"{"issues":[]}"#)]
+        #expect(await m.dismiss(conversationId: "conv-1"))
+        #expect(m.issues.isEmpty)
+        let sent = AppServerStub.requests.filter { $0.path == "/v1/conversations/conv-1/dismiss" }
+        let body = try #require(sent.first.flatMap { try? JSONSerialization.jsonObject(with: $0.body) as? [String: String] })
+        #expect(sent.count == 1 && body["request_id"].map { UUID(uuidString: $0) != nil && $0 == $0.lowercased() } == true)
+
+        AppServerStub.routes["/v1/conversations/conv-2/dismiss"] = [(409, #"{"error":"retry_in_progress","detail":"a retry is queued"}"#)]
+        #expect(await m.dismiss(conversationId: "conv-2") == false)
+        #expect(m.retryMessages["conv-2"] != nil, "the refusal is shown")
+    }
+
     @Test func aKeepSurvivesARelaunchAndIsSentOnceToKeep() async throws {
         let (m, root) = try model()
         AppServerStub.routes["/v1/status"] = [(200, Self.keepStatus)]

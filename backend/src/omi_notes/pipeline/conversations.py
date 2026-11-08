@@ -1303,7 +1303,9 @@ def queue_counts(db: Database) -> dict:
     def count(sql: str) -> int:
         return db.one(sql)["n"]
 
-    conversations_failed = count("SELECT COUNT(*) AS n FROM conversations WHERE status='failed'")
+    from ..views import NOT_DISMISSED
+
+    conversations_failed = count(f"SELECT COUNT(*) AS n FROM conversations WHERE status='failed' AND {NOT_DISMISSED}")
     chunks_failed = count("SELECT COUNT(*) AS n FROM chunks WHERE status='failed'")
     return {
         "chunks_pending": count("SELECT COUNT(*) AS n FROM chunks WHERE status='pending'"),

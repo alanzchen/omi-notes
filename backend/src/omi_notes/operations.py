@@ -19,6 +19,12 @@ A keep (`kind: "keep"`, `POST /v1/conversations/{id}/keep`) is the same operatio
 `speakers_unknown` failure, plus the owner's decision: `resolution` is committed with `retry`, so the
 attempt it queues makes a transcript-only note with the speaker unknown (cached text, no provider
 call) instead of failing again. The vault is raised to format 3 first.
+
+A dismiss (`POST /v1/conversations/{id}/dismiss`) is only the owner's decision, with nothing queued:
+`resolution: {kind: "dismissed", op, resolved_at, failure: {stage, kind, id}}` is committed into the
+failed conversation's record (vault format 3). That failure leaves the issues and the failed count;
+the conversation stays failed with its audio pinned, Retry stays possible, and a later failure (a new
+`failure_id`) shows again. A repeated request id is answered again.
 """
 
 from __future__ import annotations
@@ -40,6 +46,7 @@ log = logging.getLogger(__name__)
 FORMAT = 1
 KINDS = ("retry", "keep")
 KEPT = "kept_speaker_unknown"
+DISMISSED = "dismissed"
 TERMINAL = ("done", "failed", "stopped", "superseded")
 REQUIRED = ("id", "kind", "conversation_id", "state")
 STATES = ("accepted", *TERMINAL)
@@ -157,6 +164,51 @@ def accept(pipeline, conv_id: str, request_id: str, *, read_only: str | None, ki
         finally:
             pipeline.release(conv_id, token)
     return 202, view(pipeline, request_id)
+
+
+def dismiss(pipeline, conv_id: str, request_id: str, *, read_only: str | None) -> tuple[int, dict]:
+    """`POST /v1/conversations/{id}/dismiss`: 200 with the recorded decision."""
+    if not isinstance(request_id, str) or not UUID_RE.match(request_id):
+        raise ApiError(422, "invalid_body", "request_id must be a lowercase UUID")
+    if read_only:
+        raise ApiError(503, "vault_read_only", read_only)
+    vault, db = pipeline.vault, pipeline.db
+    with lock(vault):
+        row = _row(db, conv_id)
+        if row is None:
+            raise ApiError(404, "not_found", "unknown conversation")
+        current = _resolution(row)
+        if current.get("kind") == DISMISSED and current.get("op") == request_id:
+            return 200, _dismissed_view(conv_id, current)
+        token = pipeline.claim(conv_id)
+        if token is None:
+            raise ApiError(409, *BUSY)
+        try:
+            row = _row(db, conv_id)
+            if row["retry_op"]:
+                raise ApiError(409, "retry_in_progress", f"a retry of this conversation is queued ({row['retry_op']})")
+            if row["status"] != "failed":
+                raise ApiError(409, "not_failed", "only a failed conversation can be dismissed")
+            vault.raise_format(3)  # `resolution` in the record
+            decision = {"kind": DISMISSED, "op": request_id, "resolved_at": time.time(),
+                        "failure": {"stage": row["failed_stage"], "kind": row["error_kind"], "id": row["failure_id"]}}
+            pipeline._commit(conv_id, resolution=json.dumps(decision, sort_keys=True))
+        finally:
+            pipeline.release(conv_id, token)
+    return 200, _dismissed_view(conv_id, decision)
+
+
+def _resolution(row) -> dict:
+    try:
+        res = json.loads(row["resolution"]) if row["resolution"] else None
+    except json.JSONDecodeError:
+        return {}
+    return res if isinstance(res, dict) else {}
+
+
+def _dismissed_view(conv_id: str, decision: dict) -> dict:
+    return {"dismissed": {"conversation_id": conv_id, "request_id": decision.get("op"),
+                          "resolved_at": iso_utc_epoch(decision["resolved_at"]) if isinstance(decision.get("resolved_at"), (int, float)) else None}}
 
 
 def _check_retryable(row) -> None:

@@ -13,7 +13,8 @@ Blocks (docs/vault.md):
   that outcome — so a rebuild tells a finished retry from a pending one (docs/vault.md, "Operations");
 - `resolution`: the owner kept a `speakers_unknown` result from the phone (`{kind, op, resolved_at,
   failure}`, the failure it resolved): processed again, it becomes a transcript-only note with the
-  speaker unknown. Kept for good, so the original condition stays visible.
+  speaker unknown. Kept for good, so the original condition stays visible. Or the owner dismissed a
+  failure from the phone (`kind: "dismissed"`): only that failure leaves the issues.
 
 Open conversations have no record: they are recomputed. The index row is derived from the record
 (`row_from_record`) and the record from the row (`record_from_row`), so the rebuild and the running

@@ -148,6 +148,11 @@ resolved_at, failure: {stage, kind, id}}`, which stays in the record for good. W
 writes the cached unseparated text as a transcript with speaker `unknown` (no labels or voiceprints)
 and renders a transcript-only note without a summary; a rebuild reproduces the same note.
 
+A dismiss (`POST /v1/conversations/{id}/dismiss`) queues nothing: it commits only
+`resolution: {kind: "dismissed", op, resolved_at, failure: {stage, kind, id}}` into a failed
+conversation's record (format 3). That failure (matched by `failure.id`) leaves the issues and the
+failed counts; the conversation stays failed, its chunks stay pinned, and a later failure shows again.
+
 ## Retention
 
 Deleting `<seq>.omnc` first writes `capture.json` evidence (ring hashes/owners, coverage and loss

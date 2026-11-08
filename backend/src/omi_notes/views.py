@@ -28,6 +28,9 @@ ISSUE_LIMIT = 20
 
 # Rows the app lists: voice-enrollment readings are never conversations.
 LISTED = "enrollment_id IS NULL AND COALESCE(waiting_for, '') <> 'voice enrollment'"
+# a failure the owner dismissed from the phone (that very failure; a later one shows again)
+NOT_DISMISSED = ("NOT (COALESCE(json_extract(resolution, '$.kind'), '') = 'dismissed' "
+                 "AND json_extract(resolution, '$.failure.id') IS failure_id)")
 
 _SERVICE = {"transcribing": "transcription service", "summarizing": "summary service"}
 
@@ -450,20 +453,21 @@ def server_issues(db, *, read_only: str | None, worker: bool, limit: int = ISSUE
                     "server_step": f"See _status.md in your vault, then retry on the server with {command('retry-failed')}."})  # fmt: skip
 
     def conv(r, code: str, severity: str, message: str, step: str, server: str, can_retry: bool = True,
-             can_keep: bool = False) -> dict:  # fmt: skip
+             can_keep: bool = False, can_dismiss: bool = False) -> dict:  # fmt: skip
         return {"code": code, "severity": severity, "message": message, "next_step": step, "server_step": server,
-                "retryable": can_retry, "can_keep": can_keep,
+                "retryable": can_retry, "can_keep": can_keep, "can_dismiss": can_dismiss,
                 "conversation_id": r["id"], "started_at": iso_utc_epoch(r["start"]),
                 "title": r["title"] if r["note_path"] else None}  # fmt: skip
 
-    for r in db.query(f"SELECT * FROM conversations WHERE status='failed' AND {LISTED} ORDER BY start DESC LIMIT ?", (limit,)):
+    for r in db.query(f"SELECT * FROM conversations WHERE status='failed' AND {LISTED} AND {NOT_DISMISSED} "
+                      "ORDER BY start DESC LIMIT ?", (limit,)):  # fmt: skip
         if r["note_path"] and r["failed_stage"] == "summarizing":
             message = "Transcript ready; summary unavailable. " + failure_message(r["error_kind"], "summarizing")
         else:
             message = failure_message(r["error_kind"], r["failed_stage"])
         out.append(conv(r, "conversation_failed", "action", message, next_step(r["error_kind"], r["failed_stage"], retrying=False),
                         server_step(r["error_kind"], r["failed_stage"], retrying=False), retryable(r["error_kind"]),
-                        keepable(r["error_kind"]) and not r["retry_op"]))  # fmt: skip
+                        keepable(r["error_kind"]) and not r["retry_op"], not r["retry_op"]))  # fmt: skip
     for r in db.query(f"SELECT * FROM conversations WHERE edited=1 AND frozen=0 AND note_path IS NOT NULL AND {LISTED} "
                       "ORDER BY start DESC LIMIT ?", (limit,)):  # fmt: skip
         out.append(conv(r, "note_conflict", "action", "The note was changed outside My Notes; the server stopped updating it.",

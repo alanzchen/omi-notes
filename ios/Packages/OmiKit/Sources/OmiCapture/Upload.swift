@@ -835,6 +835,13 @@ public struct APIClient: Sendable {
         return r.operation
     }
 
+    /// Set a failed conversation aside (nothing is queued or deleted); a repeated id is answered again.
+    public func dismiss(conversationId: String, requestId: String) async throws {
+        struct Answer: Decodable { struct Dismissed: Decodable { let conversation_id: String }; let dismissed: Dismissed }
+        let body = try JSONSerialization.data(withJSONObject: ["request_id": requestId])
+        let _: Answer = try await send("POST", "/v1/conversations/\(Self.queryValue(conversationId))/dismiss", body: body)
+    }
+
     public func operation(_ id: String) async throws -> RetryOperation {
         let r: RetryOperationResponse = try await get("/v1/operations/\(Self.queryValue(id))")
         return r.operation
