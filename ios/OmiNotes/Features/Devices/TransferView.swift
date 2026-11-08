@@ -200,6 +200,8 @@ struct TransferDetailView: View {
         let line: String
         if w.inUse == nil {
             line = "Checking for Apple Watch"
+        } else if w.keptOnWatch > 0, w.reportAt != nil {
+            line = "\(TransferText.plural(w.keptOnWatch, "part", "parts")) kept on the Watch, can't be sent"
         } else if let parts = w.waitingParts, w.reportAt != nil, w.reportFresh {
             line = parts == 0 ? "Nothing left on the Watch" : "\(TransferText.plural(parts, "part", "parts")) left on the Watch"
         } else if let at = w.reportAt, at <= now {

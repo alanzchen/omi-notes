@@ -25,6 +25,8 @@ public struct TransferSummary: Equatable, Sendable {
         public var converting: Int
         /// Watch audio files queued here for the server.
         public var waitingForServer: Int
+        /// Audio parts the Watch keeps but can't send (from its report): never "all sent" while > 0.
+        public var keptOnWatch: Int = 0
     }
 
     // MARK: iPhone → server
@@ -91,7 +93,7 @@ public struct TransferSummary: Equatable, Sendable {
             reportFresh: report.map { now.timeIntervalSince($0.at) <= WatchSummary.fresh && $0.at <= now.addingTimeInterval(60) } ?? false,
             waitingParts: report?.waitingParts, waitingSeconds: report?.waitingSeconds,
             receivedOnPhone: s.watchReceived, lastReceivedAt: s.watchLastReceiptAt,
-            converting: s.watchPending, waitingForServer: s.watchWaitingUpload)
+            converting: s.watchPending, waitingForServer: s.watchWaitingUpload, keptOnWatch: report?.keptParts ?? 0)
 
         let m = s.transfer.meter
         let rate = m.rate(atMono: nowMono)
@@ -207,7 +209,7 @@ public struct TransferSummary: Equatable, Sendable {
     /// Watch → iPhone bar: parts received, of those plus the parts the Watch still reports. nil
     /// without a current Watch report (a stale or future-dated one isn't evidence of now).
     public var watchFraction: Double? {
-        guard watch.inUse == true, watch.reportAt != nil, watch.reportFresh, let waiting = watch.waitingParts else { return nil }
+        guard watch.inUse == true, watch.reportAt != nil, watch.reportFresh, watch.keptOnWatch == 0, let waiting = watch.waitingParts else { return nil }
         let total = watch.receivedOnPhone + waiting
         return total > 0 ? Double(watch.receivedOnPhone) / Double(total) : 1
     }
@@ -217,7 +219,7 @@ public struct TransferSummary: Equatable, Sendable {
     public var everythingSent: Bool {
         guard phone.state == .allSent else { return false }
         if watch.inUse == false { return true }
-        return watch.reportFresh && watch.waitingParts == 0 && watch.converting == 0 && watch.waitingForServer == 0
+        return watch.reportFresh && watch.waitingParts == 0 && watch.keptOnWatch == 0 && watch.converting == 0 && watch.waitingForServer == 0
     }
 
     /// Audio files plus conversations the server last said it still has to process: exact only when

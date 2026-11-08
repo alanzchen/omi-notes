@@ -79,6 +79,8 @@ public struct WatchReport: Codable, Equatable, Sendable {
     /// Counters since the Watch app launched (transfers, resends, capture buffer allocations…), to
     /// compare builds; absent from older Watch apps.
     public var stats: [String: Int]?
+    /// Audio parts kept on the Watch that it can't send (no manifest matches them; `orphan_parts`).
+    public var keptParts: Int { stats?["orphan_parts"] ?? 0 }
 
     public init(state: State, since: Date?, waitingParts: Int, waitingSeconds: Int? = nil, at: Date, deviceId: String? = nil,
                 stats: [String: Int]? = nil) {

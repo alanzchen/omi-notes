@@ -170,4 +170,28 @@ import OmiWatchKit
         t.server.chunksPending = 0; t.server.conversationsPending = 0
         #expect(t.serverWork?.left == 0 && t.serverWork?.atLeast == false && t.serverWorkLeft == 0)
     }
+
+    /// ASTRA-IT10-01: audio kept on the Watch that can't be sent (orphan parts) counted toward the cap
+    /// but not as "waiting", so an orphan-only Watch read as everything sent, 100%. Kept parts now
+    /// suppress every all-sent claim, below the cap and at it.
+    @Test(arguments: [false, true])
+    func audioKeptOnTheWatchIsNeverAllSent(atCap: Bool) throws {
+        let report = WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now, deviceId: "watch-1",
+                                 stats: ["orphan_parts": 1])
+        #expect(report.keptParts == 1)
+        var snap = EngineSnapshot.answered
+        snap.ready = true; snap.serverConfigured = true; snap.watchReport = report
+        snap.transfer.meter.start(atMono: 0, wall: now)
+        let t = TransferSummary.evaluate(snapshot: snap, server: .reachable(version: "t", detail: ""), status: nil, statusAt: nil,
+                                         watchInstalled: true, nowMono: 0, now: now)
+        #expect(t.watch.keptOnWatch == 1)
+        #expect(!t.everythingSent && t.watchFraction == nil, "no all-sent and no 100% while audio is kept on the Watch")
+        if atCap {
+            let reason = try #require(WatchStorage.pauseReason(freeBytes: 2_000_000_000, waitingBytes: WatchStorage.maximumWaiting,
+                                                               keptBytes: WatchStorage.maximumWaiting))
+            #expect(!reason.contains("Resume") && reason.contains("can't be sent"), "no promise that opening the iPhone clears it: \(reason)")
+            let normal = try #require(WatchStorage.pauseReason(freeBytes: 2_000_000_000, waitingBytes: WatchStorage.maximumWaiting, keptBytes: 0))
+            #expect(normal.contains("Open Omi Notes on the iPhone"), "an ordinary backlog keeps its advice")
+        }
+    }
 }

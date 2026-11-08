@@ -130,6 +130,9 @@ struct RecordView: View {
                 Image(systemName: "iphone")
                 Text(sync.pendingSeconds > 0 ? "\(WaitingAudio.text(sync.pendingSeconds).capitalizedFirst) waiting for iPhone"
                                              : "Finishing sending to iPhone")
+            } else if sync.orphans > 0 {
+                Image(systemName: "exclamationmark.triangle")
+                Text("Some audio can't be sent")  // kept on the Watch, never "all on iPhone"
             } else if sync.lastAckAt != nil || recorder.isActive {
                 Image(systemName: "checkmark")
                 Text("All audio on iPhone")

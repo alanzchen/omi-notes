@@ -159,7 +159,8 @@ struct WatchDetailView: View {
     @ViewBuilder private func places(_ f: Flow, _ now: Date) -> some View {
         place("applewatch", "On the Watch", f.report.map { r in
             // the recorded length (from the Watch's own parts), never a count of parts
-            let parts = r.waitingParts == 0 ? "Everything sent to this iPhone"
+            let parts = r.keptParts > 0 ? "\(r.keptParts) part\(r.keptParts == 1 ? "" : "s") kept on the Watch, can't be sent"
+                : r.waitingParts == 0 ? "Everything sent to this iPhone"
                 : (r.waitingSeconds ?? 0) > 0 ? "\(WaitingAudio.text(r.waitingSeconds!).capitalizedFirst) of audio not on this iPhone yet"
                 : "Some audio not on this iPhone yet"
             // waiting, and nothing has arrived for a while: what helps

@@ -265,7 +265,8 @@ final class WatchRecorder: NSObject {
 
     private func storagePauseReason() -> String? {
         let free = (try? outbox.root.resourceValues(forKeys: [.volumeAvailableCapacityKey]))?.volumeAvailableCapacity
-        return WatchStorage.pauseReason(freeBytes: free.map(Int64.init), waitingBytes: outbox.waitingBytes)
+        return WatchStorage.pauseReason(freeBytes: free.map(Int64.init), waitingBytes: outbox.waitingBytes,
+                                        keptBytes: outbox.orphans.values.reduce(0) { $0 + Int64($1) })
     }
 
     /// Ends the current run and hands its open segment to the outbox.
