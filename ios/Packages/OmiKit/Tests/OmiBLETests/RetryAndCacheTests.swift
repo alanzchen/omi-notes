@@ -220,9 +220,9 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         let (m, _) = try model()
         let dismissStatus = Self.status.replacingOccurrences(of: #""retry","#, with: #""retry","dismiss","#)
         AppServerStub.routes["/v1/status"] = [(200, dismissStatus)]
-        AppServerStub.routes["/v1/issues"] = [(200, #"{"issues":[{"code":"conversation_failed","severity":"action","message":"m","can_dismiss":true,"conversation_id":"conv-1"}]}"#)]
+        AppServerStub.routes["/v1/issues"] = [(200, #"{"issues":[{"code":"conversation_failed","severity":"action","message":"m","can_dismiss":true,"conversation_id":"conv-1","failure_id":"f-1"}]}"#)]
         await m.refreshServer()
-        #expect(m.canDismiss && m.issues.first?.canDismissFromPhone == true)
+        #expect(m.canDismiss && m.issues.first?.canDismissFromPhone == true && m.issues.first?.failureId == "f-1")
         AppServerStub.routes["/v1/conversations/conv-1/dismiss"] = [(200, #"{"dismissed":{"conversation_id":"conv-1","request_id":"r","resolved_at":null}}"#)]
         AppServerStub.routes["/v1/issues"] = [(200, #"{"issues":[]}"#)]
         #expect(await m.dismiss(conversationId: "conv-1"))
@@ -230,6 +230,7 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         let sent = AppServerStub.requests.filter { $0.path == "/v1/conversations/conv-1/dismiss" }
         let body = try #require(sent.first.flatMap { try? JSONSerialization.jsonObject(with: $0.body) as? [String: String] })
         #expect(sent.count == 1 && body["request_id"].map { UUID(uuidString: $0) != nil && $0 == $0.lowercased() } == true)
+        #expect(body["failure_id"] == "f-1", "ASTRA-IT3-02: the dismissal names the failure it is for")
 
         AppServerStub.routes["/v1/conversations/conv-2/dismiss"] = [(409, #"{"error":"retry_in_progress","detail":"a retry is queued"}"#)]
         #expect(await m.dismiss(conversationId: "conv-2") == false)

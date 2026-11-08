@@ -321,7 +321,8 @@ def create_app(
             raise ApiError(422, "invalid_body", "expected a JSON object")
         pipeline = app.state.speakers.pipeline
         status_code, payload = await run_in_threadpool(
-            operations.dismiss, pipeline, conv_id, body.get("request_id"), read_only=read_only_reason(db)
+            operations.dismiss, pipeline, conv_id, body.get("request_id"), read_only=read_only_reason(db),
+            failure_id=body.get("failure_id"),
         )
         return JSONResponse(payload, status_code=status_code)
 

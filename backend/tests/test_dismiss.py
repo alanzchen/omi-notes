@@ -83,3 +83,56 @@ def test_an_old_dismiss_request_never_dismisses_a_newer_failure(client, worker, 
     client, worker = reopen(settings)
     assert dismiss(client, row["id"], b).json()["dismissed"]["failure_id"] == row["failure_id"]
     assert [i["conversation_id"] for i in failed_issues(client)] == [row["id"]], "and after a rebuild"
+
+
+
+def test_an_evicted_or_unknown_request_never_dismisses_a_different_failure(client, worker, settings):
+    """ASTRA-IT3-02: 51 dismiss requests for F1 pushed the first one out of a 50-entry history; after a
+    retry failed as F2 and a rebuild, replaying it dismissed F2. Every request is now remembered, and a
+    request naming the failure it saw acts only on that failure."""
+    row = failed_summary(client, worker)
+    ids = [f"00000000-0000-4000-8000-{i:012d}" for i in range(51)]
+    for rid in ids:
+        assert dismiss(client, row["id"], rid).status_code == 200
+    assert retry(client, row["id"]).status_code == 202
+    worker.tick(T0 + 500)
+    (after,) = convs(worker)
+    assert after["failure_id"] != row["failure_id"]
+    client, worker = reopen(settings)
+    replay = dismiss(client, row["id"], ids[0])
+    assert replay.status_code == 200 and replay.json()["dismissed"]["failure_id"] == row["failure_id"]
+    assert [i["conversation_id"] for i in failed_issues(client)] == [row["id"]], "F2 stays listed"
+    # a new request naming the old failure is refused; naming the current one works
+    stale = client.post(f"/v1/conversations/{row['id']}/dismiss", headers=AUTH,
+                        json={"request_id": str(uuid.uuid4()), "failure_id": row["failure_id"]})
+    assert stale.status_code == 409 and stale.json()["error"] == "failure_changed"
+    (issue,) = failed_issues(client)
+    assert issue["failure_id"] == after["failure_id"]
+    fresh = client.post(f"/v1/conversations/{row['id']}/dismiss", headers=AUTH,
+                        json={"request_id": str(uuid.uuid4()), "failure_id": issue["failure_id"]})
+    assert fresh.status_code == 200 and failed_issues(client) == []
+
+
+def test_malformed_dismiss_bodies_are_422(client, worker):
+    row = failed_summary(client, worker)
+    url = f"/v1/conversations/{row['id']}/dismiss"
+    for body in [[], {}, {"request_id": None}, {"request_id": 12}, {"request_id": "invalid"},
+                 {"request_id": str(uuid.uuid4()), "failure_id": 5}, {"request_id": str(uuid.uuid4()), "failure_id": ""}]:
+        assert client.post(url, json=body, headers=AUTH).status_code == 422, body
+
+
+def test_past_the_history_cap_only_requests_naming_their_failure_are_taken(client, worker, monkeypatch):
+    from omi_notes import operations
+
+    monkeypatch.setattr(operations, "DISMISS_HISTORY", 3)
+    row = failed_summary(client, worker)
+    url = f"/v1/conversations/{row['id']}/dismiss"
+    for _ in range(3):
+        assert dismiss(client, row["id"]).status_code == 200
+    refused = dismiss(client, row["id"])
+    assert refused.status_code == 409 and refused.json()["error"] == "failure_id_required"
+    for _ in range(3):  # named requests are taken, and only they are ever forgotten
+        named = client.post(url, headers=AUTH, json={"request_id": str(uuid.uuid4()), "failure_id": row["failure_id"]})
+        assert named.status_code == 200
+    kept = record(worker, row["id"])["resolution"]["requests"]
+    assert sum(1 for v in kept.values() if not v.get("bound")) == 3, "every unnamed request is still remembered"

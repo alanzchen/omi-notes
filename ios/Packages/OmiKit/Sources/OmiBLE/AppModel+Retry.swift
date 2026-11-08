@@ -26,7 +26,8 @@ extension AppModel {
         let requestId = dismissRequestIds[conversationId] ?? UUID().uuidString.lowercased()
         dismissRequestIds[conversationId] = requestId
         do {
-            try await api.dismiss(conversationId: conversationId, requestId: requestId)
+            let failure = issues.first { $0.code == "conversation_failed" && $0.conversationId == conversationId }?.failureId
+            try await api.dismiss(conversationId: conversationId, requestId: requestId, failureId: failure)
             dismissRequestIds[conversationId] = nil
         } catch APIError.http(let code, let detail) where (400..<500).contains(code) {
             dismissRequestIds[conversationId] = nil  // answered: this id is settled

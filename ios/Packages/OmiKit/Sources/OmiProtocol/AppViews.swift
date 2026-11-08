@@ -220,6 +220,8 @@ public struct ServerIssue: Decodable, Equatable, Sendable, Identifiable, Hashabl
     public var canKeep: Bool?
     /// The phone can set this failure aside (servers with `dismiss`); missing means false.
     public var canDismiss: Bool?
+    /// The failure this issue is about (sent with a dismissal, so it can't act on a later failure).
+    public var failureId: String?
 
     public var id: String { "\(code):\(conversationId ?? "")" }
     public var needsAction: Bool { severity != "delayed" }
@@ -235,6 +237,7 @@ public struct ServerIssue: Decodable, Equatable, Sendable, Identifiable, Hashabl
         case code, severity, message, detail, count, title, retryable
         case canKeep = "can_keep"
         case canDismiss = "can_dismiss"
+        case failureId = "failure_id"
         case serverStep = "server_step"
         case nextStep = "next_step"
         case conversationId = "conversation_id"

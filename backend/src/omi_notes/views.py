@@ -455,7 +455,7 @@ def server_issues(db, *, read_only: str | None, worker: bool, limit: int = ISSUE
     def conv(r, code: str, severity: str, message: str, step: str, server: str, can_retry: bool = True,
              can_keep: bool = False, can_dismiss: bool = False) -> dict:  # fmt: skip
         return {"code": code, "severity": severity, "message": message, "next_step": step, "server_step": server,
-                "retryable": can_retry, "can_keep": can_keep, "can_dismiss": can_dismiss,
+                "retryable": can_retry, "can_keep": can_keep, "can_dismiss": can_dismiss, "failure_id": r["failure_id"],
                 "conversation_id": r["id"], "started_at": iso_utc_epoch(r["start"]),
                 "title": r["title"] if r["note_path"] else None}  # fmt: skip
 

@@ -25,8 +25,10 @@ A dismiss (`POST /v1/conversations/{id}/dismiss`) is only the owner's decision, 
 failed conversation's record (vault format 3). That failure leaves the issues and the failed count;
 the conversation stays failed with its audio pinned, Retry stays possible, and a later failure (a new
 `failure_id`) shows again. Every dismiss request id is kept in `resolution.requests` with the failure
-it dismissed (the last 50), so a repeat answers its original decision and never dismisses a newer
-failure, also after a rebuild.
+it dismissed, so a repeat answers its original decision and never dismisses a newer failure, also
+after a rebuild. A request may name the failure it saw (`failure_id`, from the issues): another
+failure than the current one is refused (409 `failure_changed`). Requests that named their failure
+are the only ones ever forgotten (beyond 1000); past that many, a request must name its failure.
 """
 
 from __future__ import annotations
@@ -49,7 +51,9 @@ FORMAT = 1
 KINDS = ("retry", "keep")
 KEPT = "kept_speaker_unknown"
 DISMISSED = "dismissed"
-DISMISS_HISTORY = 50  # dismiss requests remembered per conversation (with the failure each dismissed)
+# dismiss requests remembered per conversation, each with the failure it dismissed: every one that
+# didn't name its failure (so its replay stays safe); past this, requests must name their failure
+DISMISS_HISTORY = 1000
 TERMINAL = ("done", "failed", "stopped", "superseded")
 REQUIRED = ("id", "kind", "conversation_id", "state")
 STATES = ("accepted", *TERMINAL)
@@ -169,10 +173,14 @@ def accept(pipeline, conv_id: str, request_id: str, *, read_only: str | None, ki
     return 202, view(pipeline, request_id)
 
 
-def dismiss(pipeline, conv_id: str, request_id: str, *, read_only: str | None) -> tuple[int, dict]:
-    """`POST /v1/conversations/{id}/dismiss`: 200 with the recorded decision."""
+def dismiss(pipeline, conv_id: str, request_id: str, *, read_only: str | None, failure_id: object = None) -> tuple[int, dict]:
+    """`POST /v1/conversations/{id}/dismiss`: 200 with the recorded decision. `failure_id`: the failure
+    the phone saw (from `/v1/issues`); a request naming another failure than the current one is
+    refused, so no request can act on a failure it didn't see."""
     if not isinstance(request_id, str) or not UUID_RE.match(request_id):
         raise ApiError(422, "invalid_body", "request_id must be a lowercase UUID")
+    if failure_id is not None and (not isinstance(failure_id, str) or not failure_id):
+        raise ApiError(422, "invalid_body", "failure_id must be the failure's id")
     if read_only:
         raise ApiError(503, "vault_read_only", read_only)
     vault, db = pipeline.vault, pipeline.db
@@ -193,11 +201,19 @@ def dismiss(pipeline, conv_id: str, request_id: str, *, read_only: str | None) -
                 raise ApiError(409, "retry_in_progress", f"a retry of this conversation is queued ({row['retry_op']})")
             if row["status"] != "failed":
                 raise ApiError(409, "not_failed", "only a failed conversation can be dismissed")
+            if failure_id is not None and failure_id != row["failure_id"]:
+                raise ApiError(409, "failure_changed", "this conversation has failed again since; look at it again before dismissing")
+            requests = _dismiss_requests(_resolution(row))
+            if failure_id is None and len(requests) >= DISMISS_HISTORY:
+                # beyond what is remembered, only a request naming its failure is safe to act on
+                raise ApiError(409, "failure_id_required", "update the app: this dismissal must name the failure it is for")
             vault.raise_format(3)  # `resolution` in the record
             now = time.time()
-            requests = _dismiss_requests(_resolution(row))
-            requests[request_id] = {"failure_id": row["failure_id"], "at": now}
-            requests = dict(list(requests.items())[-DISMISS_HISTORY:])
+            requests[request_id] = {"failure_id": row["failure_id"], "at": now, "bound": failure_id is not None}
+            if len(requests) > DISMISS_HISTORY:  # forget the oldest requests that named their failure (safe to replay)
+                bound = sorted((v.get("at") or 0, k) for k, v in requests.items() if v.get("bound") and k != request_id)
+                for _, k in bound[: len(requests) - DISMISS_HISTORY]:
+                    del requests[k]
             decision = {"kind": DISMISSED, "op": request_id, "resolved_at": now, "requests": requests,
                         "failure": {"stage": row["failed_stage"], "kind": row["error_kind"], "id": row["failure_id"]}}
             pipeline._commit(conv_id, resolution=json.dumps(decision, sort_keys=True))

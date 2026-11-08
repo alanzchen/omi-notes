@@ -836,9 +836,11 @@ public struct APIClient: Sendable {
     }
 
     /// Set a failed conversation aside (nothing is queued or deleted); a repeated id is answered again.
-    public func dismiss(conversationId: String, requestId: String) async throws {
+    public func dismiss(conversationId: String, requestId: String, failureId: String? = nil) async throws {
         struct Answer: Decodable { struct Dismissed: Decodable { let conversation_id: String }; let dismissed: Dismissed }
-        let body = try JSONSerialization.data(withJSONObject: ["request_id": requestId])
+        var fields = ["request_id": requestId]
+        if let failureId { fields["failure_id"] = failureId }  // the failure this decision is about
+        let body = try JSONSerialization.data(withJSONObject: fields)
         let _: Answer = try await send("POST", "/v1/conversations/\(Self.queryValue(conversationId))/dismiss", body: body)
     }
 

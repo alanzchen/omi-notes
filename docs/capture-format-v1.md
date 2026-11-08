@@ -524,7 +524,8 @@ shows it under Diagnostics). `retryable` (conversation issues) is false when a r
 can't help until something changes on the server (for example `speakers_unknown`). `can_keep` is
 true for a `speakers_unknown` failure with no operation pending: the phone offers
 `POST /v1/conversations/{id}/keep`. `can_dismiss` is true for a failed conversation with no retry
-pending (servers with `dismiss`): the phone offers `POST /v1/conversations/{id}/dismiss`. These
+pending (servers with `dismiss`): the phone offers `POST /v1/conversations/{id}/dismiss`, sending the
+issue's `failure_id`. These
 fields are optional for older servers: a missing `retryable` means true, a missing `can_keep` or
 `can_dismiss` false.
 
@@ -559,8 +560,11 @@ attempt fails for another reason, that failure is listed as usual. The decision 
 
 ### `POST /v1/conversations/{id}/dismiss` (servers with `dismiss`)
 
-For any `failed` conversation with no retry pending: the owner sets that failure aside. Same body as
-a retry; `200` with `{"dismissed": {"conversation_id": "…", "request_id": "…", "failure_id": "…",
+For any `failed` conversation with no retry pending: the owner sets that failure aside. Body
+`{"request_id": "<lowercase uuid>", "failure_id": "…"}`, `failure_id` being the issue's (the failure
+the phone saw; `409 failure_changed` if the conversation has failed again since). It is optional for
+older phones, but a conversation with 1000 remembered requests takes only requests that name their
+failure (`409 failure_id_required`). `200` with `{"dismissed": {"conversation_id": "…", "request_id": "…", "failure_id": "…",
 "resolved_at": "…"}}`. A repeated request id returns its original decision (the failure it dismissed)
 and changes nothing, even after a newer failure or a rebuild; `409`
 `not_failed` / `retry_in_progress` / `busy`, `404`, `503` read-only. Nothing is queued and nothing is
