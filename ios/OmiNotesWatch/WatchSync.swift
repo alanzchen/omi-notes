@@ -160,9 +160,8 @@ final class WatchSync: NSObject, WCSessionDelegate {
                 // one question at a time: an older unanswered one still queued is withdrawn first
                 for t in session.outstandingUserInfoTransfers where t.userInfo[WatchWire.kind] as? String == WatchWire.inventory { t.cancel() }
                 let question = UUID().uuidString.lowercased()
-                session.transferUserInfo([WatchWire.kind: WatchWire.inventory, WatchWire.inventoryId: question,
-                                          WatchWire.inventoryItems: WatchWire.inventoryItems(Array(items)),
-                                          WatchWire.inventory: items.map(\.id), WatchWire.binding: binding])
+                // checksummed items only: no id-only list an older phone could answer by filename
+                session.transferUserInfo(WatchWire.inventoryQuestion(id: question, items: Array(items), binding: binding))
                 resend.askInventory(id: question, ids: items.map(\.id), now: now)
                 count("inventory_asked", items.count)
                 watchLog.info("asked the iPhone about \(items.count) delivered part(s)")
@@ -188,11 +187,14 @@ final class WatchSync: NSObject, WCSessionDelegate {
         /// Parts the iPhone said it doesn't hold (an inventory answer), and which question it answers.
         var missing: [String]
         var inventoryId: String?
+        /// In an inventory answer: the parts the iPhone holds, with their checksums.
+        var inventoryAcks: [WatchInventoryItem]
         init(_ m: [String: Any]) {
             binding = m[WatchWire.binding] as? String
             acks = m[WatchWire.acks] as? [String] ?? []
             missing = m[WatchWire.missing] as? [String] ?? []
             inventoryId = m[WatchWire.inventoryId] as? String
+            inventoryAcks = WatchWire.inventoryItems(from: m[WatchWire.inventoryAcks])
         }
     }
 
@@ -204,7 +206,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
             let r = Received(reply)
             // the iPhone can't read its identity yet (not unlocked since it restarted): asking again at
             // once would loop; it announces itself after unlocking, and the recheck asks again
-            guard r.binding != nil || !r.acks.isEmpty || r.inventoryId != nil else { return }
+            guard r.binding != nil || !r.acks.isEmpty || r.inventoryId != nil else { return }  // (hello reply)
             Task { @MainActor in self.handle(r) }
         }, errorHandler: nil)
     }
@@ -226,12 +228,16 @@ final class WatchSync: NSObject, WCSessionDelegate {
             binding = b
             UserDefaults.standard.set(b, forKey: "omi.phoneBinding")
         }
-        if !r.acks.isEmpty {
-            watchLog.info("iPhone acknowledged \(r.acks.count) item(s)")
-            outbox.acknowledge(r.acks)
-            perf.acknowledge(r.acks)
-            resend.acknowledged(r.acks)
-            count("acks", r.acks.count)
+        // an inventory answer deletes only parts whose echoed checksum matches this Watch's copy; plain
+        // acks count only outside an inventory answer (after a whole file reached the iPhone)
+        let held = Dictionary(outbox.segments().map { ($0.segment.id, $0.segment.sha256) }, uniquingKeysWith: { a, _ in a })
+        let retire = WatchWire.retirable(acks: r.acks, inventoryAcks: r.inventoryAcks, inventoryId: r.inventoryId, held: held)
+        if !retire.isEmpty {
+            watchLog.info("iPhone acknowledged \(retire.count) item(s)")
+            outbox.acknowledge(retire)
+            perf.acknowledge(retire)
+            resend.acknowledged(retire)
+            count("acks", retire.count)
             lastAckAt = Date()
             UserDefaults.standard.set(lastAckAt, forKey: "omi.lastAckAt")
         }

@@ -112,6 +112,22 @@ public enum WatchWire {
     /// `missing` (those it doesn't hold with that checksum) and the same `inventory_id`, beside the usual
     /// `acks` for the ones it holds. Older builds ignore all of these.
     public static let inventory = "inventory", missing = "missing", inventoryItems = "inventory_items", inventoryId = "inventory_id"
+    /// iPhone → Watch, in an inventory answer: the parts it holds, as `[{id, sha256}]` (the only thing
+    /// in an answer that lets the Watch delete anything).
+    public static let inventoryAcks = "inventory_acks"
+
+    /// The Watch's question: checksummed items only (no id-only list an older phone might answer by filename).
+    public static func inventoryQuestion(id: String, items: [WatchInventoryItem], binding: String) -> [String: Any] {
+        [kind: inventory, inventoryId: id, inventoryItems: inventoryItems(items), self.binding: binding]
+    }
+
+    /// The parts a message lets the Watch delete. An inventory answer (it names its question): only parts
+    /// whose echoed checksum matches the Watch's own copy (`held`: id → SHA-256); plain acks in it count
+    /// for nothing. Any other message: its plain acks (sent after a whole file arrived).
+    public static func retirable(acks: [String], inventoryAcks: [WatchInventoryItem], inventoryId: String?, held: [String: String]) -> [String] {
+        guard inventoryId != nil else { return acks }
+        return inventoryAcks.filter { held[$0.id] == $0.sha256 }.map(\.id)
+    }
 
     public static func inventoryItems(_ items: [WatchInventoryItem]) -> [[String: String]] {
         items.map { ["id": $0.id, "sha256": $0.sha256] }

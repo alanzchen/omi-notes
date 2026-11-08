@@ -40,13 +40,21 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
         try? session.updateApplicationContext([WatchWire.binding: phone, "at": Date().timeIntervalSince1970])
     }
 
-    private func acknowledge(_ ids: [String], missing: [String] = [], inventoryId: String? = nil, _ session: WCSession) {
-        guard !ids.isEmpty || !missing.isEmpty || inventoryId != nil, let phone = engine.settings.phoneInstallId else { return }
-        var message: [String: Any] = [WatchWire.acks: ids, WatchWire.binding: phone]
-        if let inventoryId {  // an inventory answer: always says which question, even if nothing is missing
-            message[WatchWire.missing] = missing
-            message[WatchWire.inventoryId] = inventoryId
-        }
+    private func acknowledge(_ ids: [String], _ session: WCSession) {
+        guard !ids.isEmpty else { return }
+        send([WatchWire.acks: ids], session)
+    }
+
+    /// An inventory answer: what is held, with each checksum (the only thing the Watch deletes on), and
+    /// what is missing, naming its question; no plain acks.
+    private func answerInventory(_ question: String, held: [WatchInventoryItem], missing: [String], _ session: WCSession) {
+        send([WatchWire.inventoryId: question, WatchWire.inventoryAcks: WatchWire.inventoryItems(held), WatchWire.missing: missing], session)
+    }
+
+    private func send(_ fields: [String: Any], _ session: WCSession) {
+        guard let phone = engine.settings.phoneInstallId else { return }
+        var message = fields
+        message[WatchWire.binding] = phone
         session.transferUserInfo(message)  // delivered even if the Watch app isn't running now
         if session.isReachable { session.sendMessage(message, replyHandler: nil, errorHandler: nil) }
     }
@@ -98,9 +106,10 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
             // which waiting parts are already here: acknowledge them again, name the missing ones
             guard let question = userInfo[WatchWire.inventoryId] as? String else { return }  // nothing to answer to
             do {
-                let answer = try engine.answerWatchInventory(WatchWire.inventoryItems(from: userInfo[WatchWire.inventoryItems]),
-                                                             binding: userInfo[WatchWire.binding] as? String)
-                acknowledge(answer.acks, missing: answer.missing, inventoryId: question, session)
+                let items = WatchWire.inventoryItems(from: userInfo[WatchWire.inventoryItems])
+                let answer = try engine.answerWatchInventory(items, binding: userInfo[WatchWire.binding] as? String)
+                let held = Set(answer.acks)
+                answerInventory(question, held: items.filter { held.contains($0.id) }, missing: answer.missing, session)
             } catch {
                 OmiLog.shared.log(.warning, "watch", "inventory not answered: \(error.localizedDescription)")
             }

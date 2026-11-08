@@ -22,8 +22,11 @@ import Foundation
 public struct WatchResendPolicy: Codable, Equatable, Sendable {
     public struct Entry: Codable, Equatable, Sendable {
         public var at: Date
+        /// Handovers so far (the resend wait doubles with it); restarts after a failure.
         public var times: Int
         public var delivered: Bool
+        /// This handover's number, never reused (absent in older saved state): what a question remembers.
+        public var attempt: Int?
     }
 
     public static let unconfirmedWait: TimeInterval = 60, unconfirmedMax: TimeInterval = 600
@@ -36,13 +39,18 @@ public struct WatchResendPolicy: Codable, Equatable, Sendable {
     public struct PendingInventory: Codable, Equatable, Sendable {
         public var id: String
         public var askedAt: Date
-        public var times: [String: Int]
+        /// Older saved state only (handover counts, which repeat after a failure: never matched now).
+        public var times: [String: Int]?
+        /// Each item's attempt number when asked.
+        public var attempts: [String: Int]?
     }
 
     public private(set) var entries: [String: Entry] = [:]
     /// When the Watch last asked which delivered items the iPhone has (absent in older saved state).
     public private(set) var inventoryAskedAt: Date?
     public private(set) var pendingInventory: PendingInventory?
+    /// The next attempt number (only ever grows, saved).
+    public private(set) var nextAttempt: Int?
 
     public init() {}
 
@@ -55,7 +63,9 @@ public struct WatchResendPolicy: Codable, Equatable, Sendable {
 
     /// Handed to WatchConnectivity (again, if it has an entry).
     public mutating func handedOver(_ id: String, now: Date) {
-        entries[id] = Entry(at: now, times: (entries[id]?.times ?? 0) + 1, delivered: false)
+        let attempt = nextAttempt ?? 1
+        nextAttempt = attempt + 1
+        entries[id] = Entry(at: now, times: (entries[id]?.times ?? 0) + 1, delivered: false, attempt: attempt)
     }
 
     /// WatchConnectivity finished the transfer without an error: the long wait starts now.
@@ -95,7 +105,8 @@ public struct WatchResendPolicy: Codable, Equatable, Sendable {
 
     /// A question was sent (it replaces any earlier unanswered one).
     public mutating func askInventory(id: String, ids: [String], now: Date) {
-        pendingInventory = PendingInventory(id: id, askedAt: now, times: Dictionary(uniqueKeysWithValues: ids.compactMap { i in entries[i].map { (i, $0.times) } }))
+        pendingInventory = PendingInventory(id: id, askedAt: now, times: nil,
+                                            attempts: Dictionary(uniqueKeysWithValues: ids.compactMap { i in entries[i]?.attempt.map { (i, $0) } }))
         inventoryAskedAt = now
     }
 
@@ -106,7 +117,8 @@ public struct WatchResendPolicy: Codable, Equatable, Sendable {
         pendingInventory = nil
         var due: [String] = []
         for item in missing {
-            guard let e = entries[item], e.delivered, let asked = pending.times[item], e.times == asked else { continue }
+            // the same handover it asked about: a later one (even after a failure) has another number
+            guard let e = entries[item], e.delivered, let attempt = e.attempt, pending.attempts?[item] == attempt else { continue }
             entries[item] = nil
             due.append(item)
         }

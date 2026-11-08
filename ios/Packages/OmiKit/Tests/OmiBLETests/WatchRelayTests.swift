@@ -307,4 +307,39 @@ import OmiCapture
         #expect(p.inventoryDue(now: t0.addingTimeInterval(WatchResendPolicy.inventoryRetire)), "replaced after the retire time")
         #expect(p.pendingInventory?.id == "q1")
     }
+
+    /// ASTRA-IT4-01 (blocker): the question also carried the legacy id-only list, which an older
+    /// inventory-capable phone answered by filename with plain acks, and the Watch deleted its only
+    /// copy. The question now carries checksummed items only, and an inventory answer retires audio
+    /// only for parts whose echoed checksum matches the Watch's own copy; plain acks in it count for nothing.
+    @Test func onlyAChecksumMatchedInventoryAnswerRetiresAudio() throws {
+        let item = WatchInventoryItem(id: "rec-0", sha256: String(repeating: "a", count: 64))
+        let question = WatchWire.inventoryQuestion(id: "q1", items: [item], binding: "phone-A")
+        #expect(question[WatchWire.inventory] == nil, "no id-only list an older phone could answer by filename")
+        #expect(WatchWire.inventoryItems(from: question[WatchWire.inventoryItems]) == [item] && question[WatchWire.inventoryId] as? String == "q1")
+        let held = ["rec-0": item.sha256, "rec-1": String(repeating: "b", count: 64)]
+        // an inventory answer with plain acks (the older phone's shape, or anything without checksums): nothing goes
+        #expect(WatchWire.retirable(acks: ["rec-0"], inventoryAcks: [], inventoryId: "q1", held: held).isEmpty)
+        // a checksum receipt for the Watch's own bytes: it goes; other bytes or an unknown part: kept
+        let receipts = [item, WatchInventoryItem(id: "rec-1", sha256: String(repeating: "c", count: 64)),
+                        WatchInventoryItem(id: "gone", sha256: item.sha256)]
+        #expect(WatchWire.retirable(acks: [], inventoryAcks: receipts, inventoryId: "q1", held: held) == ["rec-0"])
+        // a plain ack after a whole file arrived (no question): as before
+        #expect(WatchWire.retirable(acks: ["rec-1"], inventoryAcks: [], inventoryId: nil, held: held) == ["rec-1"])
+    }
+
+    /// ASTRA-IT4-02: a failed resend dropped its entry, the retry reused the same handover count, and a
+    /// late "missing" for an older question matched the newer delivery and sent it again.
+    @Test func aLateAnswerNeverMatchesANewerAttemptEvenAfterAFailure() throws {
+        let t0 = Date(timeIntervalSince1970: 1_791_000_000)
+        var p = WatchResendPolicy()
+        p.handedOver("x", now: t0); p.delivered("x", now: t0)
+        p.askInventory(id: "q", ids: ["x"], now: t0.addingTimeInterval(1))
+        p.handedOver("x", now: t0.addingTimeInterval(1_800)); p.failed("x")    // the 30-min resend fails
+        p.handedOver("x", now: t0.addingTimeInterval(1_810)); p.delivered("x", now: t0.addingTimeInterval(1_811))  // retry delivered
+        var relaunched = try JSONDecoder().decode(WatchResendPolicy.self, from: JSONEncoder().encode(p))
+        #expect(relaunched.answeredInventory(id: "q", missing: ["x"]).isEmpty, "q asked about an older attempt")
+        #expect(!relaunched.due("x", now: t0.addingTimeInterval(1_900)), "no further submission")
+    }
+
 }
