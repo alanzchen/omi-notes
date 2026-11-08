@@ -50,7 +50,11 @@ enum TransferText {
         guard w.inUse != false else { return nil }
         guard w.inUse == true else { return "Checking for Apple Watch" }
         guard let at = w.reportAt else { return "No report from the Watch yet" }
-        let when = w.reportFresh ? "reported \(Fmt.relative(at))" : "last report \(Fmt.relative(at))"
+        // a report dated in the future (clocks disagree) says nothing about now
+        guard at <= now.addingTimeInterval(60) else { return "Watch report time is ahead of this iPhone" }
+        // an old report is only what the Watch had then, never "nothing waiting" now
+        guard w.reportFresh else { return "Last Watch report \(Fmt.relative(at))" }
+        let when = "reported \(Fmt.relative(at))"
         if let seconds = w.waitingSeconds, seconds > 0 { return "\(duration(Double(seconds))) on the Watch · \(when)" }
         if let parts = w.waitingParts, parts > 0 { return "\(plural(parts, "part", "parts")) on the Watch · \(when)" }
         return "Nothing waiting on the Watch · \(when)"
@@ -166,7 +170,7 @@ struct TransferDetailView: View {
             note("This iPhone hasn't heard from WatchConnectivity yet, so whether a Watch is set up isn't known.")
         } else {
             Card {
-                row("On the Watch", w.reportAt == nil ? nil : waitingOnWatch(w))
+                row("On the Watch", w.reportFresh ? waitingOnWatch(w) : nil)  // unknown unless the report is current
                 Divider().padding(.leading, 16)
                 row("Watch report", w.reportAt.map { (w.reportFresh ? "" : "Old · ") + Fmt.relative($0) })
                 Divider().padding(.leading, 16)
