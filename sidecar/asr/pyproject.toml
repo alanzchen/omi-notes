@@ -1,0 +1,30 @@
+[project]
+name = "omi-asr"
+version = "0.1.0"
+description = "Local ASR sidecar for Omi Notes: MOSS-Transcribe-Diarize lines + Qwen3-ASR text, OpenAI-compatible, loopback only"
+requires-python = ">=3.12,<3.13"
+# mlx / mlx-audio pinned to the versions the 2026-11-08 bench measured (omi-asr-bench)
+dependencies = [
+    "mlx==0.32.4",
+    "mlx-metal==0.32.4",
+    "mlx-audio==0.6.3",
+    "mlx-lm==0.32.2",
+    "transformers==5.22.1",
+    "huggingface-hub==2.4.0",
+    "numpy==2.5.4",
+    "scipy==1.18.1",
+    "soundfile==0.14.0",
+    "fastapi==0.162.0",
+    "uvicorn==0.54.0",
+    "python-multipart==0.0.33",
+]
+
+[dependency-groups]
+dev = ["pytest", "httpx"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

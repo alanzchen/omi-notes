@@ -12,6 +12,7 @@ Omi pendant → iPhone app (`ios/`) → your server (`backend/`) → Markdown no
 | Speaker learning | `docs/speaker-learning.md` | `backend/tests/test_speaker*.py`, `test_enrollment.py` |
 | Omi BLE facts (firmware-coupled) | `docs/device-protocol.md` | — |
 | Backend (Python 3.13, FastAPI, SQLite) | `backend/src/omi_notes/` | `cd backend && uv run pytest` |
+| Local ASR sidecar (opt-in, `STT_LOCAL_URL`) | `sidecar/asr/` (own uv venv, MLX, loopback) | `cd sidecar/asr && uv run pytest` |
 | iOS logic (Swift 6, no dependencies) | `ios/Packages/OmiKit/` (`OmiProtocol`, `OmiCapture`, `OmiBLE`) | `cd ios/Packages/OmiKit && swift test` |
 | iOS app shell (SwiftUI, iOS 17+) | `ios/OmiNotes/`, `ios/project.yml` | `make ios-build` |
 | Omi reference code (read-only) | `/Users/alan/Developer/_ref/omi` (BasedHardware/omi `d4e5a35`) | — |
