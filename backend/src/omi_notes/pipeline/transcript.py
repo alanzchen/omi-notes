@@ -122,15 +122,19 @@ def segments_from_deepgram(response: dict, timemap: list[MapSegment]) -> list[di
         if not text:
             continue
         speaker = utt.get("speaker", 0)
-        if speaker not in labels:
-            labels[speaker] = f"S{len(labels) + 1}"
+        if utt.get("unattributed"):  # words the provider gave no speaker for (local sidecar): not numbered
+            label = "unknown"
+        else:
+            if speaker not in labels:
+                labels[speaker] = f"S{len(labels) + 1}"
+            label = labels[speaker]
         start = map_time(timemap, float(utt.get("start", 0)))
         end = max(start, map_time(timemap, float(utt.get("end", 0))))
         segments.append(
             {
                 "start": round(start, 3),
                 "end": round(end, 3),
-                "speaker": labels[speaker],
+                "speaker": label,
                 "text": text,
                 "confidence": round(float(utt.get("confidence", 0) or 0), 4),
             }

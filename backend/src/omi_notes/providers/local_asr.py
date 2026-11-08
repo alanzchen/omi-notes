@@ -26,6 +26,20 @@ from . import SttRequest
 from .openai_stt import OpenAICompatStt, _TooLarge, normalize_response, pad_short
 
 
+UNKNOWN = "UNKNOWN"  # the sidecar's label for words no MOSS line holds
+
+
+def _normalized(data: dict) -> dict:
+    """`normalize_response`, with the sidecar's UNKNOWN words marked `unattributed` (speaker None): kept and
+    shown as an unknown speaker, never numbered, linked or used for a voiceprint."""
+    segments = [dict(s, speaker_id=None) if s.get("speaker_id") == UNKNOWN else s for s in data.get("segments") or []]
+    result = normalize_response(dict(data, segments=segments))
+    for utterance in result["results"]["utterances"]:
+        if utterance.get("speaker") is None:
+            utterance["unattributed"] = True
+    return result
+
+
 class LocalAsrStt(OpenAICompatStt):
     name = "local-asr"
     links_speakers = True
@@ -55,7 +69,7 @@ class LocalAsrStt(OpenAICompatStt):
             return super()._transcribe_part(offset, part)
         windows = sorted(data.get("windows") or [], key=lambda w: float(w["start"]))
         if len(windows) < 2:
-            return [(offset, normalize_response(data))]
+            return [(offset, _normalized(data))]
         # each segment belongs to the window whose label prefix it carries (the first window's is empty)
         groups: dict[int, list[dict]] = {}
         for seg in data.get("segments") or []:
@@ -66,7 +80,7 @@ class LocalAsrStt(OpenAICompatStt):
         for k, segments in sorted(groups.items()):
             start = float(windows[k]["start"])
             shifted = [dict(seg, start=float(seg["start"]) - start, end=float(seg["end"]) - start) for seg in segments]
-            out.append((offset + start, normalize_response(dict(data, segments=shifted))))
+            out.append((offset + start, _normalized(dict(data, segments=shifted))))
         return out
 
     def healthy(self, *, refresh: bool = False) -> bool:

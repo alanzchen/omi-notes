@@ -176,7 +176,8 @@ def test_a_sidecar_down_ten_minutes_is_an_issue_and_an_alert_until_it_is_back(cl
     assert json.loads((settings.logs_dir / "alerts" / "local-transcription.json").read_text())["state"] == "recovered"
     assert "local_transcription" in client.get("/v1/status", headers=AUTH).json()
     configured = settings.model_copy(update={"stt_local_url": "http://127.0.0.1:18793/v1"})
-    assert views.local_transcription(worker.db, configured, T0 + 700) == {"available": True, "down_since": None, "down_seconds": 0}
+    state = views.local_transcription(worker.db, configured, T0 + 700)
+    assert state["available"] is True and state["down_since"] is None and state["checked_at"]
 
 
 
@@ -309,3 +310,85 @@ def test_two_alike_labels_inside_one_piece_raise_the_bar_for_every_link():
     response = pieces_response([(0, 10, 0), (10, 20, 1), (20, 30, 2), (30, 40, 3), (40, 50, 4), (50, 60, 5)], [0.0, 20.0, 40.0])
     out = link(response, pcm, embedder)
     assert out["omi_notes"]["speakers_linked"]["speakers"] == 6
+
+
+def unknown_tail(request, n):
+    """MOSS stopped early: words after it come back UNKNOWN."""
+    seconds = seconds_of(request)
+    return httpx.Response(200, json={"language": "en", "segments": [
+        {"start": 0.0, "end": seconds / 2, "speaker_id": "S01", "text": "attributed words"},
+        {"start": seconds / 2, "end": seconds, "speaker_id": "UNKNOWN", "text": "nobody's words"}]})  # fmt: skip
+
+
+def test_unattributed_words_are_kept_as_an_unknown_speaker_and_teach_no_voice(client, worker):
+    stt, _ = sidecar(unknown_tail)
+    worker.providers._local_stt = stt
+    worker.providers._embedder = FakeEmbedder()
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    transcript = json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text())
+    assert row["status"] == "done", row["error"]
+    assert [s["speaker"] for s in transcript["segments"]] == ["S1", "unknown"]
+    assert "nobody's words" in transcript["segments"][1]["text"]
+    assert set(transcript["speaker_clips"]) <= {"S1"}, "no voiceprint from unattributed speech"
+
+
+def test_a_transcript_with_no_attributed_words_is_speakers_unknown_not_an_invented_speaker(client, worker):
+    def all_unknown(request, n):
+        return httpx.Response(200, json={"segments": [{"start": 0.0, "end": 3.0, "speaker_id": "UNKNOWN", "text": "words"}]})
+
+    worker.providers._local_stt, _ = sidecar(all_unknown)
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    assert row["status"] == "failed" and row["error_kind"] == "speakers_unknown"
+
+
+def test_audio_that_keeps_killing_the_sidecar_stops_waiting_and_counts_attempts(client, worker):
+    state = {"down": False}
+
+    def transport(request):
+        if request.url.path == "/health":
+            return httpx.Response(503 if state["down"] else 200, json={})
+        state["down"] = True  # this audio takes the engine down; it restarts before the next look
+        return httpx.Response(503, json={"detail": "transcription engine failed"})
+
+    stt = LocalAsrStt("http://127.0.0.1:18793/v1", transport=httpx.MockTransport(transport))
+    stt.HEALTH_TTL = 0.0
+    worker.providers._local_stt = stt
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    for k in range(6):
+        state["down"] = False
+        worker.tick(T0 + 400 + 120 * k)
+    (row,) = convs(worker)
+    assert row["attempts"] >= 1, "after a few engine deaths on the same audio it is this conversation's problem"
+
+
+def test_a_rerun_keeps_the_speaker_links_it_made_even_if_other_voices_changed(client, worker):
+    pcm_voice = np.concatenate([np.zeros(SR, np.int16), voice(6, ALAN, 7), np.zeros(SR, np.int16), voice(6, PRIYA, 8), np.zeros(2 * SR, np.int16)])
+    stt, seen = sidecar(moss_like, max_seconds=5)
+    worker.providers._local_stt = stt
+    worker.providers._embedder = FakeEmbedder()
+    replay(client, pcm_voice)
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    conv_dir = worker.pipeline.conv_dir(row["id"])
+    first = json.loads((conv_dir / "transcript.json").read_text())["segments"]
+    assert list(conv_dir.glob("links-v1-*.json")), "the linking decision is stored next to the STT result"
+    worker.pipeline._background_voice = lambda conv_id, embedder: np.eye(32)[3]  # the other voices changed meanwhile
+    (conv_dir / "transcript.json").unlink()
+    worker.pipeline._set(row["id"], status="closed")
+    worker.tick(T0 + 500)
+    again = json.loads((conv_dir / "transcript.json").read_text())["segments"]
+    assert [s["speaker"] for s in again] == [s["speaker"] for s in first] and len(seen) >= 2
+
+
+def test_stale_health_reads_as_unknown(worker, settings):
+    from omi_notes import views
+
+    configured = settings.model_copy(update={"stt_local_url": "http://127.0.0.1:18793/v1"})
+    worker.providers._local_stt, _ = sidecar()
+    worker.pipeline.watch_local_stt(T0)
+    assert views.local_transcription(worker.db, configured, T0 + 10)["available"] is True
+    assert views.local_transcription(worker.db, configured, T0 + 600)["available"] is None, "nobody has looked for 10 min"

@@ -438,14 +438,18 @@ def worker_present(vault) -> bool:
 
 
 LOCAL_STT_ISSUE_AFTER = 600.0
+LOCAL_STT_STALE = 120.0
 
 
 def local_transcription(db, settings, now: float) -> dict | None:
     """The local sidecar's state as the worker last saw it (`/v1/status`), or None when it isn't configured."""
     if not settings.stt_local_url:
         return None
-    since = db.meta("local_stt_down_since")
-    return {"available": since is None, "down_since": iso_utc_epoch(float(since)) if since else None,
+    since, checked = db.meta("local_stt_down_since"), db.meta("local_stt_checked_at")
+    stale = checked is None or now - float(checked) > LOCAL_STT_STALE
+    return {"available": None if stale else since is None,  # None: nobody has looked lately (worker stopped?)
+            "checked_at": iso_utc_epoch(float(checked)) if checked else None,
+            "down_since": iso_utc_epoch(float(since)) if since else None,
             "down_seconds": round(now - float(since)) if since else 0}  # fmt: skip
 
 

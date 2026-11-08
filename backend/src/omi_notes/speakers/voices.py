@@ -71,8 +71,8 @@ def label_turns(response: dict, *, local_turns: list[Turn] | None = None) -> dic
     labels: dict[object, str] = {}
     turns: dict[str, list[Interval]] = {}
     for utt in sorted(utterances, key=lambda u: float(u.get("start", 0))):
-        if not str(utt.get("transcript", "")).strip():
-            continue
+        if not str(utt.get("transcript", "")).strip() or utt.get("unattributed"):
+            continue  # unattributed words (numbered by neither function) are evidence of nobody's voice
         speaker = utt.get("speaker", 0)
         if speaker not in labels:
             labels[speaker] = f"S{len(labels) + 1}"

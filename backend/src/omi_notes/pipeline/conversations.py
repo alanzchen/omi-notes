@@ -65,7 +65,7 @@ from ..vault import Vault
 from . import prompt
 from .relevance import deterministic_relevance
 from .segmenter import RingCapture, ring_resolved_until
-from .speakers import SpeakerResult, resolve_speakers
+from .speakers import SpeakerResult, has_speakers, resolve_speakers
 from . import sources
 from .transcript import ConversationAudio, assemble, detected_language, merge_same_speaker, segments_from_deepgram
 from .speaker_links import link as link_speakers
@@ -96,6 +96,8 @@ EDITED_RETRY = 600.0
 LOCAL_STT_DOWN = "local transcription (the omi-asr sidecar) is unavailable; waiting for it"
 LOCAL_STT_WAIT = 60.0  # how often a waiting conversation looks again
 LOCAL_STT_ALERT_AFTER = 600.0
+ENGINE_DEATHS_MAX = 3  # the sidecar failing on the same audio this often: a failure, not an outage
+LINKS_FORMAT = 1  # `links-v<n>-<stt file>`: the speaker-linked response (bump when linking changes)
 BACKGROUND_MIN_VOICES = 200  # stored voices needed for a stable background (speaker linking)
 # why a kept `speakers_unknown` conversation has no summary (shown in its note)
 KEPT_REASON = "kept from the phone without speaker separation"
@@ -275,6 +277,7 @@ class ConversationPipeline:
         self._move_retries: dict[str, tuple[int, float]] = {}
         self._status_written: tuple[float, str] | None = None
         self._stub_written: dict[str, float] = {}
+        self._engine_deaths: dict[str, int] = {}
 
     # -- paths / days ----------------------------------------------------------------------------
 
@@ -561,21 +564,34 @@ class ConversationPipeline:
                 try:
                     response = stt.transcribe(request)
                 except ProviderError as exc:
-                    # the sidecar went away mid-request: wait for it like any other conversation
+                    # the sidecar went away mid-request: wait for it like any other conversation, unless this
+                    # very audio has taken it down again and again (then it is this conversation's failure)
                     if linking and not exc.terminal and not stt.healthy(refresh=True):
-                        raise ProviderError(LOCAL_STT_DOWN, kind="stt_unavailable", waiting=True) from exc
+                        self._engine_deaths[conv_id] = self._engine_deaths.get(conv_id, 0) + 1
+                        if self._engine_deaths[conv_id] < ENGINE_DEATHS_MAX:
+                            raise ProviderError(LOCAL_STT_DOWN, kind="stt_unavailable", waiting=True) from exc
+                        log.error("conversation %s: the sidecar failed on its audio %d times", conv_id, self._engine_deaths[conv_id])
                     raise
+                self._engine_deaths.pop(conv_id, None)
             cached = {"created_at": now, "provider": stt.name, "model": stt.model, "response": response}
             atomic_write_bytes(path, json.dumps(cached).encode())
         if unlabeled:
             speakers = SpeakerResult(cached["response"], "unlabeled", False)
         elif windowed:
             speakers = SpeakerResult(cached["response"], "local", True)
+        elif linking and not has_speakers(cached["response"]):
+            # words, but none the sidecar could attribute: no speaker is invented (as for text-only STT)
+            unlabeled = True
+            speakers = SpeakerResult(cached["response"], "unlabeled", False)
         elif linking:
             response = cached["response"]
-            if self.providers.embedder is not None:
+            links = path.with_name(f"links-v{LINKS_FORMAT}-{path.name}")
+            if links.exists():  # decided once per STT result: a re-run never re-links against other voices
+                response = json.loads(links.read_text())
+            elif self.providers.embedder is not None:
                 response = link_speakers(response, audio.pcm, self.providers.embedder,
                                          background=self._background_voice(conv_id, self.providers.embedder))  # fmt: skip
+                atomic_write_bytes(links, json.dumps(response).encode())
             # its labels are the transcript's labels (local diarization would only blur its real turns)
             speakers = self._speakers(conv_id, response, audio, audio_sha, mode="provider")
         else:
@@ -797,24 +813,26 @@ class ConversationPipeline:
                 self.db.set_meta("local_stt_down_since", None)
             return
         ok = local.healthy(refresh=True)
+        self.db.set_meta("local_stt_checked_at", repr(now))
         alert = self.settings.logs_dir / "alerts" / "local-transcription.json"
         alert.parent.mkdir(parents=True, exist_ok=True)
+        # the alert file is written before the index remembers it was: a crash in between repeats it, never skips it
         if ok and since:
             log.warning("local transcription is back after %.0f s", now - float(since))
-            self.db.set_meta("local_stt_down_since", None)
             if self.db.meta("local_stt_alerted"):
-                self.db.set_meta("local_stt_alerted", None)
                 Vault.write_json(alert, {"state": "recovered", "down_since": iso_utc_epoch(float(since)),
                                          "recovered_at": iso_utc_epoch(now), "url": self.settings.stt_local_url})  # fmt: skip
+                self.db.set_meta("local_stt_alerted", None)
+            self.db.set_meta("local_stt_down_since", None)
         elif not ok and not since:
             log.warning("local transcription is unavailable (%s): conversations wait for it", self.settings.stt_local_url)
             self.db.set_meta("local_stt_down_since", repr(now))
         elif not ok and now - float(since) >= LOCAL_STT_ALERT_AFTER and not self.db.meta("local_stt_alerted"):
             log.error("local transcription has been unavailable for %.0f min (%s)", (now - float(since)) / 60, self.settings.stt_local_url)
-            self.db.set_meta("local_stt_alerted", repr(now))
             Vault.write_json(alert, {"state": "down", "down_since": iso_utc_epoch(float(since)), "alerted_at": iso_utc_epoch(now),
                                      "url": self.settings.stt_local_url,
                                      "check": "sidecar/asr/scripts/launchagent.sh status; ~/Library/Logs/omi-notes-asr.log"})  # fmt: skip
+            self.db.set_meta("local_stt_alerted", repr(now))
 
     def _background_voice(self, conv_id: str, embedder) -> np.ndarray | None:
         """The mean of other conversations' stored voices (same model): what every voice recorded here shares."""
@@ -1136,6 +1154,9 @@ class ConversationPipeline:
         audio = (row["audio_sha"] or "")[:16]
         for path in list(conv_dir.glob("stt-*.json")) + list(conv_dir.glob("llm-*.json")):
             if path.name not in keep:
+                path.unlink(missing_ok=True)
+        for path in conv_dir.glob("links-*.json"):
+            if not path.name.endswith(f"-{row['stt_ref']}"):
                 path.unlink(missing_ok=True)
         for path in conv_dir.glob("diarization-*.json"):
             if audio and not path.stem.endswith(audio):

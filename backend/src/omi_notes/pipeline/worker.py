@@ -94,7 +94,6 @@ class Worker:
         self.lock = worker_lock(self.vault)
         self._decoders: OrderedDict[str, tuple[int, CaptureTimeline, VadStream]] = OrderedDict()
         self._last_retention = 0.0
-        self._last_stt_watch = 0.0
         self._reconciled = False
         self.operations = operations.Sweeper()
         self.search = search.Indexer()
@@ -137,12 +136,6 @@ class Worker:
                 self.operations.run(self.pipeline)
             except Exception:
                 log.exception("could not reconcile app retries")
-            if now - self._last_stt_watch >= STT_WATCH_INTERVAL:
-                self._last_stt_watch = now
-                try:
-                    self.pipeline.watch_local_stt(now)
-                except Exception:
-                    log.exception("could not check the local transcription service")
             advanced = self.pipeline.run(now)
             try:
                 self.search.run(self.pipeline)
@@ -198,6 +191,8 @@ class Worker:
             renewed = time.time()
             self.pipeline.release_all_claims()  # we own the lock: no other worker is running
             log.info("worker started (tick %.1fs, VAD %s)", self.settings.worker_tick_seconds, self.vad.vad.name)
+            # its own thread: a long transcription in the loop below must not stop the health checks
+            threading.Thread(target=self._watch_local_stt, args=(stop,), name="local-stt-watch", daemon=True).start()
             while not stop.is_set():
                 if not self.vault.check_lease(writer_id):
                     reason = "another backend took over this vault's writer lease; this one stopped writing"
@@ -217,6 +212,15 @@ class Worker:
                     stop.wait(self.settings.worker_tick_seconds)
         finally:
             self.lock.release()
+
+    def _watch_local_stt(self, stop: threading.Event) -> None:
+        while True:
+            try:
+                self.pipeline.watch_local_stt(time.time())
+            except Exception:
+                log.exception("could not check the local transcription service")
+            if stop.wait(STT_WATCH_INTERVAL):
+                return
 
     # -- chunks ----------------------------------------------------------------------------------
 
