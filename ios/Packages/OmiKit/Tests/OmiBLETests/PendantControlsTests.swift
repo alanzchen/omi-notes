@@ -184,3 +184,51 @@ import OmiProtocol
         #expect(buttonCodes() == [1, 3], "pausing uploads no button event")
     }
 }
+
+/// Field log, build 42 (2026-11-08 05:03Z): about 40 "ledBrightness set to 0" writes in 7 s while the
+/// slider moved. Changes now settle first: only the last value is written (and logged once), and a
+/// value chosen while a write is in flight waits for it instead of piling up.
+@MainActor
+@Suite struct PendantControlsDebounceTests {
+    func model() throws -> (PendantControlsModel, () -> [Int], ([Int]) -> Void) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-debounce-\(UUID().uuidString)")
+        let settings = SettingsStore(defaults: UserDefaults(suiteName: "omi-debounce-\(UUID().uuidString)")!, tokens: InMemoryTokenStore())
+        let engine = OmiEngine(config: EngineConfiguration(dirs: CaptureDirectories(root: root), appVersion: "t", useCoreBluetooth: false),
+                               settings: settings, uploadTransport: CountingUploadTransport())
+        let m = PendantControlsModel(engine: engine)
+        m.settleDelay = .milliseconds(100)
+        var writes: [Int] = []
+        var finish: [(Result<Int, Error>) -> Void] = []
+        m.write = { _, value, done in writes.append(value); finish.append(done) }
+        return (m, { writes }, { values in for (f, v) in zip(finish, values) { f(.success(v)) }; finish.removeAll() })
+    }
+
+    func until(_ condition: () -> Bool) async throws {
+        for _ in 0..<100 where !condition() { try await Task.sleep(for: .milliseconds(20)) }
+    }
+
+    @Test func aDragWritesOnlyTheValueItEndsOn() async throws {
+        let (m, writes, _) = try model()
+        for v in stride(from: 50, through: 0, by: -5) { m.change(.ledBrightness, to: v) }
+        #expect(m.status(of: .ledBrightness) == .saving(0))
+        try await until { !writes().isEmpty }
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(writes() == [0])
+    }
+
+    @Test func aValueChosenDuringAWriteWaitsAndOnlyTheLatestFollows() async throws {
+        let (m, writes, complete) = try model()
+        m.change(.ledBrightness, to: 40)
+        try await until { writes() == [40] }
+        m.change(.ledBrightness, to: 30)
+        m.change(.ledBrightness, to: 20)
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(writes() == [40], "nothing new while the first write is in flight")
+        complete([40])
+        try await until { writes() == [40, 20] }
+        #expect(writes() == [40, 20] && m.status(of: .ledBrightness) == .saving(20))
+        complete([20])
+        try await until { m.status(of: .ledBrightness) == .saved(20) }
+        #expect(m.status(of: .ledBrightness) == .saved(20))
+    }
+}
