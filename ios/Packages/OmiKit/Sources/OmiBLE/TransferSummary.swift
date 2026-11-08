@@ -205,11 +205,25 @@ public struct TransferSummary: Equatable, Sendable {
     }
 
     /// Watch → iPhone bar: parts received, of those plus the parts the Watch still reports. nil
-    /// without a Watch report.
+    /// without a current Watch report (a stale or future-dated one isn't evidence of now).
     public var watchFraction: Double? {
-        guard watch.inUse == true, watch.reportAt != nil, let waiting = watch.waitingParts else { return nil }
+        guard watch.inUse == true, watch.reportAt != nil, watch.reportFresh, let waiting = watch.waitingParts else { return nil }
         let total = watch.receivedOnPhone + waiting
         return total > 0 ? Double(watch.receivedOnPhone) / Double(total) : 1
+    }
+
+    /// Everything reached the server as far as anyone can tell: this iPhone sent all it had, and the
+    /// Watch (if one is in use) reported, recently, nothing waiting or being prepared.
+    public var everythingSent: Bool {
+        guard phone.state == .allSent else { return false }
+        if watch.inUse == false { return true }
+        return watch.reportFresh && watch.waitingParts == 0 && watch.converting == 0 && watch.waitingForServer == 0
+    }
+
+    /// Audio files plus conversations the server last said it still has to process; nil if it didn't say.
+    public var serverWorkLeft: Int? {
+        guard server.chunksPending != nil || server.conversationsPending != nil else { return nil }
+        return (server.chunksPending ?? 0) + (server.conversationsPending ?? 0)
     }
 
     /// "820 B/s", "48.2 KB/s", "1.3 MB/s" (decimal units, like the Files app).

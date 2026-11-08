@@ -53,7 +53,10 @@ enum TransferText {
         case .preparing(let n): return ("Preparing Watch audio", plural(n, "part", "parts"), "gearshape", false)
         case .keptAside(let n): return ("Kept aside", plural(n, "file", "files") + " not uploaded", "tray.full", true)
         case .queueUnreadable: return ("Queue unreadable", nil, "questionmark.folder", true)
-        case .allSent: return ("All sent", "Everything queued reached the server", "checkmark.circle", false)
+        case .allSent:
+            if t.everythingSent { return ("All sent", "Everything queued reached the server", "checkmark.circle", false) }
+            return ("iPhone sent everything", t.watch.reportFresh ? "The Watch still has audio to send" : "Waiting for a Watch report",
+                    "checkmark.circle", false)
         case .notConfigured: return ("No server connected", nil, "server.rack", true)
         case .unknown: return ("Not measured right now", left, "questionmark.circle", false)
         }
@@ -132,7 +135,7 @@ struct TransferDetailView: View {
                     hero(t)
                     if t.watch.inUse != false { watchHop(t, now: context.date) }
                     phoneHop(t)
-                    serverLine(t.server)
+                    serverLine(t.server, summary: t)
                     fold("Details", isOn: $showDetails) { details(t, now: context.date) }
                     fold("How this works", isOn: $showHow) { explanations }
                     Text("Updated \(context.date.formatted(date: .omitted, time: .standard))")
@@ -197,8 +200,12 @@ struct TransferDetailView: View {
         let line: String
         if w.inUse == nil {
             line = "Checking for Apple Watch"
-        } else if let parts = w.waitingParts, w.reportAt != nil {
+        } else if let parts = w.waitingParts, w.reportAt != nil, w.reportFresh {
             line = parts == 0 ? "Nothing left on the Watch" : "\(TransferText.plural(parts, "part", "parts")) left on the Watch"
+        } else if let at = w.reportAt, at <= now {
+            line = "Last Watch report \(Fmt.relative(at))"  // not current: no claim about now
+        } else if w.reportAt != nil {
+            line = "Watch report time is ahead of this iPhone"
         } else {
             line = "No report from the Watch yet"
         }
@@ -218,11 +225,11 @@ struct TransferDetailView: View {
         return hop("iPhone → Server", symbol: "arrow.up", fraction: t.phoneFraction, line: line)
     }
 
-    private func serverLine(_ s: TransferSummary.Server) -> some View {
+    private func serverLine(_ s: TransferSummary.Server, summary: TransferSummary) -> some View {
         var text = "Server"
         if s.reachable == false { text += " · not reachable" }
-        if let n = s.chunksPending { text += n == 0 ? " · nothing to process" : " · \(n.formatted()) to process" }
-        if let at = s.lastNoteAt { text += " · last note \(Fmt.relative(at))" }
+        if let left = summary.serverWorkLeft { text += left == 0 ? " · nothing to process" : " · \(left.formatted()) to process" }
+        if let at = s.checkedAt { text += " · checked \(Fmt.relative(at))" }
         return Text(text).font(.footnote).foregroundStyle(Pendant.secondary).lineLimit(1).minimumScaleFactor(0.8).padding(.horizontal, 4)
     }
 
