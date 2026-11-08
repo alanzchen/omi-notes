@@ -178,3 +178,13 @@ def test_words_qwen_could_not_produce_where_moss_has_none_are_an_error_not_silen
     e.models = (FakeMoss([]), CappingQwen(limit=0), FakeAligner())
     with pytest.raises(IncompleteTranscription):
         e.transcribe(speech(30), [])
+
+
+def test_a_failed_span_only_partly_under_moss_lines_is_incomplete_not_silently_short():
+    from omi_asr.engine import IncompleteTranscription
+
+    e = Engine()
+    # MOSS covers only the first second of 10 s of speech (one chunk, too short to halve); Qwen fails on it
+    e.models = (FakeMoss([{"start": 0.0, "end": 1.0, "speaker_id": "S01", "text": "[0][S01] hi"}]), CappingQwen(limit=0), FakeAligner())
+    with pytest.raises(IncompleteTranscription):
+        e.transcribe(speech(10), [])

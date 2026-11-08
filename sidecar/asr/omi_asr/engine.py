@@ -27,6 +27,24 @@ ALIGNER = os.environ.get("OMI_ASR_ALIGNER", "mlx-community/Qwen3-ForcedAligner-0
 ALIGN_LANGUAGE = os.environ.get("OMI_ASR_ALIGN_LANGUAGE", "Chinese")  # the bench's setting for mixed zh/en
 IDLE_UNLOAD_SECONDS = float(os.environ.get("OMI_ASR_IDLE_UNLOAD", "900"))
 MAX_RESPLIT_DEPTH = 3
+UNCOVERED_MAX = 1.0  # seconds of speech in a failed Qwen span that MOSS's lines may leave uncovered...
+UNCOVERED_SHARE = 0.25  # ... or this share of it (laughs, noise and breaths between lines are not words)
+
+
+def _uncovered_speech(pcm: np.ndarray, a: float, b: float, covered: list[tuple[float, float]]) -> tuple[float, float]:
+    """(seconds of non-quiet audio in [a, b] that no covered span (+-SLACK) reaches, seconds of non-quiet audio)."""
+    frame = plan.SR // 50
+    energy = plan.frame_energy(pcm[round(a * plan.SR) : round(b * plan.SR)])
+    if len(energy) == 0:
+        return 0.0, 0.0
+    loud = energy > plan._threshold(plan.frame_energy(pcm))
+    times = a + (np.arange(len(energy)) + 0.5) * frame / plan.SR
+    hit = np.zeros(len(energy), dtype=bool)
+    for x, y in covered:
+        hit |= (times >= x - SLACK) & (times <= y + SLACK)
+    return float((loud & ~hit).sum()) * frame / plan.SR, float(loud.sum()) * frame / plan.SR
+
+
 class IncompleteTranscription(RuntimeError):
     """Qwen failed on some audio and MOSS has no words there either: rather an error than silence."""
 
@@ -193,9 +211,10 @@ class Engine:
         for a, b in zip(cuts, cuts[1:], strict=False):
             units.extend(self._qwen(qwen, aligner, pcm, start + a, start + b, context, stats, languages, capped))
         lines = [dict(line) for line in lines]
-        for a, b in capped:  # every failed span needs MOSS words over it, or the words there would vanish
-            if not any(line.get("moss_text") and line["start"] < b and line["end"] > a for line in lines):
-                raise IncompleteTranscription(f"Qwen failed on {a:.0f}-{b:.0f} s and MOSS has no words there")
+        for a, b in capped:  # the speech of every failed span needs MOSS words over it, or it would vanish
+            missing, loud = _uncovered_speech(pcm, a, b, [(line["start"], line["end"]) for line in lines if line.get("moss_text")])
+            if missing > max(UNCOVERED_MAX, UNCOVERED_SHARE * loud):
+                raise IncompleteTranscription(f"Qwen failed on {a:.0f}-{b:.0f} s and MOSS has no words for {missing:.0f} s of its speech")
         if not lines:
             if not units:
                 return []
