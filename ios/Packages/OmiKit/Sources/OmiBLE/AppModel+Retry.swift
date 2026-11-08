@@ -22,10 +22,14 @@ extension AppModel {
         let config = engine.settings.serverConfig()
         guard let endpoint = config.endpoint, config == answeredForConfig else { return false }
         let api = APIClient(endpoint: endpoint, session: session)
+        // after an uncertain answer the same id goes again: one decision, one request id
+        let requestId = dismissRequestIds[conversationId] ?? UUID().uuidString.lowercased()
+        dismissRequestIds[conversationId] = requestId
         do {
-            // a repeat (after a lost answer) records the same decision again: harmless
-            try await api.dismiss(conversationId: conversationId, requestId: UUID().uuidString.lowercased())
+            try await api.dismiss(conversationId: conversationId, requestId: requestId)
+            dismissRequestIds[conversationId] = nil
         } catch APIError.http(let code, let detail) where (400..<500).contains(code) {
+            dismissRequestIds[conversationId] = nil  // answered: this id is settled
             retryMessages[conversationId] = Self.retryRefusal(detail)
             return false
         } catch {

@@ -236,6 +236,25 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         #expect(m.retryMessages["conv-2"] != nil, "the refusal is shown")
     }
 
+    /// ASTRA-IT1-04: after an uncertain answer (no response, or a server error) the same request id is
+    /// sent again, so one decision never becomes two; a settled answer starts a fresh id next time.
+    @Test func aDismissAfterAnUncertainAnswerReusesItsRequestId() async throws {
+        let (m, _) = try model()
+        AppServerStub.routes["/v1/status"] = [(200, Self.status.replacingOccurrences(of: #""retry","#, with: #""retry","dismiss","#))]
+        await m.refreshServer()
+        let ok = (200, #"{"dismissed":{"conversation_id":"conv-1","request_id":"r","failure_id":"f","resolved_at":null}}"#)
+        AppServerStub.routes["/v1/conversations/conv-1/dismiss"] = [(502, #"{"error":"bad_gateway"}"#), ok]
+        #expect(await m.dismiss(conversationId: "conv-1") == false)
+        #expect(await m.dismiss(conversationId: "conv-1"))
+        func ids() -> [String] {
+            AppServerStub.requests.filter { $0.path == "/v1/conversations/conv-1/dismiss" }
+                .compactMap { (try? JSONSerialization.jsonObject(with: $0.body) as? [String: String])?["request_id"] }
+        }
+        #expect(ids().count == 2 && ids()[0] == ids()[1])
+        _ = await m.dismiss(conversationId: "conv-1")
+        #expect(ids().count == 3 && ids()[2] != ids()[1], "a settled request isn't reused")
+    }
+
     @Test func aKeepSurvivesARelaunchAndIsSentOnceToKeep() async throws {
         let (m, root) = try model()
         AppServerStub.routes["/v1/status"] = [(200, Self.keepStatus)]
