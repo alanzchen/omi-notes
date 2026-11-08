@@ -223,14 +223,13 @@ def dismiss(pipeline, conv_id: str, request_id: str, *, read_only: str | None, f
 
 
 def _dismiss_requests(resolution: dict) -> dict:
-    """Every dismiss request recorded for this conversation → the failure it dismissed and when, in
-    order (the latest decision's own request included, also from a record written before this)."""
-    if resolution.get("kind") != DISMISSED:
-        return {}
+    """Every dismiss request recorded for this conversation → the failure it dismissed and when,
+    whatever the latest decision is (a Keep carries them on). A dismissal recorded before this ledger
+    existed counts its own request; a Keep's operation id is never read as a dismissal."""
     out = {k: v for k, v in (resolution.get("requests") or {}).items()
            if isinstance(k, str) and isinstance(v, dict)}  # fmt: skip
     op, failure = resolution.get("op"), resolution.get("failure") or {}
-    if isinstance(op, str) and op not in out:
+    if resolution.get("kind") == DISMISSED and isinstance(op, str) and op not in out:
         out[op] = {"failure_id": failure.get("id"), "at": resolution.get("resolved_at")}
     return out
 
@@ -270,9 +269,12 @@ def _enqueue(pipeline, row, op: dict) -> None:
     keep = {}
     if op["kind"] == "keep":
         # the owner's decision, with the failure it resolves (it stays visible after the note exists)
-        keep["resolution"] = json.dumps({"kind": KEPT, "op": op["id"], "resolved_at": op["requested_at"],
-                                         "failure": {"stage": row["failed_stage"], "kind": row["error_kind"],
-                                                     "id": row["failure_id"]}}, sort_keys=True)  # fmt: skip
+        decision = {"kind": KEPT, "op": op["id"], "resolved_at": op["requested_at"],
+                    "failure": {"stage": row["failed_stage"], "kind": row["error_kind"], "id": row["failure_id"]}}
+        earlier = _dismiss_requests(_resolution(row))
+        if earlier:  # what earlier dismissals were for, so a replay never acts on a later failure
+            decision["requests"] = earlier
+        keep["resolution"] = json.dumps(decision, sort_keys=True)
     pipeline._commit(row["id"], retry_op=op["id"], retry_stage=op["stage"], **keep)
     pipeline.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1 WHERE id=?", (row["id"],))
 

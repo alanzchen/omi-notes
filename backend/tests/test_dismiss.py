@@ -136,3 +136,39 @@ def test_past_the_history_cap_only_requests_naming_their_failure_are_taken(clien
         assert named.status_code == 200
     kept = record(worker, row["id"])["resolution"]["requests"]
     assert sum(1 for v in kept.values() if not v.get("bound")) == 3, "every unnamed request is still remembered"
+
+
+def test_a_keep_never_erases_what_earlier_dismissals_were_for(tmp_path, monkeypatch):
+    """ASTRA-IT5-01: Keep replaced `resolution` and with it the dismiss ledger. Unnamed request A
+    dismissed F1; Retry failed as F2; Keep; the kept attempt failed as F3; after a rebuild, replaying A
+    answered for F3 and hid it. The ledger now survives every resolution rewrite and rebuild."""
+    from omi_notes import operations
+
+    from .test_keep_unknown_speakers import keep, unseparated
+    from .test_retry import reopen as reopen_vault
+
+    settings, client, worker, row, _, _ = unseparated(tmp_path)
+    a = str(uuid.uuid4())
+    assert dismiss(client, row["id"], a).status_code == 200
+    assert retry(client, row["id"]).status_code == 202
+    worker.tick(T0 + 300)
+    (f2,) = convs(worker)
+    assert f2["status"] == "failed" and f2["failure_id"] != row["failure_id"]
+    assert keep(client, row["id"]).status_code == 202
+    from omi_notes.providers import ProviderError
+
+    def gone(r):
+        raise ProviderError("synthetic: raw audio unavailable", terminal=True, kind="audio")
+    monkeypatch.setattr(worker.pipeline, "conversation_audio", gone)
+    worker.tick(T0 + 400)
+    (f3,) = convs(worker)
+    assert f3["status"] == "failed" and f3["failure_id"] not in (row["failure_id"], f2["failure_id"])
+    assert record(worker, row["id"])["resolution"]["requests"][a]["failure_id"] == row["failure_id"], "kept through Keep"
+    client, worker = reopen_vault(settings)
+    replay_a = dismiss(client, row["id"], a)
+    assert replay_a.status_code == 200 and replay_a.json()["dismissed"]["failure_id"] == row["failure_id"]
+    assert row["id"] in [i["conversation_id"] for i in failed_issues(client)], "F3 stays listed"
+    # the cap on unnamed requests counts the same history across the Keep
+    monkeypatch.setattr(operations, "DISMISS_HISTORY", 1)
+    refused = dismiss(client, row["id"])
+    assert refused.status_code == 409 and refused.json()["error"] == "failure_id_required"
