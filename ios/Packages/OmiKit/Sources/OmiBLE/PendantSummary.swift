@@ -144,7 +144,7 @@ public struct PendantSummary: Equatable, Sendable {
     static func connectionTitle(_ s: EngineSnapshot) -> String {
         switch s.connection {
         case .noDevice: return "No pendant paired"
-        case .bluetoothUnavailable: return "Bluetooth unavailable"
+        case .bluetoothUnavailable(let why): return SystemHealth.bluetoothTitle(why)
         case .waitingForDevice: return "Not connected"
         case .settingUp: return "Connecting…"
         case .streaming: return "Connected · recording"
@@ -247,7 +247,7 @@ public struct PendantSummary: Equatable, Sendable {
         case .settingUp: return "Connecting…"
         case .waitingForDevice: return "Not connected · may still record on its own"
         case .noDevice: return "No pendant paired"
-        case .bluetoothUnavailable: return "Bluetooth is unavailable"
+        case .bluetoothUnavailable(let why): return SystemHealth.bluetoothTitle(why)
         case .refused: return "This pendant can't be used"
         case .paused: return s.connection.isUserDisconnect ? "Disconnected by you · may still record on its own" : "Recording paused"
         }
@@ -286,7 +286,8 @@ public struct PendantSummary: Equatable, Sendable {
         case .settingUp: return flow(.working, "Connecting…")
         case .waitingForDevice: return flow(.unknown, "Not connected")
         case .noDevice: return flow(.needsAction, "Not paired")
-        case .bluetoothUnavailable: return flow(.needsAction, "Bluetooth off")
+        case .bluetoothUnavailable(let why):
+            return flow(SystemHealth.bluetoothPassing(why) ? .working : .needsAction, SystemHealth.bluetoothTitle(why))
         case .refused: return flow(.needsAction, "Can't be used")
         case .paused: return flow(.needsAction, s.connection.isUserDisconnect ? "Disconnected" : "Paused")
         }

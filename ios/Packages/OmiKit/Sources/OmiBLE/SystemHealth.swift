@@ -51,6 +51,19 @@ public struct SystemHealth: Equatable, Sendable {
     public var detail: String?
     public var steps: [Step]
 
+    /// Starting and resetting pass on their own; off, not allowed or unsupported need someone.
+    public static func bluetoothPassing(_ why: String) -> Bool { why == "starting" || why == "resetting" }
+
+    /// The one wording of a Bluetooth state, wherever it is shown.
+    public static func bluetoothTitle(_ why: String) -> String {
+        switch why {
+        case "starting": return "Bluetooth is starting…"
+        case "resetting": return "Bluetooth is restarting…"
+        case "off": return "Bluetooth is off"
+        default: return why.hasPrefix("not allowed") ? "Bluetooth isn't allowed for Omi Notes" : "Bluetooth is unavailable"
+        }
+    }
+
     /// A server answer older than this is shown as unknown.
     public static let staleAfter: TimeInterval = 5 * 60
 
@@ -100,7 +113,9 @@ public struct SystemHealth: Equatable, Sendable {
             }
             return step(.needsAction, "No recording device set up", "Pair an Omi pendant, or set up Apple Watch in Devices.", .openDevices)
         case .bluetoothUnavailable(let why):
-            return step(.needsAction, "Bluetooth is \(why)", "Turn Bluetooth on and allow Omi Notes to use it.", .openBluetoothSettings)
+            // CoreBluetooth's first moments (or a reset): passing, nothing for anyone to fix
+            if Self.bluetoothPassing(why) { return step(.working, Self.bluetoothTitle(why)) }
+            return step(.needsAction, Self.bluetoothTitle(why), "Turn Bluetooth on and allow Omi Notes to use it.", .openBluetoothSettings)
         case .refused(let why):
             return step(.needsAction, "This pendant can't be used", why, .pairDevice)
         case .paused(let why):

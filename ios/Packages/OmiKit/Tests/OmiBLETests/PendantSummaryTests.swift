@@ -39,6 +39,28 @@ import Testing
         PendantSummary.evaluate(snapshot: s, server: reach, status: st, statusAt: st == nil ? nil : now.addingTimeInterval(-age), now: now)
     }
 
+    /// TestFlight feedback 2026-11-08 03:22Z (build 41): "Bluetooth is unavailable" under the pendant's
+    /// name while the warning said "Bluetooth is starting · Open Settings". Starting (CoreBluetooth's
+    /// first moments) is a passing state, said the same everywhere and with nothing to fix; off or not
+    /// allowed still asks for Settings.
+    @Test func bluetoothStartingIsOneStateWithNothingToFix() throws {
+        var s = streaming()
+        s.connection = .bluetoothUnavailable("starting")
+        s.device = nil
+        let starting = summary(s, reachable, nil)
+        let texts = [starting.connectionTitle, starting.stateLine, starting.headline.title] + starting.rows.map(\.title)
+        #expect(texts.allSatisfy { !$0.contains("unavailable") && !$0.contains("off") }, "\(texts)")
+        #expect(starting.stateLine.contains("starting") && starting.connectionTitle.contains("starting"))
+        let step = try #require(SystemHealth.evaluate(snapshot: s, server: reachable, status: nil, statusAt: nil, now: now).steps.first { $0.area == .pendant })
+        #expect(step.level == .working && step.fix == nil, "\(step)")
+
+        s.connection = .bluetoothUnavailable("off")
+        let off = summary(s, reachable, nil)
+        #expect(off.stateLine == "Bluetooth is off" && off.connectionTitle == "Bluetooth is off")
+        let offStep = try #require(SystemHealth.evaluate(snapshot: s, server: reachable, status: nil, statusAt: nil, now: now).steps.first { $0.area == .pendant })
+        #expect(offStep.level == .needsAction && offStep.fix == .openBluetoothSettings)
+    }
+
     @Test func thePhonesChoicesAreSaidWithAWayBack() throws {
         var s = streaming()
         s.recordingPaused = true
