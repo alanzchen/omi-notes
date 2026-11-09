@@ -371,6 +371,37 @@ def test_an_import_never_recreates_a_voice_forgotten_while_it_was_judged(env, mo
     assert worker.db.one("SELECT COUNT(*) AS n FROM samples")["n"] == 0
 
 
+def test_forget_purges_the_whole_move_lineage_enrollment_audio_and_calibration_entries(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    priya = consented_priya(client)
+    ravi = new_person(client, "Ravi", attest_knows=True)
+    assert client.post(f"/v1/samples/{ids[0]}/move", json={"person_id": priya, "request_id": "l-1"}, headers=AUTH).status_code == 200
+    copy = sample_file(settings, me, ids[0])["moved_to"]["sample_id"]
+    assert client.post(f"/v1/samples/{copy}/move", json={"person_id": ravi, "request_id": "l-2"}, headers=AUTH).status_code == 200
+    # an enrollment of Alan's that was really Priya's voice
+    row = monologue_row(client, worker)
+    imported = import_range(client, me, row["id"], 0, 60).json()
+    assert client.post(f"/v1/samples/{imported['sample_id']}/move", json={"person_id": priya, "request_id": "l-3"},
+                       headers=AUTH).status_code == 200  # fmt: skip
+    assert worker.calibrator.run(T0 + 20_000, force=True)
+    assert priya in json.loads((settings.vault_dir / "_omi" / "speakers" / "calibration.json").read_text())["people"]
+
+    assert client.delete(f"/v1/people/{ravi}", headers=AUTH).status_code == 200
+    vault = Vault.open(settings)
+    assert not (vault.person_dir(me) / "samples" / f"{ids[0]}.json").exists(), "A→B→C: A's record holds C's voice"
+    assert not (vault.person_dir(priya) / "samples" / f"{copy}.json").exists()
+
+    audio = vault.person_dir(me) / "enrollment" / f"{imported['import_id']}.omiaudio"
+    assert audio.exists()
+    assert client.delete(f"/v1/people/{priya}", headers=AUTH).status_code == 200
+    assert not audio.exists() and not (vault.person_dir(me) / "enrollments" / f"{imported['import_id']}.json").exists()
+    calibration = json.loads((settings.vault_dir / "_omi" / "speakers" / "calibration.json").read_text())
+    assert priya not in calibration["people"]
+    log = (settings.vault_dir / "_omi" / "speakers" / "calibration-log.jsonl").read_text()
+    assert priya not in log and ravi not in log
+
+
 def test_a_reject_leaves_a_label_alone_that_no_longer_lists_the_sample(env):
     settings, client, worker = env
     me, rows, ids = me_with_samples(client, worker)

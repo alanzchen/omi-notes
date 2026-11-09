@@ -348,6 +348,12 @@ class SpeakerStore:
     def forget_voice(self, person_id: str, *, delete_note: bool = False) -> None:
         """Delete the person's voice data (samples, enrollment audio, consent). A global enrollment
         result keeps only its decision, so the reading is not learned again."""
+        # a durable mark that this voice was forgotten (first), so work begun before it (an import being judged)
+        # can tell and never writes the voice back
+        current = Vault.read_json(self.settings_path) or {}
+        forgotten = dict(current.get("forgotten_voices") or {})
+        forgotten[person_id] = int(forgotten.get(person_id) or 0) + 1
+        self.update_settings(forgotten_voices=forgotten)
         results = self.vault.speakers / "enrollments"
         for path in sorted(results.glob("*.json")) if results.exists() else []:
             data = Vault.read_json(path) or {}
@@ -355,21 +361,8 @@ class SpeakerStore:
                 for key in ("person_id", "sample_id", "model", "model_sha"):
                     data.pop(key, None)
                 Vault.write_json(path, data | {"forgotten": True})
-        # a sample moved to this person left a `moved` record (with the vector) in the old person's folder:
-        # it is this person's voice, so it goes with them (history and all)
-        for path in sorted(self.vault.people.glob("*/samples/*.json")) if self.vault.people.exists() else []:
-            if path.parent.parent.name == person_id:
-                continue
-            data = Vault.read_json(path) or {}
-            if data.get("state") == MOVED and (data.get("moved_to") or {}).get("person_id") == person_id:
-                remove(path)
-                self.db.execute("DELETE FROM samples WHERE id=?", (path.stem,))
-        # a durable mark that this voice was forgotten (first), so work begun before it (an import being judged)
-        # can tell and never writes the voice back
-        current = Vault.read_json(self.settings_path) or {}
-        forgotten = dict(current.get("forgotten_voices") or {})
-        forgotten[person_id] = int(forgotten.get(person_id) or 0) + 1
-        self.update_settings(forgotten_voices=forgotten)
+        self._purge_lineage(person_id)
+        self._forget_calibration(person_id)
         folder = self.person_dir(person_id)
         if folder.exists():
             shutil.rmtree(folder)
@@ -379,6 +372,49 @@ class SpeakerStore:
             remove(self.vault.root / person["note_path"])
         self.db.execute("DELETE FROM samples WHERE person_id=?", (person_id,))
         self.scan_people()
+
+    def _purge_lineage(self, person_id: str) -> None:
+        """A sample moved to this person (directly, or A→B→this) left `moved` records holding this person's voice in
+        other folders, and an enrollment sample keeps its audio in the folder it was imported into: they go with
+        this person (history and all)."""
+        records: dict[tuple[str, str], tuple[Path, dict]] = {}
+        for path in sorted(self.vault.people.glob("*/samples/*.json")) if self.vault.people.exists() else []:
+            data = Vault.read_json(path) or {}
+            if data.get("state") == MOVED:
+                records[(path.parent.parent.name, path.stem)] = (path, data)
+
+        def reaches(key: tuple[str, str]) -> bool:
+            seen = set()
+            while key in records and key not in seen:
+                seen.add(key)
+                target = records[key][1].get("moved_to") or {}
+                if target.get("person_id") == person_id:
+                    return True
+                key = (target.get("person_id"), target.get("sample_id"))
+            return False
+
+        for (owner, sample_id), (path, data) in records.items():
+            if owner == person_id or not reaches((owner, sample_id)):
+                continue
+            if data.get("enrollment_id"):  # its audio and result are this person's voice too
+                for extra in (self.person_dir(owner) / "enrollment" / f"{data['enrollment_id']}.omiaudio",
+                              self.person_dir(owner) / "enrollments" / f"{data['enrollment_id']}.json"):  # fmt: skip
+                    remove(extra)
+            remove(path)
+            self.db.execute("DELETE FROM samples WHERE id=?", (sample_id,))
+
+    def _forget_calibration(self, person_id: str) -> None:
+        """Calibration results about this person are removed too (the published one and every logged run)."""
+        path = self.vault.speakers / "calibration.json"
+        data = Vault.read_json(path)
+        if data and person_id in (data.get("people") or {}):
+            data["people"] = {k: v for k, v in data["people"].items() if k != person_id}
+            Vault.write_json(path, data)
+        log_path = self.vault.speakers / "calibration-log.jsonl"
+        lines = Vault.read_jsonl(log_path)
+        if any(person_id in (line.get("people") or {}) for line in lines):
+            kept = [line | {"people": {k: v for k, v in (line.get("people") or {}).items() if k != person_id}} for line in lines]
+            atomic_write_bytes(log_path, "".join(canonical_json(line) + "\n" for line in kept).encode())
 
     def forget_count(self, person_id: str) -> int:
         """How many times this person's voice was forgotten (`forget_voice`)."""
