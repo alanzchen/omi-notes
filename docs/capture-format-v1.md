@@ -273,6 +273,10 @@ enrollment only when it contains `voice_enrollment`: a server that doesn't know 
 events would transcribe the reading as a conversation. `conversation_detail` and `issues` announce
 the app views below. `pendant_star` announces button code 3 (below); the phone offers "star
 conversation" for a double tap only when it is listed, because older servers store code 3 but ignore it.
+`voice_review` (the review queue and sample remove/restore/move), `voice_calibration`
+(`GET /v1/speakers/calibration` and the `measured`/`calibrated_at` fields of `GET /v1/people`) and
+`enrollment_import` (`POST /v1/people/{id}/enrollments/import`) announce the Voices hub APIs, specified
+in `docs/speaker-learning.md` ("Voices hub"); the phone shows those screens only when they are listed.
 
 The response is cheap and calls no provider: `ready` means *configured*, not that inference works.
 `worker.present` means a process holds the vault's worker lock (the pipeline, or a maintenance

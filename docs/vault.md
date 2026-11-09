@@ -31,10 +31,14 @@ operational index. Copy the folder anywhere, point a backend at it, and it rebui
     events/YYYY-MM-DD.jsonl               {event_id, received_at, body} — append-only (torn tail repaired before appending)
     conversations/YYYY-MM/<id>/conversation.json   decision + render + failure blocks — rewritten atomically (server only)
     conversations/YYYY-MM/<id>/{stt,diarization,llm,voices}-*.json, transcript.json   write-once
-    people/<person_id>/samples/<sample_id>.json    voiceprint {model, model_sha, dim, vector_b64, source, seconds, created_at}
-    people/<person_id>/enrollment/<id>.omiaudio    wearer's own consented enrollment audio (FLAC bytes; non-attachment extension)
-    people/<person_id>/enrollments/<id>.json       enrollment result
+    people/<person_id>/samples/<sample_id>.json    voiceprint {model, model_sha, dim, vector_b64, source, seconds, created_at,
+                                                   clips?, voices_file?, caption?, f0?/f0_source?, import?, state?, revision?,
+                                                   history?, flag?, moved_to?/moved_from?} — rewritten (server only)
+    people/<person_id>/enrollment/<id>.omiaudio    consented enrollment speech (pendant or imported; FLAC bytes; non-attachment extension)
+    people/<person_id>/enrollments/<id>.json       enrollment result (an import's: its source and what it merged)
     speakers/settings.json                         recognition acknowledgment, unknown-voice opt-in, dismissed suggestions
+    speakers/calibration.json                      the last published (informational) speaker calibration + its input fingerprint
+    speakers/calibration-log.jsonl                 one line per published calibration — append-only
     displaced/<sha>.md                             user-edited note versions set aside by an explicit "overwrite"
     operations/<request_id>.json                   app retries: accepted → done | failed | superseded (see "Operations")
 ```
@@ -42,8 +46,12 @@ operational index. Copy the folder anywhere, point a backend at it, and it rebui
 `VAULT.json` `format` is 1 until the first app retry raises it to 2 (records may then carry retry
 state), the first keep from the phone raises it to 3 (records may carry `resolution`), and the
 first "keep unknown" of a voice raises it to 4 (`speakers.json` label states may be
-`source: "unknown"`); an older backend refuses a newer vault instead of rewriting records without
-that state.
+`source: "unknown"`), and the first sample state or review flag raises it to 6 (voice samples may be
+`removed` or `moved` and carry `history` and `flag`; 5 is unused); an older backend refuses a newer
+vault instead of rewriting records without that state (or training on a removed voiceprint). Raises
+re-read `VAULT.json` under a per-vault meta lock (`vault-meta.lock` in `LOCK_DIR`) and never lower
+it. Additive fields an older backend safely ignores (sample F0, clip bounds, captions, import
+provenance, `rm_basis` in label evidence, voices-file F0 next to a kept vector) raise nothing.
 
 `<conversation dir>/priority.json` `{format, state: important|less_useful|auto, set_at, revision,
 request_id, requests, source: app|pendant, event_id?}` is the owner's explicit choice (made in the app,
