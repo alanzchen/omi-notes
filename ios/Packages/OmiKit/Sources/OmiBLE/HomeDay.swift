@@ -37,6 +37,33 @@ public struct HomeDay: Equatable, Sendable {
         }
     }
 
+    /// Home's sections: one per server day (`day`), newest first as listed. A day appears when it has rows to show
+    /// under the filter, or short sessions by the server's whole-day totals even if none of them is loaded (an
+    /// older short failure stays visible).
+    public struct Section: Equatable, Sendable {
+        public var day: String
+        public var home: HomeDay
+        public var totals: ShortDay
+        public var showsFold: Bool { totals.short > 0 }
+    }
+
+    public static func sections(_ all: [ConversationSummary], filter: HomeFilter?, shortSeconds: Double,
+                                shortDays: [String: ShortDay], day: (ConversationSummary) -> String,
+                                priority: (ConversationSummary) -> String) -> [Section] {
+        var order: [String] = []
+        var byDay: [String: [ConversationSummary]] = [:]
+        for c in all {
+            let key = day(c)
+            if byDay[key] == nil { order.append(key) }
+            byDay[key, default: []].append(c)
+        }
+        return order.compactMap { key in
+            let home = HomeDay(byDay[key] ?? [], filter: filter, shortSeconds: shortSeconds, priority: priority)
+            let section = Section(day: key, home: home, totals: totals(home.shortClips, server: shortDays[key]))
+            return section.home.rows.isEmpty && section.home.lessUseful.isEmpty && !section.showsFold ? nil : section
+        }
+    }
+
     /// The folded row's short sessions by kind, in a fixed order, only kinds that occur: 对话, 我, 背景, 未确定.
     public static func byKind(_ clips: [ConversationSummary]) -> [(kind: String, rows: [ConversationSummary])] {
         let order = ["dialogue", "monologue", "passive", "undetermined"]

@@ -99,20 +99,21 @@ struct HomeView: View {
 
     // MARK: Conversations
 
-    private var days: [(day: String, rows: [ConversationSummary])] {
-        var out: [(String, [ConversationSummary])] = []
-        for c in model.recent {
-            let day = c.startedDate.map(Fmt.day) ?? "Earlier"
-            if out.last?.0 == day { out[out.count - 1].1.append(c) } else { out.append((day, [c])) }
-        }
-        return out
+    /// One section per server day (the key the fold's totals and its day list use too); the filter applies to the
+    /// main list only (on servers with recording classes), and a day stays for its fold while it has short sessions.
+    private var sections: [HomeDay.Section] {
+        HomeDay.sections(model.recent, filter: model.supportsRecordingClass ? kindFilter : nil, shortSeconds: model.shortSeconds,
+                         shortDays: model.shortDays, day: { model.day(of: $0) }) { model.priorityState(of: $0).state }
     }
 
-    /// One day as Home shows it: the filter applies to the main list only (on servers with recording classes).
-    private func homeDay(_ rows: [ConversationSummary]) -> HomeDay {
-        HomeDay(rows, filter: model.supportsRecordingClass ? kindFilter : nil, shortSeconds: model.shortSeconds) {
-            model.priorityState(of: $0).state
-        }
+    /// "Today", "Yesterday" or the date, for a server day (YYYY-MM-DD).
+    static func dayTitle(_ day: String) -> String {
+        let f = DateFormatter()
+        f.calendar = Calendar(identifier: .gregorian)
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        guard let date = f.date(from: day) else { return "Earlier" }
+        return Fmt.day(date.addingTimeInterval(12 * 3600))  // noon: the same calendar day in any nearby zone
     }
 
     @ViewBuilder private var conversationSections: some View {
@@ -137,17 +138,15 @@ struct HomeView: View {
                     HomeFilterPicker(selection: $kindFilter)
                 }
             }
-            ForEach(days, id: \.day) { group in
-                let day = homeDay(group.rows)
-                if !day.rows.isEmpty || !day.shortClips.isEmpty || !day.lessUseful.isEmpty {
-                    Section(group.day) {
-                        ForEach(day.rows) { c in ConversationLink(model: model, conversation: c) }
-                        // short sessions (under a minute of speech) and the owner's "less useful" fold into rows
-                        if !day.shortClips.isEmpty {
-                            ShortClipsGroup(model: model, day: model.day(of: day.shortClips[0]), rows: day.shortClips)
-                        }
-                        if !day.lessUseful.isEmpty { LessUsefulGroup(model: model, rows: day.lessUseful) }
+            ForEach(sections, id: \.day) { section in
+                Section(Self.dayTitle(section.day)) {
+                    ForEach(section.home.rows) { c in ConversationLink(model: model, conversation: c) }
+                    // short sessions (under a minute of speech) fold into one row, shown from the server's whole-day
+                    // totals even when none of them is loaded; the owner's "less useful" into another
+                    if section.showsFold {
+                        ShortClipsGroup(model: model, day: section.day, rows: section.home.shortClips, totals: section.totals)
                     }
+                    if !section.home.lessUseful.isEmpty { LessUsefulGroup(model: model, rows: section.home.lessUseful) }
                 }
             }
             Section {
