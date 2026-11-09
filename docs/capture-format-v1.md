@@ -414,8 +414,7 @@ wakes — they are how silent stretches with no rotated chunk yet become evidenc
 
 `processed_through` = highest `chunk_sequence` such that all chunks `0…n` have been decoded and
 run through VAD/segmentation (−1 if none). It does **not** mean transcribed; the server keeps its
-own raw originals until every conversation using them is finished (and then for
-`RAW_RETENTION_DAYS`), so the phone may delete its `sent/` copy of chunk `n` once
+own raw originals permanently (it never deletes raw audio), so the phone may delete its `sent/` copy of chunk `n` once
 `n <= processed_through` and the copy is ≥ 24 h old. The phone's hard cap (sent files older than
 7 days, or `sent/` above 1 GB, oldest first) wins over this rule: acknowledged chunks are already
 durable on the server. Unacknowledged files are never deleted. `404` for unknown capture.

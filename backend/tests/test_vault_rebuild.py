@@ -29,6 +29,7 @@ from omi_notes.providers.fake import FakeLlm, FakeStt
 from omi_notes.vault import Vault
 
 from .conftest import AUTH, DEVICE, FIXTURES, cli_env, make_settings
+from .helpers import historical_retention
 
 STARTED = datetime(2026, 9, 26, 19, 0, tzinfo=UTC)
 T0 = STARTED.timestamp()
@@ -380,7 +381,7 @@ def test_d_rebuild_after_retention_keeps_every_note(tmp_path):
     first = Backend(settings, Clock(T0), scripted)
     run(first, scenario_inputs(), TICKS)
     settle(first)
-    deleted = first.worker.retention(time.time() + 400 * 86400)
+    deleted = historical_retention(first.worker, time.time() + 400 * 86400)
     assert deleted > 0
     notes = {k: v for k, v in snapshot(settings).items() if k.endswith(".md")}
     before_rows = conversations(first.worker.db)

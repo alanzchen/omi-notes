@@ -114,7 +114,7 @@ All settings come from the environment or `backend/.env`; see [`.env.example`](.
 | `PROVISIONAL_WAIT_SECONDS` | `1200` | …and otherwise (e.g. waiting for an offline sync) |
 | `SOFT_MAX_CONVERSATION_SECONDS` | `10800` | split long conversations at the next 20 s pause |
 | `HARD_MAX_CONVERSATION_SECONDS` | `11400` | hard split |
-| `RAW_RETENTION_DAYS` | `30` | keep raw uploads this long after their conversations finish |
+| `RAW_RETENTION_DAYS` | — | ignored: raw uploads are kept permanently (a warning is logged if set) |
 | `VAD_BACKEND` / `VAD_THRESHOLD` | `silero` / `0.5` | speech detector |
 | `WORKER_TICK_SECONDS` | `5` | worker polling interval |
 
@@ -225,8 +225,8 @@ Enroll your voice and name people from the iPhone app (People tab); see
 
 Audio stays on your Mac except for what the providers need: **speech segments are sent to
 the transcription service** (Deepgram, or your `STT_BASE_URL`; local diarization never leaves the Mac) and **transcripts are sent to Anthropic** for summaries (both only
-when those providers are configured). Raw uploads are kept in `DATA_DIR/raw` for
-`RAW_RETENTION_DAYS` after their conversations are finished; transcripts and provider responses
+when those providers are configured). Raw uploads are kept in `DATA_DIR/raw` permanently (nothing
+deletes raw audio); transcripts and provider responses
 are cached in `DATA_DIR/derived`. The server is reachable only on your tailnet, with a bearer token.
 
 ## Troubleshooting

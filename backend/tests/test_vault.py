@@ -24,7 +24,7 @@ from omi_notes.util import uuid7_for
 from omi_notes.vault import LeaseError, Vault, VaultError, index_dir
 
 from .conftest import AUTH, DEVICE, make_settings, put_chunk
-from .helpers import STARTED, T0, convs, iso, live, live_seal, replay, silence
+from .helpers import historical_retention, STARTED, T0, convs, iso, live, live_seal, replay, silence
 
 SPEECH = np.concatenate([silence(2), synth_speech_like(15), silence(3)])
 
@@ -328,7 +328,7 @@ def test_retention_writes_evidence_then_tombstones(client, worker, settings):
     (row,) = convs(worker)
     assert row["status"] == "done"
     chunks = worker.db.query("SELECT * FROM chunks WHERE capture_id=? ORDER BY chunk_sequence", (capture,))
-    deleted = worker.retention(time.time() + 31 * 86400)
+    deleted = historical_retention(worker, time.time() + 31 * 86400)
     assert deleted == len(chunks)
     vault = Vault.open(settings)
     evidence = json.loads(vault.capture_json_path(DEVICE, capture).read_text())

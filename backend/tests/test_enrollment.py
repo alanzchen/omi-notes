@@ -18,7 +18,7 @@ from omi_notes.speakers import enroll
 from omi_notes.speakers.service import SpeakerService
 
 from .conftest import AUTH, make_settings
-from .helpers import STARTED, T0, convs, event, replay, silence
+from .helpers import historical_retention, STARTED, T0, convs, event, replay, silence
 from .test_speaker_learning import FakeEmbedder
 
 SR = 16000
@@ -191,6 +191,6 @@ def test_undecided_enrollment_audio_survives_retention(env):
     capture = replay(client, np.concatenate([silence(2), voice(40, 150), silence(4)]))
     start_event(client, eid, capture, 1.0)  # no end yet: undecided
     worker.tick(T0 + 400)
-    worker.retention(T0 + (settings.raw_retention_days + 5) * 86400)
+    historical_retention(worker, T0 + (30 + 5) * 86400)
     alive = worker.db.query("SELECT raw_deleted FROM chunks WHERE capture_id=?", (capture,))
     assert alive and all(r["raw_deleted"] == 0 for r in alive)

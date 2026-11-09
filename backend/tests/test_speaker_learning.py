@@ -25,7 +25,7 @@ from omi_notes.speakers.voices import Clip, LabelVoice, centroid, embed_voices, 
 from omi_notes.vault import Vault
 
 from .conftest import AUTH, make_settings
-from .helpers import STARTED, T0, convs, replay, silence
+from .helpers import historical_retention, STARTED, T0, convs, replay, silence
 
 SR = 16000
 ALAN, PRIYA, RAVI = 120.0, 210.0, 300.0  # fundamental frequencies of three synthetic "voices"
@@ -434,7 +434,7 @@ def test_clips_are_wav_while_raw_audio_exists_then_gone(env):
     assert rate == 16000 and pcm.ndim == 1 and 0 < len(pcm) <= 10 * 16000
     assert client.get(f"/v1/clips/{row['id']}.S1.9", headers=AUTH).status_code == 404
     assert client.get(f"/v1/clips/{row['id']}.S7.0", headers=AUTH).status_code == 404
-    worker.retention(time.time() + 400 * 86400)
+    historical_retention(worker, time.time() + 400 * 86400)
     gone = client.get(f"/v1/clips/{row['id']}.S1.0", headers=AUTH)
     assert gone.status_code == 410 and gone.json()["error"] == "audio_expired"
     assert client.get(f"/v1/conversations/{row['id']}/speakers", headers=AUTH).json()["audio_available"] is False
@@ -479,7 +479,7 @@ def test_unknown_voices_suggestions_and_pruning(env):
 
     # Unknown vectors expire with the raw audio; assigned ones stay.
     other = talk(client, worker, dialogue(PRIYA, 350.0, seed=77), day=0, at=T0 + 3000)
-    worker.retention(time.time() + 400 * 86400)
+    historical_retention(worker, time.time() + 400 * 86400)
     voices = json.loads(next(Vault.open(settings).conversation_dir(other["id"]).glob("voices-*.json")).read_text())
     assert not any("vector_b64" in v for v in voices["labels"].values())
     kept = json.loads(next(Vault.open(settings).conversation_dir(rows[0]["id"]).glob("voices-*.json")).read_text())

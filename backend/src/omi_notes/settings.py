@@ -100,7 +100,9 @@ class Settings(BaseSettings):
     provisional_wait_seconds: float = 1200.0
     soft_max_conversation_seconds: float = 10800.0
     hard_max_conversation_seconds: float = 11400.0
-    raw_retention_days: float = 30.0
+    # Raw audio is kept permanently (Alan's rule, 2026-11-08); nothing deletes it. RAW_RETENTION_DAYS from older
+    # configurations is accepted and ignored (the worker logs a warning).
+    raw_retention_days: float | None = None
 
     vad_backend: Literal["silero", "energy"] = "silero"
     vad_threshold: float = 0.5

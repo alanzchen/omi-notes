@@ -191,6 +191,8 @@ class Worker:
             renewed = time.time()
             self.pipeline.release_all_claims()  # we own the lock: no other worker is running
             log.info("worker started (tick %.1fs, VAD %s)", self.settings.worker_tick_seconds, self.vad.vad.name)
+            if self.settings.raw_retention_days is not None:
+                log.warning("RAW_RETENTION_DAYS=%g is ignored: raw audio is kept permanently", self.settings.raw_retention_days)
             # its own thread: a long transcription in the loop below must not stop the health checks
             threading.Thread(target=self._watch_local_stt, args=(stop,), name="local-stt-watch", daemon=True).start()
             while not stop.is_set():
@@ -837,78 +839,14 @@ class Worker:
     # -- retention -------------------------------------------------------------------------------
 
     def retention(self, now: float) -> int:
-        """Delete raw chunk files older than RAW_RETENTION_DAYS, except any chunk inside the decode
-        range (first..last chunk of each capture, empty ones included) of a conversation that is
-        unfinished, finished within the retention period, or still being assembled."""
-        cutoff = now - self.settings.raw_retention_days * 86400
-        protected: set[tuple[str, int]] = set()
-        placeholders = ",".join("?" * (len(PENDING) + 1))
-        needed = self.db.query(
-            f"""SELECT device_id, start, end FROM conversations
-                WHERE status IN ({placeholders}) OR COALESCE(done_at, 0) > ?""",
-            (*PENDING, "failed", cutoff),
-        )
-        spans = [(r["device_id"], r["start"], r["end"]) for r in needed]
-        spans += [
-            (r["device_id"], r["start"], r["end"])
-            for r in self.db.query("SELECT device_id, start, end FROM speech WHERE claimed_by IS NULL")
-        ]
-        # an undecided voice enrollment keeps its window's audio until the result is written
-        spans += [(w.device_id, w.start, w.end if w.end is not None else now) for w in self.enrollments.undecided()]
-        for device, start, end in spans:
-            for r in self.db.query(
-                """SELECT capture_id, MIN(chunk_sequence) AS lo, MAX(chunk_sequence) AS hi FROM chunks
-                   WHERE device_id=? AND audio_start IS NOT NULL AND audio_start <= ? AND audio_end >= ?
-                   GROUP BY capture_id""",
-                (device, end + 2, start - 2),
-            ):
-                protected.update((r["capture_id"], s) for s in range(r["lo"], r["hi"] + 1))
-        by_capture: dict[str, list] = {}
-        for chunk in self.db.query(
-            "SELECT * FROM chunks WHERE status='processed' AND raw_deleted=0 AND received_at < ? ORDER BY capture_id, chunk_sequence",
-            (cutoff,),
-        ):
-            if (chunk["capture_id"], chunk["chunk_sequence"]) not in protected:
-                by_capture.setdefault(chunk["capture_id"], []).append(chunk)
-        deleted = 0
-        for capture_id, chunks in by_capture.items():
-            try:
-                deleted += self._expire(capture_id, chunks, now)
-            except Exception:  # one capture's problem must not stop the others
-                log.exception("retention: could not expire raw audio of capture %s", capture_id)
-        if deleted:
-            log.info("retention: deleted %d raw chunks", deleted)
-        try:  # every pass, so a cleanup a crash interrupted is finished
+        """Raw audio is kept permanently (Alan's rule, 2026-11-08): nothing here deletes a chunk file, and there is
+        no setting that would. Each pass only finishes a stored-vector cleanup a crash interrupted. Returns the
+        number of raw chunks deleted, always 0 (vaults keep the tombstones of audio deleted before this rule)."""
+        try:
             self.pipeline.speakers.reconcile_vectors()
         except Exception:
             log.exception("retention: could not reconcile stored voice vectors")
-        return deleted
-
-    def _expire(self, capture_id: str, chunks: list, now: float) -> int:
-        """Delete raw chunks of one capture: first `capture.json` (what they contributed: chunk
-        facts, coverage, losses, ring ownership, tentative speech, continuation checkpoints), then
-        a `<seq>.gone` tombstone per chunk, then the `.omnc` files, then the index."""
-        capture = self.db.one("SELECT * FROM captures WHERE capture_id=?", (capture_id,))
-        device = capture["device_id"]
-        already = {r["chunk_sequence"] for r in self.db.query(
-            "SELECT chunk_sequence FROM chunks WHERE capture_id=? AND raw_deleted=1", (capture_id,))}  # fmt: skip
-        seqs = sorted(already | {c["chunk_sequence"] for c in chunks})
-        Vault.write_json(self.vault.capture_json_path(device, capture_id), self._evidence_for(capture, set(seqs)))
-        for chunk in chunks:
-            tomb_path = self.vault.tombstone_path(device, capture_id, chunk["chunk_sequence"])
-            if tomb_path.exists():  # an earlier pass got this far (its .omnc may be gone): resume
-                continue
-            path = self.vault.root / chunk["path"]
-            header = parse_envelope(path.read_bytes()).header.model_dump(mode="json")
-            tomb = {"sha256": chunk["sha256"], "size": chunk["size"], "header": header, "deleted_at": now}
-            Vault.write_json(tomb_path, tomb, pretty=False)
-        for chunk in chunks:
-            remove(self.vault.root / chunk["path"])
-        with self.db.tx() as conn:
-            conn.executemany("UPDATE chunks SET raw_deleted=1 WHERE capture_id=? AND chunk_sequence=?",
-                             [(capture_id, c["chunk_sequence"]) for c in chunks])  # fmt: skip
-        self._prune_voices(device, chunks)
-        return len(chunks)
+        return 0
 
     def _prune_voices(self, device: str, chunks: list) -> None:
         """Unknown-voice vectors live only as long as the conversation's raw audio."""

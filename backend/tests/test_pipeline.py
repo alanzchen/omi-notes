@@ -275,16 +275,19 @@ def test_chunk_decode_failure_is_retryable_not_silence(client, worker, settings)
     assert convs(worker)[0]["status"] == "done"
 
 
-def test_retention_deletes_old_raw_audio_only_when_done(client, worker, settings):
+def test_raw_audio_is_never_deleted_however_old_and_whatever_the_old_setting_says(client, worker, settings):
     capture = replay(client, np.concatenate([silence(1), synth_speech_like(10), silence(2)]))
     worker.tick(T0 + 200)
-    path = next(settings.raw_dir.rglob("0.omnc"))
-    body = path.read_bytes()
-    assert worker.retention(time.time() + 29 * 86400) == 0
-    assert worker.retention(time.time() + 31 * 86400) == 1
-    assert not path.exists()
-    # the ledger still knows the chunk: a re-upload is an idempotent duplicate
-    assert put_chunk(client, capture, 0, body).status_code == 200
+    paths = list(settings.raw_dir.rglob("*.omnc"))
+    assert paths
+    worker.settings.raw_retention_days = 1.0  # an old RAW_RETENTION_DAYS is ignored
+    for years in (1, 10, 100):
+        assert worker.retention(time.time() + years * 365 * 86400) == 0
+    assert all(p.exists() for p in paths)
+    assert not worker.db.query("SELECT 1 FROM chunks WHERE raw_deleted=1")
+    assert not list(settings.raw_dir.rglob("*.gone"))
+    worker.tick(time.time() + 400 * 86400)  # the hourly pass inside a normal tick deletes nothing either
+    assert all(p.exists() for p in paths)
 
 
 def test_rebuild_makes_no_api_calls_and_reproduces_notes(client, worker, settings):

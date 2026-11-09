@@ -30,6 +30,7 @@ from omi_notes.providers.fake import FakeLlm, FakeStt
 
 from .conftest import AUTH, DEVICE, cli_env, make_settings, put_chunk, upload_all
 from .helpers import (
+    historical_retention,
     STARTED,
     T0,
     convs,
@@ -114,7 +115,7 @@ def test_f02_retention_keeps_empty_chunks_inside_a_pending_decode_range(client, 
     worker.tick(T0 + 400)
     (row,) = convs(worker)
     assert row["status"] == "transcribing"
-    worker.retention(time.time() + 31 * 86400)
+    historical_retention(worker, time.time() + 31 * 86400)
     assert (settings.vault_dir / empty["path"]).exists()
     audio = worker.pipeline.conversation_audio(worker.db.one("SELECT * FROM conversations"))
     assert len(audio.pcm) > 0

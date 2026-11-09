@@ -14,7 +14,7 @@ import numpy as np
 import soundfile as sf
 
 from .conftest import AUTH
-from .helpers import STARTED, T0, convs, replay, silence
+from .helpers import historical_retention, STARTED, T0, convs, replay, silence
 
 SR = 16000
 
@@ -104,7 +104,7 @@ def test_expired_audio_is_said_plainly(client, worker):
     worker.tick(T0 + 400)
     (row,) = convs(worker)
     assert meta(client, row["id"])[1]["available"] is True
-    worker.retention(time.time() + 400 * 86400)
+    historical_retention(worker, time.time() + 400 * 86400)
     code, m = meta(client, row["id"])
     assert code == 200 and m["available"] is False and m["reason"] == "expired" and m["duration_s"] is None
     r = wav(client, row["id"])

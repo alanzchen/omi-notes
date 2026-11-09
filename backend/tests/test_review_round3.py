@@ -30,7 +30,7 @@ from omi_notes.util import canonical_json, sha256_hex
 from omi_notes.vault import Vault, VaultError
 
 from .conftest import AUTH, cli_env, make_settings
-from .helpers import T0, convs, replay, silence
+from .helpers import historical_retention, T0, convs, replay, silence
 from .test_enrollment import CountingStt, start_event
 from .test_enrollment import voice as reading
 from .test_speaker_learning import ALAN, PRIYA, RAVI, CountingLlm, FakeEmbedder, dialogue, name_label, new_person, talk
@@ -191,7 +191,7 @@ def test_vector_cleanup_is_restartable(env):
     name_label(client, row["id"], "S1", me)
     assert "vector_b64" in voices_file(worker, row["id"])["labels"]["S2"]
     worker.pipeline.speakers.update_settings(unknown_voices_enabled=False)  # crashed before pruning
-    worker.retention(T0 + 600)
+    worker.retention(T0 + 600)  # each pass finishes the cleanup (it deletes no audio)
     stored = voices_file(worker, row["id"])["labels"]
     assert "vector_b64" in stored["S1"] and "vector_b64" not in stored["S2"]
 
@@ -202,7 +202,7 @@ def test_unknown_vectors_expire_with_raw_audio_even_after_a_crash(env):
     row = talk(client, worker, dialogue(ALAN, PRIYA))
     me = new_person(client, "Alan", me=True)
     name_label(client, row["id"], "S1", me)
-    worker.db.execute("UPDATE chunks SET raw_deleted=1")  # raw deleted, crashed before _prune_voices
+    worker.db.execute("UPDATE chunks SET raw_deleted=1")  # raw deleted (before 2026-11-08), crashed before pruning
     worker.retention(T0 + 600)
     stored = voices_file(worker, row["id"])["labels"]
     assert "vector_b64" in stored["S1"] and "vector_b64" not in stored["S2"]
@@ -443,7 +443,7 @@ def test_raw_expiry_resumes_after_a_crash_between_deleting_files_and_the_index(e
     me = new_person(client, "Alan", me=True)
     name_label(client, row["id"], "S1", me)
     assert "vector_b64" in voices_file(worker, row["id"])["labels"]["S2"]
-    later = time.time() + (settings.raw_retention_days + 1) * 86400
+    later = time.time() + (30 + 1) * 86400
     real_tx = worker.db.tx
     calls = {"n": 0}
 
@@ -454,11 +454,11 @@ def test_raw_expiry_resumes_after_a_crash_between_deleting_files_and_the_index(e
         return real_tx()
 
     monkeypatch.setattr(worker.db, "tx", flaky)
-    worker.retention(later)
+    historical_retention(worker, later)
     assert not list(settings.vault_dir.rglob("*.omnc")), "the files were deleted…"
     assert worker.db.one("SELECT COUNT(*) AS n FROM chunks WHERE raw_deleted=0")["n"] > 0, "…the index commit was not"
     monkeypatch.setattr(worker.db, "tx", real_tx)
-    worker.retention(later + 10)
+    historical_retention(worker, later + 10)
     assert worker.db.one("SELECT COUNT(*) AS n FROM chunks WHERE raw_deleted=0")["n"] == 0
     stored = voices_file(worker, row["id"])["labels"]
     assert "vector_b64" in stored["S1"] and "vector_b64" not in stored["S2"]
