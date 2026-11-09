@@ -83,12 +83,27 @@ def _samples_of(op: dict) -> set[str]:
     return ids | ({op["sample"]["sample_id"]} if op.get("sample") else set())
 
 
-def blocking(store, persons: set, samples: set = frozenset()) -> None:
-    """Refuse a change while an operation recovery couldn't finish touches the same people or samples (call after
-    `reconcile`, under the speaker lock): acting on top of a half-applied operation could be overwritten by it."""
+def _label_of(op: dict) -> tuple | None:
+    where = op.get("label")
+    return (where["conversation_id"], where["label"]) if where else None
+
+
+def blocking(store, persons: set, samples: set = frozenset(), labels: set = frozenset()) -> None:
+    """Refuse a change while an operation recovery couldn't finish touches the same people, samples or label (call
+    after `reconcile`, under the speaker lock): acting on top of a half-applied operation could be overwritten by it.
+    A person whose forget began but didn't finish gets no new voice data either."""
+    persons = {p for p in persons if p}
     for op in pending(store):
-        if involved(op) & {p for p in persons if p} or _samples_of(op) & set(samples):
+        if involved(op) & persons or _samples_of(op) & set(samples) or _label_of(op) in set(labels):
             raise ApiError(409, "recovery_pending", "an earlier change to these voices is still being recovered; try again later")
+    forgetting(store, persons)
+
+
+def forgetting(store, persons: set) -> None:
+    """Refuse new voice data for a person whose forget is unfinished (`_omi/speakers/forgetting/<id>.json`)."""
+    for person_id in persons:
+        if person_id and store.forgetting_path(person_id).exists():
+            raise ApiError(409, "forget_in_progress", "forgetting this person's voice hasn't finished; finish it first")
 
 
 def cancel_for(store, person_id: str) -> int:
@@ -97,9 +112,19 @@ def cancel_for(store, person_id: str) -> int:
     n = 0
     for op in pending(store):
         if person_id in involved(op):
-            cancel(store, op, forgotten={person_id})
+            if op.get("phase") == "committed":
+                apply(store, op)  # past its point of no return: finished (writes nothing for the forgotten person)
+            else:
+                cancel(store, op, forgotten={person_id})
             n += 1
     return n
+
+
+def commit_point(store, op: dict) -> None:
+    """Record that `op` is past its point of no return: from here a replay always finishes it (rolls forward)."""
+    if op.get("phase") != "committed":
+        op["phase"] = "committed"
+        Vault.write_json(directory(store) / f"{op['id']}.json", op)
 
 
 def run(store, op: dict) -> dict:
@@ -131,7 +156,7 @@ def _invalid(store, op: dict) -> str:
 
 
 def apply(store, op: dict) -> None:
-    why = _invalid(store, op)
+    why = "" if op.get("phase") == "committed" else _invalid(store, op)
     if why:
         log.warning("cancelling the journaled speaker operation %s: %s", op["id"], why)
         cancel(store, op)
@@ -172,6 +197,7 @@ def _label_step(store, op: dict, request_id: str, change) -> None:
         return
     store.sync_conversation(conv_id)
     if store.request_result(conv_id, request_id) is not None:
+        _schedule_render(store, conv_id)  # the label part was applied; its render may not have been scheduled
         return
     states = store.labels(conv_id)
     made = change(dict(states.get(label) or {}))
@@ -182,8 +208,32 @@ def _label_step(store, op: dict, request_id: str, change) -> None:
     states[label] = after
     store.write_labels(conv_id, states, request=(request_id, record | {
         "label": label, "before": store.persisted({label: before}).get(label), "after": store.persisted({label: after}).get(label)}))  # fmt: skip
-    # its note shows the label's name: re-render it (from cache), recorded before the operation completes
+    _schedule_render(store, conv_id)
+
+
+DECISION_KEYS = ("person_id", "source", "samples", "not")
+
+
+def _schedule_render(store, conv_id: str) -> None:
+    """Its note shows the label's name: re-render it (from cache). Idempotent, so every replay that reaches the step
+    schedules it, before the operation completes."""
     store.db.execute("UPDATE conversations SET needs_render=1, next_attempt_at=NULL WHERE id=? AND note_path IS NOT NULL", (conv_id,))
+
+
+def _restore(store, op: dict):
+    """The label step of an undo: put the label back as it was before `undo_of`, only while it is still exactly as
+    `undo_of` left it (a newer choice is never overwritten by a replay)."""
+
+    def change(before: dict):
+        where = op["label"]
+        original = (store.request_result(where["conversation_id"], op["undo_of"]) or {}).get("after") or {}
+        current = store.persisted({where["label"]: before}).get(where["label"]) or {}
+        # the decision itself (match evidence a relabel refreshes doesn't count)
+        if any(current.get(k) != original.get(k) for k in DECISION_KEYS):
+            return None
+        return op["label_before"], {"undo_of": op["undo_of"]}
+
+    return change
 
 
 # -- operations ------------------------------------------------------------------------------------
@@ -239,7 +289,8 @@ def _unmove(store, op: dict) -> None:
         if data is not None and data.get("state") == "moved" and (data.get("moved_to") or {}).get("sample_id") == new:
             store.update_sample(a, src, {"state": "active", "moved_to": None}, action="undo", by="user", request_id=uid,
                                 now=op["at"], record={"undo_of": op["undo_of"], "op": op["id"], "from": "moved", "to": "active"})  # fmt: skip
-    _label_step(store, op, f"{uid}:{op['undo_of']}", lambda before: (op["label_before"], {"undo_of": op["undo_of"]}))
+    _label_step(store, op, f"{uid}:{op['undo_of']}", _restore(store, op))
+    commit_point(store, op)  # the originals count again: from here it only rolls forward
     for _, new in op["pairs"]:  # 3. the copies go
         store.remove_sample_ids(b, [new])
 
@@ -272,7 +323,7 @@ def _unreject(store, op: dict) -> None:
         if data is not None and data.get("state") == "removed":
             store.update_sample(x, sid, {"state": "active"}, action="undo", by="user", request_id=uid, now=op["at"],
                                 record={"undo_of": op["undo_of"], "op": op["id"], "from": "removed", "to": "active"})  # fmt: skip
-    _label_step(store, op, f"{uid}:{op['undo_of']}", lambda before: (op["label_before"], {"undo_of": op["undo_of"]}))
+    _label_step(store, op, f"{uid}:{op['undo_of']}", _restore(store, op))
 
 
 def _merge(store, op: dict) -> None:
@@ -358,7 +409,10 @@ def _label_revert(store, op: dict, key: str, undo_of: str | None = None) -> None
     conv_id, label = where["conversation_id"], where["label"]
     store.sync_conversation(conv_id)
     rec = store.request_result(conv_id, key)
-    if rec is None or store.request_result(conv_id, f"rollback:{op['id']}") is not None:
+    if store.request_result(conv_id, f"rollback:{op['id']}") is not None:
+        _schedule_render(store, conv_id)
+        return
+    if rec is None:
         return
     if undo_of is not None:  # an undo restored `before` of `undo_of`; its rollback puts that request's `after` back
         original = store.request_result(conv_id, undo_of) or {}
@@ -366,8 +420,9 @@ def _label_revert(store, op: dict, key: str, undo_of: str | None = None) -> None
     else:
         made, back = rec.get("after"), rec.get("before")
     states = store.labels(conv_id)
-    if store.persisted({label: states.get(label) or {}}).get(label) != made or back is None:
-        return
+    current = store.persisted({label: states.get(label) or {}}).get(label) or {}
+    if back is None or made is None or any(current.get(k) != made.get(k) for k in DECISION_KEYS):
+        return  # changed since: the later decision stands
     states[label] = back
     store.write_labels(conv_id, states, request=(f"rollback:{op['id']}", {"label": label, "rollback_of": key}))
-    store.db.execute("UPDATE conversations SET needs_render=1, next_attempt_at=NULL WHERE id=? AND note_path IS NOT NULL", (conv_id,))
+    _schedule_render(store, conv_id)

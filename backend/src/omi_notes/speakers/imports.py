@@ -122,6 +122,7 @@ class Importer:
         if not UUID_RE.match(person_id):
             raise ApiError(404, "not_found", "unknown person")
         with self.store.lock:  # the authorization is the snapshot it was made from, taken together
+            journal.forgetting(self.store, {person_id})  # an unfinished forget: no new voice data
             consent = self._consent(person_id)
             person = self.store.person(person_id)
         if consent is None or person is None:

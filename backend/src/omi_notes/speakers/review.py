@@ -271,6 +271,8 @@ class Review:
                        *, proposed: str, evidence: str) -> dict:  # fmt: skip
         with self.store.lock:
             self.store.sync_conversation(conv_id)
+            self.store.reconcile()
+            journal.blocking(self.store, {person_id}, labels={(conv_id, label)})
             if self.store.request_result(conv_id, request_id) is not None:  # a retry: the naming path answers it
                 outcome = self.service.assign(conv_id, label, {"person_id": None, "expected_revision": -1, "request_id": request_id})
                 return {"conversation_id": conv_id, "label": label, "revision": outcome.revision, "sample": outcome.sample}
@@ -308,14 +310,16 @@ class Review:
         """confirm | reject | remove | restore | move one sample (see the module docstring)."""
         with self.store.lock:
             self.store.reconcile()  # an interrupted operation finishes first (a retry of it is then answered)
+            found = self.store.find_sample(sample_id)
+            # before any answer, a retry's included: never report success on top of an unfinished operation
+            journal.blocking(self.store, {(found or {}).get("person_id"), person_id}, {sample_id})
             done = self._history_entry(sample_id, request_id)
             if done is not None:
                 data, _ = done
                 return {"sample": self.sample_view(self.store.find_sample(sample_id) or data)}
-            data = self.store.find_sample(sample_id)
+            data = found
             if data is None:
                 raise ApiError(404, "not_found", "unknown sample")
-            journal.blocking(self.store, {data["person_id"], person_id}, {sample_id})
             if expected_revision is not None and int(data.get("revision") or 0) != expected_revision:
                 raise ApiError(409, "stale_review", "this sample changed since the review item was made")
             state = data.get("state") or ACTIVE
@@ -335,6 +339,7 @@ class Review:
             elif decision == "restore":
                 if state != REMOVED:
                     raise ApiError(409, "sample_not_removed", f"the sample is {state}")
+                journal.forgetting(self.store, {pid})
                 self._consented(pid)  # never back into use without current consent
                 self._not_superseded(data)
                 data = self.store.set_sample_state(pid, sample_id, ACTIVE, action="restore", by="user", request_id=request_id)
@@ -350,15 +355,17 @@ class Review:
         if not person["me"] and not (self.store.settings()["acknowledged_at"] and self.store.attested(person_id)):
             raise ApiError(409, "consent_required", "this person's voice can't be kept without the acknowledgment and their attestation")
 
-    def _overlap_why(self, data: dict) -> str:
+    def _overlap_why(self, data: dict, person_id: str | None = None) -> str:
         """Why this imported enrollment can't count again ("" when it can): another active enrollment of the same
-        person holds audio from the same source over an overlapping range (whatever merged into what)."""
+        person (`person_id`: of the person it would move to) holds audio from the same source over an overlapping
+        range (whatever merged into what)."""
         source = data.get("import") or {}
         if data.get("source") != "enrollment" or not source.get("sha256"):
             return ""
+        owner = person_id or data["person_id"]
         for r in self.db.query("SELECT id FROM samples WHERE person_id=? AND source='enrollment' AND id<>?",
-                               (data["person_id"], data["sample_id"])):  # fmt: skip
-            other = self.store.read_sample(data["person_id"], r["id"]) or {}
+                               (owner, data["sample_id"])):  # fmt: skip
+            other = self.store.read_sample(owner, r["id"]) or {}
             theirs = other.get("import") or {}
             if (sample_eligible(other) and theirs.get("sha256") == source["sha256"]
                     and float(theirs["start"]) < float(source["end"]) and float(theirs["end"]) > float(source["start"])):  # fmt: skip
@@ -399,6 +406,9 @@ class Review:
         self._consented(person_id)
         label = self._listing_label(data)
         pairs = [[sid, str(uuid.uuid4())] for sid in self._label_samples(data, label)]
+        for src, _ in pairs:  # the same audio must not count twice for the person it moves to
+            if self._overlap_why(self.store.read_sample(data["person_id"], src) or {}, person_id):
+                raise ApiError(409, "superseded", "that person already has an active enrollment of the same audio")
         journal.run(self.store, {"kind": "move", "request_id": request_id, "by": "user", "from": data["person_id"], "to": person_id,
                                  "pairs": pairs, "label": {"conversation_id": data["conversation_id"], "label": label} if label else None})  # fmt: skip
         return self.store.read_sample(data["person_id"], data["sample_id"])

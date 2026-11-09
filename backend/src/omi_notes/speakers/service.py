@@ -300,6 +300,12 @@ class SpeakerService:
             row = self._conversation(conv_id)
             if label not in {s["speaker"] for s in transcript.get("segments") or []}:
                 raise ApiError(404, "not_found", f"conversation has no speaker {label}")
+            # before anything (a retry's answer included): an unfinished operation on this label or these people, or
+            # an unfinished forget of the person named, must not be built on or raced
+            self.store.reconcile()
+            current = (self.store.labels(conv_id).get(label) or {}).get("person_id")
+            journal.blocking(self.store, {not_person, current}, labels={(conv_id, label)})
+            journal.forgetting(self.store, {person_id})
             done = self.store.request_result(conv_id, request_id)
             if done is not None:  # a retry of an applied request: finish its work, answer with the current state
                 self.db.set_meta("relabel_pending", "1")
