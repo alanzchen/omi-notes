@@ -25,19 +25,22 @@ extension AppModel {
         return f.string(from: start)
     }
 
-    /// Every page of a filtered list, following `next_cursor` (at most `maxPages`).
-    static func collectPages(maxPages: Int = 50,
-                              fetch: (String?) async throws -> RecentConversationsResponse) async throws -> [ConversationSummary] {
+    /// Every page of a filtered list, following `next_cursor` (at most `maxPages`), with the per-day totals the pages
+    /// carried (a later page's count for a day replaces an earlier one's).
+    static func collectPages(maxPages: Int = 50, fetch: (String?) async throws -> RecentConversationsResponse) async throws
+        -> (rows: [ConversationSummary], days: [String: ShortDay]) {
         var rows: [ConversationSummary] = []
+        var days: [String: ShortDay] = [:]
         var cursor: String?
         for _ in 0..<maxPages {
             let page = try await fetch(cursor)
             let seen = Set(rows.map(\.id))
             rows += page.conversations.filter { !seen.contains($0.id) }
+            for (day, counts) in page.days ?? [:] { days[day] = counts }
             guard let next = page.nextCursor, next != cursor else { break }
             cursor = next
         }
-        return rows
+        return (rows, days)
     }
 
     /// The whole day's short sessions from the server, every page (when the folded row opens, and on each refresh
@@ -47,10 +50,21 @@ extension AppModel {
         guard let endpoint = config.endpoint, serverStatus?.supportsDeferredTranscription == true, !day.isEmpty else { return }
         let data = dataEpoch
         let api = APIClient(endpoint: endpoint, session: session)
-        guard let rows = try? await Self.collectPages(fetch: { cursor in
+        guard let collected = try? await Self.collectPages(fetch: { cursor in
             try await api.recentConversations(limit: 200, before: cursor, day: day, short: true)
         }), isCurrent(config), data == dataEpoch else { return }
+        applyShortDay(day, rows: collected.rows, days: collected.days)
+    }
+
+    /// A day just fetched from the server: its rows become the day's list, they replace the matching rows of the main
+    /// list (older pages kept by `mergeFirstPage` may be stale; nothing is appended there), and its totals are kept.
+    func applyShortDay(_ day: String, rows: [ConversationSummary], days: [String: ShortDay]) {
         shortDayRows[day] = rows
+        let byId = Dictionary(rows.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        for i in recent.indices {
+            if let fresh = byId[recent[i].id] { recent[i] = fresh }
+        }
+        for (d, counts) in days { shortDays[d] = counts }
     }
 
     /// Reload every day whose fold has been opened (after a list refresh or a finished request).

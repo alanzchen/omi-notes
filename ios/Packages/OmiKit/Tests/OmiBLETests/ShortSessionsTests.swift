@@ -100,11 +100,14 @@ import Testing
             "c1": RecentConversationsResponse(conversations: [row("2", day: "d", start: "s", speech: 9)], nextCursor: "c2"),
             "c2": RecentConversationsResponse(conversations: [row("3", day: "d", start: "s", speech: 9)], nextCursor: nil),
         ]
-        let rows = try await AppModel.collectPages { cursor in
+        let collected = try await AppModel.collectPages { cursor in
             asked.append(cursor)
-            return pages[cursor]!
+            var page = pages[cursor]!
+            page.days = ["d": ShortDay(short: 3, deferred: asked.count)]
+            return page
         }
-        #expect(rows.map(\.id) == ["1", "2", "3"] && asked == [nil, "c1", "c2"])
+        #expect(collected.rows.map(\.id) == ["1", "2", "3"] && asked == [nil, "c1", "c2"])
+        #expect(collected.days["d"] == ShortDay(short: 3, deferred: 3), "the latest page's totals")
     }
 
     @Test func aRefreshReconcilesLoadedDayRowsAndNeverTheOtherWay() throws {
@@ -138,5 +141,21 @@ import Testing
         m.retries["w"] = RetryOperation(id: "op", kind: "transcribe", state: "done")
         m.shortDayRows["d"] = [row("w", day: "d", start: "s", speech: 9)]
         #expect(m.transcribeState(of: waiting) == .none)
+    }
+
+    @Test func aReloadedDayUpdatesStaleMainListRowsAndItsTotals() {
+        let m = model()
+        // an older page kept by mergeFirstPage still says "waiting"
+        m.recent = [row("a", day: "2026-11-01", start: "s", speech: 9, status: "closed", deferred: "waiting")]
+        m.shortDays["2026-11-01"] = ShortDay(short: 2, deferred: 2)
+        var done = row("a", day: "2026-11-01", start: "s", speech: 9)
+        done.title = "Dentist"
+        let other = row("b", day: "2026-11-01", start: "s", speech: 9, status: "closed", deferred: "waiting")
+        m.applyShortDay("2026-11-01", rows: [done, other], days: ["2026-11-01": ShortDay(short: 2, deferred: 1)])
+        #expect(m.recent.map(\.id) == ["a"], "matching rows are updated, none appended")
+        #expect(m.recent[0].deferred == nil && m.recent[0].title == "Dentist")
+        #expect(m.row(of: other).deferred?.isWaiting == true && m.row(of: done).title == "Dentist")
+        #expect(m.shortDays["2026-11-01"] == ShortDay(short: 2, deferred: 1), "the fetched totals are kept")
+        #expect(m.transcribeState(of: m.recent[0]) == .none)
     }
 }
