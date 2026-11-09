@@ -12,12 +12,29 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var offline = false
     /// path → seconds to hold the next answer to that path (once).
     nonisolated(unsafe) static var delayNext: [String: TimeInterval] = [:]
+    /// Paths whose next request is held until the test calls `release(_:offline:)`.
+    nonisolated(unsafe) static var holdNext: Set<String> = []
+    /// A held request, failed offline (true) or answered from `routes` (false) when released.
+    nonisolated(unsafe) static var held: [String: @Sendable (Bool) -> Void] = [:]
 
     static func reset() {
         routes = [:]
         requests = []
         offline = false
         delayNext = [:]
+        holdNext = []
+        held = [:]
+    }
+
+    /// Waits (up to 5 s) until a request to `path` is being held.
+    static func waitUntilHeld(_ path: String) async throws {
+        for _ in 0..<500 where held[path] == nil { try await Task.sleep(for: .milliseconds(10)) }
+        if held[path] == nil { throw URLError(.timedOut) }
+    }
+
+    /// Answers the held request to `path`, or fails it as if offline.
+    static func release(_ path: String, offline: Bool) {
+        held.removeValue(forKey: path)?(offline)
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -36,6 +53,20 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
             stream.close()
         }
         Self.requests.append((path, body))
+        if Self.holdNext.remove(path) != nil {
+            Self.held[path] = { [self] fail in
+                if fail {
+                    client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+                } else {
+                    answer(path: path)
+                }
+            }
+            return
+        }
+        answer(path: path)
+    }
+
+    private func answer(path: String) {
         if Self.offline {
             client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
             return
@@ -44,15 +75,15 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         let (status, text) = queue.count > 1 ? queue.removeFirst() : queue[0]
         Self.routes[path] = queue
         let resp = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
-        let answer: @Sendable () -> Void = { [self] in
+        let send: @Sendable () -> Void = { [self] in
             client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: Data(text.utf8))
             client?.urlProtocolDidFinishLoading(self)
         }
         if let delay = Self.delayNext.removeValue(forKey: path) {
-            DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: answer)
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: send)
         } else {
-            answer()
+            send()
         }
     }
     override func stopLoading() {}
@@ -454,6 +485,73 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         let labels = try #require(m.serviceLabels(now: answered), "the cached configuration stays")
         #expect(labels.transcription.health == .lastKnown && labels.summaries.health == .lastKnown)
         #expect(labels.transcription.text == "Local · Qwen3-ASR-1.7B" && labels.summaries.text == "gpt-6-luna")
+    }
+
+    /// ASTRA-20261109-IT2-03: starting a refresh set `.checking`, which counted as "not failed", so a
+    /// retry after a failed refresh turned the cached dots green again before it was answered. The
+    /// last completed refresh decides: only a successful, current answer clears a failure.
+    @Test func aPendingRefreshKeepsTheLastFailureLastKnown() async throws {
+        let (m, _) = try model()
+        let healthy = #"{"ok":true,"stt":{"provider":"local","model":"Qwen3-ASR-1.7B-bf16","ready":true,"engine":{"healthy":true}},"llm":{"provider":"openai","model":"gpt-6-luna","ready":true}}"#
+        AppServerStub.routes["/v1/status"] = [(200, healthy)]
+        await m.refreshServer()
+        let answered = try #require(m.serverStatusAt)
+        #expect(m.serviceLabels(now: answered)?.transcription.health == .ok)
+
+        // a refresh still waiting after a healthy answer doesn't hide it
+        AppServerStub.holdNext = ["/v1/status"]
+        var pending = Task { await m.refreshServer() }
+        try await AppServerStub.waitUntilHeld("/v1/status")
+        #expect(m.serviceLabels(now: answered)?.transcription.health == .ok)
+        AppServerStub.release("/v1/status", offline: false)
+        await pending.value
+
+        // healthy → failed → pending: still last-known
+        AppServerStub.offline = true
+        await m.refreshServer()
+        AppServerStub.offline = false
+        #expect(m.serviceLabels(now: answered)?.transcription.health == .lastKnown)
+        AppServerStub.holdNext = ["/v1/status"]
+        pending = Task { await m.refreshServer() }
+        try await AppServerStub.waitUntilHeld("/v1/status")
+        if case .checking = m.server {} else { Issue.record("expected a refresh in flight") }
+        var during = try #require(m.serviceLabels(now: answered))
+        #expect(during.transcription.health == .lastKnown && during.summaries.health == .lastKnown,
+                "an unanswered retry can't undo the last failure")
+
+        // pending → failure: stays last-known
+        AppServerStub.release("/v1/status", offline: true)
+        await pending.value
+        #expect(m.serviceLabels(now: answered)?.transcription.health == .lastKnown)
+
+        // pending → success: the new answer decides (red here: the engine is down)
+        AppServerStub.routes["/v1/status"] = [(200, healthy.replacingOccurrences(of: #""healthy":true"#, with: #""healthy":false"#))]
+        AppServerStub.holdNext = ["/v1/status"]
+        pending = Task { await m.refreshServer() }
+        try await AppServerStub.waitUntilHeld("/v1/status")
+        during = try #require(m.serviceLabels(now: answered))
+        #expect(during.transcription.health == .lastKnown)
+        AppServerStub.release("/v1/status", offline: false)
+        await pending.value
+        let down = try #require(m.serverStatusAt)
+        #expect(m.serviceLabels(now: down)?.transcription.health == .down && m.serviceLabels(now: down)?.summaries.health == .ok)
+        // ... and green when it answers again
+        AppServerStub.routes["/v1/status"] = [(200, healthy)]
+        await m.refreshServer()
+        #expect(m.serviceLabels(now: try #require(m.serverStatusAt))?.transcription.health == .ok)
+
+        // a failure is forgotten with the server it was about
+        AppServerStub.offline = true
+        await m.refreshServer()
+        AppServerStub.offline = false
+        try m.engine.settings.setServer(url: URL(string: "https://other.ts.net")!, token: "tok2")
+        AppServerStub.holdNext = ["/v1/status"]
+        pending = Task { await m.refreshServer() }
+        try await AppServerStub.waitUntilHeld("/v1/status")
+        #expect(m.serviceLabels(now: Date()) == nil, "nothing is shown for a server that hasn't answered")
+        AppServerStub.release("/v1/status", offline: false)
+        await pending.value
+        #expect(m.serviceLabels(now: try #require(m.serverStatusAt))?.transcription.health == .ok)
     }
 }
 
