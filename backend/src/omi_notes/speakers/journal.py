@@ -163,11 +163,13 @@ def _move(store, op: dict) -> None:
     def rename(before: dict):  # 3. the label follows its samples
         if before.get("person_id") != a or not sources & set(before.get("samples") or []):
             return None
-        after = before | {"person_id": b, "source": "user", "forgotten": False,
-                          "samples": sorted((set(before.get("samples") or []) - sources) | copies),
+        # every sample the label keeps must be the new person's: the old person's others (removed, moved, or
+        # already gone) are detached, and the undo puts them back with the rest of the state
+        detached = sorted(set(before.get("samples") or []) - sources)
+        after = before | {"person_id": b, "source": "user", "forgotten": False, "samples": sorted(copies),
                           "not": sorted(set(before.get("not") or []) - {b})}  # fmt: skip
         return after, {"person_id": b, "sample": "moved", "keep_unknown": False, "withdrawn": None,
-                       "moved": {"person_id": a, "to_person": b, "pairs": op["pairs"], "op": op["id"]}}  # fmt: skip
+                       "moved": {"person_id": a, "to_person": b, "pairs": op["pairs"], "op": op["id"], "detached": detached}}  # fmt: skip
 
     _label_step(store, op, rid, rename)
     for _, new in op["pairs"]:  # 4. the copies count
@@ -200,10 +202,11 @@ def _reject(store, op: dict) -> None:
     def not_x(before: dict):
         if before.get("person_id") != x or not rejected & set(before.get("samples") or []):
             return None
-        after = before | {"person_id": None, "source": None, "samples": sorted(set(before.get("samples") or []) - rejected),
-                          "not": sorted(set(before.get("not") or []) | {x})}  # fmt: skip
+        # nobody is named now: the label keeps none of X's samples (the inactive ones are detached, put back on undo)
+        detached = sorted(set(before.get("samples") or []) - rejected)
+        after = before | {"person_id": None, "source": None, "samples": [], "not": sorted(set(before.get("not") or []) | {x})}
         return after, {"person_id": None, "not_person_id": x, "sample": "rejected", "keep_unknown": False, "withdrawn": None,
-                       "rejected": {"person_id": x, "samples": sorted(rejected), "op": op["id"]}}  # fmt: skip
+                       "rejected": {"person_id": x, "samples": sorted(rejected), "op": op["id"], "detached": detached}}  # fmt: skip
 
     _label_step(store, op, rid, not_x)
 

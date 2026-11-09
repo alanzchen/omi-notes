@@ -62,3 +62,28 @@ def test_a_journaled_label_change_queues_the_render_and_the_relabel(env):
     assert store.labels(rows[0]["id"])["S1"]["person_id"] == priya
     assert worker.db.one("SELECT needs_render FROM conversations WHERE id=?", (rows[0]["id"],))["needs_render"] == 1
     assert worker.db.meta("relabel_pending") == "1"
+
+
+# -- 7: a moved label keeps only the new person's samples -----------------------------------------------------------
+
+
+def test_a_move_detaches_the_previous_persons_inactive_samples_from_the_label(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    priya = consented_priya(client)
+    store = worker.pipeline.speakers
+    with store.lock:  # Alan confirmed twice on this label
+        second = store.add_sample(me, vec(ALAN, 3), model=MODEL[0], model_sha=MODEL[1], source="user", seconds=8.0,
+                                  day="2026-09-20", session=rows[0]["id"], conversation_id=rows[0]["id"], label="S1")  # fmt: skip
+        states = store.labels(rows[0]["id"])
+        states["S1"]["samples"] = sorted({ids[0], second})
+        store.write_labels(rows[0]["id"], states)
+    assert client.post(f"/v1/samples/{ids[0]}/remove", json={"request_id": "d-1"}, headers=AUTH).status_code == 200
+    assert client.post(f"/v1/samples/{second}/move", json={"person_id": priya, "request_id": "d-2"}, headers=AUTH).status_code == 200
+    label = store.labels(rows[0]["id"])["S1"]
+    copy = sample_file(settings, me, second)["moved_to"]["sample_id"]
+    assert (label["person_id"], label["samples"]) == (priya, [copy]), "no Alan sample stays on a label named Priya"
+    undo = client.post("/v1/speakers/undo", json={"request_id": "d-2", "undo_request_id": "u-d"}, headers=AUTH).json()
+    assert undo["undone"] == [rows[0]["id"]], undo
+    label = store.labels(rows[0]["id"])["S1"]
+    assert (label["person_id"], label["samples"]) == (me, sorted({ids[0], second}))
