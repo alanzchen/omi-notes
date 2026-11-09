@@ -178,42 +178,55 @@ class Review:
             elif not any(h.get("action") == "confirm" for h in data.get("history") or []):
                 rest.append(data)
         entries = [("sample", d) for *_, d in sorted(flagged, key=lambda x: (x[0], x[1]))]
-        entries += [("label", item) for item in self.label_items(len(entries) + len(rest) + offset + limit, now)]
+        entries += [("label", key) for key in self._label_keys(now)]
         entries += [("sample", d) for d in rest]
         offset = max(0, offset)
         chosen = entries[offset:offset + limit]
-        out = [self._sample_item(v) if kind == "sample" else v for kind, v in chosen]
+        evidence = self._evidence() if any(kind == "label" for kind, _ in chosen) else ""
+        out = [self._sample_item(v) if kind == "sample" else self._label_item(*v, evidence=evidence) for kind, v in chosen]
         end = offset + len(chosen)
         return {"items": out, "total": len(entries), "next_offset": end if end < len(entries) else None}
 
     def label_items(self, limit: int, now: float) -> list[dict]:
         """Recent automatic names and "possibly X" hints, newest conversation first."""
+        keys = self._label_keys(now)[:limit]
+        evidence = self._evidence() if keys else ""
+        return [self._label_item(*key, evidence=evidence) for key in keys]
+
+    def _label_keys(self, now: float) -> list[tuple]:
+        """(row, label, person, reasons) of every label item, in queue order: cheap, so a page can count and
+        skip them and build only its own (the voice space is computed once, not per conversation)."""
         people = {p["id"] for p in self.store.people()}
-        out = []
+        embedder = self.pipeline.providers.embedder
+        space = None
+        keys = []
         rows = self.db.query(
             """SELECT * FROM conversations WHERE status <> 'open' AND transcript_sha IS NOT NULL
                ORDER BY start DESC LIMIT ?""",
             (RECENT_CONVERSATIONS,),
         )
         for row in rows:
-            if len(out) >= limit:
-                break
             states = self.store.labels(row["id"])
-            hints = self._hint_people(row) if not states or any(not s.get("person_id") for s in states.values()) else {}
+            hints = {}
+            if not states or any(not s.get("person_id") for s in states.values()):
+                if space is None and embedder is not None:
+                    space = self.pipeline.voice_space(embedder) or False
+                hints = self._hint_people(row, space) if space else {}
             for label in sorted(set(states) | set(hints)):
                 state = states.get(label) or {}
                 if state.get("source") == "auto" and state.get("person_id") in people:
-                    out.append(self._label_item(row, label, state["person_id"], ["auto"]))
+                    keys.append((row, label, state["person_id"], ["auto"]))
                 elif label in hints and hints[label] in people and not state.get("person_id"):
-                    out.append(self._label_item(row, label, hints[label], ["possible"]))
-        return out[:limit]
+                    keys.append((row, label, hints[label], ["possible"]))
+        return keys
 
-    def _hint_people(self, row) -> dict:
+    def _hint_people(self, row, space=None) -> dict:
         """label → the person a "possibly X" hint names (the rule of `possible_voice_names`)."""
         embedder = self.pipeline.providers.embedder
-        space = self.pipeline.voice_space(embedder) if embedder else None
         if space is None:
-            return {}
+            space = self.pipeline.voice_space(embedder) if embedder else None
+            if space is None:
+                return {}
         from ..pipeline.conversations import possible_names
         from .space import label_centre
 
@@ -222,12 +235,13 @@ class Review:
         centres = {lab: label_centre(v, list(vectors.values()), space.ga, full=False)[0] for lab, v in vectors.items()}
         return possible_names(vectors, self.store.labels(row["id"]), space.centroids, background=centres)
 
-    def _label_item(self, row, label: str, person_id: str, reasons: list[str]) -> dict:
+    def _label_item(self, row, label: str, person_id: str, reasons: list[str], *, evidence: str | None = None) -> dict:
         transcript = self.service._transcript(row["id"])
         spans = self.service._clips(row["id"], transcript).get(label) or []
         clips = self.service._clip_list(row["id"], transcript, label, spans)
         playable = bool(clips) and self.store.raw_available(row)
-        item = {"id": label_item_id(row["id"], label, row["speakers_revision"], person_id, self._evidence()), "kind": "label",
+        item = {"id": label_item_id(row["id"], label, row["speakers_revision"], person_id,
+                                    evidence if evidence is not None else self._evidence()), "kind": "label",
                 "person_id": person_id,
                 "label": label, "reasons": reasons, "playable": playable,
                 "text": next((c["text"] for c in clips if c["text"]), ""),
