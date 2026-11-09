@@ -596,6 +596,30 @@ Every list and search entry carries `value`; the detail adds `value_reasons` and
   word-aligned). Map `start_at` to a playable offset with the recording's `timemap`; time inside a
   gap or missing audio means opening the transcript instead.
 
+### Recording class (`features` contains `recording_class`)
+
+Every summarized conversation is one of three kinds, each treated differently: `monologue` (the owner
+talking alone: dictation, a thought dump, requests for an assistant; never discarded by the summary's
+judgement, a cleaned near-verbatim text first when it is up to 10 minutes, `assistant_input: true` in the
+note), `dialogue` (the owner and someone else: the full notes) or `passive` (the owner not speaking: a
+video, broadcast or background talk; a brief note with the transcript folded, action items only when
+addressed to the owner, listed under "Background" in the daily note). The class comes from two cues, the
+voices (a confirmed owner's share of the speech) and the content (the summary's `interaction`); passive
+needs both, and any doubt keeps the fuller treatment.
+
+`/recent` and `/{id}` entries carry `recording_class`: `{class, auto, confidence, overridden,
+wearer_share, updating}` or `null` (not classified yet). `confidence` is `high`, `medium`, `low` or
+`owner`; `updating` is true while an owner's newer choice waits for its new summary.
+`GET /v1/conversations/recent?class=monologue|dialogue|passive` filters before paging (start the cursor
+again when the filter changes).
+
+`PUT /v1/conversations/{id}/class` with `{"class": "monologue"|"dialogue"|"passive"|"auto", "request_id":
+"<uuid>", "set_at": "<ISO-8601 with zone>"}` stores the owner's choice in the vault (`class.json`);
+`auto` goes back to the automatic class. The same `request_id` again is applied once; an older `set_at`
+than the stored one is not applied (`applied: false`). `200` with the resulting `recording_class` view plus
+`applied`; `404` unknown, `409 in_progress` while recording, `409 unreadable` when the stored choice can't
+be read (never treated as no choice), `422` invalid body, `503` read-only vault.
+
 ### `PUT /v1/conversations/{id}/priority`
 
 Body `{"state": "important" | "less_useful" | "auto", "request_id": "…", "set_at": "<ISO time of the

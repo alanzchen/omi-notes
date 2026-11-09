@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from datetime import time as dt_time
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.requests import ClientDisconnect
@@ -210,7 +210,7 @@ def create_app(
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes
-            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star", "watch_performance", "phone_log", "dismiss"] + (["watch_aac"] if aac.available() else []),
+            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star", "watch_performance", "phone_log", "dismiss", "recording_class"] + (["watch_aac"] if aac.available() else []),
             "vault_id": vault.vault_id,
         }
 
@@ -260,9 +260,14 @@ def create_app(
                 "latest_watch": watch_perf.latest(samples), "phone_relay": watch_perf.phone_relay(db)}  # fmt: skip
 
     @app.get("/v1/conversations/recent")
-    def recent(limit: int = 20, before: str | None = None) -> dict:
+    def recent(limit: int = 20, before: str | None = None, recording_class: str | None = Query(None, alias="class")) -> dict:
         limit = max(1, min(limit, 200))
         where, params = views.LISTED, []
+        if recording_class is not None:  # filtered before paging, so a page is full and the cursor stays valid
+            if recording_class not in ("monologue", "dialogue", "passive"):
+                raise ApiError(422, "invalid_class", "class must be monologue, dialogue or passive")
+            where += " AND json_extract(index_json, '$.recording_class.class') = ?"
+            params.append(recording_class)
         if before is not None:
             cursor = views.parse_cursor(before)
             if cursor is None:
@@ -328,6 +333,28 @@ def create_app(
         if read_only_reason(db):
             raise ApiError(503, "vault_read_only", read_only_reason(db))
         return await run_in_threadpool(priority.put, app.state.speakers.pipeline, conv_id, body)
+
+    @app.put("/v1/conversations/{conv_id}/class")
+    async def put_class(conv_id: str, request: Request) -> dict:
+        """The owner's recording class: monologue, dialogue, passive, or auto (docs: capture-format-v1.md)."""
+        from . import recording_class as rclass
+
+        body = await read_json(request)
+        if not isinstance(body, dict):
+            raise ApiError(422, "invalid_body", "expected a JSON object")
+        if read_only_reason(db):
+            raise ApiError(503, "vault_read_only", read_only_reason(db))
+        pipeline = app.state.speakers.pipeline
+
+        def apply() -> dict:
+            row = db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
+            applied = (json.loads(row["index_json"] or "{}").get("recording_class") or {}) if row else {}
+            result = rclass.put(pipeline, conv_id, body, applied.get("auto_detail") or applied)
+            if result.get("applied") and row is not None and row["note_path"]:
+                db.execute("UPDATE conversations SET needs_render=1 WHERE id=?", (conv_id,))  # the worker re-summarizes
+            return result
+
+        return await run_in_threadpool(apply)
 
     @app.post("/v1/conversations/{conv_id}/retry")
     async def retry(conv_id: str, request: Request) -> JSONResponse:

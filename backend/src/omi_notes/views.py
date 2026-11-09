@@ -340,7 +340,27 @@ def summary_row(pipeline, row: sqlite3.Row) -> dict:
         # nothing to review when no speaker was separated
         "speakers_ready": row["status"] != "open" and row["transcript_sha"] is not None and not _kept(row),
         "value": value(pipeline, row, notes, summary_state),
+        "recording_class": recording_view(pipeline, row),
     }
+
+
+def recording_view(pipeline, row: sqlite3.Row) -> dict | None:
+    """The class the note was made for (monologue | dialogue | passive), with the automatic one and its
+    confidence; `updating` while an owner's newer choice waits for its new summary. None: not classified yet."""
+    from . import recording_class as rclass
+
+    applied = _index(row).get("recording_class") if row["note_path"] else None
+    try:
+        choice = rclass.read(pipeline, row["id"])
+    except rclass.UnreadableChoice:
+        choice = None
+    if not applied:
+        return None
+    out = {k: applied.get(k) for k in ("class", "auto", "confidence", "overridden", "wearer_share")}
+    chosen = (choice or {}).get("class")
+    out["updating"] = bool(chosen in rclass.CLASSES and chosen != applied.get("class")) or bool(
+        chosen == "auto" and applied.get("overridden"))
+    return out
 
 
 def parse_cursor(cursor: str) -> tuple[float, str] | None:

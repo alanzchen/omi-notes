@@ -64,6 +64,7 @@ from ..speakers.voices import cosine_distance, embed_voices, label_turns, select
 from ..vault import Vault
 from . import prompt
 from .relevance import deterministic_relevance
+from .. import recording_class as rclass
 from .segmenter import RingCapture, ring_resolved_until
 from .speakers import SpeakerResult, has_speakers, resolve_speakers
 from . import sources
@@ -93,6 +94,7 @@ _PROMPT_IN_NAME = re.compile(r"-p(\d+)-[0-9a-f]{16}\.json$")
 
 STATUS_INTERVAL = 60.0  # `_status.md` and stubs are rewritten at most once a minute
 EDITED_RETRY = 600.0
+MONOLOGUE_CLEANED_MAX_S = 600.0  # a monologue up to this much speech also gets a cleaned near-verbatim text
 TOO_SHORT_S = 1.5  # detected speech below this is set aside without a note (not a failure)
 TOO_SHORT_REASON = "too short: under 1.5 s of speech"
 LOCAL_STT_DOWN = "local transcription (the omi-asr sidecar) is unavailable; waiting for it"
@@ -279,6 +281,7 @@ class ConversationPipeline:
         self._move_retries: dict[str, tuple[int, float]] = {}
         self._status_written: tuple[float, str] | None = None
         self._stub_written: dict[str, float] = {}
+        self._class_rank: dict[str, int] = {}  # conversation → summarizing priority (recording class), this process
         self._engine_deaths: dict[tuple[str, str], tuple[int, int]] = {}  # (conversation, audio) -> (counted, successes then)
         self._local_successes = 0  # sidecar transcriptions that worked, in this process
         self._deaths_in_a_row = 0
@@ -342,6 +345,9 @@ class ConversationPipeline:
                LIMIT ?""",
             (now, limit),
         )
+        # summaries by recording class: monologue, then dialogue, then passive (anything else as a dialogue);
+        # a stable sort keeps the order above (new work before re-runs, oldest first) within each
+        rows = sorted(rows, key=lambda r: (self._class_rank.get(r["id"], 1) if self._row(r["id"])["status"] == "summarizing" else 1))
         for row in rows:
             try:
                 self.advance(row["id"], now)
@@ -389,6 +395,8 @@ class ConversationPipeline:
                 self._set(conv_id, status="transcribing", updated_at=now)
                 self.transcribe(conv_id, now)
                 stage = "summarizing"
+                if self._outranked(conv_id, now):  # summaries go by class: monologue, dialogue, passive
+                    return
             self.summarize_and_render(conv_id, now)
         except ProviderError as exc:
             self._fail(conv_id, stage, exc, now)
@@ -835,6 +843,64 @@ class ConversationPipeline:
     def voice_names(self, conv_id: str) -> dict[str, tuple[str, bool]]:
         return {label: (v["name"], v["me"]) for label, v in self.speakers.names(conv_id).items()}
 
+    def _outranked(self, conv_id: str, now: float) -> bool:
+        """Whether another conversation waiting for its summary has a higher-priority class than this one."""
+        try:
+            mine = rclass.RANK.get(self.recording(conv_id, self.load_transcript(conv_id), self._row(conv_id)["transcript_sha"])["class"], 1)
+        except Exception:  # the summary stage reports its own problems
+            return False
+        waiting = self.db.query("SELECT id FROM conversations WHERE status='summarizing' AND id<>? AND "
+                                "(next_attempt_at IS NULL OR next_attempt_at <= ?)", (conv_id, now))  # fmt: skip
+        return any(self._class_rank.get(r["id"], 1) < mine for r in waiting)
+
+    def recording(self, conv_id: str, transcript: dict, transcript_sha: str | None, *, interaction: str | None = None) -> dict:
+        """The recording class this conversation is treated as (`recording_class`): the owner's choice, else the
+        automatic one from the wearer's share of the speech, with what decided it."""
+        auto = self.auto_class(conv_id, transcript, transcript_sha, interaction=interaction)
+        try:
+            override = rclass.read(self, conv_id)
+        except rclass.UnreadableChoice as exc:  # never "no choice": retried, and shown as an issue meanwhile
+            raise ProviderError(str(exc), kind="io") from exc
+        out = rclass.effective(auto, override) | {"auto_detail": auto}
+        self._class_rank[conv_id] = rclass.RANK.get(out["class"], 1)
+        return out
+
+    def auto_class(self, conv_id: str, transcript: dict, transcript_sha: str | None, *, interaction: str | None = None) -> dict:
+        """`recording_class.classify` on this conversation: per-label speech time, the wearer's named labels and
+        each label's centred voiceprint score against the wearer (`speakers.space`)."""
+        segments = transcript.get("segments") or []
+        per, total = rclass.speech_seconds(segments)
+        me = self.speakers.me()
+        states = self.speakers.labels(conv_id)
+        scores: dict[str, float] = {}
+        embedder = self.providers.embedder
+        if me is not None and embedder is not None:
+            try:  # without scores the class can still come from names, and passive then needs proof it can't get
+                from ..speakers.space import score
+
+                space = self.voice_space(embedder)
+                centroid = space[1].get(me["id"]) if space else None
+                if centroid is not None:
+                    for label, v in self.speakers.voices_of_labels(conv_id, transcript_sha).items():
+                        if getattr(v, "vector", None) is not None and getattr(v, "model_sha", None) == embedder.model_sha:
+                            scores[label] = score(v.vector, centroid, space[0])
+            except Exception:
+                log.exception("could not score voices against the wearer for %s", conv_id)
+        confirmed = ("user", "auto")
+        voices = [
+            rclass.Voice(label, seconds,
+                         named_wearer=me is not None and (states.get(label) or {}).get("person_id") == me["id"]
+                         and (states.get(label) or {}).get("source") in confirmed,
+                         named_other=bool((states.get(label) or {}).get("person_id")) and (me is None or (states.get(label) or {}).get("person_id") != me["id"])
+                         and (states.get(label) or {}).get("source") in confirmed,
+                         score=None if label not in scores else round(scores[label], 3))
+            for label, seconds in per.items()
+        ]  # fmt: skip
+        out = rclass.classify(voices, total, interaction=interaction, coarse_timing=transcript.get("timing_source") != "provider")
+        evidence = [[v.label, round(v.seconds, 1), v.named_wearer, v.named_other, v.score] for v in voices]
+        out["fingerprint"] = sha256_hex(canonical_json(evidence).encode())[:16]
+        return out
+
     def possible_voice_names(self, conv_id: str, transcript_sha: str | None) -> dict[str, tuple[str, bool]]:
         """Unnamed labels whose stored voice is close to a known person's (see `possible_names`): label →
         (name, me). Empty without a voice model or people."""
@@ -1001,7 +1067,8 @@ class ConversationPipeline:
             )
         )
 
-    def llm_notes(self, row: sqlite3.Row, segments: list[dict], language: str, now: float, *, cache_only: bool) -> dict:
+    def llm_notes(self, row: sqlite3.Row, segments: list[dict], language: str, now: float, *, cache_only: bool,
+                  recording_class: str = "dialogue") -> dict:  # fmt: skip
         conv_dir = self.conv_dir(row["id"])
         if cache_only:
             # Re-render from exactly what the note was made with, whatever the current model/prompt.
@@ -1019,6 +1086,8 @@ class ConversationPipeline:
             keyed += sorted(("~" + k, v[0], v[1]) for k, v in possible.items())
         speakers_sha = sha256_hex(canonical_json(keyed).encode())[:8]
         base = f"llm-{_slug(self.providers.llm_model)}-p{prompt.PROMPT_VERSION}-{row['transcript_sha'][:16]}-s{speakers_sha}"
+        if recording_class != "dialogue":  # a different summary for monologues and passive recordings
+            base += f"-c{recording_class[0]}{rclass.RULE_VERSION}"
         name = _reusable(conv_dir, base, row["llm_ref"], row["skip_llm"])
         path = conv_dir / name
         if path.exists():
@@ -1028,13 +1097,14 @@ class ConversationPipeline:
             timezone_name=self.timezone, language=language,
             owner_name=self.owner_name, bookmarks=self.bookmarks(row),
             provisional=bool(row["provisional"]), audio_gaps=json.loads(row["gaps_json"]), now=now,
-            speaker_names=names, possible_names=possible,
+            speaker_names=names, possible_names=possible, recording_class=recording_class,
         )  # fmt: skip
         result = self.providers.llm.summarize(
             LlmRequest(system=prompt.SYSTEM_PROMPT, user=user, schema=NOTES_JSON_SCHEMA, segments=segments)
         )
         cached = {"created_at": now, "model": result.model, "prompt_version": prompt.PROMPT_VERSION,
-                  "usage": result.usage, "fallback_used": result.fallback_used, "data": result.data}  # fmt: skip
+                  "usage": result.usage, "fallback_used": result.fallback_used, "data": result.data,
+                  **({"recording_class": recording_class} if recording_class != "dialogue" else {})}  # fmt: skip
         atomic_write_bytes(path, json.dumps(cached, ensure_ascii=False).encode())
         return cached | {"file": name}
 
@@ -1048,6 +1118,20 @@ class ConversationPipeline:
         segments = transcript["segments"]
         language = transcript.get("language") or self.settings.stt_language
         verdict, rule = deterministic_relevance([s["text"] for s in segments], row["speech_seconds"])
+        if cache_only:
+            # a re-render reproduces the class the note was made for (no fresh inference: a rebuild gives the same
+            # note); only the owner's choosing another class asks for a new summary
+            recording = json.loads(row["index_json"] or "{}").get("recording_class") or {}
+            try:
+                choice = rclass.read(self, conv_id)
+            except rclass.UnreadableChoice as exc:
+                raise ProviderError(str(exc), kind="io") from exc
+            chosen = (choice or {}).get("class")
+            if chosen in rclass.CLASSES and chosen != recording.get("class"):
+                self._set(conv_id, status="summarizing", needs_render=0, updated_at=now)
+                return
+        else:
+            recording = {}  # decided after the summary: its `interaction` is one of the two cues
         notes: ConversationNotes | None = None
         llm_cached: dict | None = None
         discard_reason = None
@@ -1069,16 +1153,35 @@ class ConversationPipeline:
             kind = "transcript_only"
             summary_error = summary_error or "LLM_PROVIDER=none"
         else:
-            llm_cached = self.llm_notes(row, segments, language, now, cache_only=cache_only)
+            llm_cached = self.llm_notes(row, segments, language, now, cache_only=cache_only,
+                                        recording_class=recording.get("class") or "dialogue")  # fmt: skip
             notes = ConversationNotes.model_validate(llm_cached["data"])
-            kind = "completed" if verdict == "keep" or notes.keep else "discarded"
+            if not cache_only:
+                recording = self.recording(conv_id, transcript, row["transcript_sha"], interaction=notes.interaction)
+                if recording["class"] == "monologue" and row["speech_seconds"] <= MONOLOGUE_CLEANED_MAX_S:
+                    # the owner's own words: a cleaned near-verbatim text, then ideas, tasks and questions
+                    llm_cached = self.llm_notes(row, segments, language, now, cache_only=False, recording_class="monologue")
+                    notes = ConversationNotes.model_validate(llm_cached["data"])
+            treated = recording.get("class") or "dialogue"
+            # a monologue (Alan talking to the assistant) or a passive recording is never discarded by the
+            # summary's judgement: one is the owner's own input, the other is kept as a brief background note
+            kept = verdict == "keep" or notes.keep or treated in ("monologue", "passive")
+            kind = "completed" if kept else "discarded"
             if kind == "discarded":
                 discard_reason = notes.discard_reason or "judged not worth keeping"
+        if not cache_only and not recording and kind != "discarded":  # no summary to judge the content: voices only
+            recording = self.recording(conv_id, transcript, row["transcript_sha"])
         self.render(row, kind, segments, language, transcript, notes, llm_cached, discard_reason, summary_error,
-                    verdict, rule, now, cache_only=cache_only)  # fmt: skip
+                    verdict, rule, now, cache_only=cache_only, recording=recording)  # fmt: skip
 
     def render(self, row, kind, segments, language, transcript, notes, llm_cached, discard_reason, summary_error,
-               verdict, rule, now, *, cache_only: bool = False) -> None:  # fmt: skip
+               verdict, rule, now, *, cache_only, recording=None) -> None:  # fmt: skip
+        return self._render(row, kind, segments, language, transcript, notes, llm_cached, discard_reason, summary_error,
+                            verdict, rule, now, cache_only=cache_only, recording=recording or {})  # fmt: skip
+
+    def _render(self, row, kind, segments, language, transcript, notes, llm_cached, discard_reason, summary_error,
+               verdict, rule, now, *, cache_only: bool = False, recording: dict | None = None) -> None:  # fmt: skip
+        recording = recording or {}
         """Publish the note crash-safely: read the user's My Notes (refusing ambiguous markers),
         durably write the new file, record it (conversation.json, then the index), and only then
         remove a previous location. A note edited outside My Notes since we wrote it is not
@@ -1119,6 +1222,7 @@ class ConversationPipeline:
             speakers_unknown=transcript.get("speaker_source") == "unlabeled",
             voice_names={label: name for label, (name, _) in self.voice_names(conv_id).items()},
             possible_names={label: name for label, (name, _) in self.possible_voice_names(conv_id, row["transcript_sha"]).items()},
+            recording_class=recording if kind != "discarded" else {},
         )  # fmt: skip
         content_sha = sha256_hex(render_note(data, "").encode())
         revision = row["revision"] if row["content_sha"] == content_sha and row["revision"] else row["revision"] + 1
@@ -1142,6 +1246,8 @@ class ConversationPipeline:
             "stt_seconds": transcript.get("submitted_seconds", 0),
             "discard_reason": discard_reason,
             "relevance": [verdict, rule],
+            # the class this note was made for, with what decided it (persisted in conversation.json's render index)
+            **({"recording_class": recording} if recording.get("class") else {}),
             # only when true, so the records of every other note stay byte-identical
             **({"speakers_unknown": True} if data.speakers_unknown else {}),
         }
@@ -1384,6 +1490,7 @@ class ConversationPipeline:
                         llm_model=index.get("llm_model"), llm_usage=index.get("llm_usage", {}),
                         late_audio=bool(row["late_audio"]), provisional=bool(row["provisional"]),
                         discard_reason=index.get("discard_reason"),
+                        recording_class=(index.get("recording_class") or {}).get("class"),
                     )
                 )  # fmt: skip
             path = self.settings.vault_dir / "Daily" / f"{day.isoformat()}.md"

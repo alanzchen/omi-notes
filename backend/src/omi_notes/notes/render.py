@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from .schema import ActionItem, ConversationNotes
+from .schema import CLEANED_TEXT, ActionItem, ConversationNotes
 from .writer import MY_NOTES_END, MY_NOTES_START
 
 NoteStatus = Literal["completed", "discarded", "transcript_only"]
@@ -62,6 +62,8 @@ class NoteData:
     voice_names: dict[str, str] = field(default_factory=dict)
     # Unnamed labels whose voice is close to a known person, without a confident match: shown as a guess.
     possible_names: dict[str, str] = field(default_factory=dict)
+    # The recording class this note was made for (`recording_class.effective`); empty: not classified.
+    recording_class: dict = field(default_factory=dict)
 
 
 def neutralize(text: str) -> str:
@@ -191,6 +193,9 @@ def frontmatter(d: NoteData) -> dict:
         "audio_lost_s": round(d.lost_seconds, 1),
         "clock_suspect": d.clock_suspect,
         "speaker_labels_consistent": d.speaker_labels_consistent,
+        **({"recording_class": d.recording_class["class"], "class_confidence": d.recording_class.get("confidence"),
+            "wearer_share": d.recording_class.get("wearer_share")} if d.recording_class.get("class") else {}),
+        **({"assistant_input": True} if d.recording_class.get("class") == "monologue" else {}),
         "action_items_open": len(items),
         "tags": (notes.tags if notes else []),
         "discard_reason": d.discard_reason if d.status == "discarded" else None,
@@ -264,12 +269,21 @@ def render_note(d: NoteData, my_notes: str | None = None) -> str:
             "",
         ]
 
+    passive = d.recording_class.get("class") == "passive"
+    if passive:
+        out += ["> [!info] Background recording: you aren't speaking in it, so it has a brief note only. "
+                "Reclassify it in the app for full notes.", ""]
     if notes:
-        if notes.sections:
+        sections = list(notes.sections)
+        if d.recording_class.get("class") == "monologue" and sections and sections[0].heading.strip().lower() == CLEANED_TEXT.lower():
+            out += ["## Cleaned Text", ""]
+            for paragraph in sections.pop(0).bullets:
+                out += [paragraph, ""]
+        if sections and not passive:
             out += ["## Key Points", ""]
-            for section in notes.sections:
+            for section in sections:
                 out += [f"### {section.heading}", *[f"- {b}" for b in section.bullets], ""]
-        owned = [i for i in notes.action_items if not i.directed_at_ai]
+        owned = [i for i in notes.action_items if not i.directed_at_ai and (not passive or i.owner == "me")]
         if owned:
             out += ["## Action Items", ""]
             for item in owned:
@@ -283,22 +297,22 @@ def render_note(d: NoteData, my_notes: str | None = None) -> str:
                 if item.context:
                     out.append(f"    - {item.context}")
             out.append("")
-        asked = [i for i in notes.action_items if i.directed_at_ai]
+        asked = [i for i in notes.action_items if i.directed_at_ai] if not passive else []
         if asked:  # dictated to an assistant: kept for reference, not the owner's tasks
             out += ["## Asked of an Assistant", "", *[f"- {i.description}" for i in asked], ""]
         for heading, values in (("Decisions", notes.decisions), ("Open Questions", notes.open_questions)):
-            if values:
+            if values and not passive:
                 out += [f"## {heading}", "", *[f"- {v}" for v in values], ""]
-        if notes.events:
+        if notes.events and not passive:
             out += ["## Events", ""]
             for event in notes.events:
                 when = f" — {event.start_local_iso.replace('T', ' ')}" if event.start_local_iso else ""
                 length = f" ({event.duration_min} min)" if event.duration_min else ""
                 out.append(f"- {event.title}{when}{length}")
             out.append("")
-        if notes.people:
+        if notes.people and not passive:
             out += ["## People", "", *[f"- **{p.name}**" + (f" — {p.note}" if p.note else "") for p in notes.people], ""]
-        if notes.memorable_facts:
+        if notes.memorable_facts and not passive:
             out += ["## Worth Remembering", "", *[f"- {f}" for f in notes.memorable_facts], ""]
 
     if d.bookmarks:
@@ -313,7 +327,9 @@ def render_note(d: NoteData, my_notes: str | None = None) -> str:
     out += ["## My Notes", "", f"{MY_NOTES_START}{body_notes}{MY_NOTES_END}", ""]
 
     out += ["## Transcript", ""]
-    if d.segments:
+    if d.segments and passive:  # folded: kept in full, out of the way
+        out += ["> [!quote]- Transcript", *[line for seg in d.segments for line in (f"> {_transcript_line(seg, d)}", ">")], ""]
+    elif d.segments:
         for seg in d.segments:
             out += [_transcript_line(seg, d), ""]
     else:

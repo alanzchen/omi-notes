@@ -142,6 +142,9 @@ _ELEMENT_MODELS: dict[str, type[BaseModel]] = {
 _STRING_LISTS = ("decisions", "open_questions", "memorable_facts", "tags")
 
 
+CLEANED_TEXT = "Cleaned text"  # a monologue's near-verbatim section heading (rendered as paragraphs)
+
+
 class ConversationNotes(BaseModel):
     model_config = ConfigDict(extra="ignore")
 

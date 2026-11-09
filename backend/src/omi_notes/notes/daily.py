@@ -36,6 +36,7 @@ class DailyEntry:
     late_audio: bool = False
     provisional: bool = False
     discard_reason: str | None = None
+    recording_class: str | None = None  # passive recordings are listed apart, without their action items
 
 
 def llm_cost(model: str | None, usage: dict) -> float:
@@ -59,10 +60,12 @@ def _link(relpath: str, label: str) -> str:
 
 def render_daily(day: date, entries: list[DailyEntry], tz: ZoneInfo) -> str:
     entries = sorted(entries, key=lambda e: e.start)
-    kept = [e for e in entries if e.status in ("completed", "transcript_only")]
+    shown = [e for e in entries if e.status in ("completed", "transcript_only")]
+    kept = [e for e in shown if e.recording_class != "passive"]
+    background = [e for e in shown if e.recording_class == "passive"]
     discarded = [e for e in entries if e.status == "discarded"]
     pending = [e for e in entries if e.status in ("in_progress", "failed")]
-    speech = sum(e.speech_seconds for e in kept + discarded)
+    speech = sum(e.speech_seconds for e in kept + background + discarded)
     stt_cost = sum(e.stt_seconds for e in entries) / 60 * STT_USD_PER_MINUTE
     llm_total = sum(llm_cost(e.llm_model, e.llm_usage) for e in entries)
     fm = yaml.safe_dump(
@@ -96,6 +99,13 @@ def render_daily(day: date, entries: list[DailyEntry], tz: ZoneInfo) -> str:
         out += ["## Action Items", ""]
         # Plain bullets on purpose: checkboxes here would duplicate the notes' tasks in Obsidian Tasks.
         out += [f"- {item} · {_link(e.relpath, e.title)}" if e.relpath else f"- {item}" for e, item in items]
+        out.append("")
+    if background:  # recordings the owner wasn't speaking in: one line each, out of the way
+        out += ["## Background", ""]
+        for e in background:
+            local = datetime.fromtimestamp(e.start, tz)
+            label = f"{local:%H:%M} · {e.title}"
+            out.append(f"- {_link(e.relpath, label)}" if e.relpath else f"- {label}")
         out.append("")
     if pending:
         out += ["## In Progress", ""]
