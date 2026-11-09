@@ -62,6 +62,10 @@ public final class SpeakersModel {
     public private(set) var serverSupportsEnrollment: Bool?
     /// The server supports the "Name this voice" flow (clip text, scope, keep unknown, undo).
     public private(set) var serverSupportsNameVoice = false
+    /// The 声纹 hub's review queue and per-person samples.
+    public private(set) var serverSupportsVoiceReview = false
+    /// People carry their last calibration and held-out counts.
+    public private(set) var serverSupportsVoiceCalibration = false
     public var enrollment: Enrollment = .idle
 
     private let engine: OmiEngine
@@ -118,6 +122,8 @@ public final class SpeakersModel {
         error = nil
         serverSupportsEnrollment = nil
         serverSupportsNameVoice = false
+        serverSupportsVoiceReview = false
+        serverSupportsVoiceCalibration = false
         switch enrollment {
         case .idle: break
         case .checking, .reading: cancelEnrollment()
@@ -148,6 +154,8 @@ public final class SpeakersModel {
         guard current() else { return }
         serverSupportsEnrollment = status?.supportsVoiceEnrollment
         serverSupportsNameVoice = status?.supportsNameVoice == true
+        serverSupportsVoiceReview = status?.supportsVoiceReview == true
+        serverSupportsVoiceCalibration = status?.supportsVoiceCalibration == true
         do {
             async let p = api.people()
             async let s = api.speakerSettings()
@@ -284,6 +292,28 @@ public final class SpeakersModel {
     }
 
     public func clip(_ clipId: String) async throws -> Data { try await api().clip(clipId) }
+
+    // MARK: 声纹 hub (errors are thrown to the screen's model)
+
+    public func reviewItems(limit: Int) async throws -> [ReviewItem] { try await api().reviewItems(limit: limit) }
+
+    public func decideReview(_ itemId: String, decision: String, personId: String?, requestId: String) async throws -> ReviewDecisionAnswer {
+        try await api().decideReview(itemId, decision: decision, personId: personId, requestId: requestId)
+    }
+
+    public func samples(personId: String, state: String) async throws -> [VoiceSample] {
+        try await api().samples(personId: personId, state: state)
+    }
+
+    public func sampleAction(_ sampleId: String, action: String, personId: String?, expectedRevision: Int?,
+                             requestId: String) async throws -> SampleActionAnswer {
+        try await api().sampleAction(sampleId, action: action, personId: personId, expectedRevision: expectedRevision, requestId: requestId)
+    }
+
+    /// Puts back a hub decision (review, remove, restore, move) by its undo token.
+    public func undo(token: String) async throws -> UndoNamingResponse {
+        try await api().undoNaming(requestId: token, undoRequestId: "undo-" + token)
+    }
 
     // MARK: Enrollment
 

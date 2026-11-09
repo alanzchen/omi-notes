@@ -58,6 +58,40 @@ extension APIClient {
         return try await json("POST", "/v1/speakers/undo", body: Body(requestId: requestId, undoRequestId: undoRequestId))
     }
 
+    // MARK: 声纹 hub (servers with `voice_review`)
+
+    /// The next questions, suspicious first (the server's order).
+    public func reviewItems(limit: Int) async throws -> [ReviewItem] {
+        let r: ReviewItemsResponse = try await json("GET", "/v1/speakers/review", query: "limit=\(limit)")
+        return r.items
+    }
+
+    /// `confirm`, `reject` or `move` (with `personId`). A changed item → `APIError.http(409, "stale_review: …")`.
+    public func decideReview(_ itemId: String, decision: String, personId: String? = nil, requestId: String) async throws -> ReviewDecisionAnswer {
+        struct Body: Encodable { var decision: String; var personId: String?; var requestId: String }
+        return try await json("POST", "/v1/speakers/review/\(Self.pathSegment(itemId))",
+                              body: Body(decision: decision, personId: personId, requestId: requestId))
+    }
+
+    /// A person's samples in one state (`active`, `flagged`, `removed`, `moved`).
+    public func samples(personId: String, state: String) async throws -> [VoiceSample] {
+        let r: VoiceSamplesResponse = try await json("GET", "/v1/people/\(personId)/samples", query: "state=\(state)")
+        return r.samples
+    }
+
+    /// `remove`, `restore` or `move` (with `personId`); `expectedRevision` refuses a sample changed since it was listed.
+    public func sampleAction(_ sampleId: String, action: String, personId: String? = nil, expectedRevision: Int?,
+                             requestId: String) async throws -> SampleActionAnswer {
+        struct Body: Encodable { var requestId: String; var expectedRevision: Int?; var personId: String? }
+        return try await json("POST", "/v1/samples/\(sampleId)/\(action)",
+                              body: Body(requestId: requestId, expectedRevision: expectedRevision, personId: personId))
+    }
+
+    /// Review item ids carry `.`-separated parts (labels too); anything else a path can't hold is escaped.
+    static func pathSegment(_ s: String) -> String {
+        s.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))) ?? s
+    }
+
     public func dismissSuggestion(_ id: String) async throws {
         _ = try await raw("POST", "/v1/speakers/suggestions/\(id)/dismiss")
     }
