@@ -303,6 +303,8 @@ CREATE TABLE IF NOT EXISTS voices (
     spread REAL NOT NULL DEFAULT 0,
     rms_db REAL,
     clips_json TEXT NOT NULL,
+    f0 REAL,
+    f0_voiced INTEGER,
     PRIMARY KEY (conversation_id, label)
 );
 CREATE TABLE IF NOT EXISTS speaker_labels (
@@ -489,7 +491,7 @@ COLUMN_SOURCES: dict[str, dict[str, str]] = {
     "voices": {
         c: "<conversation dir>/voices-<model>-<audio_sha16>.json" for c in (
             "conversation_id", "label", "file", "model", "model_sha", "vector", "seconds", "turns", "spread", "rms_db",
-            "clips_json")
+            "clips_json", "f0", "f0_voiced")
     },  # fmt: skip
     "speaker_labels": {
         c: "<conversation dir>/speakers.json labels"

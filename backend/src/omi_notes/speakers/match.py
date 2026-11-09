@@ -90,6 +90,7 @@ class PersonModel:
     why_inactive: str = ""
     enrolled_wearer: bool = False
     wearer: bool = False  # this is "me" (`OwnerRule`)
+    enrollment_only: bool = False  # the centroid comes from enrollment audio alone
 
 
 @dataclass(frozen=True)

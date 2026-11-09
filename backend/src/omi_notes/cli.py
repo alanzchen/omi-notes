@@ -782,6 +782,46 @@ speakers_app = typer.Typer(no_args_is_help=True, help="Speaker recognition tools
 app.add_typer(speakers_app, name="speakers")
 
 
+def _counts(counts) -> None:
+    for key, n in sorted(counts.items(), key=lambda kv: (not kv[0].startswith(("measured", "imported")), kv[0])):
+        typer.echo(f"  {key} {n}")
+
+
+@speakers_app.command("measure-f0")
+def speakers_measure_f0() -> None:
+    """Add F0 (review evidence, never identity) to samples made before it was measured, from raw audio
+    where it still exists or the person's stored enrollment audio. Idempotent; only adds fields."""
+    from .speakers import f0
+
+    settings = _settings()
+    w = _worker(settings)
+    counts = f0.measure(w.pipeline)
+    if counts["measured"] or counts["unknown (too little voiced speech)"]:
+        w.pipeline.speakers.samples_changed()  # the worker re-evaluates review flags
+    typer.echo("F0 backfill:")
+    counts.setdefault("measured", 0)
+    _counts(counts)
+
+
+@speakers_app.command("import-f0")
+def speakers_import_f0(
+    bench_dir: Path = typer.Argument(..., help="The bench data folder with pitch.json, clips.json and manifest.json"),
+    tag: str = typer.Option("bench-20261108", help="Recorded as each imported sample's f0_source"),
+) -> None:
+    """Import F0 measured by the speaker bench, only for samples whose conversation, label, voices
+    generation, audio and clip bounds match the bench's clips. Never overwrites; reports what it skipped."""
+    from .speakers import f0
+
+    settings = _settings()
+    w = _worker(settings)
+    counts = f0.import_bench(w.pipeline.speakers, w.db, bench_dir, tag=tag)
+    if counts["imported"]:
+        w.pipeline.speakers.samples_changed()
+    typer.echo(f"F0 import from {bench_dir}:")
+    counts.setdefault("imported", 0)
+    _counts(counts)
+
+
 @speakers_app.command("bench")
 def speakers_bench() -> None:
     """Measure how well the confirmed voice samples separate, and recommend operating points.

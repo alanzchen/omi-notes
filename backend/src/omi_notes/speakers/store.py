@@ -82,6 +82,9 @@ class VoiceRow:
     clips: list[list[float]]
     model: str
     model_sha: str
+    f0: float | None = None
+    f0_voiced: int = 0
+    file: str | None = None  # the voices file it is from
 
     @property
     def mixed(self) -> bool:
@@ -357,7 +360,10 @@ class SpeakerStore:
 
     def add_sample(self, person_id: str, vector: np.ndarray, *, model: str, model_sha: str, source: str, seconds: float,
                    day: str | None, session: str | None, conversation_id: str | None = None, label: str | None = None,
-                   request_id: str | None = None, enrollment_id: str | None = None, now: float | None = None) -> str:  # fmt: skip
+                   request_id: str | None = None, enrollment_id: str | None = None, now: float | None = None,
+                   extra: dict | None = None, attested: bool | None = None) -> str:  # fmt: skip
+        """A new confirmed voiceprint (`extra`: provenance such as clip bounds, caption and F0; `attested`:
+        the consent recorded with it, by default the person's attestation or a pendant enrollment)."""
         now = time.time() if now is None else now
         sample_id = str(uuid.uuid4())
         person = self.person(person_id)
@@ -366,11 +372,77 @@ class SpeakerStore:
             "model": model, "model_sha": model_sha, "dim": int(len(vector)), "vector_b64": encode_vector(vector),
             "source": source, "seconds": round(float(seconds), 3), "created_at": now, "day": day, "session": session,
             "conversation_id": conversation_id, "label": label, "request_id": request_id, "enrollment_id": enrollment_id,
-            "attested": self.attested(person_id) or source == "enrollment",
+            "attested": (self.attested(person_id) or source == "enrollment") if attested is None else attested,
         }  # fmt: skip
+        data |= {k: v for k, v in (extra or {}).items() if v is not None and k not in data}
         Vault.write_json(self.person_dir(person_id) / "samples" / f"{sample_id}.json", data)
         self._index_sample(data)
+        self.samples_changed(now)
         return sample_id
+
+    def add_sample_fields(self, person_id: str, sample_id: str, fields: dict) -> bool:
+        """Add measurements to a sample file (F0 backfill and import): never overwrites a key it has, never
+        touches its state or revision. False when there was nothing to add."""
+        data = self.read_sample(person_id, sample_id)
+        if data is None:
+            return False
+        new = {k: v for k, v in fields.items() if k not in data}
+        if not new:
+            return False
+        data = data | new
+        Vault.write_json(self.sample_path(person_id, sample_id), data)
+        self._index_sample(data)
+        return True
+
+    # -- review flags (`speakers.flags`) ----------------------------------------------------------
+
+    def apply_flags(self, now: float | None = None) -> int:
+        """Re-evaluate every eligible sample's review flag (call under the speaker lock); how many flags were
+        raised. A flag resolved for the same evidence stays resolved; a flag whose evidence went away is
+        cleared. Flags never change eligibility, so they don't ask for a recalibration."""
+        from . import flags
+
+        now = time.time() if now is None else now
+        raised = 0
+        groups = self.db.query("SELECT DISTINCT model, model_sha FROM samples")
+        for group in groups:
+            samples = self.samples(group["model"], group["model_sha"])
+            models = build_models(samples)
+            enrolled = {pid: m.centroid for pid, m in models.items() if m.enrollment_only and m.centroid is not None}
+            inputs = [flags.FlagInput(s.id, s.person_id, s.vector, s.f0, 2.0 if s.source == "enrollment" else 1.0) for s in samples]
+            found = flags.evaluate(inputs, enrolled)
+            for s in samples:
+                data = self.read_sample(s.person_id, s.id)
+                if data is None:
+                    continue
+                reasons, flag = found.get(s.id) or [], data.get("flag")
+                if reasons:
+                    fp = flags.fingerprint(reasons, data)
+                    if (flag or {}).get("evidence_fingerprint") == fp:
+                        continue
+                    new = {"reasons": reasons, "evidence_fingerprint": fp, "flagged_at": now, "rule": flags.VERSION}
+                    if (flag or {}).get("resolved"):
+                        new["resolved"] = flag["resolved"]  # an earlier answer, for other evidence: asked again
+                    self.update_sample(s.person_id, s.id, {"flag": new}, action="flag", by="calibration", request_id=None,
+                                       now=now, record={"reasons": reasons}, recalibrate=False)  # fmt: skip
+                    raised += flag_open(new)
+                elif flag_open(flag):
+                    self.update_sample(s.person_id, s.id, {"flag": None}, action="unflag", by="calibration", request_id=None,
+                                       now=now, recalibrate=False)  # fmt: skip
+        return raised
+
+    def resolve_flag(self, person_id: str, sample_id: str, decision: str, *, request_id: str | None, now: float | None = None,
+                     by: str = "user") -> dict:  # fmt: skip
+        """The owner answered a flag: recorded with its evidence fingerprint, so the same evidence never asks again."""
+        now = time.time() if now is None else now
+        data = self.read_sample(person_id, sample_id) or {}
+        flag = dict(data.get("flag") or {})
+        changes = {}
+        if flag:
+            flag["resolved"] = {"decision": decision, "at": now, "fingerprint": flag.get("evidence_fingerprint")}
+            changes["flag"] = flag
+        return self.update_sample(person_id, sample_id, changes, action=decision, by=by, request_id=request_id, now=now,
+                                  recalibrate=False)  # fmt: skip
 
     def _index_sample(self, data: dict) -> None:
         self.db.execute(
@@ -400,7 +472,8 @@ class SpeakerStore:
         return next((Vault.read_json(p) for p in self.vault.people.glob(f"*/samples/{sample_id}.json")), None)
 
     def update_sample(self, person_id: str, sample_id: str, changes: dict, *, action: str, by: str,
-                      request_id: str | None, now: float | None = None, record: dict | None = None) -> dict:  # fmt: skip
+                      request_id: str | None, now: float | None = None, record: dict | None = None,
+                      recalibrate: bool = True) -> dict:  # fmt: skip
         """Change a sample file (the vault first, then the index; call under the speaker lock): `changes`
         are merged (None removes a key), the revision goes up, and `history` gains {at, action, by,
         request_id, ...record}. The vault is raised to format 6 before the first such write."""
@@ -420,7 +493,8 @@ class SpeakerStore:
                                                                "request_id": request_id} | (record or {})]  # fmt: skip
         Vault.write_json(self.sample_path(person_id, sample_id), data)
         self._index_sample(data)
-        self.samples_changed(now)
+        if recalibrate:
+            self.samples_changed(now)
         return data
 
     def set_sample_state(self, person_id: str, sample_id: str, state: str, *, action: str, by: str,
@@ -548,6 +622,8 @@ class SpeakerStore:
                      "clips": [[c.start, c.end] for c in voice.clips]}  # fmt: skip
             if voice.vector is not None and label in keep_vectors:
                 entry["vector_b64"] = encode_vector(voice.vector)
+                if getattr(voice, "f0", None) is not None:  # a voice feature too: kept and pruned with the vector
+                    entry |= {"f0": voice.f0, "f0_voiced": voice.f0_voiced}
             labels[label] = entry
         Vault.write_json(self.conv_dir(conv_id) / name, {"model": model, "model_sha": model_sha, "labels": labels})
         self.index_voices(conv_id, name)
@@ -558,11 +634,11 @@ class SpeakerStore:
             conn.execute("DELETE FROM voices WHERE conversation_id=?", (conv_id,))
             conn.executemany(
                 """INSERT INTO voices (conversation_id, label, file, model, model_sha, vector, seconds, turns, spread, rms_db,
-                       clips_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                       clips_json, f0, f0_voiced) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 [(conv_id, label, name, data.get("model"), data.get("model_sha"),
                   np.asarray(decode_vector(e["vector_b64"]), dtype="<f4").tobytes() if e.get("vector_b64") else None,
                   e.get("seconds") or 0.0, e.get("turns") or 0, e.get("spread") or 0.0, e.get("rms_db"),
-                  json.dumps(e.get("clips") or [])) for label, e in (data.get("labels") or {}).items()],
+                  json.dumps(e.get("clips") or []), e.get("f0"), e.get("f0_voiced")) for label, e in (data.get("labels") or {}).items()],
             )  # fmt: skip
 
     def keep_vectors(self, conv_id: str, labels: set[str]) -> bool:
@@ -584,6 +660,8 @@ class SpeakerStore:
         changed = False
         for label, entry in (data.get("labels") or {}).items():
             if label not in keep and entry.pop("vector_b64", None) is not None:
+                changed = True
+            if label not in keep and (entry.pop("f0", None), entry.pop("f0_voiced", None)) != (None, None):
                 changed = True
         if changed:
             Vault.write_json(path, data)
@@ -645,7 +723,7 @@ class SpeakerStore:
         return {
             r["label"]: VoiceRow(r["label"], np.frombuffer(r["vector"], dtype="<f4").astype(np.float32) if r["vector"] else None,
                                  r["seconds"], r["turns"], r["spread"], r["rms_db"], json.loads(r["clips_json"]), r["model"],
-                                 r["model_sha"])
+                                 r["model_sha"], r["f0"], r["f0_voiced"] or 0, r["file"])
             for r in self.db.query("SELECT * FROM voices WHERE conversation_id=?", (conv_id,))
         }  # fmt: skip
 
@@ -783,7 +861,7 @@ class SpeakerStore:
         return {
             label: VoiceRow(label, decode_vector(e["vector_b64"]) if e.get("vector_b64") else None, e.get("seconds") or 0.0,
                             e.get("turns") or 0, e.get("spread") or 0.0, e.get("rms_db"), e.get("clips") or [],
-                            data.get("model"), data.get("model_sha"))
+                            data.get("model"), data.get("model_sha"), e.get("f0"), e.get("f0_voiced") or 0, name)
             for label, e in (data.get("labels") or {}).items()
         }  # fmt: skip
 

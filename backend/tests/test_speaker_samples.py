@@ -14,7 +14,7 @@ from omi_notes.api import create_app
 from omi_notes.pipeline.worker import Worker
 from omi_notes.speakers import match as sm
 from omi_notes.speakers.service import SpeakerService
-from omi_notes.speakers.store import sample_eligible
+from omi_notes.speakers.store import flag_open, sample_eligible
 from omi_notes.vault import Vault
 
 from .conftest import AUTH
@@ -289,3 +289,164 @@ def test_possible_names_are_scored_by_recording_mean_and_only_from_eligible_samp
     with worker.pipeline.speakers.lock:
         worker.pipeline.speakers.set_sample_state(priya, sid, "removed", action="remove", by="user", request_id="r")
     assert worker.pipeline.possible_voice_names(later["id"], later["transcript_sha"]) == {}
+
+
+# -- M4: F0 and review flags ---------------------------------------------------------------------------
+
+from omi_notes.audio import pitch  # noqa: E402
+from omi_notes.speakers import flags as fl  # noqa: E402
+
+from .helpers import silence  # noqa: E402
+from .test_speaker_learning import voice  # noqa: E402
+
+
+def test_yin_finds_the_pitch_of_a_voiced_clip_and_needs_enough_voiced_frames():
+    clip = pitch.clip_f0(voice(3, 150.0))
+    assert clip["f0"] == pytest.approx(150.0, abs=4) and clip["voiced"] >= pitch.MIN_VOICED
+    assert pitch.clip_f0(voice(0.12, 150.0))["f0"] is None  # too few voiced frames
+    assert pitch.clip_f0(silence(2))["f0"] is None
+    pcm = np.concatenate([voice(4, 120.0), voice(4, 120.0, 1)])
+    whole = pitch.voice_f0(pcm, [[0.0, 4.0], [4.0, 8.0]])
+    assert whole["f0"] == pytest.approx(120.0, abs=4) and whole["voiced"] >= pitch.SAMPLE_MIN_VOICED
+    assert whole["estimator"] == pitch.ESTIMATOR
+    short = pitch.voice_f0(pcm, [[0.0, 0.6]])  # a clip passes, but a sample needs 100 voiced frames
+    assert short["f0"] is None and short["voiced"] >= pitch.MIN_VOICED
+
+
+def test_a_new_sample_carries_its_f0_and_clips_measured_while_the_pcm_was_in_hand(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker, days=(6,))
+    data = sample_file(settings, me, ids[0])
+    assert data["f0"] == pytest.approx(ALAN, abs=6) and data["f0_source"] == "voices-stage"
+    assert data["f0_estimator"] == pitch.ESTIMATOR and data["f0_voiced"] >= pitch.SAMPLE_MIN_VOICED
+    assert data["clips"] and data["voices_file"].startswith("voices-")
+    voices = json.loads((Vault.open(settings).conversation_dir(rows[0]["id"]) / data["voices_file"]).read_text())
+    assert voices["labels"]["S1"]["f0"] == data["f0"] and "f0" not in voices["labels"]["S2"]  # unknown: not kept
+    assert worker.db.one("SELECT f0 FROM samples WHERE id=?", (ids[0],))["f0"] == data["f0"]
+
+
+def strip_f0(settings, worker, person_id, sample_id, *, clips: bool = False) -> None:
+    """Make a sample look like one from before F0 (and, with `clips`, before clip bounds were recorded)."""
+    path = Vault.open(settings).person_dir(person_id) / "samples" / f"{sample_id}.json"
+    data = json.loads(path.read_text())
+    for key in ("f0", "f0_voiced", "f0_source", "f0_estimator", "f0_measurement") + (("clips", "voices_file") if clips else ()):
+        data.pop(key, None)
+    Vault.write_json(path, data)
+    worker.pipeline.speakers.load_samples()
+
+
+def run_cli(settings, *args):
+    from typer.testing import CliRunner
+
+    from omi_notes.cli import app as cli
+
+    from .conftest import cli_env
+
+    result = CliRunner().invoke(cli, ["speakers", *args], env=cli_env(settings))
+    assert result.exit_code == 0, result.output
+    return result.output
+
+
+def test_measure_f0_backfills_from_raw_audio_once_and_only_adds_fields(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker, days=(6, 5))
+    strip_f0(settings, worker, me, ids[0])
+    strip_f0(settings, worker, me, ids[1], clips=True)  # older still: its bounds come from the voices file it matches
+    before = sample_file(settings, me, ids[0])
+    out = run_cli(settings, "measure-f0")
+    assert "measured 2" in out, out
+    for sid in ids:
+        data = sample_file(settings, me, sid)
+        assert data["f0"] == pytest.approx(ALAN, abs=6) and data["f0_source"] == "raw-backfill"
+    after = sample_file(settings, me, ids[0])
+    assert {k: v for k, v in after.items() if k in before} == before, "nothing else changes"
+    assert "measured 0" in run_cli(settings, "measure-f0"), "idempotent"
+
+
+def bench_dir(tmp_path, settings, rows, sample_data, *, shift: float = 0.0, pitches=(111.0, 113.0)) -> str:
+    """A bench data dir (clips.json + pitch.json + manifest.json) for one sample's conversation and label."""
+    conv = rows[0]
+    bench = tmp_path / "bench" / "data"
+    bench.mkdir(parents=True, exist_ok=True)
+    spans = sample_data["clips"]
+    clips = [{"i": i, "cid": conv["id"], "label": sample_data["label"], "j": i, "start": conv["start"], "person": "Alan"}
+             for i in range(len(spans))]  # fmt: skip
+    manifest = [{"id": conv["id"], "start": conv["start"], "voices_file": sample_data["voices_file"],
+                 "labels": {sample_data["label"]: {"clips": [[a + shift, b + shift] for a, b in spans]}}}]  # fmt: skip
+    (bench / "clips.json").write_text(json.dumps(clips))
+    (bench / "manifest.json").write_text(json.dumps(manifest))
+    (bench / "pitch.json").write_text(json.dumps({str(i): pitches[i % len(pitches)] for i in range(len(spans))}))
+    return str(bench)
+
+
+def test_import_f0_adds_bench_values_only_where_conversation_label_and_clip_bounds_match(env, tmp_path):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker, days=(6,))
+    data = sample_file(settings, me, ids[0])
+    strip_f0(settings, worker, me, ids[0])
+    off = bench_dir(tmp_path / "off", settings, rows, data, shift=0.2)
+    out = run_cli(settings, "import-f0", off)
+    assert "imported 0" in out and "skipped (clip bounds differ) 1" in out, out
+    assert "f0" not in sample_file(settings, me, ids[0])
+    good = bench_dir(tmp_path / "good", settings, rows, data, shift=0.03, pitches=(111.0, 113.0, 115.0))
+    out = run_cli(settings, "import-f0", good)
+    assert "imported 1" in out, out
+    imported = sample_file(settings, me, ids[0])
+    assert imported["f0_source"] == "bench-20261108" and imported["f0_clips"] == list(range(len(data["clips"])))
+    assert imported["f0"] == pytest.approx(float(np.median([(111.0, 113.0, 115.0)[i % 3] for i in range(len(data["clips"]))])))
+    assert "torchaudio" in imported["f0_estimator"] and imported["f0_aggregation"]
+    out = run_cli(settings, "import-f0", good)
+    assert "imported 0" in out and "skipped (already measured) 1" in out, "never overwrites"
+    assert sample_file(settings, me, ids[0]) == imported
+
+
+def flag_input(i: int, f0: float | None, f0_voice: float = ALAN, pid: str = "alan") -> fl.FlagInput:
+    return fl.FlagInput(f"{pid}-{i}", pid, vec(f0_voice, i), f0)
+
+
+def test_flags_mark_pitch_outside_the_persons_band_and_scores_far_below_the_rest():
+    people = [flag_input(i, 118.0 + i) for i in range(8)]
+    odd_pitch = flag_input(8, 190.0)
+    odd_voice = flag_input(9, 121.0, f0_voice=RAVI)
+    found = fl.evaluate(people + [odd_pitch, odd_voice])
+    assert found["alan-8"] == ["pitch"]
+    assert "score" in found["alan-9"]
+    assert all(found.get(s.id, []) == [] for s in people)
+    # no fixed 165 Hz split: a high-pitched person is judged by their own band
+    high = [flag_input(i, 210.0 + i, pid="gigi") for i in range(8)]
+    assert all(not v for v in fl.evaluate(high).values())
+    assert fl.evaluate(people[:3] + [odd_pitch]) == {s.id: [] for s in people[:3] + [odd_pitch]}  # too few to judge
+
+
+def add_samples(store, person_id: str, f0s: list[float | None], voice_f0: float = ALAN) -> list[str]:
+    ids = []
+    for i, f0 in enumerate(f0s):
+        ids.append(store.add_sample(person_id, vec(voice_f0, i), model=MODEL[0], model_sha=MODEL[1],
+                                    source="user", seconds=8.0, day=f"2026-09-{10 + i}", session=f"s{i}",
+                                    extra={"f0": f0, "f0_source": "voices-stage"} if f0 else None))  # fmt: skip
+    return ids
+
+
+def test_a_confirmed_flag_never_returns_on_unchanged_evidence_and_flags_never_exclude(env):
+    settings, client, worker = env
+    me = new_person(client, "Alan", me=True)
+    store = worker.pipeline.speakers
+    with store.lock:
+        ids = add_samples(store, me, [118.0 + i for i in range(8)] + [190.0])
+        assert store.apply_flags(T0) == 1
+    flag = sample_file(settings, me, ids[-1])["flag"]
+    assert flag["reasons"] == ["pitch"] and flag["evidence_fingerprint"]
+    assert Vault.open(settings).format == 6
+    assert ids[-1] in {s.id for s in store.samples(*MODEL)}, "a flag orders the review queue, it never excludes"
+    with store.lock:
+        store.resolve_flag(me, ids[-1], "confirm", request_id="r-confirm", now=T0 + 1)
+        assert store.apply_flags(T0 + 2) == 0
+    assert sample_file(settings, me, ids[-1])["flag"]["resolved"]["decision"] == "confirm"
+    # new evidence (another F0 measurement) is a new question
+    path = Vault.open(settings).person_dir(me) / "samples" / f"{ids[-1]}.json"
+    data = json.loads(path.read_text()) | {"f0": 230.0}
+    Vault.write_json(path, data)
+    store.load_samples()
+    with store.lock:
+        assert store.apply_flags(T0 + 3) == 1
+    assert flag_open(sample_file(settings, me, ids[-1]).get("flag"))

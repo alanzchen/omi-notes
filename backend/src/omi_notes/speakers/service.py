@@ -19,6 +19,7 @@ import numpy as np
 import soundfile as sf
 
 from .. import operations
+from ..audio import pitch
 from ..ingest import ApiError
 from ..util import UUID_RE, iso_utc_epoch
 from . import enroll
@@ -323,8 +324,21 @@ class SpeakerService:
         day = datetime.fromtimestamp(row["start"], self.pipeline.tz).date().isoformat()
         sample_id = self.store.add_sample(person_id, voice.vector, model=embedder.model, model_sha=embedder.model_sha,
                                           source="user", seconds=voice.seconds, day=day, session=row["id"],
-                                          conversation_id=row["id"], label=label, request_id=request_id)  # fmt: skip
+                                          conversation_id=row["id"], label=label, request_id=request_id,
+                                          extra=self._provenance(row, transcript, label, voice))  # fmt: skip
         return "created", sample_id
+
+    def _provenance(self, row, transcript: dict, label: str, voice) -> dict:
+        """What a new sample keeps besides its vector: the clip bounds and voices file it was embedded from
+        (so it can be played and re-measured), the phrase it overlaps (a caption that outlives the audio)
+        and its F0, measured at the voices stage while the PCM was in hand (`audio.pitch`)."""
+        spans = [[c.start, c.end] if isinstance(c, Clip) else [float(c[0]), float(c[1])] for c in voice.clips]
+        clips = self._clip_list(row["id"], transcript, label, spans)
+        out = {"clips": spans, "voices_file": getattr(voice, "file", None), "audio_sha": row["audio_sha"],
+               "caption": next((c["text"] for c in clips if c["text"]), None)}  # fmt: skip
+        if getattr(voice, "f0", None) is not None:
+            out |= {"f0": voice.f0, "f0_voiced": voice.f0_voiced, "f0_source": "voices-stage", "f0_estimator": pitch.ESTIMATOR}
+        return out
 
     def _label_voice(self, row, transcript: dict, label: str, embedder):
         """The label's voice: stored, else recomputed from raw audio (kept in the voices file)."""
@@ -344,7 +358,7 @@ class SpeakerService:
         self.store.write_voices(row["id"], name, embedder.model, embedder.model_sha, voices, keep)
         self.store.reference_voices(row["id"], name)
         self.store.remove_other_voices(row["id"], name)
-        return voices.get(label)
+        return self.store.voices(row["id"]).get(label)  # as stored (with its file), or None
 
     def resummarize(self, conv_id: str) -> None:
         if self._conversation(conv_id)["enrollment_id"]:
