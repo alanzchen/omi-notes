@@ -78,9 +78,31 @@ def voices_name(embedder, audio_sha: str, transcript_sha: str, clips: dict[str, 
     number the voices differently, and other clip bounds (a corrected selection, same words and labels)
     make other voices. The transcript's part stays last (`voices-*-<transcript8>.json` finds it)."""
     model = re.sub(r"[^A-Za-z0-9._-]+", "-", embedder.model).strip("-")[:40]
-    spans = {label: [[round(float(a), 3), round(float(b), 3)] for a, b in v] for label, v in sorted(clips.items()) if v}
-    bounds = hashlib.sha256(json.dumps(spans, sort_keys=True).encode()).hexdigest()[:8]
-    return f"voices-{model}-{embedder.model_sha[:8]}-{(audio_sha or '')[:16]}-c{bounds}-{(transcript_sha or '')[:8]}.json"
+    return f"voices-{model}-{embedder.model_sha[:8]}-{(audio_sha or '')[:16]}-c{clip_bounds(clips)}-{(transcript_sha or '')[:8]}.json"
+
+
+def _spans(clips: list) -> list[list[float]]:
+    return [[round(float(a), 3), round(float(b), 3)] for a, b in clips]
+
+
+def clip_bounds(clips: dict[str, list[list[float]]]) -> str:
+    """A fingerprint of every label's clip bounds (`voices_name`'s `c…` part)."""
+    spans = {label: _spans(v) for label, v in sorted(clips.items()) if v}
+    return hashlib.sha256(json.dumps(spans, sort_keys=True).encode()).hexdigest()[:8]
+
+
+def same_clips(stored: list, current: list) -> bool:
+    """Whether a stored voice was embedded from these clip bounds: every clip it used is one of them
+    (embedding skips fragments too short to use, so it may hold fewer)."""
+    allowed = {tuple(c) for c in _spans(current or [])}
+    return all(tuple(c) in allowed for c in _spans(stored or []))
+
+
+def current_voices_file(names, transcript: dict) -> str | None:
+    """Of these voices file names, the one made from this transcript and its clip bounds, if any."""
+    sha = sha256_hex(canonical_json(transcript.get("segments") or []).encode())
+    tail = f"-c{clip_bounds(transcript.get('speaker_clips') or {})}-{sha[:8]}.json"
+    return next((n for n in sorted(names) if n.endswith(tail)), None)
 
 
 _KEEP = object()
@@ -623,6 +645,17 @@ class SpeakerStore:
             data["transcript_sha"] = row["transcript_sha"] if row else None
         Vault.write_json(path, data | {"voices": name})
 
+    def labels_to_move(self, conv_id: str, transcript: dict) -> bool:
+        """Whether the label states need moving to this transcript (`move_labels`): they were made for
+        another one, or a voices file of this transcript's own clip bounds isn't named by speakers.json yet
+        (a crash after the voices file was written, before its reference: that file is the current evidence)."""
+        sha = sha256_hex(canonical_json(transcript.get("segments") or []).encode())
+        if self.labels_transcript(conv_id) not in (None, sha):
+            return True
+        _, referenced = self.referenced_voices(conv_id)
+        matching = current_voices_file([p.name for p in self.conv_dir(conv_id).glob("voices-*.json")], transcript)
+        return matching is not None and matching != referenced
+
     def referenced_voices(self, conv_id: str) -> tuple[bool, str | None]:
         """(speakers.json names its voices file, that file): the generation its labels were made against."""
         data = Vault.read_json(self.conv_dir(conv_id) / "speakers.json") or {}
@@ -700,6 +733,11 @@ class SpeakerStore:
             keep = {data["voices"]} if data["voices"] else set()
             if sha and data.get("transcript_sha") not in (None, sha):
                 keep |= {p.name for p in files if (m := tag.search(p.name)) and m.group(1) == sha[:8]}
+            # the current transcript's own clip bounds, written before speakers.json could name it (a crash
+            # in between): kept for the move to adopt, never deleted in favour of other bounds
+            transcript = Vault.read_json(self.conv_dir(conv_id) / "transcript.json")
+            if transcript and (matching := current_voices_file([p.name for p in files], transcript)):
+                keep.add(matching)
         elif sha is None:
             return False
         else:  # speakers.json from before references: by transcript tag (its labels' own, while a move is pending)

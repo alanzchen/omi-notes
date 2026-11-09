@@ -24,7 +24,7 @@ from ..util import UUID_RE, iso_utc_epoch
 from . import enroll
 from . import match as speaker_match
 from . import suggest as speaker_suggest
-from .store import voices_name
+from .store import same_clips, voices_name
 from ..vault import Vault
 from .voices import Clip, embed_voices
 
@@ -130,15 +130,31 @@ class SpeakerService:
         return json.loads(path.read_text())
 
     def _clips(self, conv_id: str, transcript: dict) -> dict[str, list[list[float]]]:
-        stored = {label: v.clips for label, v in self.store.voices(conv_id).items() if v.clips}
+        stored = {label: v.clips for label, v in self.store.voices(conv_id).items() if v.clips and self._current(v, transcript)}
         return stored | {k: v for k, v in (transcript.get("speaker_clips") or {}).items() if k not in stored}
+
+    @staticmethod
+    def _current(voice, transcript: dict) -> bool:
+        """A stored voice still describes this transcript: embedded from its clip bounds (a transcript from
+        before `speaker_clips` has nothing to compare). Otherwise (an interrupted reprocess with corrected
+        bounds) it is never offered or confirmed: the transcript's clips are, and the voice is rebuilt."""
+        if "speaker_clips" not in transcript:
+            return True
+        return same_clips(voice.clips, (transcript.get("speaker_clips") or {}).get(voice.label) or [])
 
     def audio_available(self, row) -> bool:
         return self.store.raw_available(row)
 
     def conversation_speakers(self, conv_id: str) -> dict:
-        row = self._conversation(conv_id)
+        self._conversation(conv_id)
         transcript = self._transcript(conv_id)
+        # the recovery a change runs first, when there is any (checked without waiting for the lock), so the
+        # revision shown is the one a change will meet
+        if self.store.labels_to_move(conv_id, transcript):
+            with self.store.lock:
+                self.store.sync_conversation(conv_id)
+                self.pipeline.move_labels(conv_id, transcript)
+        row = self._conversation(conv_id)
         return {
             "revision": row["speakers_revision"],
             "transcript_sha": row["transcript_sha"],
@@ -310,7 +326,8 @@ class SpeakerService:
     def _label_voice(self, row, transcript: dict, label: str, embedder):
         """The label's voice: stored, else recomputed from raw audio (kept in the voices file)."""
         stored = self.store.voices(row["id"]).get(label)
-        if stored is not None and stored.vector is not None and (stored.model, stored.model_sha) == (embedder.model, embedder.model_sha):
+        if stored is not None and stored.vector is not None and (stored.model, stored.model_sha) == (embedder.model, embedder.model_sha) \
+                and self._current(stored, transcript):
             return stored
         clips = transcript.get("speaker_clips") or {}
         if not clips.get(label) or not self.audio_available(row):

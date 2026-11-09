@@ -896,3 +896,64 @@ def test_reprocessed_evidence_replaces_voices_embedded_from_other_clip_bounds(cl
     served, transcript = mixed_then_reprocessed(client, worker, later_turns)
     assert all(end <= 6.0 for _, end in served.get("S1", [])), served
     assert served.get("S1", []) == transcript["speaker_clips"].get("S1", [])
+
+
+@pytest.mark.parametrize("boundary", ["before_identify", "before_reference"])
+def test_an_interrupted_clip_only_reprocess_never_serves_or_confirms_the_old_mixed_voice(client, worker, monkeypatch, boundary):
+    # Astra IT3-01: same words and labels, corrected clip bounds; a crash (a) before the voices stage or (b) after
+    # the corrected voices file was written but before speakers.json referenced it. The naming API offered the old
+    # 9.5 s clip and made a sample from its vector; at (b) cleanup also deleted the corrected file.
+    from .test_speaker_learning import PRIYA, FakeEmbedder, name_label, new_person
+    from omi_notes.speakers.service import SpeakerService
+
+    def response(request, n):
+        return httpx.Response(200, json={"segments": [{"start": 0.0, "end": 10.0, "speaker_id": "UNKNOWN", "text": "a synthetic utterance"}]})
+
+    worker.providers._local_stt, _ = sidecar(response)
+    worker.providers._diarizer = TurnsDiarizer([(0.0, 10.0, 0)])  # the old evidence: one voice over all of it
+    worker.providers._embedder = FakeEmbedder()
+    client.app.state.speakers = SpeakerService(worker.pipeline)
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(6, ALAN, 7), voice(14, PRIYA, 8), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    assert name_label(client, row["id"], "S1", new_person(client, "Wearer", me=True)).json()["sample"] == "created"
+    directory = worker.pipeline.conv_dir(row["id"])
+    old_file = worker.pipeline.speakers.voices_file(row["id"])
+
+    worker.providers._diarizer = TurnsDiarizer([(0.0, 6.0, 0), (7.0, 10.0, 1)])
+    for p in directory.glob("diarization-*.json"):
+        p.unlink()
+    worker.db.execute("UPDATE conversations SET force_restt = 1 WHERE id=?", (row["id"],))
+
+    def crash(*a, **kw):
+        raise SystemExit("synthetic crash")
+
+    with monkeypatch.context() as m:
+        if boundary == "before_identify":
+            m.setattr(worker.pipeline, "identify", crash)
+        else:
+            m.setattr(worker.pipeline.speakers, "write_labels", crash)
+        with pytest.raises(SystemExit):
+            worker.pipeline.transcribe(row["id"], T0 + 800)
+    transcript = json.loads((directory / "transcript.json").read_text())
+    assert transcript["speaker_clips"]["S1"] == [[0.25, 5.75]]
+    corrected = [p.name for p in directory.glob("voices-*.json") if p.name != old_file]
+
+    answer = name_label(client, row["id"], "S1", new_person(client, "Someone else"))
+    assert answer.status_code == 200, answer.text
+    label = next(v for v in answer.json()["labels"] if v["label"] == "S1")
+    assert label["clips"][0]["seconds"] == 5.5, label["clips"]
+    assert client.app.state.speakers._clips(row["id"], transcript)["S1"] == [[0.25, 5.75]]
+    assert all((directory / name).exists() for name in corrected), "the corrected voices file is kept"
+    used = worker.pipeline.speakers.voices_file(row["id"])
+    if boundary == "before_reference" or answer.json()["sample"] == "created":
+        # the corrected file is adopted (or a confirmation rebuilt it from raw audio): never the old vector
+        assert used != old_file and json.loads((directory / used).read_text())["labels"]["S1"]["clips"] == [[0.25, 5.75]]
+
+
+def test_a_stored_voice_that_skipped_a_too_short_fragment_still_describes_its_transcript():
+    # 72 live conversations: the voices file holds the clips actually embedded, without a 0.13 s fragment
+    from omi_notes.speakers.store import same_clips
+
+    assert same_clips([[760.95, 770.95], [751.34, 758.95]], [[760.95, 770.95], [784.12, 784.25], [751.34, 758.95]])
+    assert not same_clips([[0.25, 9.75]], [[0.25, 5.75]])
