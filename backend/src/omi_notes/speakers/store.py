@@ -44,6 +44,7 @@ log = logging.getLogger(__name__)
 PEOPLE_DIR = "People"
 REQUEST_MEMORY = 200
 ACTIVE, REMOVED, MOVED = "active", "removed", "moved"
+PENDING = "pending"  # index-only: a copy an unfinished journaled operation wrote (`speakers.journal`)
 SAMPLE_STATES = (ACTIVE, REMOVED, MOVED)
 SAMPLE_FORMAT = 6  # vault format whose samples may carry a state, history and flag
 _FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
@@ -51,8 +52,11 @@ _FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
 
 def sample_eligible(sample) -> bool:
     """The one rule for which voiceprints teach anything (matching, activation, hints, suggestions and
-    calibration): an active sample. A review flag never changes it; only the owner's remove or move does."""
+    calibration): an active sample. A review flag never changes it; only the owner's remove or move does. A copy
+    an unfinished journaled operation wrote (`pending_op`) isn't one until the operation completes."""
     if isinstance(sample, Mapping):
+        if sample.get("pending_op"):
+            return False
         state = sample.get("state")
     elif isinstance(sample, sqlite3.Row):
         state = sample["state"] if "state" in sample.keys() else None
@@ -379,11 +383,14 @@ class SpeakerStore:
     def add_sample(self, person_id: str, vector: np.ndarray, *, model: str, model_sha: str, source: str, seconds: float,
                    day: str | None, session: str | None, conversation_id: str | None = None, label: str | None = None,
                    request_id: str | None = None, enrollment_id: str | None = None, now: float | None = None,
-                   extra: dict | None = None, attested: bool | None = None) -> str:  # fmt: skip
+                   extra: dict | None = None, attested: bool | None = None, sample_id: str | None = None) -> str:  # fmt: skip
         """A new confirmed voiceprint (`extra`: provenance such as clip bounds, caption and F0; `attested`:
-        the consent recorded with it, by default the person's attestation or a pendant enrollment)."""
+        the consent recorded with it, by default the person's attestation or a pendant enrollment; `sample_id`:
+        chosen by a journaled operation, which re-runs this idempotently)."""
         now = time.time() if now is None else now
-        sample_id = str(uuid.uuid4())
+        if sample_id is not None and self.read_sample(person_id, sample_id) is not None:
+            return sample_id
+        sample_id = sample_id or str(uuid.uuid4())
         person = self.person(person_id)
         data = {
             "sample_id": sample_id, "person_id": person_id, "person_name": person["name"] if person else None,
@@ -477,7 +484,8 @@ class SpeakerStore:
             (data["sample_id"], data["person_id"], data["model"], data["model_sha"],
              np.asarray(decode_vector(data["vector_b64"]), dtype="<f4").tobytes(), data["source"], data.get("seconds"),
              data.get("day"), data.get("session"), data.get("conversation_id"), data.get("label"), data.get("request_id"),
-             data.get("created_at") or 0.0, data.get("state") or ACTIVE, int(data.get("revision") or 0),
+             data.get("created_at") or 0.0, PENDING if data.get("pending_op") else data.get("state") or ACTIVE,
+             int(data.get("revision") or 0),
              json.dumps(data["flag"], sort_keys=True) if data.get("flag") else None, data.get("f0")),
         )  # fmt: skip
 
@@ -531,7 +539,11 @@ class SpeakerStore:
                                   request_id=request_id, now=now, record={"from": before, "to": state} | (record or {}))  # fmt: skip
 
     def reconcile(self) -> None:
-        """Before anything uses the samples: the index catches up with the sample files."""
+        """Before anything uses the samples: unfinished journaled operations finish (`speakers.journal`), and the
+        index catches up with the sample files."""
+        from . import journal
+
+        journal.reconcile(self)
         self.sync_samples()
 
     def samples_changed(self, now: float | None = None) -> None:

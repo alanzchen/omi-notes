@@ -152,3 +152,127 @@ def test_an_uploaded_wav_at_another_rate_is_resampled_without_aliasing():
     sf.write(buf, low, rate, format="WAV", subtype="PCM_16")
     kept = decode_upload("tone.wav", buf.getvalue()).astype(np.float64)
     assert np.sqrt(np.mean(kept**2)) == pytest.approx(12000 / np.sqrt(2), rel=0.05)
+
+
+# -- 3, 4, 5 and decision (a): journaled moves, rejects and their undo ------------------------------------------
+
+
+def journal_files(settings) -> list:
+    folder = settings.vault_dir / "_omi" / "speakers" / "journal"
+    return sorted(folder.glob("*.json")) if folder.exists() else []
+
+
+def consented_priya(client) -> str:
+    client.put("/v1/speakers/settings", json={"acknowledged_at": "2026-09-27T10:00:00Z"}, headers=AUTH)
+    return new_person(client, "Priya", attest_knows=True)
+
+
+def test_a_move_interrupted_after_its_copy_is_finished_and_the_copy_never_counted_before(env, monkeypatch):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    priya = consented_priya(client)
+    store = worker.pipeline.speakers
+    real = store.set_sample_state
+
+    def crash(*args, **kwargs):
+        if kwargs.get("action") == "move":
+            raise OSError("power cut")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(store, "set_sample_state", crash)
+    with pytest.raises(OSError):
+        client.post(f"/v1/samples/{ids[0]}/move", json={"person_id": priya, "request_id": "mv-1"}, headers=AUTH)
+    monkeypatch.setattr(store, "set_sample_state", real)
+    (op,) = journal_files(settings)
+    copies = list((Vault.open(settings).person_dir(priya) / "samples").glob("*.json"))
+    assert len(copies) == 1 and json.loads(copies[0].read_text())["pending_op"]
+    assert worker.db.one("SELECT state FROM samples WHERE id=?", (copies[0].stem,))["state"] == "pending"
+    # the next model build finishes it: original moved, copy counts, label follows, journal empty
+    eligible = {s.id for s in store.samples(*MODEL)}
+    assert copies[0].stem in eligible and ids[0] not in eligible
+    assert sample_file(settings, me, ids[0])["state"] == "moved" and journal_files(settings) == []
+    assert store.labels(rows[0]["id"])["S1"]["person_id"] == priya
+    again = client.post(f"/v1/samples/{ids[0]}/move", json={"person_id": priya, "request_id": "mv-1"}, headers=AUTH)
+    assert again.status_code == 200 and again.json()["sample"]["state"] == "moved"
+
+
+def test_an_interrupted_undo_of_a_move_is_finished_without_both_copies_counting(env, monkeypatch):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    priya = consented_priya(client)
+    store = worker.pipeline.speakers
+    assert client.post(f"/v1/samples/{ids[0]}/move", json={"person_id": priya, "request_id": "mv-2"}, headers=AUTH).status_code == 200
+    copy = sample_file(settings, me, ids[0])["moved_to"]["sample_id"]
+    real = store.remove_sample_ids
+    monkeypatch.setattr(store, "remove_sample_ids", lambda *a, **k: (_ for _ in ()).throw(OSError("power cut")))
+    with pytest.raises(OSError):
+        client.post("/v1/speakers/undo", json={"request_id": "mv-2", "undo_request_id": "u-2"}, headers=AUTH)
+    monkeypatch.setattr(store, "remove_sample_ids", real)
+    assert sample_file(settings, me, ids[0])["state"] == "active"
+    eligible = {s.id for s in store.samples(*MODEL)}  # reconciles: the copy goes
+    assert copy not in eligible and ids[0] in eligible and journal_files(settings) == []
+    assert not (Vault.open(settings).person_dir(priya) / "samples" / f"{copy}.json").exists()
+    assert store.labels(rows[0]["id"])["S1"]["person_id"] == me
+
+
+def test_moving_one_sample_moves_every_sample_its_label_gave_that_person(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    priya = consented_priya(client)
+    store = worker.pipeline.speakers
+    with store.lock:  # the label contributed a second confirmation of Alan (e.g. confirmed again later)
+        second = store.add_sample(me, vec(ALAN, 3), model=MODEL[0], model_sha=MODEL[1], source="user", seconds=8.0,
+                                  day="2026-09-20", session=rows[0]["id"], conversation_id=rows[0]["id"], label="S1")  # fmt: skip
+        states = store.labels(rows[0]["id"])
+        states["S1"]["samples"] = sorted({ids[0], second})
+        store.write_labels(rows[0]["id"], states)
+    listed = [second]
+    r = client.post(f"/v1/samples/{ids[0]}/move", json={"person_id": priya, "request_id": "mv-3"}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    label = store.labels(rows[0]["id"])["S1"]
+    assert label["person_id"] == priya
+    owners = {sid: (Vault.open(settings).person_dir(priya) / "samples" / f"{sid}.json").exists() for sid in label["samples"]}
+    assert len(owners) == 2 and all(owners.values()), "no sample of Alan's stays on a label named Priya"
+    assert all(sample_file(settings, me, sid)["state"] == "moved" for sid in sorted(set(listed) | {ids[0]}))
+
+
+def test_undoing_a_move_is_skipped_after_a_later_decision_about_its_copy(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    priya = consented_priya(client)
+    assert client.post(f"/v1/samples/{ids[0]}/move", json={"person_id": priya, "request_id": "mv-4"}, headers=AUTH).status_code == 200
+    copy = sample_file(settings, me, ids[0])["moved_to"]["sample_id"]
+    assert client.post(f"/v1/samples/{copy}/remove", json={"request_id": "rm-4"}, headers=AUTH).status_code == 200
+    undo = client.post("/v1/speakers/undo", json={"request_id": "mv-4", "undo_request_id": "u-4"}, headers=AUTH).json()
+    assert undo["undone"] == [] and undo["skipped"] == [rows[0]["id"]]
+    assert sample_file(settings, me, ids[0])["state"] == "moved" and sample_file(settings, priya, copy)["state"] == "removed"
+
+
+def test_undoing_a_reject_needs_the_persons_current_consent(env):
+    settings, client, worker = env
+    priya = consented_priya(client)
+    row = talk(client, worker, dialogue(ALAN, PRIYA, seed=3), day=3)
+    assert name_label(client, row["id"], "S2", priya).json()["sample"] == "created"
+    (sid,) = worker.pipeline.speakers.labels(row["id"])["S2"]["samples"]
+    item = next(i for i in review(client) if i.get("sample_id") == sid)
+    assert decide(client, item["id"], "reject", "rj-5").status_code == 200
+    client.put(f"/v1/people/{priya}", json={"name": "Priya", "attest_knows": False}, headers=AUTH)
+    client.put("/v1/speakers/settings", json={"acknowledged_at": None}, headers=AUTH)
+    undo = client.post("/v1/speakers/undo", json={"request_id": "rj-5", "undo_request_id": "u-5"}, headers=AUTH).json()
+    assert undo["undone"] == [] and sample_file(settings, priya, sid)["state"] == "removed"
+    restore = client.post(f"/v1/samples/{sid}/restore", json={"request_id": "rs-5"}, headers=AUTH)
+    assert restore.status_code == 409 and restore.json()["error"] == "consent_required"
+
+
+def test_a_reject_leaves_a_label_alone_that_no_longer_lists_the_sample(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    store = worker.pipeline.speakers
+    states = store.labels(rows[0]["id"])
+    states["S1"]["samples"] = []  # the label's provenance moved on (another confirmation, a re-transcription)
+    store.write_labels(rows[0]["id"], states)
+    item = next(i for i in review(client) if i.get("sample_id") == ids[0])
+    assert decide(client, item["id"], "reject", "rj-6").status_code == 200
+    assert sample_file(settings, me, ids[0])["state"] == "removed"
+    label = store.labels(rows[0]["id"])["S1"]
+    assert label["person_id"] == me and label["not"] == []

@@ -24,13 +24,15 @@ from __future__ import annotations
 import io
 import json
 import time
+import uuid
 
 import soundfile as sf
 
 from ..ingest import ApiError
 from ..util import UUID_RE, iso_utc_epoch
 from . import f0 as sample_f0
-from .store import ACTIVE, MOVED, REMOVED, flag_open, sample_eligible
+from . import journal
+from .store import ACTIVE, MOVED, REMOVED, consent_ok, flag_open, sample_eligible
 
 RECENT_CONVERSATIONS = 60  # how far back label items reach (newest conversations)
 MAX_CLIP_SECONDS = 10.0
@@ -289,12 +291,10 @@ class Review:
                         person_id: str | None = None) -> dict:  # fmt: skip
         """confirm | reject | remove | restore | move one sample (see the module docstring)."""
         with self.store.lock:
-            self.store.sync_samples()
+            self.store.reconcile()  # an interrupted operation finishes first (a retry of it is then answered)
             done = self._history_entry(sample_id, request_id)
             if done is not None:
-                data, entry = done
-                if entry.get("action") == "move":
-                    self._finish_move(data, entry, request_id)
+                data, _ = done
                 return {"sample": self.sample_view(self.store.find_sample(sample_id) or data)}
             data = self.store.find_sample(sample_id)
             if data is None:
@@ -307,13 +307,19 @@ class Review:
                 if state != ACTIVE:
                     raise ApiError(409, "sample_not_active", f"the sample is {state}")
                 data = self.store.resolve_flag(pid, sample_id, "confirm", request_id=request_id)
-            elif decision in ("reject", "remove"):
+            elif decision == "reject":
+                if state != ACTIVE:
+                    raise ApiError(409, "sample_not_active", f"the sample is {state}")
+                data = self._reject(data, request_id)
+            elif decision == "remove":
                 if state != ACTIVE:
                     raise ApiError(409, "sample_not_active", f"the sample is {state}")
                 data = self.store.set_sample_state(pid, sample_id, REMOVED, action=decision, by="user", request_id=request_id)
             elif decision == "restore":
                 if state != REMOVED:
                     raise ApiError(409, "sample_not_removed", f"the sample is {state}")
+                self._consented(pid)  # never back into use without current consent
+                self._not_superseded(data)
                 data = self.store.set_sample_state(pid, sample_id, ACTIVE, action="restore", by="user", request_id=request_id)
             elif decision == "move":
                 data = self._move(data, person_id, request_id)
@@ -327,34 +333,16 @@ class Review:
         if not person["me"] and not (self.store.settings()["acknowledged_at"] and self.store.attested(person_id)):
             raise ApiError(409, "consent_required", "this person's voice can't be kept without the acknowledgment and their attestation")
 
-    def _move(self, data: dict, person_id: str | None, request_id: str) -> dict:
-        if (data.get("state") or ACTIVE) != ACTIVE:
-            raise ApiError(409, "sample_not_active", f"the sample is {data.get('state')}")
-        if person_id == data["person_id"]:
-            raise ApiError(422, "invalid_body", "the sample already belongs to that person")
-        self._consented(person_id)
-        # 1. the intent: the other person's copy (a retry after a crash reuses it)
-        intent = f"{request_id}:move"
-        existing = self.store.sample_for_request(intent)
-        if existing is not None:
-            new_id = existing["id"]
-        else:
-            provenance = {k: data[k] for k in ("clips", "voices_file", "audio_sha", "caption", "f0", "f0_voiced", "f0_source",
-                                               "f0_estimator", "f0_clips", "f0_aggregation") if data.get(k) is not None}  # fmt: skip
-            provenance["moved_from"] = {"person_id": data["person_id"], "sample_id": data["sample_id"]}
-            new_id = self.store.add_sample(person_id, sample_f0.decode_vector(data["vector_b64"]), model=data["model"],
-                                           model_sha=data["model_sha"], source="user" if data.get("source") != "enrollment" else "enrollment",
-                                           seconds=data.get("seconds") or 0.0, day=data.get("day"), session=data.get("session"),
-                                           conversation_id=data.get("conversation_id"), label=data.get("label"),
-                                           request_id=intent, enrollment_id=None, extra=provenance)  # fmt: skip
-        # 2. the old one is marked moved; 3. a label that still lists it follows (`_finish_move`)
-        label = self._listing_label(data)
-        moved = self.store.set_sample_state(data["person_id"], data["sample_id"], MOVED, action="move", by="user",
-                                            request_id=request_id, extra={"moved_to": {"person_id": person_id, "sample_id": new_id}},
-                                            record={"label": label} if label else None)  # fmt: skip
-        if label is not None:
-            self._finish_move(moved, moved["history"][-1], request_id)
-        return moved
+    def _not_superseded(self, data: dict) -> None:
+        """A sample an import merge replaced comes back only once the union that replaced it is gone (else its
+        seconds would count twice)."""
+        merge = next((h for h in reversed(data.get("history") or []) if h.get("action") == "merge"), None)
+        if merge is None or data.get("source") != "enrollment":
+            return
+        for r in self.db.query("SELECT id, state FROM samples WHERE person_id=? AND source='enrollment'", (data["person_id"],)):
+            other = self.store.read_sample(data["person_id"], r["id"]) or {}
+            if other.get("enrollment_id") == merge.get("into") and sample_eligible(other):
+                raise ApiError(409, "superseded", "an import that covers this audio replaced it; remove that one first")
 
     def _listing_label(self, data: dict) -> str | None:
         """The label in the sample's conversation whose state lists this sample under its person."""
@@ -367,33 +355,43 @@ class Review:
                 return label
         return None
 
-    def _finish_move(self, data: dict, entry: dict, request_id: str) -> None:
-        """Rename the label that listed the moved sample (idempotent: the request entry in speakers.json)."""
-        label, conv_id = entry.get("label"), data.get("conversation_id")
-        target = data.get("moved_to") or {}
-        if not label or not conv_id or self.store.request_result(conv_id, request_id) is not None:
-            return
-        states = self.store.labels(conv_id)
-        before = dict(states.get(label) or {})
-        if data["sample_id"] not in (before.get("samples") or []) or before.get("person_id") != data["person_id"]:
-            return  # the label changed since: the sample alone moved
-        state = dict(before) | {"person_id": target["person_id"], "source": "user", "forgotten": False}
-        state["samples"] = sorted((set(before.get("samples") or []) - {data["sample_id"]}) | {target["sample_id"]})
-        state["not"] = sorted(set(before.get("not") or []) - {target["person_id"]})
-        states[label] = state
-        change = {"before": self.store.persisted({label: before}).get(label), "after": self.store.persisted({label: state}).get(label)}
-        self.store.write_labels(conv_id, states, request=(request_id, {
-            "label": label, "person_id": target["person_id"], "sample": "moved", "keep_unknown": False, "withdrawn": None,
-            "moved": {"person_id": data["person_id"], "sample_id": data["sample_id"], "to": target}} | change))  # fmt: skip
-        row = self.db.one("SELECT note_path FROM conversations WHERE id=?", (conv_id,))
-        if row and row["note_path"]:
-            self.pipeline._set(conv_id, needs_render=1, next_attempt_at=None)
+    def _label_samples(self, data: dict, label: str | None) -> list[str]:
+        """This sample and every other active one its label contributed to the same person (one voice, one decision)."""
+        ids = {data["sample_id"]}
+        if label is not None:
+            state = self.store.labels(data["conversation_id"]).get(label) or {}
+            for sid in state.get("samples") or []:
+                other = self.store.read_sample(data["person_id"], sid)
+                if other is not None and sample_eligible(other):
+                    ids.add(sid)
+        return sorted(ids)
+
+    def _move(self, data: dict, person_id: str | None, request_id: str) -> dict:
+        if (data.get("state") or ACTIVE) != ACTIVE:
+            raise ApiError(409, "sample_not_active", f"the sample is {data.get('state')}")
+        if person_id == data["person_id"]:
+            raise ApiError(422, "invalid_body", "the sample already belongs to that person")
+        self._consented(person_id)
+        label = self._listing_label(data)
+        pairs = [[sid, str(uuid.uuid4())] for sid in self._label_samples(data, label)]
+        journal.run(self.store, {"kind": "move", "request_id": request_id, "by": "user", "from": data["person_id"], "to": person_id,
+                                 "pairs": pairs, "label": {"conversation_id": data["conversation_id"], "label": label} if label else None})  # fmt: skip
+        return self.store.read_sample(data["person_id"], data["sample_id"])
+
+    def _reject(self, data: dict, request_id: str) -> dict:
+        """Not this person's voice: the sample is soft-removed, and when its label still lists it under that person,
+        so are the label's other samples of them and the label becomes "not X" (one journaled operation)."""
+        label = self._listing_label(data)
+        journal.run(self.store, {"kind": "reject", "request_id": request_id, "person": data["person_id"],
+                                 "samples": self._label_samples(data, label),
+                                 "label": {"conversation_id": data["conversation_id"], "label": label} if label else None})  # fmt: skip
+        return self.store.read_sample(data["person_id"], data["sample_id"])
 
     # -- undo of sample decisions ----------------------------------------------------------------
 
     def undo(self, request_id: str, undo_id: str) -> dict:
         """Put back what sample decisions under `request_id` changed, where nothing changed since (call under the
-        speaker lock). A move whose label was renamed is undone with the label (`SpeakerService.undo`)."""
+        speaker lock). A move or reject whose label changed too is undone with its label (`undo_label_op`)."""
         undone, skipped = [], []
         for path in sorted(self.store.vault.people.glob("*/samples/*.json")) if self.store.vault.people.exists() else []:
             data = self.store.read_sample(path.parent.parent.name, path.stem) or {}
@@ -406,7 +404,7 @@ class Review:
             if any(h.get("action") == "undo" and h.get("request_id") == undo_id and h.get("undo_of") == request_id for h in history):
                 undone.append(data["sample_id"])
                 continue
-            if index != len(history) - 1 and not all(h.get("action") in ("flag", "unflag") for h in history[index + 1 :]):
+            if _later(history, index):
                 skipped.append({"id": data["sample_id"], "reason": "changed since"})
                 continue
             why = self.revert(data, entry, undo_id, request_id)
@@ -420,14 +418,15 @@ class Review:
         record = {"undo_of": request_id}
         if action == "move":
             target = data.get("moved_to") or {}
-            copy = self.store.read_sample(target.get("person_id", ""), target.get("sample_id", "")) if target else None
-            if copy is None or (copy.get("state") or ACTIVE) != ACTIVE or len(copy.get("history") or []) > 0:
-                return "the moved copy changed or was forgotten since"
-            self.store.remove_sample_ids(target["person_id"], [target["sample_id"]])
-            self.store.update_sample(pid, sid, {"state": ACTIVE, "moved_to": None}, action="undo", by="user",
-                                     request_id=undo_id, record=record | {"from": MOVED, "to": ACTIVE})  # fmt: skip
+            why = self._copies_unchanged(target.get("person_id"), [[sid, target.get("sample_id")]]) or self._consent_why(pid)
+            if why:
+                return why
+            journal.run(self.store, {"kind": "unmove", "request_id": undo_id, "undo_of": request_id, "from": pid,
+                                     "to": target["person_id"], "pairs": [[sid, target["sample_id"]]], "label": None})  # fmt: skip
         elif action in ("reject", "remove", "restore"):
             back = entry.get("from") or ACTIVE
+            if back == ACTIVE and (why := self._consent_why(pid)):
+                return why
             self.store.update_sample(pid, sid, {"state": back}, action="undo", by="user", request_id=undo_id,
                                      record=record | {"from": data.get("state") or ACTIVE, "to": back})  # fmt: skip
         elif action == "confirm":
@@ -439,18 +438,60 @@ class Review:
             return "nothing to undo"
         return ""
 
-    def can_revert_moved(self, moved: dict) -> bool:
-        data = self.store.read_sample(moved.get("person_id", ""), moved.get("sample_id", ""))
-        return data is not None and data.get("state") == MOVED and (data.get("moved_to") or {}) == moved.get("to")
+    def _consent_why(self, person_id: str) -> str:
+        person = self.store.person(person_id)
+        if person is None:
+            return "that person was forgotten"
+        return "" if consent_ok(person, self.store.settings()) else "that person's consent is withdrawn"
 
-    def revert_moved(self, moved: dict, undo_id: str, request_id: str) -> bool:
-        """The sample half of undoing a move whose label was renamed: the old sample back to active (its copy is
-        removed by the label undo, as a sample the request created)."""
-        if not self.can_revert_moved(moved):
-            return False
-        self.store.update_sample(moved["person_id"], moved["sample_id"], {"state": ACTIVE, "moved_to": None}, action="undo",
-                                 by="user", request_id=undo_id, record={"undo_of": request_id, "from": MOVED, "to": ACTIVE})  # fmt: skip
-        return True
+    def _copies_unchanged(self, person_id: str | None, pairs: list) -> str:
+        """Why the copies a move made can't simply be taken back ("" when they can): each still exists, counts,
+        and nothing was decided about it since."""
+        for _, new in pairs:
+            copy = self.store.read_sample(person_id or "", new or "")
+            if copy is None:
+                return "the moved copy was forgotten since"
+            if copy.get("pending_op") or (copy.get("state") or ACTIVE) != ACTIVE or copy.get("history"):
+                return "the moved copy changed since"
+        return ""
+
+    def undo_label_op(self, conv_id: str, key: str, rec: dict, undo_id: str) -> str:
+        """Undo a journaled move or reject recorded in `speakers.json` under `key` (call under the speaker lock): ""
+        when undone, else why not. All or nothing, and only where the label and every sample are as it left them."""
+        states = self.store.labels(conv_id)
+        label = rec["label"]
+        current = self.store.persisted({label: states.get(label) or {}}).get(label) or {}
+        after = rec.get("after") or {}
+        if any(current.get(k) != after.get(k) for k in ("person_id", "source", "samples", "not")):
+            return "the label changed since"
+        if rec.get("moved"):
+            moved = rec["moved"]
+            a, b, pairs = moved["person_id"], moved["to_person"], moved["pairs"]
+            for src, new in pairs:
+                data = self.store.read_sample(a, src) or {}
+                history = data.get("history") or []
+                index = next((i for i, h in enumerate(history) if h.get("request_id") == key and h.get("action") == "move"), None)
+                if data.get("state") != MOVED or (data.get("moved_to") or {}).get("sample_id") != new or index is None or _later(history, index):
+                    return "a moved sample changed since"
+            why = self._copies_unchanged(b, pairs) or self._consent_why(a)
+            if why:
+                return why
+            journal.run(self.store, {"kind": "unmove", "request_id": undo_id, "undo_of": key, "from": a, "to": b, "pairs": pairs,
+                                     "label": {"conversation_id": conv_id, "label": label}, "label_before": rec.get("before") or {}})  # fmt: skip
+            return ""
+        rejected = rec["rejected"]
+        x = rejected["person_id"]
+        for sid in rejected["samples"]:
+            data = self.store.read_sample(x, sid) or {}
+            history = data.get("history") or []
+            index = next((i for i, h in enumerate(history) if h.get("request_id") == key and h.get("action") == "reject"), None)
+            if data.get("state") != REMOVED or index is None or _later(history, index):
+                return "a rejected sample changed since"
+        if why := self._consent_why(x):
+            return why
+        journal.run(self.store, {"kind": "unreject", "request_id": undo_id, "undo_of": key, "person": x, "samples": rejected["samples"],
+                                 "label": {"conversation_id": conv_id, "label": label}, "label_before": rec.get("before") or {}})  # fmt: skip
+        return ""
 
     # -- clips -----------------------------------------------------------------------------------
 
@@ -522,3 +563,8 @@ def status_line(model, active_samples: int, auto_assign: bool) -> str:
     if active_samples and "leave-one-out" in (model.why_inactive if model else ""):
         return "停用：样本不一致"
     return "需要更多样本"
+
+
+def _later(history: list[dict], index: int) -> bool:
+    """Something was decided about the sample after `history[index]` (flags don't count)."""
+    return any(h.get("action") not in ("flag", "unflag") for h in history[index + 1 :])

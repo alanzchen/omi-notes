@@ -561,7 +561,7 @@ class SpeakerService:
         undone: set[str] = set()
         skipped: set[str] = set()
         with self.store.lock:
-            self.store.sync_samples()
+            self.store.reconcile()
             for path in sorted(self.vault.conversations.glob("*/*/speakers.json")):
                 conv_id = path.parent.name
                 requests = (Vault.read_json(path) or {}).get("requests") or {}
@@ -574,6 +574,10 @@ class SpeakerService:
                         undone.add(conv_id)
                         continue
                     self.store.sync_conversation(conv_id)
+                    if rec.get("moved") or rec.get("rejected"):  # a journaled sample operation (`speakers.review`)
+                        why = self.review.undo_label_op(conv_id, key, rec, undo_id)
+                        (skipped if why else undone).add(conv_id)
+                        continue
                     states = self.store.labels(conv_id)
                     label = rec["label"]
                     current = self.store.persisted({label: states.get(label) or {}}).get(label)
@@ -589,17 +593,11 @@ class SpeakerService:
                     if withdrawn.get("samples") and not self.store.can_restore(withdrawn["person_id"], withdrawn["samples"], key):
                         skipped.add(conv_id)  # their voiceprints are gone (forgotten, or past the window): no partial undo
                         continue
-                    moved = rec.get("moved") or {}
-                    if moved and not self.review.can_revert_moved(moved):
-                        skipped.add(conv_id)  # the moved sample changed or was forgotten since
-                        continue
                     created = set((after.get("samples") or [])) - set(before.get("samples") or [])
                     if created and after.get("person_id"):
                         self.store.remove_sample_ids(after["person_id"], sorted(created))
                     if withdrawn.get("samples"):
                         self.store.restore_samples(withdrawn["person_id"], withdrawn["samples"], key)
-                    if moved:
-                        self.review.revert_moved(moved, undo_id, key)
                     states[label] = before
                     self.store.write_labels(conv_id, states, request=(done_key, {"label": label, "undo_of": key}))
                     row = self.db.one("SELECT note_path FROM conversations WHERE id=?", (conv_id,))

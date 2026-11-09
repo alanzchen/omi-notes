@@ -521,9 +521,14 @@ def test_a_review_reject_soft_removes_and_undo_puts_it_back(env):
     alan = people(client)["Alan"]
     assert (alan["samples_active"], alan["samples_removed"], alan["auto_active"]) == (2, 1, False)
     assert [s["id"] for s in client.get(f"/v1/people/{me}/samples?state=removed", headers=AUTH).json()["samples"]] == [ids[2]]
+    # its label still listed it: the label is "not Alan" now too, and the undo restores both (decision a)
+    state = worker.pipeline.speakers.labels(rows[2]["id"])["S1"]
+    assert (state["person_id"], state["not"], state["samples"]) == (None, [me], [])
     undo = client.post("/v1/speakers/undo", json={"request_id": "rq-rej", "undo_request_id": "u-1"}, headers=AUTH).json()
-    assert undo["samples"]["undone"] == [ids[2]]
+    assert undo["undone"] == [rows[2]["id"]], undo
     assert sample_file(settings, me, ids[2])["state"] == "active"
+    state = worker.pipeline.speakers.labels(rows[2]["id"])["S1"]
+    assert (state["person_id"], state["samples"]) == (me, [ids[2]])
     repeat = client.post("/v1/speakers/undo", json={"request_id": "rq-rej", "undo_request_id": "u-1"}, headers=AUTH).json()
     assert repeat == undo
     assert people(client)["Alan"]["auto_active"] is True
