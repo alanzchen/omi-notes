@@ -150,6 +150,18 @@ def create_app(
     async def healthz() -> dict:
         return {"ok": True}
 
+    def local_engine() -> dict:
+        """The local sidecar as the transcription engine: its models and whether it answers right now."""
+        local = app.state.speakers.pipeline.providers.local_stt
+        ok = bool(local and local.healthy())
+        info = (local.health_info if local else {}) or {}
+        models = info.get("models") or {}
+        short = {role: str(name).rsplit("/", 1)[-1] for role, name in models.items()}
+        label = " · ".join(f"{short[role]} ({what})" for role, what in (("diarization", "speakers"), ("text", "text"),
+                                                                          ("aligner", "timing")) if role in short)  # fmt: skip
+        return {"provider": "local", "model": label or "omi-asr sidecar", "diarization": "provider", "ready": ok,
+                "engine": {"name": "omi-asr sidecar", "healthy": ok, "self_test": info.get("self_test"), "models": models}}
+
     @app.get("/v1/status")
     def status() -> dict:
         return {
@@ -159,7 +171,7 @@ def create_app(
             "server_time": iso_utc_epoch(time.time()),
             "server_started_at": iso_utc_epoch(started_at),
             # `ready` means configured, not proven: nothing here calls a provider
-            "stt": {
+            "stt": local_engine() if settings.stt_local_url else {
                 "provider": settings.stt_provider,
                 "model": "fake-stt" if settings.stt_provider == "fake" else settings.stt_model,
                 "diarization": settings.stt_diarization,

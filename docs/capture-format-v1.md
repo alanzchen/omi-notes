@@ -285,7 +285,7 @@ configured service (cached results don't count, so reuse never looks like a work
 successful transcription request is not yet a finished transcript); null until one happens or
 after an index rebuild, and scoped to the current provider configuration. `vault_id` identifies the
 vault, so the phone can tell when a URL starts serving another one. `failed` is the sum of `conversations_failed` and `chunks_failed`, kept
-for older phones. Model labels are non-secret; base URLs and keys are never reported. Fields added
+for older phones. With the local transcription sidecar configured, top-level `stt` describes it: `provider: "local"`, `model` naming its three models and their roles (MOSS-Transcribe-Diarize for speakers, Qwen3-ASR for text, Qwen3-ForcedAligner for timing), `diarization: "provider"`, `ready` = its health check answering now (the one network call this endpoint makes, cached 30 s), and `engine` {name, healthy, self_test, models}; `local_transcription` says when it was last checked and since when it is down. Recordings with under 1.5 s of detected speech are set aside (`discarded`, no note, raw audio kept) and appear in no list, issue or count. Model labels are non-secret; base URLs and keys are never reported. Fields added
 after v1's first release may be absent on older servers; the phone treats absence as unknown.
 
 ### `PUT /v1/captures/{capture_id}/chunks/{chunk_sequence}`

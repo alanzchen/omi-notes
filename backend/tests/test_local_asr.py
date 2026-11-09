@@ -690,3 +690,40 @@ def test_possible_names_use_the_centred_space_and_need_a_clear_winner():
     voices = {"S1": np.eye(8)[0] * 3 + np.eye(8)[1], "S2": np.eye(8)[0] * 3 + 0.5 * np.eye(8)[1] + 0.5 * np.eye(8)[2]}
     out = possible_names(voices, {}, cents, background=background)
     assert out == {"S1": "p-alan"}, "S2 is as much Gigi as Alan: no guess"
+
+
+def test_status_reports_the_local_engine_its_models_and_health(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from omi_notes.api import create_app
+
+    from .conftest import make_settings
+
+    settings = make_settings(tmp_path).model_copy(update={"stt_local_url": "http://127.0.0.1:18793/v1"})
+    app = create_app(settings, start_worker=False)
+
+    def transport(request):
+        return httpx.Response(200, json={"ok": True, "self_test": "ok", "models": {
+            "diarization": "OpenMOSS-Team/MOSS-Transcribe-Diarize", "text": "mlx-community/Qwen3-ASR-1.7B-bf16",
+            "aligner": "mlx-community/Qwen3-ForcedAligner-0.6B-bf16"}})  # fmt: skip
+
+    app.state.speakers.pipeline.providers._local_stt = LocalAsrStt("http://127.0.0.1:18793/v1", transport=httpx.MockTransport(transport))
+    stt = TestClient(app).get("/v1/status", headers=AUTH).json()["stt"]
+    assert stt["provider"] == "local" and stt["ready"] is True and stt["diarization"] == "provider"
+    assert "MOSS-Transcribe-Diarize" in stt["model"] and "Qwen3-ASR-1.7B" in stt["model"], stt
+    assert stt["engine"]["models"]["aligner"].endswith("Qwen3-ForcedAligner-0.6B-bf16")
+
+
+def test_a_recording_with_under_a_second_and_a_half_of_speech_is_set_aside_quietly(client, worker, settings):
+    from omi_notes import views
+
+    stt, seen = sidecar(moss_like)
+    worker.providers._local_stt = stt
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(0.6, ALAN, 7), np.zeros(3 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = worker.db.query("SELECT * FROM conversations")
+    assert row["status"] == "discarded" and row["relevance"] == "too_short" and row["note_path"] is None
+    assert not seen, "no transcription for it"
+    assert not worker.db.query(f"SELECT id FROM conversations WHERE {views.LISTED}"), "not in the list"
+    assert not views.server_issues(worker.db, read_only=None, worker=True)
+    assert list(settings.raw_dir.rglob("*.omnc")), "its raw audio is kept"

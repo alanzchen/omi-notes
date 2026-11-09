@@ -93,6 +93,8 @@ _PROMPT_IN_NAME = re.compile(r"-p(\d+)-[0-9a-f]{16}\.json$")
 
 STATUS_INTERVAL = 60.0  # `_status.md` and stubs are rewritten at most once a minute
 EDITED_RETRY = 600.0
+TOO_SHORT_S = 1.5  # detected speech below this is set aside without a note (not a failure)
+TOO_SHORT_REASON = "too short: under 1.5 s of speech"
 LOCAL_STT_DOWN = "local transcription (the omi-asr sidecar) is unavailable; waiting for it"
 LOCAL_STT_WAIT = 60.0  # how often a waiting conversation looks again
 LOCAL_STT_ALERT_AFTER = 600.0
@@ -379,6 +381,9 @@ class ConversationPipeline:
                 return
             sources.decide(self, row, now)
         stage = "transcribing" if row["status"] in ("closed", "transcribing") else "summarizing"
+        if stage == "transcribing" and self._too_short(row):
+            self._set_aside(row, now)
+            return
         try:
             if stage == "transcribing":
                 self._set(conv_id, status="transcribing", updated_at=now)
@@ -451,6 +456,20 @@ class ConversationPipeline:
             self._set(row["id"], attempts=attempts, error=str(exc)[:500],
                       error_kind="notes" if isinstance(exc, UserRegionError) else "io",
                       next_attempt_at=now + backoff(attempts))  # fmt: skip
+
+    def _too_short(self, row) -> bool:
+        """Under TOO_SHORT_S of detected speech: a cough, a tap, a word. Not worth a note or a failure, unless the
+        owner asked for it (a retry or keep) or it already has a note."""
+        return (row["enrollment_id"] is None and row["speech_seconds"] < TOO_SHORT_S and not row["note_path"]
+                and not row["retry_op"] and not _kept(row))  # fmt: skip
+
+    def _set_aside(self, row, now: float) -> None:
+        """Quietly out of the list, issues and counts (`relevance = too_short`); its raw audio is kept like all audio.
+        Deterministic and provider-free, so a rebuild sets it aside again the same way."""
+        log.info("conversation %s: %.1f s of speech, set aside as too short", row["id"], row["speech_seconds"])
+        self._commit(row["id"], status="discarded", relevance="too_short", error=None, error_kind=None, failed_stage=None,
+                     attempts=0, next_attempt_at=None, done_at=row["done_at"] or now, updated_at=now,
+                     index_json=json.dumps({"kind": "discarded", "discard_reason": TOO_SHORT_REASON}))  # fmt: skip
 
     def _fail(self, conv_id: str, stage: str, exc: ProviderError, now: float) -> None:
         row = self._row(conv_id)
@@ -1349,7 +1368,8 @@ class ConversationPipeline:
             lo = datetime(day.year, day.month, day.day, tzinfo=tz).timestamp()
             hi = (datetime(day.year, day.month, day.day, tzinfo=tz) + timedelta(days=1)).timestamp()
             entries = []
-            for row in self.db.query("SELECT * FROM conversations WHERE start >= ? AND start < ? ORDER BY start", (lo, hi)):
+            for row in self.db.query("SELECT * FROM conversations WHERE start >= ? AND start < ? AND COALESCE(relevance, '') "
+                                     "<> 'too_short' ORDER BY start", (lo, hi)):  # fmt: skip
                 index = json.loads(row["index_json"]) if row["index_json"] else {}
                 kind = index.get("kind")
                 if row["note_path"] and kind:

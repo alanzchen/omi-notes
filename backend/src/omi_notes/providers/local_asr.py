@@ -167,6 +167,7 @@ class LocalAsrStt(OpenAICompatStt):
         super().__init__(base_url, "", model, style="openai_diarized", max_request_seconds=max_request_seconds,
                          timeout=timeout, transport=transport)  # fmt: skip
         self._health: tuple[float, bool] | None = None
+        self.health_info: dict = {}  # the last /health answer (models, self-test), for /v1/status
         self._health_client = httpx.Client(timeout=httpx.Timeout(2.0, connect=1.0), transport=transport)
 
     @property
@@ -266,7 +267,12 @@ class LocalAsrStt(OpenAICompatStt):
             return self._health[1]
         root = self.base_url[: -len("/v1")] if self.base_url.endswith("/v1") else self.base_url
         try:
-            ok = self._health_client.get(root + "/health").status_code == 200
+            answer = self._health_client.get(root + "/health")
+            ok = answer.status_code == 200
+            try:
+                self.health_info = answer.json() if isinstance(answer.json(), dict) else {}
+            except ValueError:
+                self.health_info = {}
         except httpx.HTTPError:
             ok = False
         self._health = (now, ok)

@@ -78,7 +78,8 @@ def test_a_failed_startup_self_test_makes_health_fail():
 def test_a_passing_self_test_is_reported():
     app = server.create_app(FakeEngine())
     app.state.guard.self_test()
-    assert TestClient(app).get("/health").json()["self_test"] == "ok"
+    body = TestClient(app).get("/health").json()
+    assert body["self_test"] == "ok" and set(body["models"]) == {"diarization", "text", "aligner"}
 
 
 def test_a_request_stuck_past_its_deadline_fails_health_and_the_watchdog_exits():

@@ -30,7 +30,7 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import VERSION, plan
-from .engine import Engine, IncompleteTranscription
+from .engine import ALIGNER, MOSS, QWEN, Engine, IncompleteTranscription
 
 log = logging.getLogger("omi_asr")
 MAX_SECONDS = float(os.environ.get("OMI_ASR_MAX_SECONDS", str(2 * 3600)))
@@ -150,7 +150,8 @@ def create_app(engine: Engine | None = None, *, self_test: bool = False, exit=os
     @app.get("/health")
     def health() -> JSONResponse:
         problem = guard.problem()
-        body = {"ok": problem is None, "version": VERSION, "models_loaded": engine.loaded, "self_test": guard.self_test_state}
+        body = {"ok": problem is None, "version": VERSION, "models_loaded": engine.loaded, "self_test": guard.self_test_state,
+                "models": {"diarization": MOSS, "text": QWEN, "aligner": ALIGNER}}  # fmt: skip
         if problem:
             body["reason"] = problem
         return JSONResponse(body, status_code=503 if problem else 200)

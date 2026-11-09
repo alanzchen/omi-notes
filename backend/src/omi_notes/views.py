@@ -28,7 +28,9 @@ SEGMENT_PAGE = 500
 ISSUE_LIMIT = 20
 
 # Rows the app lists: voice-enrollment readings are never conversations.
-LISTED = "enrollment_id IS NULL AND COALESCE(waiting_for, '') <> 'voice enrollment'"
+# set-aside recordings (under 1.5 s of speech) are kept with their audio but listed nowhere
+LISTED = ("enrollment_id IS NULL AND COALESCE(waiting_for, '') <> 'voice enrollment' "
+          "AND COALESCE(relevance, '') <> 'too_short'")
 # a failure the owner dismissed from the phone (that very failure; a later one shows again)
 NOT_DISMISSED = ("NOT (COALESCE(json_extract(resolution, '$.kind'), '') = 'dismissed' "
                  "AND json_extract(resolution, '$.failure.id') IS failure_id)")
