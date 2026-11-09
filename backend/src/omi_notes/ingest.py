@@ -645,8 +645,13 @@ def same_audio(a, b) -> bool:
     if abs(len(x) - len(y)) > 1600:
         return False
     n = min(len(x), len(y))
+    longer = x if len(x) > n else y
     x, y = x[:n] - x[:n].mean(), y[:n] - y[:n].mean()
     ex, ey = float(np.sqrt((x**2).mean())), float(np.sqrt((y**2).mean()))
+    # what the longer copy has past the shorter one's end is cut off below: it may only be quiet padding
+    tail = longer[n:] - longer[:n].mean()
+    if len(tail) and float(np.sqrt((tail**2).mean())) >= max(1.0, 0.05 * max(ex, ey)):
+        return False
     if ex < 1.0 and ey < 1.0:
         return True
     if ex < 1.0 or ey < 1.0:

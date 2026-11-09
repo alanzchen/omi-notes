@@ -160,3 +160,27 @@ def test_a_different_last_half_second_is_not_the_same_audio():
     b = parse_envelope(aac_envelopes(changed, capture_id=capture, device_id=WATCH, started_at=STARTED)[0])
     assert same_audio(a, b) is False
     assert same_audio(a, parse_envelope(aac_envelopes(pcm, capture_id=capture, device_id=WATCH, started_at=STARTED)[0])) is True
+
+
+def test_a_copy_with_extra_sound_past_the_shorter_end_is_not_the_same_audio():
+    # Astra's probe: the identical 30 s plus 80 ms of loud audio passed, since both were cut to the shorter
+    # length before any check; the same holds when everything before it is silent
+    from omi_notes.ingest import same_audio
+
+    capture = str(uuid.uuid4())
+    t = np.arange(1280) / 16000
+    loud = (8000 * np.sin(2 * np.pi * 237 * t)).astype(np.int16)
+    for pcm in (talk(30, 3), silence(30)):
+        a, b = (
+            parse_envelope(pcm_envelopes(p, capture_id=capture, device_id=WATCH, started_at=STARTED, source="watch_mic")[0])
+            for p in (pcm, np.concatenate([pcm, loud]))
+        )
+        assert same_audio(a, b) is False
+        assert same_audio(b, a) is False
+    pcm = talk(30, 3)
+    padded = np.concatenate([pcm, np.zeros(1280, dtype=np.int16)])
+    a, b = (
+        parse_envelope(pcm_envelopes(p, capture_id=capture, device_id=WATCH, started_at=STARTED, source="watch_mic")[0])
+        for p in (pcm, padded)
+    )
+    assert same_audio(a, b) is True, "quiet padding past the end is still the same recording"
