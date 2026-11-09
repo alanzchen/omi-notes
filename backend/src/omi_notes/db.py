@@ -316,6 +316,7 @@ CREATE TABLE IF NOT EXISTS speaker_labels (
     not_json TEXT NOT NULL DEFAULT '[]',
     forgotten INTEGER NOT NULL DEFAULT 0,
     samples_json TEXT NOT NULL DEFAULT '[]',
+    rm_basis TEXT,
     PRIMARY KEY (conversation_id, label)
 );
 CREATE INDEX IF NOT EXISTS speaker_labels_person ON speaker_labels(person_id);
@@ -493,7 +494,7 @@ COLUMN_SOURCES: dict[str, dict[str, str]] = {
     "speaker_labels": {
         c: "<conversation dir>/speakers.json labels"
         for c in ("conversation_id", "label", "person_id", "source", "distance", "margin", "evidence_s", "not_json",
-                  "forgotten", "samples_json")
+                  "forgotten", "samples_json", "rm_basis")
     },
     "known_through": {
         "conversation_id": "conversation.json id",

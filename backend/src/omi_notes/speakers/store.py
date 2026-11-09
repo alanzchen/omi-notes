@@ -36,7 +36,7 @@ from ..notes.writer import remove, sanitize_title, write_if_changed
 from ..spool import atomic_write_bytes, fsync_dir, make_dirs_durable
 from ..util import canonical_json, sha256_hex
 from ..vault import Vault
-from .match import Operating, Sample, build_models
+from .match import Operating, Sample, build_models, centroid_basis
 from .voices import LabelVoice, decode_vector, encode_vector
 
 log = logging.getLogger(__name__)
@@ -232,6 +232,31 @@ class SpeakerStore:
     def models(self, model: str, model_sha: str, op: Operating):
         me = self.me()
         return build_models(self.samples(model, model_sha), op, wearer_id=me["id"] if me else None)
+
+    def rm_space(self, model: str, model_sha: str):
+        """GA and people's GA-centred centroids (`speakers.space`), in memory only: GA over the stored label
+        vectors `vector_labels` allows now (named for me or a consented person; others only with unknown-voice
+        storage on; never a forgotten label) plus every eligible sample. None without any vector."""
+        from .space import build_space
+
+        prefs = self.settings()
+        people = {r["id"]: r for r in self.people()}
+        vectors = []
+        for r in self.db.query(
+            """SELECT v.vector, l.person_id, COALESCE(l.forgotten, 0) AS forgotten FROM voices v
+               LEFT JOIN speaker_labels l ON l.conversation_id = v.conversation_id AND l.label = v.label
+               WHERE v.vector IS NOT NULL AND v.model=? AND v.model_sha=?""",
+            (model, model_sha),
+        ):
+            person = people.get(r["person_id"])
+            consented = person is not None and (person["me"] or (prefs["acknowledged_at"] and person["attested_at"]))
+            if not r["forgotten"] and (consented or prefs["unknown_voices_enabled"]):
+                vectors.append(np.frombuffer(r["vector"], dtype="<f4").astype(np.float32))
+        samples = self.samples(model, model_sha)
+        by_person: dict[str, list] = {}
+        for s in centroid_basis(samples):
+            by_person.setdefault(s.person_id, []).append(s.vector)
+        return build_space(vectors + [s.vector for s in samples], by_person)
 
     def put_person(self, person_id: str, name: str, *, me: bool | None = None, attest: bool = False,
                    now: float | None = None) -> bool:  # fmt: skip
@@ -628,7 +653,7 @@ class SpeakerStore:
         return {
             r["label"]: {"person_id": r["person_id"], "source": r["source"], "distance": r["distance"], "margin": r["margin"],
                          "evidence_s": r["evidence_s"], "not": json.loads(r["not_json"]), "forgotten": bool(r["forgotten"]),
-                         "samples": json.loads(r["samples_json"])}
+                         "samples": json.loads(r["samples_json"])} | ({"rm_basis": r["rm_basis"]} if r["rm_basis"] else {})
             for r in self.db.query("SELECT * FROM speaker_labels WHERE conversation_id=?", (conv_id,))
         }  # fmt: skip
 
@@ -670,6 +695,8 @@ class SpeakerStore:
                     or state.get("source") == "unknown"):  # fmt: skip
                 continue
             out[label] = {k: (sorted(state.get(k) or []) if k == "not" else state.get(k)) for k in keys}
+            if state.get("rm_basis"):  # how the label was centred for the recording-mean check (`speakers.space`)
+                out[label]["rm_basis"] = state["rm_basis"]
             if state.get("forgotten"):
                 out[label]["forgotten"] = True
             if state.get("samples"):  # the confirmations this assignment created: they move with it
@@ -685,10 +712,10 @@ class SpeakerStore:
             conn.execute("DELETE FROM speaker_labels WHERE conversation_id=?", (conv_id,))
             conn.executemany(
                 """INSERT INTO speaker_labels (conversation_id, label, person_id, source, distance, margin, evidence_s, not_json,
-                       forgotten, samples_json) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                       forgotten, samples_json, rm_basis) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 [(conv_id, label, s.get("person_id"), s.get("source"), s.get("distance"), s.get("margin"),
                   s.get("evidence_s"), json.dumps(sorted(s.get("not") or [])), int(bool(s.get("forgotten"))),
-                  json.dumps(sorted(s.get("samples") or []))) for label, s in states.items()],
+                  json.dumps(sorted(s.get("samples") or [])), s.get("rm_basis")) for label, s in states.items()],
             )  # fmt: skip
             conn.execute("UPDATE conversations SET speakers_revision=? WHERE id=?", (revision, conv_id))
 

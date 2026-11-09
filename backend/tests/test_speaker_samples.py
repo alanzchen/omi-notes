@@ -186,3 +186,106 @@ def test_a_multi_label_owner_label_needs_the_top_raw_rank_and_raw_cosine_088():
     assert sm.assign({"S1": label(at_cosine(c, 0.85)), "S2": stored}, {}, models, auto_assign=True)["S1"]["person_id"] is None
     assert sm.OWNER_RULE.version >= 1
     assert (sm.OWNER_RULE.multi_min_cosine, sm.OWNER_RULE.single_min_cosine) == (0.88, 0.80)
+
+
+# -- M3: recording-mean (rm) and global-mean (GA) centring ------------------------------------------------
+
+from omi_notes.speakers import space as sp  # noqa: E402
+from omi_notes.speakers import suggest as sg  # noqa: E402
+
+
+def two_people_space(swap: bool = False) -> sp.RmSpace:
+    priya = [sample("priya", PRIYA, i, day=f"2026-09-2{i}") for i in (1, 2, 3)]
+    ravi = [sample("ravi", RAVI, i, day=f"2026-09-2{i}") for i in (1, 2, 3)]
+    stored = [s.vector for s in priya + ravi] + [vec(ALAN, i) for i in range(6)]
+    space = sp.build_space(stored, {"priya": [s.vector for s in priya], "ravi": [s.vector for s in ravi]})
+    if swap:  # rm would rank the other person first
+        space.centroids = {"priya": space.centroids["ravi"], "ravi": space.centroids["priya"]}
+    return space
+
+
+def test_recording_mean_basis_and_residual_guard():
+    ga = sp.background_of([vec(ALAN), vec(PRIYA), vec(RAVI)])
+    centre, basis = sp.label_centre(vec(PRIYA), [vec(PRIYA), vec(ALAN)], ga, full=True)
+    assert basis == "conversation" and np.allclose(centre, sp.background_of([vec(PRIYA), vec(ALAN)]))
+    assert sp.label_centre(vec(PRIYA), [vec(PRIYA), vec(ALAN)], ga, full=False)[1] == "partial"
+    assert sp.label_centre(vec(PRIYA), [vec(PRIYA)], ga, full=True)[1] == "ga"
+    # two nearly identical labels: the label sits on its recording mean, nothing is left to compare
+    centre, basis = sp.label_centre(vec(PRIYA, 1), [vec(PRIYA, 1), vec(PRIYA, 2)], ga, full=True)
+    assert basis == "ga" and np.allclose(centre, ga)
+    assert sp.RESIDUAL_GUARD == 0.20
+
+
+def test_a_non_owner_is_named_automatically_only_when_rm_agrees():
+    models = sm.build_models([sample("priya", PRIYA, i, day=f"2026-09-2{i}") for i in (1, 2, 3)]
+                             + [sample("ravi", RAVI, i, day=f"2026-09-2{i}") for i in (1, 2, 3)])  # fmt: skip
+    voices = {"S1": label(vec(ALAN, 7)), "S2": label(vec(PRIYA, 7))}
+    agreed = sm.assign(voices, {}, models, auto_assign=True, space=two_people_space(), full_rm=True)
+    assert agreed["S2"]["person_id"] == "priya" and agreed["S2"]["rm_basis"] == "conversation"
+    disagreed = sm.assign(voices, {}, models, auto_assign=True, space=two_people_space(swap=True), full_rm=True)
+    assert disagreed["S2"]["person_id"] is None and disagreed["S2"]["rm_basis"] == "conversation"
+    assert disagreed["S2"]["distance"] == agreed["S2"]["distance"], "the raw evidence is unchanged"
+    alone = sm.assign({"S2": voices["S2"]}, {}, models, auto_assign=True, space=two_people_space(), full_rm=False)
+    assert alone["S2"]["rm_basis"] == "ga" and alone["S2"]["person_id"] == "priya"
+
+
+def test_rm_chooses_who_a_recurring_voice_might_be():
+    quiet = [sg.Candidate(f"p{i}", "S1", vec(PRIYA, i), 12.0, f"d{i % 2}", -30.0) for i in range(3)]
+    models = sm.build_models([sample("priya", PRIYA, i) for i in range(2)] + [sample("ravi", RAVI, i) for i in range(2)])
+    found = sg.suggestions(quiet, models, me_exists=True, dismissed={}, now=0, space=two_people_space())
+    assert found[0].kind == "is_this_person" and found[0].person_id == "priya"
+    swapped = sg.suggestions(quiet, models, me_exists=True, dismissed={}, now=0, space=two_people_space(swap=True))
+    assert swapped[0].person_id != "priya"
+
+
+def test_ga_and_centroids_use_only_eligible_samples_and_consented_vectors(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    store = worker.pipeline.speakers
+    space = store.rm_space(*MODEL)
+    stored = worker.db.query("SELECT COUNT(*) AS n FROM voices WHERE vector IS NOT NULL")[0]["n"]
+    assert space.count == stored + 3 and set(space.centroids) == {me}
+    with store.lock:
+        for sid in ids:
+            store.set_sample_state(me, sid, "removed", action="remove", by="user", request_id=f"r-{sid}")
+    space = store.rm_space(*MODEL)
+    assert space.count == stored and space.centroids == {}
+
+
+def test_auto_names_record_their_rm_basis_and_a_relabel_uses_the_stored_vectors(env):
+    settings, client, worker = env
+    client.put("/v1/speakers/settings", json={"acknowledged_at": "2026-09-27T10:00:00Z"}, headers=AUTH)
+    me = new_person(client, "Alan", me=True)
+    priya = new_person(client, "Priya", attest_knows=True)
+    for day in (6, 5, 4):
+        row = talk(client, worker, dialogue(ALAN, PRIYA, seed=day), day=day)
+        assert name_label(client, row["id"], "S2", priya).json()["sample"] == "created"
+        name_label(client, row["id"], "S1", me)
+    fresh = talk(client, worker, dialogue(ALAN, PRIYA, seed=40), day=1)
+    states = worker.pipeline.speakers.labels(fresh["id"])
+    assert states["S2"]["person_id"] == priya and states["S2"]["source"] == "auto"
+    assert states["S2"]["rm_basis"] == "conversation"
+    record = json.loads((Vault.open(settings).conversation_dir(fresh["id"]) / "speakers.json").read_text())
+    assert record["labels"]["S2"]["rm_basis"] == "conversation"
+    worker.db.set_meta("relabel_pending", "1")
+    worker.pipeline.relabel(T0 + 5000)
+    assert worker.pipeline.speakers.labels(fresh["id"])["S2"]["rm_basis"] in ("partial", "ga")
+
+
+def test_possible_names_are_scored_by_recording_mean_and_only_from_eligible_samples(env, monkeypatch):
+    from omi_notes.pipeline import conversations
+
+    settings, client, worker = env
+    monkeypatch.setattr(conversations, "BACKGROUND_MIN_VOICES", 1)
+    client.put("/v1/speakers/settings", json={"acknowledged_at": "2026-09-27T10:00:00Z", "unknown_voices_enabled": True},
+               headers=AUTH)  # fmt: skip
+    priya = new_person(client, "Priya", attest_knows=True)
+    first = talk(client, worker, dialogue(ALAN, PRIYA, seed=3), day=3)
+    assert name_label(client, first["id"], "S2", priya).json()["sample"] == "created"
+    later = talk(client, worker, dialogue(RAVI, PRIYA, seed=9), day=1)  # Priya isn't active: no name, a hint
+    assert worker.pipeline.speakers.labels(later["id"]).get("S2", {}).get("person_id") is None
+    assert worker.pipeline.possible_voice_names(later["id"], later["transcript_sha"]) == {"S2": ("Priya", False)}
+    (sid,) = [r["id"] for r in worker.db.query("SELECT id FROM samples WHERE person_id=?", (priya,))]
+    with worker.pipeline.speakers.lock:
+        worker.pipeline.speakers.set_sample_state(priya, sid, "removed", action="remove", by="user", request_id="r")
+    assert worker.pipeline.possible_voice_names(later["id"], later["transcript_sha"]) == {}

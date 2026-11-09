@@ -16,7 +16,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from .match import THRESHOLD, PersonModel, best_match
-from .voices import centroid
+from .space import ranking
+from .voices import centroid, cosine_distance
 
 SIGNIFICANT_SECONDS = 10.0
 MIN_CONVERSATIONS = 3
@@ -94,7 +95,7 @@ def suggestion_id(members: list[Candidate]) -> str:
 
 
 def suggestions(candidates: list[Candidate], models: dict[str, PersonModel], *, me_exists: bool,
-                dismissed: dict[str, float], now: float, limit: int = LIMIT) -> list[Suggestion]:  # fmt: skip
+                dismissed: dict[str, float], now: float, limit: int = LIMIT, space=None) -> list[Suggestion]:  # fmt: skip
     pool = [c for c in candidates if c.seconds >= SIGNIFICANT_SECONDS]
     found: list[Suggestion] = []
     for group in cluster([c.vector for c in pool]):
@@ -106,6 +107,12 @@ def suggestions(candidates: list[Candidate], models: dict[str, PersonModel], *, 
             continue
         center = centroid([m.vector for m in members], [m.seconds for m in members])
         pid, distance, _ = best_match(center, models)
+        if space is not None:
+            # the person rm ranks first (members come from several recordings: centred by GA), if raw agrees they're near
+            scored, _ = ranking(center, [], space, full=False)
+            pid = scored[0][1] if scored else None
+            model = models.get(pid) if pid else None
+            distance = cosine_distance(center, model.centroid) if model is not None and model.centroid is not None else None
         if pid is not None and distance is not None and distance < THRESHOLD:
             s.kind, s.person_id = "is_this_person", pid
         found.append(s)

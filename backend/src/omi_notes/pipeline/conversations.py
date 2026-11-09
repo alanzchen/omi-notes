@@ -736,8 +736,10 @@ class ConversationPipeline:
             if voices is not None:
                 models = self.speakers.models(embedder.model, embedder.model_sha, self.operating)
                 if models:
-                    states = speaker_match.assign(voices, current, models,
-                                                  auto_assign=self.speakers.settings()["auto_assign"], op=self.operating)  # fmt: skip
+                    # freshly embedded: every label's vector is in memory (the full recording mean)
+                    states = speaker_match.assign(voices, current, models, auto_assign=self.speakers.settings()["auto_assign"],
+                                                  op=self.operating, space=self.speakers.rm_space(embedder.model, embedder.model_sha),
+                                                  full_rm=fresh)  # fmt: skip
             if fresh:
                 keep = self.speakers.vector_labels(states, set(voices), raw=True)
                 self.speakers.write_voices(conv_id, name, embedder.model, embedder.model_sha, voices, keep)
@@ -825,6 +827,7 @@ class ConversationPipeline:
             return []
         prefs = self.speakers.settings()
         models_by_voice: dict[tuple[str, str], dict] = {}
+        spaces: dict[tuple[str, str], object] = {}
         changed: list[str] = []
         conv_ids = [r["conversation_id"] for r in self.db.query(
             "SELECT DISTINCT conversation_id FROM voices UNION SELECT DISTINCT conversation_id FROM speaker_labels")]  # fmt: skip
@@ -839,8 +842,10 @@ class ConversationPipeline:
             if key is not None:
                 if key not in models_by_voice:
                     models_by_voice[key] = self.speakers.models(*key, self.operating)
+                    spaces[key] = self.speakers.rm_space(*key)
+                # stored voices: only the consented labels' vectors (a partial recording mean)
                 states = speaker_match.assign(voices, current, models_by_voice[key], auto_assign=prefs["auto_assign"],
-                                              op=self.operating)  # fmt: skip
+                                              op=self.operating, space=spaces[key])  # fmt: skip
             else:
                 states = current
             known = {r["id"] for r in self.speakers.people()}
@@ -867,15 +872,18 @@ class ConversationPipeline:
         if embedder is None:
             return {}
         try:  # a hint is never worth failing a note for
+            from ..speakers.space import label_centre
+
             space = self.voice_space(embedder)
             voices = self.speakers.voices_of_labels(conv_id, transcript_sha)
             if space is None or not voices:
                 return {}
-            background, centroids = space
             # only voices made by the model the people's samples are in: other vectors aren't comparable
             vectors = {label: v.vector for label, v in voices.items()
                        if getattr(v, "vector", None) is not None and getattr(v, "model_sha", None) == embedder.model_sha}  # fmt: skip
-            found = possible_names(vectors, self.speakers.labels(conv_id), centroids, background=background)
+            # each label centred by this recording's (stored, consented) mean, else GA (`speakers.space`)
+            centres = {label: label_centre(v, list(vectors.values()), space.ga, full=False)[0] for label, v in vectors.items()}
+            found = possible_names(vectors, self.speakers.labels(conv_id), space.centroids, background=centres)
             people = {r["id"]: (r["name"], bool(r["me"])) for r in self.speakers.people()}
             return {label: people[pid] for label, pid in found.items() if pid in people}
         except Exception:
@@ -932,18 +940,13 @@ class ConversationPipeline:
                                      "check": "sidecar/asr/scripts/launchagent.sh status; ~/Library/Logs/omi-notes-asr.log"})  # fmt: skip
             self.db.set_meta("local_stt_alerted", repr(now))
 
-    def voice_space(self, embedder) -> tuple[np.ndarray, dict[str, np.ndarray]] | None:
-        """(background, person → centred centroid) for comparing voices with people (`speakers.space`), or None
-        without enough stored voices or any samples."""
-        from ..speakers.space import centred_centroids
-
-        background = self._background_voice("", embedder)
-        samples: dict[str, list[np.ndarray]] = {}
-        for sample in self.speakers.samples(embedder.model, embedder.model_sha):
-            samples.setdefault(sample.person_id, []).append(sample.vector)
-        if background is None or not samples:
+    def voice_space(self, embedder):
+        """GA and person → GA-centred centroid for comparing voices with people (`speakers.space.RmSpace`), or
+        None without enough consent-eligible stored voices for a stable GA, or without any samples."""
+        space = self.speakers.rm_space(embedder.model, embedder.model_sha)
+        if space is None or space.count < BACKGROUND_MIN_VOICES or not space.centroids:
             return None
-        return background, centred_centroids(samples, background)
+        return space
 
     def _background_voice(self, conv_id: str, embedder) -> np.ndarray | None:
         """The mean of other conversations' stored voices (same model): what every voice recorded here shares."""
@@ -1716,11 +1719,13 @@ HINT_GAP = 0.20  # ... and this much above the next person
 
 
 def possible_names(voices: dict[str, np.ndarray], states: dict[str, dict], centroids: dict[str, np.ndarray], *,
-                   background: np.ndarray, min_score: float = HINT_SCORE, gap: float = HINT_GAP) -> dict[str, str]:  # fmt: skip
+                   background: np.ndarray | dict[str, np.ndarray], min_score: float = HINT_SCORE,
+                   gap: float = HINT_GAP) -> dict[str, str]:  # fmt: skip
     """label → person id for unnamed labels whose voice clearly resembles one person in the centred space
-    (`speakers.space`): the nearest person, at least `min_score`, `gap` above the next; per person only the
-    closest such label, and nobody already named in this conversation or ruled out for that label ("not X",
-    kept unknown). A guess shown as a guess, never a name."""
+    (`speakers.space`; `background`: one for every label, or each label's own recording-mean centre): the
+    nearest person, at least `min_score`, `gap` above the next; per person only the closest such label, and
+    nobody already named in this conversation or ruled out for that label ("not X", kept unknown). A guess
+    shown as a guess, never a name."""
     from ..speakers.space import score
 
     named = {s.get("person_id") for s in states.values() if s.get("person_id")}
@@ -1729,7 +1734,8 @@ def possible_names(voices: dict[str, np.ndarray], states: dict[str, dict], centr
         state = states.get(label) or {}
         if state.get("person_id") or state.get("source") == "unknown" or label == "unknown":
             continue
-        scored = sorted(((score(vector, c, background), pid) for pid, c in centroids.items()), reverse=True)
+        centre = background[label] if isinstance(background, dict) else background
+        scored = sorted(((score(vector, c, centre), pid) for pid, c in centroids.items()), reverse=True)
         if not scored or scored[0][0] < min_score or (len(scored) > 1 and scored[0][0] - scored[1][0] < gap):
             continue
         value, pid = scored[0]  # the nearest of everyone; if that one is ruled out, no guess (not the runner-up)

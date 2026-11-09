@@ -107,6 +107,11 @@ def confirmed(samples: list[Sample]) -> list[Sample]:
     return sorted(keep, key=lambda s: (s.created_at, s.id))[-SAMPLE_CAP:]
 
 
+def centroid_basis(samples: list[Sample]) -> list[Sample]:
+    """The samples people's voices are compared with in the recording-mean space: every confirmed one."""
+    return [s for s in samples if s.source in CONFIRMED]
+
+
 def build_models(samples: list[Sample], op: Operating = Operating(), *, wearer_id: str | None = None) -> dict[str, PersonModel]:
     by_person: dict[str, list[Sample]] = {}
     for s in samples:
@@ -216,10 +221,15 @@ def owner_refusal(label: str, voices: dict[str, object], model: PersonModel, rul
 
 
 def assign(voices: dict[str, object], current: dict[str, dict], models: dict[str, PersonModel], *, auto_assign: bool,
-           op: Operating = Operating(), owner: OwnerRule = OWNER_RULE) -> dict[str, dict]:  # fmt: skip
+           op: Operating = Operating(), owner: OwnerRule = OWNER_RULE, space=None, full_rm: bool = False) -> dict[str, dict]:  # fmt: skip
     """Label states after (re)assignment. User assignments and `not` lists are kept; automatic
     ones are recomputed from the stored voices (only for active people, when auto naming is on;
-    the wearer only within `OwnerRule`)."""
+    the wearer only within `OwnerRule`). With `space` (`speakers.space.RmSpace`) anyone else is
+    named only when the recording-mean scores rank that person first too (`rm_basis` records how
+    the label was centred; `full_rm`: `voices` hold every label vector of the conversation)."""
+    from .space import ranking
+
+    label_vectors = [v.vector for v in voices.values() if v is not None and getattr(v, "vector", None) is not None]
     out: dict[str, dict] = {}
     for label in sorted(set(voices) | set(current), key=_label_key):
         state = dict(current.get(label) or {})
@@ -232,7 +242,11 @@ def assign(voices: dict[str, object], current: dict[str, dict], models: dict[str
                  "evidence_s": getattr(voices.get(label), "seconds", None), "not": sorted(blocked),
                  "forgotten": bool(state.get("forgotten")), "samples": list(state.get("samples") or [])}  # fmt: skip
         model = models.get(found.person_id) if found.person_id else None
-        if auto_assign and found.accepted and model is not None and model.active and not (
+        agrees = True
+        if space is not None and model is not None and not model.wearer:
+            scored, fresh["rm_basis"] = ranking(voices[label].vector, label_vectors, space, full=full_rm)
+            agrees = bool(scored) and scored[0][1] == found.person_id
+        if auto_assign and found.accepted and model is not None and model.active and agrees and not (
                 model.wearer and owner_refusal(label, voices, model, owner)):  # fmt: skip
             fresh |= {"person_id": found.person_id, "source": "auto"}
         out[label] = fresh
