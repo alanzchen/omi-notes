@@ -390,9 +390,16 @@ class SpeakerStore:
         if not new:
             return False
         data = data | new
+        self._publish_sample(person_id, sample_id, data)
+        return True
+
+    def _publish_sample(self, person_id: str, sample_id: str, data: dict) -> None:
+        """A changed sample file, then its index row. The index is marked as possibly behind the files first, and
+        unmarked only after its row is written: a crash in between leaves the mark, and `sync_samples` reloads."""
+        self.db.set_meta("samples_dirty", "1")
         Vault.write_json(self.sample_path(person_id, sample_id), data)
         self._index_sample(data)
-        return True
+        self.db.set_meta("samples_dirty", None)
 
     # -- review flags (`speakers.flags`) ----------------------------------------------------------
 
@@ -491,8 +498,7 @@ class SpeakerStore:
         data["revision"] = int(data.get("revision") or 0) + 1
         data["history"] = list(data.get("history") or []) + [{"at": now, "action": action, "by": by,
                                                                "request_id": request_id} | (record or {})]  # fmt: skip
-        Vault.write_json(self.sample_path(person_id, sample_id), data)
-        self._index_sample(data)
+        self._publish_sample(person_id, sample_id, data)
         if recalibrate:
             self.samples_changed(now)
         return data
@@ -505,6 +511,10 @@ class SpeakerStore:
         before = (self.read_sample(person_id, sample_id) or {}).get("state") or ACTIVE
         return self.update_sample(person_id, sample_id, {"state": state} | (extra or {}), action=action, by=by,
                                   request_id=request_id, now=now, record={"from": before, "to": state} | (record or {}))  # fmt: skip
+
+    def reconcile(self) -> None:
+        """Before anything uses the samples: the index catches up with the sample files."""
+        self.sync_samples()
 
     def samples_changed(self, now: float | None = None) -> None:
         """People's voice evidence changed (a sample, a state, consent): recalibrate (debounced, `calibration`)."""
@@ -523,7 +533,9 @@ class SpeakerStore:
         return count
 
     def samples(self, model: str, model_sha: str, *, every_state: bool = False) -> list[Sample]:
-        """This model's samples that may teach anything (`sample_eligible`); `every_state`: removed and moved ones too."""
+        """This model's samples that may teach anything (`sample_eligible`); `every_state`: removed and moved ones too.
+        Every model build starts from the files' truth (`reconcile`)."""
+        self.reconcile()
         return [
             Sample(r["id"], r["person_id"], np.frombuffer(r["vector"], dtype="<f4").astype(np.float32), r["source"],
                    r["day"], r["session"], r["created_at"], seconds=r["seconds"] or 0.0, state=r["state"], f0=r["f0"])
@@ -825,9 +837,10 @@ class SpeakerStore:
         """Re-index voice samples if the index lost any (or kept a deleted one)."""
         files = {p.stem for p in self.vault.people.glob("*/samples/*.json")} if self.vault.people.exists() else set()
         indexed = {r["id"] for r in self.db.query("SELECT id FROM samples")}
-        if files == indexed:
+        if files == indexed and self.db.meta("samples_dirty") is None:
             return False
-        self.load_samples()
+        self.load_samples()  # a file the index lost or kept, or a change whose index write never happened
+        self.db.set_meta("samples_dirty", None)
         return True
 
     def reference_voices(self, conv_id: str, name: str) -> None:
