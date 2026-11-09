@@ -103,11 +103,14 @@ def gather(pipeline) -> dict | None:
         voices = {lab: v for lab, v in store.voices(conv_id).items() if (v.model, v.model_sha) == key}
         if any(v.vector is not None for v in voices.values()):
             conversations[conv_id] = {"truth": labels, "voices": voices}
-    stored = []
-    for r in db.query("SELECT conversation_id, vector FROM voices WHERE vector IS NOT NULL AND model=? AND model_sha=?", key):
-        stored.append((r["conversation_id"], np.frombuffer(r["vector"], dtype="<f4").astype(np.float32)))
+    population = store.ga_population(*key)  # the same rule as matching's GA
+    stored = [(conv, np.frombuffer(v, dtype="<f4").astype(np.float32)) for conv, v in population]
+    op = pipeline.operating
     return {"model": key, "samples": samples, "wearer": me["id"] if me else None,
-            "consent": {"acknowledged_at": prefs["acknowledged_at"], "attested": attested},
+            "consent": {"acknowledged_at": prefs["acknowledged_at"], "attested": attested,
+                        "unknown_voices_enabled": prefs["unknown_voices_enabled"]},
+            "operating": [op.threshold, op.margin, op.min_evidence, op.min_turns],
+            "ga": hashlib.sha256(b"".join(sorted(v for _, v in population))).hexdigest(),
             "conversations": conversations, "stored": stored}  # fmt: skip
 
 
@@ -117,6 +120,7 @@ def fingerprint(inputs: dict | None) -> str | None:
     basis = {
         "version": VERSION, "owner_rule": speaker_match.OWNER_RULE.version, "flags": speaker_flags.VERSION,
         "model": list(inputs["model"]), "wearer": inputs["wearer"], "consent": inputs["consent"],
+        "operating": inputs["operating"], "ga": inputs["ga"],
         "samples": sorted([s.id, s.state] for s in inputs["samples"]),
         "labels": sorted([c, lab, pid, (data["voices"][lab].file if lab in data["voices"] else None)]
                          for c, data in inputs["conversations"].items() for lab, pid in data["truth"].items()),
@@ -150,7 +154,7 @@ def evaluate(inputs: dict, op: speaker_match.Operating) -> dict:
     for conv_id, data in sorted(inputs["conversations"].items()):
         held = [s for s in samples if _session(s) != conv_id]
         models = speaker_match.build_models(held, op, wearer_id=wearer)
-        vectors = [v for c, v in inputs["stored"] if c != conv_id] + [s.vector for s in held]
+        vectors = [v for c, v in inputs["stored"] if c != conv_id]  # GA without this conversation's voices
         space = build_space(vectors, _centroid_samples(held))
         states = speaker_match.assign(data["voices"], {}, models, auto_assign=True, op=op, space=space) if models else {}
         decided = {lab: (states.get(lab) or {}).get("person_id") for lab in data["truth"]}
@@ -239,7 +243,8 @@ class Calibrator:
             return False
         with self.store.lock:
             self.store.apply_flags(now)
-        inputs = gather(self.pipeline)
+        with self.store.lock:  # a consistent snapshot; the evaluation itself runs outside the lock
+            inputs = gather(self.pipeline)
         if inputs is None or (not inputs["samples"] and self.current() is None):
             if pending is not None and self.db.meta("calibrate_pending") == pending:
                 self.db.set_meta("calibrate_pending", None)  # nothing to calibrate (yet)

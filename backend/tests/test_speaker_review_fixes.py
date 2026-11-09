@@ -101,3 +101,26 @@ def test_an_enrollment_only_model_is_active_only_if_the_confirmations_match_it()
     same = [sm.Sample(s.id, s.person_id, vec(ALAN, 5 + i), s.source, s.day, s.session, s.created_at, seconds=20.0)
             for i, s in enumerate(other)]  # fmt: skip
     assert sm.build_models(same + mine)["alan"].active, "the gates themselves are unchanged"
+
+
+# -- 13: the calibration fingerprint covers everything the evaluation depends on ----------------------------------
+
+
+def test_the_calibration_fingerprint_covers_ga_unknown_storage_and_operating_points(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker, days=(6, 5))
+    calibrator = worker.calibrator
+    first = calibrator.fingerprint()
+    client.put("/v1/speakers/settings", json={"unknown_voices_enabled": True}, headers=AUTH)
+    second = calibrator.fingerprint()
+    assert second != first, "the unknown-voice preference changes what GA may hold"
+    worker.pipeline.operating = sm.Operating(threshold=0.45, margin=0.1)
+    third = calibrator.fingerprint()
+    assert third != second, "other operating points are another matcher"
+    store = worker.pipeline.speakers
+    with store.lock:  # GA changes without any sample or named label changing: a stored unknown voice
+        store.prune_vectors(rows[0]["id"], {"S1"})
+    assert calibrator.fingerprint() == third
+    worker.db.execute("UPDATE voices SET vector=? WHERE conversation_id=? AND label='S1'",
+                      (np.asarray(vec(RAVI), dtype="<f4").tobytes(), rows[1]["id"]))  # fmt: skip
+    assert calibrator.fingerprint() != third, "the GA cohort is part of the input"

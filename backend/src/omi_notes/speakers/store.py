@@ -241,22 +241,19 @@ class SpeakerStore:
         me = self.me()
         return build_models(self.samples(model, model_sha), op, wearer_id=me["id"] if me else None)
 
-    def rm_space(self, model: str, model_sha: str):
-        """GA and people's GA-centred centroids (`speakers.space`), in memory only. GA is the mean of the label
-        population `vector_labels` allows now (the one consent rule: named for me or a consented person; any
-        other label only with unknown-voice storage on and its raw audio still there; never a forgotten one),
-        plus the eligible samples of consented people that aren't one of those voices already (a named label's
-        sample is its voice: counted once). None without any vector."""
-        from .space import build_space
-
+    def ga_population(self, model: str, model_sha: str) -> list[tuple[str | None, bytes]]:
+        """What GA is the mean of, as (conversation, vector bytes): the label population `vector_labels` allows now
+        (the one consent rule: named for me or a consented person; any other label only with unknown-voice storage
+        on and its raw audio still there; never a forgotten one), plus the eligible samples of consented people that
+        aren't one of those voices already (a named label's sample is its voice: counted once)."""
         prefs, people = self.settings(), {r["id"]: r for r in self.people()}
         by_conv: dict[str, dict[str, bytes]] = {}
         for r in self.db.query("SELECT conversation_id, label, vector FROM voices WHERE vector IS NOT NULL AND model=? AND model_sha=?",
                                (model, model_sha)):  # fmt: skip
             by_conv.setdefault(r["conversation_id"], {})[r["label"]] = r["vector"]
-        population: list[bytes] = []
+        population: list[tuple[str | None, bytes]] = []
         kept: dict[str, set[bytes]] = {}  # conversation → its allowed voices (a sample from one of them is that voice)
-        for conv_id, stored in by_conv.items():
+        for conv_id, stored in sorted(by_conv.items()):
             states = self.labels(conv_id)
             keep = self.vector_labels(states, set(stored), raw=False, prefs=prefs, people=people)
             if set(stored) - keep and prefs["unknown_voices_enabled"]:
@@ -264,16 +261,22 @@ class SpeakerStore:
                 if row is not None and self.raw_available(row):
                     keep = self.vector_labels(states, set(stored), raw=True, prefs=prefs, people=people)
             kept[conv_id] = {stored[label] for label in keep}
-            population += [stored[label] for label in sorted(keep)]
-        samples = self.samples(model, model_sha)
-        for s in samples:
+            population += [(conv_id, stored[label]) for label in sorted(keep)]
+        for s in self.samples(model, model_sha):
             raw = np.asarray(s.vector, dtype="<f4").tobytes()
             if consent_ok(people.get(s.person_id), prefs) and raw not in kept.get(s.session or "", set()):
-                population.append(raw)
+                population.append((s.session, raw))
+        return population
+
+    def rm_space(self, model: str, model_sha: str):
+        """GA (`ga_population`) and people's GA-centred centroids (`speakers.space`), in memory only; None without
+        any vector."""
+        from .space import build_space
+
         by_person: dict[str, list] = {}
-        for s in centroid_basis(samples):
+        for s in centroid_basis(self.samples(model, model_sha)):
             by_person.setdefault(s.person_id, []).append(s.vector)
-        vectors = [np.frombuffer(v, dtype="<f4").astype(np.float32) for v in population]
+        vectors = [np.frombuffer(v, dtype="<f4").astype(np.float32) for _, v in self.ga_population(model, model_sha)]
         return build_space(vectors, by_person)
 
     def put_person(self, person_id: str, name: str, *, me: bool | None = None, attest: bool = False,
