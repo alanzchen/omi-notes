@@ -357,7 +357,11 @@ def recording_view(pipeline, row: sqlite3.Row) -> dict | None:
         choice, unreadable = None, str(exc)
     if not applied and not unreadable:
         return None
-    return rclass.view(applied, choice, unreadable=unreadable)
+    failed = None
+    if row["failed_stage"] == "class_rewrite" and row["status"] in ("done", "discarded"):  # the note stands as it was
+        failed = ("The note couldn't be rewritten for the new kind: " + failure_message(row["error_kind"], "summarizing")
+                  + " It keeps its current kind and is tried again later.")  # fmt: skip
+    return rclass.view(applied, choice, unreadable=unreadable, update_failed=failed)
 
 
 def parse_cursor(cursor: str) -> tuple[float, str] | None:
@@ -405,7 +409,7 @@ def detail(pipeline, row: sqlite3.Row, *, segments_from: int = 0) -> dict:
     if row["status"] == "failed" and summary_state == "failed":
         body["summary_error"] = failure_message(row["error_kind"], "summarizing")
     if notes is not None:
-        from .recording_class import visible_items
+        from .notes.schema import assistant_items, task_items
 
         owner = _owner_name(pipeline, row)
         treated = (idx.get("recording_class") or {}).get("class")
@@ -417,8 +421,10 @@ def detail(pipeline, row: sqlite3.Row, *, segments_from: int = 0) -> dict:
                 {"description": a.description, "owner": a.owner,
                  "owner_name": owner if a.owner == "me" and owner else a.owner_name,
                  "due_date": a.due_date.isoformat() if a.due_date else None}  # fmt: skip
-                for a in visible_items(notes.action_items, treated)
+                for a in task_items(notes.action_items, treated)
             ],
+            # requests dictated to an assistant: proposals for it, never the owner's tasks (as in the note)
+            "assistant_requests": [{"description": a.description} for a in assistant_items(notes.action_items, treated)],
             "decisions": [] if passive else notes.decisions,
             "open_questions": [] if passive else notes.open_questions,
         }

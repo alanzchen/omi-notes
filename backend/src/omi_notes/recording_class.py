@@ -164,14 +164,6 @@ def effective(auto: dict | None, override: dict | None) -> dict:
             "wearer_share": auto.get("wearer_share"), "revision": revision}  # fmt: skip
 
 
-def visible_items(items: list, treated: str | None) -> list:
-    """The action items a note of this class shows, everywhere (Markdown, API, index, daily): all of them,
-    except in a passive recording, where only those addressed to the owner remain."""
-    if treated != "passive":
-        return list(items)
-    return [i for i in items if getattr(i, "owner", None) == "me" or (isinstance(i, dict) and i.get("owner") == "me")]
-
-
 # -- the owner's choice ----------------------------------------------------------------------------
 
 
@@ -193,6 +185,14 @@ def read(pipeline, conv_id: str) -> dict | None:
         raise UnreadableChoice(f"{path.name} of {conv_id} can't be read: {exc}") from exc
     if not isinstance(data, dict) or data.get("class") not in (*CLASSES, "auto"):
         raise UnreadableChoice(f"{path.name} of {conv_id} has no valid class")
+    # every field the choice is compared by: a malformed one is unreadable here, never an error further on
+    revision, set_at, requests = data.get("revision", 0), data.get("set_at", 0), data.get("requests", [])
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise UnreadableChoice(f"{path.name} of {conv_id} has an invalid revision")
+    if isinstance(set_at, bool) or not isinstance(set_at, int | float) or set_at != set_at or set_at < 0:
+        raise UnreadableChoice(f"{path.name} of {conv_id} has an invalid set_at")
+    if not isinstance(requests, list) or not all(isinstance(r, str) for r in requests):
+        raise UnreadableChoice(f"{path.name} of {conv_id} has an invalid request history")
     return data
 
 
@@ -203,9 +203,10 @@ def pending(choice: dict | None, applied: dict | None) -> bool:
 
 
 def view(applied: dict | None, choice: dict | None, *, unreadable: str | None = None,
-         applied_flag: bool | None = None) -> dict | None:  # fmt: skip
+         applied_flag: bool | None = None, update_failed: str | None = None) -> dict | None:  # fmt: skip
     """What the phone shows: the class the note was made for (never a requested one before it is applied), with
-    `updating` and the `requested` class while the owner's newer choice waits for its new summary."""
+    `updating` and the `requested` class while the owner's newer choice waits for its new summary, and
+    `update_failed` when that summary couldn't be written (the note stays as it was; tried again later)."""
     if not applied and not choice and not unreadable:
         return None
     applied = applied or {}
@@ -213,6 +214,8 @@ def view(applied: dict | None, choice: dict | None, *, unreadable: str | None = 
     out["updating"] = pending(choice, applied)
     if out["updating"]:
         out["requested"] = (choice or {}).get("class")
+        if update_failed:
+            out["update_failed"] = update_failed
     if unreadable:
         out["choice_unreadable"] = unreadable
     if choice and choice.get("set_at"):
@@ -241,6 +244,8 @@ def put(pipeline, conv_id: str, body: dict, applied: dict | None) -> dict:
         raise ApiError(409, "in_progress", "the conversation is still being recorded")
     if row["frozen"]:  # the owner's own version of the note stands: no new summary for it
         raise ApiError(409, "frozen", "the note is frozen; unfreeze it on the server to change its kind")
+    if row["status"] == "failed":  # no summary to rewrite: the retry makes one, and reads a choice made after it
+        raise ApiError(409, "failed", "this conversation's processing failed; retry it first, then change its kind")
     when_epoch = when.astimezone(UTC).timestamp()
     auto = (applied or {}).get("auto_detail") or applied or {}
     with SpeakerLock(pipeline.vault, name="class.lock"):

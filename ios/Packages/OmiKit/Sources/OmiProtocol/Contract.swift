@@ -490,21 +490,32 @@ public struct RecordingClassView: Codable, Equatable, Hashable, Sendable {
     public var requested: String?
     /// The stored choice can't be read on the server; the note keeps `kind`.
     public var choiceUnreadable: String?
+    /// The new summary for `requested` couldn't be written; the note stays as it was and the server tries again later.
+    public var updateFailed: String?
 
     enum CodingKeys: String, CodingKey {
         case kind = "class", auto, confidence, overridden, updating, requested
         case wearerShare = "wearer_share"
         case choiceUnreadable = "choice_unreadable"
+        case updateFailed = "update_failed"
     }
 
     public init(kind: String?, auto: String? = nil, confidence: String? = nil, overridden: Bool? = nil,
-                wearerShare: Double? = nil, updating: Bool? = nil, requested: String? = nil, choiceUnreadable: String? = nil) {
+                wearerShare: Double? = nil, updating: Bool? = nil, requested: String? = nil, choiceUnreadable: String? = nil,
+                updateFailed: String? = nil) {
         self.kind = kind; self.auto = auto; self.confidence = confidence
         self.overridden = overridden; self.wearerShare = wearerShare; self.updating = updating
-        self.requested = requested; self.choiceUnreadable = choiceUnreadable
+        self.requested = requested; self.choiceUnreadable = choiceUnreadable; self.updateFailed = updateFailed
     }
 
     public var isUpdating: Bool { updating == true }
+
+    /// Whether a note made for `self` still shows what `newer` describes: the same kind, and no rewrite finished
+    /// in between (a pending choice that is no longer pending means the server wrote a new summary).
+    public func sameTreatment(as newer: RecordingClassView?) -> Bool {
+        guard let newer else { return true }
+        return kind == newer.kind && overridden == newer.overridden && !(isUpdating && !newer.isUpdating)
+    }
 
     /// The short name a row shows.
     public static func title(_ kind: String?) -> String? {

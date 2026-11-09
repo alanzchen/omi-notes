@@ -478,6 +478,7 @@ included (with nothing to show yet). The body is the list entry plus:
  "summary_state": "ready",
  "summary": {"overview": "…", "sections": [{"heading": "…", "bullets": ["…"]}],
              "action_items": [{"description": "Send the budget", "owner": "me", "owner_name": "Alan", "due_date": "2026-09-30"}],
+             "assistant_requests": [{"description": "Draft the hotel email"}],
              "decisions": ["…"], "open_questions": ["…"]},
  "transcript_state": "ready",
  "speakers": [{"label": "S1", "name": "Priya"}, {"label": "S2", "name": null}],
@@ -489,6 +490,9 @@ included (with nothing to show yet). The body is the list entry plus:
   `summary_error` is a sanitized sentence), `not_applicable` (discarded before summarizing, or kept
   without a summary),
   `updating`, `unavailable` (the referenced file is missing or unreadable).
+- `action_items` are the owner's and other people's tasks; requests dictated to an AI assistant are
+  never among them but in `assistant_requests` (additive; proposals for an assistant, not tasks), as in
+  the note's "Asked of an Assistant". A passive recording has neither others' tasks nor assistant requests.
 - `transcript_state`: `ready`, `pending`, `updating`, `unavailable`. Segments come 500 at a time;
   `next_from` is the `segments_from` of the next page (null on the last).
 - Speaker names are shown only when the stored assignments were made for this transcript. A
@@ -610,11 +614,14 @@ summary's `interaction`); passive needs media content and no confirmed owner spe
 assigned to someone else is never a monologue, and any doubt keeps the fuller treatment.
 
 `/recent` and `/{id}` entries carry `recording_class`: `{class, auto, confidence, overridden,
-wearer_share, updating, requested?, set_at?, choice_unreadable?}` or `null` (not classified yet).
+wearer_share, updating, requested?, update_failed?, set_at?, choice_unreadable?}` or `null` (not
+classified yet).
 `class` is always the kind the current note was made for, never a requested one. `confidence` is `high`,
 `medium`, `low` or `owner`; `overridden` is true while an owner's choice (including pinning the automatic
 class) applies. `updating` is true while an owner's newer choice waits for its new summary, and
-`requested` is then the chosen kind (`auto` for a reset). `choice_unreadable` (a message) means the stored
+`requested` is then the chosen kind (`auto` for a reset). `update_failed` (a sanitized sentence) means
+the new summary for it couldn't be written: the note, its references and its kind stay exactly as they
+were, the choice stays requested, and the server tries again after six hours. `choice_unreadable` (a message) means the stored
 choice can't be read; the note keeps its kind and the Server page shows `class_choice_unreadable`.
 `GET /v1/conversations/recent?class=monologue|dialogue|passive` filters by the applied class before
 paging (start the cursor again when the filter changes).
@@ -626,7 +633,9 @@ revision raised by every choice); `auto` goes back to the automatic class. The s
 same `request_id` again is applied once; an older `set_at` than the stored one is not applied
 (`applied: false`). `200` with the `recording_class` view (still the applied class, `updating: true`,
 `requested`) plus `applied`; `404` unknown, `409 in_progress` while recording, `409 frozen` for a frozen
-note (its own version stands), `409 unreadable` when the stored choice can't be read (never treated as no
+note (its own version stands; also a note frozen after the choice is left as it is), `409 failed` for a
+conversation whose processing failed (retry it first; the retry's summary reads a later choice),
+`409 unreadable` when the stored choice can't be read (never treated as no
 choice), `422` invalid body, `503` read-only vault.
 
 ### `PUT /v1/conversations/{id}/priority`

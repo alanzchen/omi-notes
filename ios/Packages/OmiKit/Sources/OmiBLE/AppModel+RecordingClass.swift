@@ -9,9 +9,17 @@ import OmiProtocol
 extension AppModel {
     public var supportsRecordingClass: Bool { serverStatus?.supportsRecordingClass == true }
 
-    /// The freshest view of a conversation's class: the open note's, else the list's.
+    /// The freshest view of a conversation's class: the list's (a loaded note also refreshes its row, and a list
+    /// refresh is newer than a note opened earlier), else the open note's.
     public func recordingClass(of c: ConversationSummary) -> RecordingClassView? {
-        details[c.id]?.entry.recordingClass ?? recent.first { $0.id == c.id }?.recordingClass ?? c.recordingClass
+        recent.first { $0.id == c.id }?.recordingClass ?? details[c.id]?.entry.recordingClass ?? c.recordingClass
+    }
+
+    /// Whether the cached note was made for a different treatment than the server now reports (a rewrite for
+    /// the owner's choice finished): its summary is stale and must be loaded again.
+    public func detailNeedsReload(_ id: String) -> Bool {
+        guard let shown = details[id]?.entry.recordingClass, let row = recent.first(where: { $0.id == id }) else { return false }
+        return !shown.sameTreatment(as: row.recordingClass)
     }
 
     public func setRecordingClass(_ conversationId: String, _ kind: String) async {
@@ -29,8 +37,15 @@ extension AppModel {
         }
     }
 
+    /// The server's answer: still the applied class. The cached note takes it only when it describes the summary
+    /// that note shows; otherwise (the server applied another choice meanwhile) the note is loaded again.
     func applyRecordingClass(_ view: RecordingClassView, to conversationId: String) {
         if let i = recent.firstIndex(where: { $0.id == conversationId }) { recent[i].recordingClass = view }
-        details[conversationId]?.entry.recordingClass = view
+        guard let shown = details[conversationId]?.entry.recordingClass else { return }
+        if shown.sameTreatment(as: view) {
+            details[conversationId]?.entry.recordingClass = view
+        } else {
+            Task { _ = try? await conversation(conversationId) }
+        }
     }
 }

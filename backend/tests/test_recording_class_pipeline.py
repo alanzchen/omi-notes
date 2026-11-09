@@ -4,15 +4,17 @@ choice through the API (applied by revision, never from a render), daily notes a
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 import numpy as np
 
-from omi_notes.pipeline.conversations import _reusable
-from omi_notes.providers import LlmResult
+from omi_notes import recording_class as rclass
+from omi_notes.pipeline.conversations import CLASS_REWRITE_RETRY, _reusable
+from omi_notes.providers import LlmResult, ProviderError
 from omi_notes.providers.fake import FakeLlm
 
 from .conftest import AUTH
-from .helpers import T0, convs, note_text, replay
+from .helpers import STARTED, T0, convs, note_text, replay
 from .test_speaker_learning import ALAN, voice
 
 SR = 16000
@@ -23,13 +25,18 @@ class ScriptedLlm(FakeLlm):
     """The fake summary with a chosen `interaction` and keep; asked for a monologue, it writes a cleaned text
     (unless `cleaned` is false). `during` runs inside a call (an owner acting while a summary is being made)."""
 
-    def __init__(self, interaction: str, keep: bool = True, cleaned: bool = True, owner_items: bool = False):
+    def __init__(self, interaction: str, keep: bool = True, cleaned: bool = True, owner_items: bool = False,
+                 ai_items: bool = False):  # fmt: skip
         self.interaction, self.keep, self.cleaned, self.owner_items = interaction, keep, cleaned, owner_items
+        self.ai_items = ai_items
         self.calls: list[str] = []
         self.during = None
+        self.fail: ProviderError | None = None
 
     def summarize(self, request):
         self.calls.append(request.user)
+        if self.fail:
+            raise self.fail
         if self.during:
             during, self.during = self.during, None
             during()
@@ -39,6 +46,10 @@ class ScriptedLlm(FakeLlm):
         if self.owner_items:
             data["action_items"] = [dict(data["action_items"][0], description="Call the dentist", owner="me"),
                                     dict(data["action_items"][0], description="Someone else's errand", owner="other")]  # fmt: skip
+        if self.ai_items:
+            data["action_items"] = [dict(data["action_items"][0], description="Call the dentist", owner="me"),
+                                    dict(data["action_items"][0], description="Draft the hotel email", owner="me",
+                                         directed_at_ai=True)]  # fmt: skip
         if "Recording kind: MONOLOGUE" in request.user and self.cleaned:
             data["sections"] = [{"heading": "Cleaned text", "bullets": ["Book the Lisbon hotel for the conference."]},
                                 {"heading": "Tasks", "bullets": ["Hotel booking"]}]  # fmt: skip
@@ -239,3 +250,119 @@ def test_cache_lookups_match_exact_identities_not_longer_names_that_start_the_sa
     assert _reusable(tmp_path, base, f"{base}-cm3.json", None) == f"{base}.json"
     (tmp_path / f"{base}-2.json").write_text("{}")
     assert _reusable(tmp_path, base, f"{base}-2.json", None) == f"{base}-2.json", "a write-once retry still counts"
+
+
+def test_a_class_rewrite_that_fails_keeps_the_last_good_note_and_stays_requested(client, worker, settings):
+    worker.providers._llm = llm = ScriptedLlm("media")
+    one_voice(client)
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    before, conv_dir = note_text(settings, row), worker.pipeline.conv_dir(row["id"])
+    choose(client, row["id"], "monologue", "r1", "2026-11-08T20:00:00Z")
+    llm.fail = ProviderError("the summary provider refused", terminal=True, kind="notes")
+    worker.tick(T0 + 500)
+    worker.tick(T0 + 540)
+    (after,) = convs(worker)
+    assert after["status"] == "done" and after["llm_ref"] == row["llm_ref"] and after["llm_status"] == "ok"
+    assert (conv_dir / row["llm_ref"]).exists(), "the last good summary is never collected"
+    assert note_text(settings, after) == before and applied(worker, row["id"])["class"] == "passive"
+    shown = listed(client)
+    assert shown["class"] == "passive" and shown["updating"] is True and shown["requested"] == "monologue"
+    assert "couldn't be rewritten" in shown["update_failed"]
+    worker.tick(T0 + 600)
+    assert convs(worker)[0]["status"] == "done", "not retried at once"
+    llm.fail = None
+    worker.tick(T0 + 540 + CLASS_REWRITE_RETRY + 1)
+    worker.tick(T0 + 540 + CLASS_REWRITE_RETRY + 40)
+    assert applied(worker, row["id"])["class"] == "monologue" and "update_failed" not in listed(client)
+
+
+def test_a_note_frozen_after_its_rewrite_was_queued_is_left_as_it_was(client, worker):
+    worker.providers._llm = llm = ScriptedLlm("media")
+    one_voice(client)
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    choose(client, row["id"], "monologue", "r1", "2026-11-08T20:00:00Z")
+    assert worker.pipeline.reconcile_classes(T0 + 450) == 1
+    worker.db.execute("UPDATE conversations SET frozen=1 WHERE id=?", (row["id"],))
+    calls = len(llm.calls)
+    worker.tick(T0 + 500)
+    worker.tick(T0 + 540)
+    (after,) = convs(worker)
+    assert after["status"] == "done" and len(llm.calls) == calls and applied(worker, row["id"])["class"] == "passive"
+
+
+def test_a_choice_file_with_malformed_fields_is_unreadable_and_never_breaks_the_list(client, worker):
+    worker.providers._llm = ScriptedLlm("media")
+    one_voice(client)
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    path = worker.pipeline.conv_dir(row["id"]) / "class.json"
+    for bad in ({"class": "monologue", "revision": "broken", "set_at": 1}, {"class": "monologue", "revision": 1, "set_at": "x"},
+                {"class": "monologue", "revision": True, "set_at": 1}, {"class": "monologue", "revision": 1, "set_at": 1, "requests": 3}):
+        path.write_text(json.dumps(bad))
+        try:
+            rclass.read(worker.pipeline, row["id"])
+        except rclass.UnreadableChoice:
+            pass
+        else:
+            raise AssertionError(f"{bad} was read as a choice")
+    path.write_text(json.dumps({"class": "monologue", "revision": "broken", "set_at": 1}))
+    r = client.get("/v1/conversations/recent", headers=AUTH)
+    assert r.status_code == 200 and r.json()["conversations"][0]["recording_class"]["choice_unreadable"]
+    assert worker.pipeline.reconcile_classes(T0 + 450) == 0
+
+
+def test_one_bad_choice_never_stops_the_others_being_applied(client, worker, monkeypatch):
+    worker.providers._llm = ScriptedLlm("media")
+    one_voice(client)
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8.0, ALAN, 7), np.zeros(3 * SR, np.int16)]),
+           start=STARTED + timedelta(hours=1))  # fmt: skip
+    worker.tick(T0 + 3600 + 400)
+    rows = convs(worker)
+    assert len(rows) == 2 and all(r["status"] == "done" for r in rows)
+    for i, r in enumerate(rows):
+        choose(client, r["id"], "monologue", f"r{i}", "2026-11-08T20:00:00Z")
+    real = rclass.read
+
+    def read(pipeline, conv_id):
+        if conv_id == rows[0]["id"]:
+            raise RuntimeError("boom")
+        return real(pipeline, conv_id)
+
+    monkeypatch.setattr(rclass, "read", read)
+    assert worker.pipeline.reconcile_classes(T0 + 3600 + 450) == 1
+
+
+def test_a_failed_conversation_refuses_a_class_change_with_a_way_forward(client, worker):
+    worker.providers._llm = ScriptedLlm("media")
+    one_voice(client)
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    worker.db.execute("UPDATE conversations SET status='failed' WHERE id=?", (row["id"],))
+    r = choose(client, row["id"], "monologue", "r1", "2026-11-08T20:00:00Z")
+    assert r.status_code == 409 and "retry" in r.text.lower()
+    assert not (worker.pipeline.conv_dir(row["id"]) / "class.json").exists()
+
+
+def test_requests_for_an_assistant_stay_apart_from_action_items_everywhere(client, worker, settings):
+    worker.providers._llm = ScriptedLlm("conversation", ai_items=True)
+    two_voices(client)
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    summary = client.get(f"/v1/conversations/{row['id']}", headers=AUTH).json()["summary"]
+    assert [a["description"] for a in summary["action_items"]] == ["Call the dentist"]
+    assert [a["description"] for a in summary["assistant_requests"]] == ["Draft the hotel email"]
+    assert "## Asked of an Assistant" in note_text(settings, row)
+
+
+def test_a_passive_recording_has_no_requests_for_an_assistant_anywhere(client, worker, settings):
+    worker.providers._llm = ScriptedLlm("media", ai_items=True)
+    two_voices(client)
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    summary = client.get(f"/v1/conversations/{row['id']}", headers=AUTH).json()["summary"]
+    assert [a["description"] for a in summary["action_items"]] == ["Call the dentist"]
+    assert summary["assistant_requests"] == []
+    text = note_text(settings, row)
+    assert "Draft the hotel email" not in text and "Draft the hotel email" not in row["index_json"]

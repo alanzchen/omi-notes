@@ -38,4 +38,21 @@ import Testing
                 .appending(#""choice_unreadable":"class.json can't be read","applied":true}"#).utf8))
         #expect(view.kind == "passive" && view.choiceUnreadable != nil && !view.isUpdating)
     }
+
+    @Test func aFailedRewriteIsShownWithTheKindThatStands() throws {
+        let view = try JSONDecoder().decode(RecordingClassView.self, from: Data(
+            #"{"class":"passive","overridden":false,"updating":true,"requested":"monologue","update_failed":"couldn't be rewritten"}"#.utf8))
+        #expect(view.kind == "passive" && view.isUpdating && view.updateFailed != nil)
+    }
+
+    @Test func aNoteIsStaleOnceTheServerAppliedAnotherTreatment() {
+        let shown = RecordingClassView(kind: "passive", overridden: false, updating: false)
+        let asked = RecordingClassView(kind: "passive", overridden: false, updating: true, requested: "monologue")
+        #expect(shown.sameTreatment(as: asked), "a pending choice doesn't change the summary shown")
+        #expect(!asked.sameTreatment(as: RecordingClassView(kind: "monologue", overridden: true, updating: false)))
+        #expect(!asked.sameTreatment(as: RecordingClassView(kind: "passive", overridden: true, updating: false)), "pinned: rewritten")
+        #expect(!asked.sameTreatment(as: RecordingClassView(kind: "passive", overridden: false, updating: false)),
+                "the rewrite for auto finished with the same kind: still a new summary")
+        #expect(shown.sameTreatment(as: nil))
+    }
 }

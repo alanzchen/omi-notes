@@ -120,14 +120,16 @@ struct RecordingClassMenu: View {
 
     var body: some View {
         let view = model.recordingClass(of: conversation)
+        // the owner's standing choice (pending, or applied); the automatic kind can still be pinned
+        let chosen = view?.isUpdating == true ? view?.requested : (view?.overridden == true ? view?.kind : nil)
         Menu {
             ForEach(RecordingClassView.kinds, id: \.self) { kind in
                 Button { set(kind) } label: {
                     Label(RecordingClassStyle.name(kind), systemImage: view?.kind == kind ? "checkmark" : RecordingClassStyle.icon(kind))
                 }
-                .disabled(view?.kind == kind && view?.isUpdating != true)
+                .disabled(chosen == kind)
             }
-            if view?.overridden == true || view?.isUpdating == true {
+            if chosen != nil && chosen != "auto" {
                 Button { set("auto") } label: {
                     Label("Automatic (\(RecordingClassStyle.name(view?.auto)))", systemImage: "arrow.uturn.backward")
                 }
@@ -174,7 +176,10 @@ struct RecordingClassBadge: View {
                         .padding(.horizontal, 6).padding(.vertical, 2)
                         .background(Color(.tertiarySystemFill), in: .capsule)
                 }
-                if view.isUpdating {
+                if view.isUpdating, view.updateFailed != nil {
+                    Label("Couldn't change the kind yet", systemImage: "exclamationmark.circle")
+                        .font(.caption2).foregroundStyle(.orange)
+                } else if view.isUpdating {
                     Label(view.requested == "auto" ? "Going back to automatic…"
                           : "Changing to \(RecordingClassStyle.name(view.requested).lowercased())…", systemImage: "clock.arrow.circlepath")
                         .font(.caption2).foregroundStyle(.secondary)

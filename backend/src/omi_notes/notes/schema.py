@@ -146,6 +146,18 @@ CLEANED_TEXT = "Cleaned text"  # a monologue's near-verbatim section heading (re
 CLEANED_TEXT_MAX_S = 600.0  # a monologue up to this much speech also gets a cleaned near-verbatim text
 
 
+def task_items(items: list[ActionItem], treated: str | None) -> list[ActionItem]:
+    """A note's action items, the same everywhere (Markdown, API, index, daily): never requests for an assistant
+    (those are `assistant_items`), and in a passive recording only those addressed to the owner."""
+    return [i for i in items if not i.directed_at_ai and (treated != "passive" or i.owner == "me")]
+
+
+def assistant_items(items: list[ActionItem], treated: str | None) -> list[ActionItem]:
+    """Requests dictated to an assistant, kept apart from the owner's tasks; none in a passive recording (the owner
+    wasn't talking to one)."""
+    return [] if treated == "passive" else [i for i in items if i.directed_at_ai]
+
+
 class ConversationNotes(BaseModel):
     model_config = ConfigDict(extra="ignore")
 

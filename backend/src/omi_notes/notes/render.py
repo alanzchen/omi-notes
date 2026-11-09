@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from .schema import CLEANED_TEXT, CLEANED_TEXT_MAX_S, ActionItem, ConversationNotes
+from .schema import CLEANED_TEXT, CLEANED_TEXT_MAX_S, ActionItem, ConversationNotes, assistant_items, task_items
 from .writer import MY_NOTES_END, MY_NOTES_START
 
 NoteStatus = Literal["completed", "discarded", "transcript_only"]
@@ -160,7 +160,7 @@ def _duration_text(seconds: float) -> str:
 
 def frontmatter(d: NoteData) -> dict:
     notes = d.notes if d.status != "transcript_only" else None
-    items = [i for i in notes.action_items if not i.directed_at_ai] if notes else []
+    items = task_items(notes.action_items, d.recording_class.get("class")) if notes else []
     words = sum(len(s["text"].split()) for s in d.segments)
     labels = sorted({s["speaker"] for s in d.segments}, key=lambda x: (int(x[1:]) if x[1:].isdigit() else 10**6, x))
     speakers: int | list[str] = len(labels)
@@ -289,7 +289,7 @@ def render_note(d: NoteData, my_notes: str | None = None) -> str:
             out += ["## Key Points", ""]
             for section in sections:
                 out += [f"### {section.heading}", *[f"- {b}" for b in section.bullets], ""]
-        owned = [i for i in notes.action_items if not i.directed_at_ai and (not passive or i.owner == "me")]
+        owned = task_items(notes.action_items, d.recording_class.get("class"))
         if owned:
             out += ["## Action Items", ""]
             for item in owned:
@@ -303,7 +303,7 @@ def render_note(d: NoteData, my_notes: str | None = None) -> str:
                 if item.context:
                     out.append(f"    - {item.context}")
             out.append("")
-        asked = [i for i in notes.action_items if i.directed_at_ai] if not passive else []
+        asked = assistant_items(notes.action_items, d.recording_class.get("class"))
         if asked:  # dictated to an assistant: kept for reference, not the owner's tasks
             out += ["## Asked of an Assistant", "", *[f"- {i.description}" for i in asked], ""]
         for heading, values in (("Decisions", notes.decisions), ("Open Questions", notes.open_questions)):

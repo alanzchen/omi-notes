@@ -43,7 +43,9 @@ struct ConversationDetailView: View {
             if let message = model.priorityMessages[summary.id] ?? model.classMessages[summary.id] {
                 Section { Label(message, systemImage: "exclamationmark.circle").font(.footnote).foregroundStyle(.orange) }
             }
-            if let kind = model.recordingClass(of: entry), kind.isUpdating {
+            if let kind = model.recordingClass(of: entry), kind.isUpdating, let failed = kind.updateFailed {
+                Section { Label(failed, systemImage: "exclamationmark.circle").font(.footnote).foregroundStyle(.orange) }
+            } else if let kind = model.recordingClass(of: entry), kind.isUpdating {
                 Section {
                     Label("This note was written as \(RecordingClassStyle.name(kind.kind).lowercased()). The server is rewriting it as "
                           + (kind.requested == "auto" ? "the automatic kind" : RecordingClassStyle.name(kind.requested).lowercased())
@@ -126,6 +128,10 @@ struct ConversationDetailView: View {
         }
         .refreshable { await load() }
         // a retry or keep that finished changed the note: show the new state, not "Failed"
+        // a list refresh learned that the server rewrote this note for the owner's choice: load the new summary
+        .onChange(of: model.recordingClass(of: entry)) { _, _ in
+            if model.detailNeedsReload(summary.id) { Task { await load() } }
+        }
         .onChange(of: model.retries[summary.id]?.state) { _, state in
             if state == "done" { Task { await load() } }
         }
@@ -302,6 +308,12 @@ struct ConversationDetailView: View {
                         }
                     }
                 }
+            }
+        }
+        if let asked = d.summary?.assistantRequests, !asked.isEmpty {
+            // dictated to an assistant: kept for reference, not the owner's tasks (as in the note)
+            Section("Asked of an assistant") {
+                ForEach(asked, id: \.self) { Label($0.description, systemImage: "sparkle").textSelection(.enabled) }
             }
         }
     }

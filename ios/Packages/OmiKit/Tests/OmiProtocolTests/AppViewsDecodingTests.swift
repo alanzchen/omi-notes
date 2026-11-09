@@ -50,6 +50,15 @@ import Testing
         #expect(d.summary?.actionItems.first?.description == "Review the fake transcript")
         #expect(d.transcript?.segments.count == d.transcript?.total && d.noteState == "matches")
         #expect(d.speakerName("S1") == "Speaker 1")
+        #expect(d.summary?.assistantRequests == nil, "servers before assistant requests were listed apart")
+    }
+
+    @Test func assistantRequestsStayApartFromActionItems() throws {
+        let json = Self.detail.replacingOccurrences(of: #""decisions": [], "open_questions": []"#,
+                                                    with: #""assistant_requests": [{"description": "Draft the hotel email"}], "decisions": [], "open_questions": []"#)
+        let d = try decode(ConversationDetail.self, json)
+        #expect(d.summary?.assistantRequests?.map(\.description) == ["Draft the hotel email"])
+        #expect(d.summary?.actionItems.map(\.description) == ["Review the fake transcript"])
     }
 
     @Test func detailOfAnOpenConversation() throws {

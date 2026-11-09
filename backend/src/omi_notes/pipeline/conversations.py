@@ -38,7 +38,7 @@ from ..envelope import OPUS_CODECS, parse_envelope
 from ..ingest import seal_end_epoch
 from ..notes import daily as daily_mod
 from ..notes.render import NoteData, owner_display, render_note, render_stub, title_of
-from ..notes.schema import CLEANED_TEXT_MAX_S, NOTES_JSON_SCHEMA, ConversationNotes
+from ..notes.schema import CLEANED_TEXT_MAX_S, NOTES_JSON_SCHEMA, ConversationNotes, task_items
 from ..notes.status import StatusSnapshot, render_status
 from ..notes.writer import (
     UserRegionError,
@@ -95,6 +95,8 @@ _PROMPT_IN_NAME = re.compile(r"-p(\d+)-[0-9a-f]{16}\.json$")
 STATUS_INTERVAL = 60.0  # `_status.md` and stubs are rewritten at most once a minute
 EDITED_RETRY = 600.0
 MONOLOGUE_CLEANED_MAX_S = CLEANED_TEXT_MAX_S  # a monologue up to this much speech also gets a cleaned text
+CLASS_REWRITE_RETRY = 6 * 3600.0  # an owner's class change whose new summary failed is tried again after this
+CLASS_REWRITE_STAGE = "class_rewrite"  # `failed_stage` of a finished note whose class change failed (it stands)
 TOO_SHORT_S = 1.5  # detected speech below this is set aside without a note (not a failure)
 TOO_SHORT_REASON = "too short: under 1.5 s of speech"
 LOCAL_STT_DOWN = "local transcription (the omi-asr sidecar) is unavailable; waiting for it"
@@ -380,6 +382,11 @@ class ConversationPipeline:
             self._commit(conv_id, status="done", needs_render=0, next_attempt_at=None, **_outcome(row, "frozen", None))
             operations.finished(self, row["retry_op"])
             return
+        rewrite = self._class_rewrite(row)
+        if rewrite and row["frozen"]:
+            # frozen after its class change was queued: the owner's own version stands, before any provider call
+            self._set(conv_id, status=_finished_status(row), next_attempt_at=None, updated_at=now)
+            return
         if row["status"] == "closed" and sources.watch_only(self.db, row) and sources.read(self, conv_id) is None:
             # the same conversation may also be on the pendant: decide once both are finished
             if not sources.ready(self, row, now):
@@ -399,17 +406,17 @@ class ConversationPipeline:
                     return
             self.summarize_and_render(conv_id, now)
         except ProviderError as exc:
-            self._fail(conv_id, stage, exc, now)
+            self._fail(conv_id, stage, exc, now, rewrite=rewrite)
         except CacheMiss as exc:
             log.warning("conversation %s: %s; transcribing again (cached audio/STT are reused)", conv_id, exc)
             self._set(conv_id, status="closed", updated_at=now)
         except UserRegionError as exc:
-            self._fail(conv_id, stage, ProviderError(str(exc), kind="notes"), now)
+            self._fail(conv_id, stage, ProviderError(str(exc), kind="notes"), now, rewrite=rewrite)
         except NoteEdited:
             self._set(conv_id, next_attempt_at=now + EDITED_RETRY)
         except Exception as exc:  # a bug or unexpected I/O error must not stop the worker loop
             log.exception("conversation %s failed in %s", conv_id, stage)
-            self._fail(conv_id, stage, ProviderError(f"{type(exc).__name__}: {exc}"), now)
+            self._fail(conv_id, stage, ProviderError(f"{type(exc).__name__}: {exc}"), now, rewrite=rewrite)
 
     def _consume_reprocess(self, row: sqlite3.Row) -> sqlite3.Row:
         """Apply `reprocess` requests (a counter plus accumulated force flags, stored apart from the
@@ -479,7 +486,7 @@ class ConversationPipeline:
                      attempts=0, next_attempt_at=None, done_at=row["done_at"] or now, updated_at=now,
                      index_json=json.dumps({"kind": "discarded", "discard_reason": TOO_SHORT_REASON}))  # fmt: skip
 
-    def _fail(self, conv_id: str, stage: str, exc: ProviderError, now: float) -> None:
+    def _fail(self, conv_id: str, stage: str, exc: ProviderError, now: float, *, rewrite: bool = False) -> None:
         row = self._row(conv_id)
         if exc.waiting:  # the engine is down, not this conversation: wait, attempts untouched
             if row["error_kind"] != exc.kind:
@@ -487,6 +494,14 @@ class ConversationPipeline:
             self._set(conv_id, error=str(exc)[:500], error_kind=exc.kind, next_attempt_at=now + LOCAL_STT_WAIT, updated_at=now)
             return
         attempts = row["attempts"] + 1
+        if rewrite and (exc.terminal or attempts >= MAX_ATTEMPTS):
+            # an owner's class change whose new summary can't be written: the last good note, its references and
+            # the class it was made for stand (nothing rendered, nothing collected); the choice stays requested,
+            # its failure is shown with it, and `reconcile_classes` tries again after CLASS_REWRITE_RETRY
+            log.error("conversation %s: the new summary for the owner's class choice failed: %s", conv_id, exc)
+            self._set(conv_id, status=_finished_status(row), failed_stage=CLASS_REWRITE_STAGE, attempts=0,
+                      error=str(exc)[:500], error_kind=exc.kind, next_attempt_at=now + CLASS_REWRITE_RETRY, updated_at=now)  # fmt: skip
+            return
         if exc.terminal or attempts >= MAX_ATTEMPTS:
             log.error("conversation %s failed permanently in %s: %s", conv_id, stage, exc)
             self._commit(conv_id, status="failed", failed_stage=stage, attempts=attempts, error=str(exc)[:500],
@@ -861,23 +876,39 @@ class ConversationPipeline:
         queued, unreadable = 0, []
         for path in self.vault.conversations.glob("*/*/class.json"):
             conv_id = path.parent.name
-            row = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
-            if row is None or not row["note_path"] or row["frozen"] or row["status"] not in ("done", "discarded"):
-                continue
-            try:
-                choice = rclass.read(self, conv_id)
-            except rclass.UnreadableChoice as exc:
-                unreadable.append(conv_id)
-                log.error("%s", exc)
-                continue
-            applied = json.loads(row["index_json"] or "{}").get("recording_class") or {}
-            if rclass.pending(choice, applied):
-                log.info("conversation %s: the owner chose %s (revision %s): summarizing again", conv_id,
-                         (choice or {}).get("class"), (choice or {}).get("revision"))  # fmt: skip
-                self._set(conv_id, status="summarizing", next_attempt_at=None, updated_at=now)
-                queued += 1
+            try:  # one bad row never stops the others
+                row = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
+                if row is None or not row["note_path"] or row["frozen"] or row["status"] not in ("done", "discarded"):
+                    continue
+                if row["next_attempt_at"] and row["next_attempt_at"] > now:
+                    continue  # its last class change failed: tried again later (CLASS_REWRITE_RETRY)
+                try:
+                    choice = rclass.read(self, conv_id)
+                except rclass.UnreadableChoice as exc:
+                    unreadable.append(conv_id)
+                    log.error("%s", exc)
+                    continue
+                applied = json.loads(row["index_json"] or "{}").get("recording_class") or {}
+                if rclass.pending(choice, applied):
+                    log.info("conversation %s: the owner chose %s (revision %s): summarizing again", conv_id,
+                             (choice or {}).get("class"), (choice or {}).get("revision"))  # fmt: skip
+                    self._set(conv_id, status="summarizing", attempts=0, next_attempt_at=None, updated_at=now)
+                    queued += 1
+            except Exception:
+                log.exception("conversation %s: its class choice could not be checked", conv_id)
         self.db.set_meta("class_unreadable", json.dumps(sorted(unreadable)) if unreadable else None)
         return queued
+
+    def _class_rewrite(self, row) -> bool:
+        """A finished note queued again only for an owner's newer class choice (`reconcile_classes`): its last good
+        render, references and applied class stand until the new summary is written."""
+        if row["status"] != "summarizing" or row["retry_op"] or not row["note_path"] or row["llm_status"] != "ok" or not row["llm_ref"]:
+            return False
+        try:
+            choice = rclass.read(self, row["id"])
+        except rclass.UnreadableChoice:
+            return True  # its summary would fail on the unreadable choice: the note stands meanwhile
+        return rclass.pending(choice, json.loads(row["index_json"] or "{}").get("recording_class") or {})
 
     def recording(self, conv_id: str, transcript: dict, transcript_sha: str | None, *, interaction: str | None = None) -> dict:
         """The recording class this conversation is treated as (`recording_class`): the owner's choice, else the
@@ -1264,8 +1295,8 @@ class ConversationPipeline:
         index = {
             "kind": kind,
             "emoji": notes.emoji if notes else "",
-            "action_items": [_action_text(i, snap["owner_name"]) for i in rclass.visible_items(notes.action_items, recording.get("class"))
-                             if not i.directed_at_ai] if notes else [],  # fmt: skip
+            "action_items": [_action_text(i, snap["owner_name"]) for i in task_items(notes.action_items, recording.get("class"))]
+                            if notes else [],  # fmt: skip
             "llm_model": llm_cached["model"] if llm_cached else None,
             "llm_usage": _usage_sum(llm_cached.get("usage", {}), (llm_cached.get("preceded_by") or {}).get("usage", {})) if llm_cached else {},
             # a monologue's first summary call (its file is kept, its cost counted)
@@ -1754,6 +1785,11 @@ def _outcome(row, status: str, failure_kind: str | None) -> dict:
     if _kept(row).get("op") == row["retry_op"]:
         outcome["kind"] = "keep"
     return {"retry_outcome": json.dumps(outcome, sort_keys=True), "retry_op": None, "retry_stage": None}
+
+
+def _finished_status(row) -> str:
+    """The status a finished note had before its class change was queued (its render index says which)."""
+    return "discarded" if json.loads(row["index_json"] or "{}").get("kind") == "discarded" else "done"
 
 
 def _kept(row) -> dict:

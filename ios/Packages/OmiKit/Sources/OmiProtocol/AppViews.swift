@@ -23,15 +23,22 @@ public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
                 case dueDate = "due_date"
             }
         }
+        /// Something dictated to an AI assistant: a proposal for it, never one of the owner's tasks.
+        public struct AssistantRequest: Codable, Equatable, Sendable, Hashable {
+            public var description: String
+        }
         public var overview: String
         public var sections: [Section]
         public var actionItems: [ActionItem]
+        /// Nil from servers before assistant requests were listed apart.
+        public var assistantRequests: [AssistantRequest]?
         public var decisions: [String]
         public var openQuestions: [String]
 
         enum CodingKeys: String, CodingKey {
             case overview, sections, decisions
             case actionItems = "action_items"
+            case assistantRequests = "assistant_requests"
             case openQuestions = "open_questions"
         }
     }
