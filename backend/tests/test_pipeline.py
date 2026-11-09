@@ -252,7 +252,7 @@ def test_duplicate_ring_records_are_ignored(client, worker, settings):
 
 def test_restart_resumes_interrupted_stage(client, worker, settings):
     replay(client, np.concatenate([silence(1), synth_speech_like(10), silence(2)]))
-    worker.pipeline.run = lambda now, limit=20: 0  # "crash" before any stage runs
+    worker.pipeline.run = lambda now, **kw: 0  # "crash" before any stage runs
     worker.tick(T0 + 200)
     (row,) = convs(worker)
     assert row["status"] == "closed"

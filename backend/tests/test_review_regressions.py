@@ -368,7 +368,7 @@ class SlowCountingStt(FakeStt):
 def test_f10_two_workers_never_advance_the_same_conversation(client, worker, settings):
     replay(client, SPEECH)
     run = worker.pipeline.run
-    worker.pipeline.run = lambda now, limit=20: 0
+    worker.pipeline.run = lambda now, **kw: 0
     worker.tick(T0 + 200)
     worker.pipeline.run = run
     (row,) = convs(worker)

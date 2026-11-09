@@ -334,7 +334,7 @@ def test_r2b_1_one_bad_row_does_not_stall_the_rest(client, worker, monkeypatch, 
         worker.tick(T0 + 5000)
         assert [r["device_id"] for r in convs(worker)] == [other]
     else:
-        worker.pipeline.run = lambda now, limit=20: 0
+        worker.pipeline.run = lambda now, **kw: 0
         worker.tick(T0 + 5000)
         del worker.pipeline.run
         first, second = convs(worker)
