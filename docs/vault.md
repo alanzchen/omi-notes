@@ -29,14 +29,14 @@ operational index. Copy the folder anywhere, point a backend at it, and it rebui
                                           coverage/loss intervals, continuation checkpoint for a deleted prefix — rewritten (server only)
     raw/<device>/<capture>/receipts.jsonl {seq, sha256, received_at} per accepted chunk — append-only
     events/YYYY-MM-DD.jsonl               {event_id, received_at, body} — append-only (torn tail repaired before appending)
-    conversations/YYYY-MM/<id>/conversation.json   decision + render + failure blocks — rewritten atomically (server only)
+    conversations/YYYY-MM/<id>/conversation.json   decision + render + failure (+ retry, resolution, deferral) blocks — rewritten atomically (server only)
     conversations/YYYY-MM/<id>/{stt,diarization,llm,voices}-*.json, transcript.json   write-once
     people/<person_id>/samples/<sample_id>.json    voiceprint {model, model_sha, dim, vector_b64, source, seconds, created_at}
     people/<person_id>/enrollment/<id>.omiaudio    wearer's own consented enrollment audio (FLAC bytes; non-attachment extension)
     people/<person_id>/enrollments/<id>.json       enrollment result
     speakers/settings.json                         recognition acknowledgment, unknown-voice opt-in, dismissed suggestions
     displaced/<sha>.md                             user-edited note versions set aside by an explicit "overwrite"
-    operations/<request_id>.json                   app retries: accepted → done | failed | superseded (see "Operations")
+    operations/<request_id>.json                   app retries, keeps and transcription requests: accepted → done | failed | superseded (see "Operations")
 ```
 
 `VAULT.json` `format` is 1 until the first app retry raises it to 2 (records may then carry retry
@@ -50,6 +50,17 @@ request_id, requests, source: app|pendant, event_id?}` is the owner's explicit c
 or a star from the pendant's double tap, applied from its button event) for a conversation (`PUT …/priority`): read on
 demand, never derived, never overwritten by a re-summary, untouched by rebuilds and re-renders. It
 changes nothing else (note, path, keep/discard, statistics). Older backends ignore the file.
+
+`conversation.json` `deferral` `{policy: "short_speech", threshold_s, speech_s, decided_at, provisional:
+{class, confidence, rule_id, model}, requested?: {op, at}}` is written when segmentation finalizes a
+conversation with under `DEFER_SPEECH_SECONDS` (60) of speech (not an enrollment, not under 1.5 s). The
+status stays `closed`; the index column `deferral` is derived from it, so a rebuild reproduces the deferred
+state, and `requested` (the owner's transcription request) survives restarts, rebuilds and retries. The
+block stays after the session is transcribed, as history. No format raise: an older backend ignores the
+key, transcribes deferred sessions normally and drops the block when it rewrites the record, and logs the
+`transcribe` operation files it doesn't know (never overwritten). The render index's `recording_class` may
+be `{revision, outcome: "not_applicable"}` for a deterministic discard: the owner's choice it handled
+without applying.
 
 No lock files, temp files, logs, or caches that aren't referenced results live in the vault.
 
@@ -148,6 +159,15 @@ resolved_at, failure: {stage, kind, id}}`, which stays in the record for good. W
 writes the cached unseparated text as a transcript with speaker `unknown` (no labels or voiceprints)
 and renders a transcript-only note without a summary; a rebuild reproduces the same note.
 
+A transcription request (`POST /v1/conversations/{id}/transcribe`, `kind: "transcribe"`) for a
+deferred short session is written first too; the index notes it (`transcribe_op`, operational), and
+`deferral.requested: {op, at}` is committed into the record under the conversation's claim, by the
+API, the worker or the sweeper (whichever holds it; after a rebuild the sweeper notes it again from
+the file). One request per conversation: other requests answer with it. It closes `done` once the
+conversation has a note (or was set aside) and `failed` when processing failed; a request for a
+conversation already finished is closed at once (`outcome: "already"`). It never forces fresh
+inference.
+
 A dismiss (`POST /v1/conversations/{id}/dismiss`) queues nothing: it commits only
 `resolution: {kind: "dismissed", op, resolved_at, failure: {stage, kind, id}}` into a failed
 conversation's record (format 3). That failure (matched by `failure.id`) leaves the issues and the
@@ -169,7 +189,7 @@ Unknown-voice embeddings are pruned with raw retention.
    `capture.json` evidence (ring_seen, coverage, losses for deleted prefixes).
 4. Load events (dedupe by id; first wins; conflicting body flagged), heartbeat coverage, devices.
 5. Load conversation records (status derived: no render → closed; render.kind → done/discarded;
-   failure → failed) and people / speaker assignments.
+   failure → failed; `deferral` kept as the index's `deferral`) and people / speaker assignments.
 6. Validate: a record referencing a chunk/result/llm_ref that is neither present nor tombstoned ⇒
    the vault opens **read-only** and reports the gap ("incomplete sync is not an empty vault").
 7. `replay_pending`: the normal `process_chunks` re-derives speech/coverage/losses/ring_seen for all

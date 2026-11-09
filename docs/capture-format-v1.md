@@ -254,7 +254,8 @@ No auth. `200 {"ok": true}`.
   "stt": {"provider": "openai", "model": "whisper-large-v3-turbo", "diarization": "local", "ready": true},
   "llm": {"provider": "anthropic", "model": "claude-opus-5", "ready": true},
   "queue": {"chunks_pending": 0, "conversations_open": 1, "conversations_pending": 0, "failed": 0,
-            "conversations_failed": 0, "chunks_failed": 0, "conversations_retrying": 0, "notes_conflicted": 0},
+            "conversations_failed": 0, "chunks_failed": 0, "conversations_retrying": 0, "notes_conflicted": 0,
+            "conversations_deferred": 0},
   "worker": {"present": true},
   "last_note_at": "2026-09-26T19:20:41.002Z",
   "vault_dir": "/Users/alan/Notes/Omi",
@@ -285,7 +286,8 @@ configured service (cached results don't count, so reuse never looks like a work
 successful transcription request is not yet a finished transcript); null until one happens or
 after an index rebuild, and scoped to the current provider configuration. `vault_id` identifies the
 vault, so the phone can tell when a URL starts serving another one. `failed` is the sum of `conversations_failed` and `chunks_failed`, kept
-for older phones. With the local transcription sidecar configured, top-level `stt` describes it: `provider: "local"`, `model` naming its three models and their roles (MOSS-Transcribe-Diarize for speakers, Qwen3-ASR for text, Qwen3-ForcedAligner for timing), `diarization: "provider"`, `ready` = its health check answering now (the one network call this endpoint makes, cached 30 s), and `engine` {name, healthy, self_test, models}; `local_transcription` says when it was last checked and since when it is down. Recordings with under 1.5 s of detected speech are set aside (`discarded`, no note, raw audio kept) and appear in no list, issue or count. Model labels are non-secret; base URLs and keys are never reported. Fields added
+for older phones. `conversations_pending` excludes deferred short sessions (servers with `deferred_transcription`), which
+`conversations_deferred` counts: they wait for an idle moment or the owner, and are not a backlog. With the local transcription sidecar configured, top-level `stt` describes it: `provider: "local"`, `model` naming its three models and their roles (MOSS-Transcribe-Diarize for speakers, Qwen3-ASR for text, Qwen3-ForcedAligner for timing), `diarization: "provider"`, `ready` = its health check answering now (the one network call this endpoint makes, cached 30 s), and `engine` {name, healthy, self_test, models}; `local_transcription` says when it was last checked and since when it is down. Recordings with under 1.5 s of detected speech are set aside (`discarded`, no note, raw audio kept) and appear in no list, issue or count. Model labels are non-secret; base URLs and keys are never reported. Fields added
 after v1's first release may be absent on older servers; the phone treats absence as unknown.
 
 ### `PUT /v1/captures/{capture_id}/chunks/{chunk_sequence}`
@@ -426,7 +428,7 @@ own raw originals permanently (it never deletes raw audio), so the phone may del
 7 days, or `sent/` above 1 GB, oldest first) wins over this rule: acknowledged chunks are already
 durable on the server. Unacknowledged files are never deleted. `404` for unknown capture.
 
-### `GET /v1/conversations/recent?limit=20&before=<cursor>`
+### `GET /v1/conversations/recent?limit=20&before=<cursor>&day=&short=`
 
 Newest first (`start` descending, then id), for the app's home screen. Voice enrollment recordings
 (including those still waiting for the enrollment to end) are excluded before applying the limit.
@@ -465,6 +467,40 @@ the speakers endpoint remains unavailable before transcription. This additive fi
 on older servers; the phone then offers details only for `done` or `discarded` rows with a note path.
 Every field after `title` except `note_path`, `late_audio` and `provisional` is additive: older
 servers omit them and the phone falls back to `status`.
+
+Servers with `deferred_transcription` add to each entry `speech_s` (detected speech; `duration_s` is the
+elapsed span and never decides a short session), `day` (the server's local YYYY-MM-DD of `started_at`),
+`revision` (the note's revision, bumped whenever its content changes; null without a note: the phone reloads
+a cached detail when it moves) and `deferred` (below), and to the response `short_s` (the short-session
+threshold, 60) and `days`: for each day of this page's entries, that whole day's short sessions, whatever
+the page or filter: `{"2026-11-08": {"short": 9, "deferred": 7, "requested": 1, "issues": 1}}` (`issues`:
+failed, or carrying an issue). `day=YYYY-MM-DD` and `short=true|false` (under `short_s` of speech, or at
+least it) filter before paging.
+
+#### Deferred short sessions (`features` contains `deferred_transcription`)
+
+A finalized conversation with under 60 s of detected speech (and at least 1.5 s: shorter ones are set aside
+as before) is not transcribed by default. The decision is made after the usual closure (the 120 s gap,
+provisional closure and late audio are unchanged) and kept in the vault. Its `status` stays `closed`, its
+`state.code` is `deferred`, and `deferred` is `{"state": "waiting"|"requested", "operation_id", "threshold_s",
+"provisional_class"}` until it has a note (then null). The server transcribes it on its own only when nothing
+else is runnable, its summary included. Its `recording_class` is provisional until then: `{class:
+"undetermined", provisional: true, rule_id, model, …}` (`model`: the identity of the model a provisional rule
+depends on, null for now), or the owner's choice (`overridden: true`). A class change on a deferred session
+is stored and shown, and schedules nothing; the first summary applies it. Raw audio is kept as always.
+
+### `POST /v1/conversations/{id}/transcribe` (servers with `deferred_transcription`)
+
+`{"request_id": "<lowercase uuid>"}` asks for a deferred session now: a durable operation like a retry
+(`kind: "transcribe"`), written to the vault before the answer. The conversation is then processed with
+ordinary work, also after a restart, an index rebuild or a retry. `202 {"operation": …}` for a new request.
+`200` with the existing operation for a repeated request id, for another request while one for the same
+conversation is open (taps share one request, also with an idle-lane job already running), or for a
+conversation that already has its note (`state: "done"`; nothing new is run). Results already made (a
+transcript, a summary) are used as they are. The operation's states: `queued`, `running`, `backing_off`,
+`done` (it has a note, or was set aside), `failed` (processing failed: use Retry). `404` unknown, `409
+in_progress` while recording, `409 failed` for a failed conversation, `409 request_conflict` for a request id
+of another operation, `422` invalid body, `503` read-only vault.
 
 ## App views
 
@@ -643,7 +679,11 @@ same `request_id` again is applied once; an older `set_at` than the stored one i
 note (its own version stands; also a note frozen after the choice is left as it is), `409 failed` for a
 conversation whose processing failed (retry it first; the retry's summary reads a later choice),
 `409 unreadable` when the stored choice can't be read (never treated as no
-choice), `422` invalid body, `503` read-only vault.
+choice), `409 not_applicable` for a recording set aside without a summary (a deterministic relevance rule,
+or a Watch recording kept as the pendant's alternate: no kind changes that; a choice stored by other means
+is recorded as handled with `outcome: "not_applicable"`, never applied in a loop), `422` invalid body, `503`
+read-only vault. For a conversation without a note yet (deferred or queued) the answer is the provisional
+view above.
 
 ### `PUT /v1/conversations/{id}/priority`
 
