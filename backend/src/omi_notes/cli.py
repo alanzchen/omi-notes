@@ -685,10 +685,11 @@ def reprocess(
     since: str = typer.Option(None, help="All conversations starting on/after this date (YYYY-MM-DD, local)"),
     restt: bool = typer.Option(False, help="Discard the cached transcription (calls STT again)"),
     force_llm: bool = typer.Option(False, help="Discard the cached summary (calls the LLM again)"),
+    queue_only: bool = typer.Option(False, help="Only queue it for the server's worker, never run it here"),
 ) -> None:
     """Re-run STT/summary for conversations, reusing caches unless told otherwise.
 
-    Runs inline when no worker is running; otherwise queues the work for the worker."""
+    Runs inline when no worker is running (unless --queue-only); otherwise queues the work for the worker."""
     from .lock import worker_lock
 
     settings = load_settings()
@@ -708,6 +709,9 @@ def reprocess(
     if skipped:
         typer.echo(f"Skipped {len(skipped)} conversation(s) with an app retry queued: {', '.join(skipped)}")
         rows = [r for r in rows if r["id"] not in skipped]
+    if queue_only:  # a scheduled caller (the ASR backfill) must not take the worker lock from a restarting server
+        typer.echo(f"{len(rows)} conversation(s) queued for the server's worker.")
+        return
     lock = worker_lock(w.vault)
     if not lock.acquire():
         typer.echo(f"A worker is running: {len(rows)} conversation(s) queued for it.")

@@ -84,7 +84,7 @@ def test_a_second_backend_on_one_vault_refuses_to_start_even_with_another_index(
 
 
 def test_serve_with_a_worker_refuses_while_a_separate_worker_runs(tmp_path):
-    settings = make_settings(tmp_path)
+    settings = make_settings(tmp_path).model_copy(update={"worker_lock_wait_seconds": 0.2})
     create_app(settings, start_worker=False)  # creates the vault
     lock = worker_lock(Vault.open(settings))
     assert lock.acquire()

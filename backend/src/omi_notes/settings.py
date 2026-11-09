@@ -67,6 +67,9 @@ class Settings(BaseSettings):
     # in overlapping requests of up to STT_LOCAL_MAX_REQUEST_SECONDS with its own speakers; while it is down,
     # conversations wait for it. Empty = the STT_* provider above.
     stt_local_url: str = ""
+    # How long a starting server waits for the worker lock held by another process (a maintenance command
+    # running work inline, e.g. during a deploy) before refusing to start its own worker.
+    worker_lock_wait_seconds: float = 300.0
     stt_local_model: str = "omi-asr"
     # one MOSS window: it stops by itself after ~16.4k output tokens, which dense speech reaches at ~20 min
     # (asr-bench-20261108 longwin), so 15 min leaves room

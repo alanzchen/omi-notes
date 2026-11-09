@@ -727,3 +727,38 @@ def test_a_recording_with_under_a_second_and_a_half_of_speech_is_set_aside_quiet
     assert not worker.db.query(f"SELECT id FROM conversations WHERE {views.LISTED}"), "not in the list"
     assert not views.server_issues(worker.db, read_only=None, worker=True)
     assert list(settings.raw_dir.rglob("*.omnc")), "its raw audio is kept"
+
+
+def test_reprocess_queue_only_never_runs_the_work_itself_even_with_no_worker(client, worker, settings):
+    from typer.testing import CliRunner
+
+    from omi_notes.cli import app as cli
+
+    from .conftest import cli_env
+
+    worker.providers._local_stt, _ = sidecar(moss_like)
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    out = CliRunner().invoke(cli, ["reprocess", row["id"], "--restt", "--queue-only"], env=cli_env(settings)).output
+    assert "queued" in out.lower(), out
+    (after,) = convs(worker)
+    assert after["reprocess_request"] > after["reprocess_handled"], "left for the server's worker"
+
+
+def test_the_server_waits_for_a_maintenance_command_to_release_the_worker_lock():
+    from omi_notes.api import acquire_worker_lock
+
+    class Lock:
+        def __init__(self, free_after):
+            self.tries, self.free_after = 0, free_after
+
+        def acquire(self):
+            self.tries += 1
+            return self.tries > self.free_after
+
+        def owner(self):
+            return 4242
+
+    assert acquire_worker_lock(Lock(3), wait=5.0, step=0.01) is True
+    assert acquire_worker_lock(Lock(10**6), wait=0.05, step=0.01) is False

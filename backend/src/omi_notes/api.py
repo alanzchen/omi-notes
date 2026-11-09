@@ -49,6 +49,21 @@ def _day(value: str | None, tz, *, next_day: bool = False) -> float | None:
     return datetime.combine(day, dt_time.min, tzinfo=tz).timestamp()
 
 
+def acquire_worker_lock(lock, *, wait: float, step: float = 1.0) -> bool:
+    """The vault's worker lock, waiting up to `wait` seconds for whoever holds it (a maintenance command running
+    work inline while no server was up, e.g. during a deploy) rather than failing the start at once."""
+    deadline = time.monotonic() + wait
+    if lock.acquire():
+        return True
+    log.warning("the worker lock is held by pid %s; waiting up to %.0f s for it", lock.owner(), wait)
+    while time.monotonic() < deadline:
+        time.sleep(step)
+        if lock.acquire():
+            log.info("worker lock released by its holder; starting the worker")
+            return True
+    return False
+
+
 def create_app(
     settings: Settings, *, start_worker: bool = True, worker: Worker | None = None, take_over: bool = False
 ) -> FastAPI:
@@ -85,7 +100,7 @@ def create_app(
             if start_worker:
                 w = worker or Worker(settings, db)
                 w.take_over = take_over
-                if not w.lock.acquire():
+                if not acquire_worker_lock(w.lock, wait=settings.worker_lock_wait_seconds):
                     raise VaultBusy(f"a separate `omi-notes worker` (pid {w.lock.owner()}) is processing this vault; "
                                     "run `omi-notes serve --no-worker` next to it")  # fmt: skip
                 thread = threading.Thread(target=w.run_forever, args=(stop,), name="omi-notes-worker", daemon=True)
