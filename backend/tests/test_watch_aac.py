@@ -145,3 +145,18 @@ def test_a_damaged_alternate_copy_is_rewritten_before_the_resend_is_acknowledged
     alternate.write_bytes(as_aac[0][:100])  # truncated on disk
     assert put_chunk(client, capture, 0, as_aac[0]).status_code == 200
     assert alternate.read_bytes() == as_aac[0], "the sent bytes are durably there again before the 200"
+
+
+def test_a_different_last_half_second_is_not_the_same_audio():
+    # Astra's probe: 30.5 s with the final 0.5 s replaced slipped past the whole-second windows
+    from omi_notes.ingest import same_audio
+
+    capture = str(uuid.uuid4())
+    pcm = talk(30.5, 3)
+    changed = pcm.copy()
+    t = np.arange(8000) / 16000  # other speech: a different voice (talk() shares one carrier across seeds)
+    changed[-8000:] = (8000 * np.sin(2 * np.pi * 237 * t) * np.sin(2 * np.pi * 3 * t)).astype(np.int16)
+    a = parse_envelope(pcm_envelopes(pcm, capture_id=capture, device_id=WATCH, started_at=STARTED, source="watch_mic")[0])
+    b = parse_envelope(aac_envelopes(changed, capture_id=capture, device_id=WATCH, started_at=STARTED)[0])
+    assert same_audio(a, b) is False
+    assert same_audio(a, parse_envelope(aac_envelopes(pcm, capture_id=capture, device_id=WATCH, started_at=STARTED)[0])) is True

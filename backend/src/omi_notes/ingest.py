@@ -662,8 +662,16 @@ def same_audio(a, b) -> bool:
     lag = best if best <= SAME_AUDIO_MAX_LAG else best - len(lags)
     xa, ya = (x[lag:], y[: n - lag]) if lag >= 0 else (x[: n + lag], y[-lag:])
     floor = 0.05 * max(ex, ey)
-    for k in range(0, len(xa) - SAME_AUDIO_WINDOW + 1, SAME_AUDIO_WINDOW):
-        wx, wy = xa[k : k + SAME_AUDIO_WINDOW], ya[k : k + SAME_AUDIO_WINDOW]
+    # what the alignment trims off either copy's edges may only be codec padding: quiet
+    edges = (x[:lag], y[n - lag :]) if lag > 0 else (y[:-lag], x[n + lag :]) if lag < 0 else ()
+    if any(len(e) and float(np.sqrt((e**2).mean())) >= floor for e in edges):
+        return False
+    # every aligned window, the last partial one too (a tail under 0.1 s joins the window before it)
+    bounds = list(range(0, len(xa), SAME_AUDIO_WINDOW)) + [len(xa)]
+    if len(bounds) > 2 and bounds[-1] - bounds[-2] < SAME_AUDIO_WINDOW // 10:
+        bounds.pop(-2)
+    for a, b in zip(bounds, bounds[1:], strict=False):
+        wx, wy = xa[a:b], ya[a:b]
         rx, ry = float(np.sqrt((wx**2).mean())), float(np.sqrt((wy**2).mean()))
         if rx < floor and ry < floor:
             continue
