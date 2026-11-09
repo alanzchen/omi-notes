@@ -123,4 +123,28 @@ import OmiProtocol
         #expect(t.outbox.quarantined().map(\.name) == [name] && t.outbox.pending().isEmpty)
         #expect(try Data(contentsOf: t.outbox.requeuedLedger) == Data("{not json".utf8), "left for a person to look at")
     }
+
+    @Test func aRequeuedFileStaysPendingWhenItsSecondQuarantineCantBeRecorded() throws {
+        // Astra: the move went ahead without the record, and the next startup moved it back a second time
+        let t = TestEnv()
+        let item = try t.outbox.write(Data("chunk 10".utf8), kind: .chunk(captureId: "cap", sequence: 10))
+        try saveIntent(t, item.name)
+        let parent = t.outbox.requeuedLedger.deletingLastPathComponent()
+        chmod(parent.path, 0o555)  // the ledger can be read but not replaced
+        #expect(throws: (any Error).self) { try t.outbox.quarantine(item.name, reason: "409: real conflict") }
+        chmod(parent.path, 0o755)
+        #expect(t.outbox.pending().map(\.name) == [item.name] && t.outbox.quarantined().isEmpty, "kept where it was")
+        #expect(try t.outbox.recoverRequeueIntents() == [], "pending: the startup check only completes the record")
+        try t.outbox.quarantine(item.name, reason: "409: real conflict")
+        #expect(try t.outbox.readRequeueLedger()[item.name]?.state == .done)
+        #expect(try t.outbox.recoverRequeueIntents() == [] && (try t.outbox.requeueConflicts()) == [])
+    }
+
+    @Test func nothingIsQuarantinedWhileTheLedgerCantBeRead() throws {
+        let t = TestEnv()
+        let item = try t.outbox.write(Data("chunk 11".utf8), kind: .chunk(captureId: "cap", sequence: 11))
+        try FileIO.atomicWrite(Data("{not json".utf8), to: t.outbox.requeuedLedger)
+        #expect(throws: Outbox.RequeueError.self) { try t.outbox.quarantine(item.name, reason: "409: x") }
+        #expect(t.outbox.pending().map(\.name) == [item.name], "it may be a re-queued file whose record is in there")
+    }
 }

@@ -204,7 +204,8 @@ public final class Outbox: @unchecked Sendable {
         }
     }
 
-    /// pending → quarantine with a `.reason` sidecar.
+    /// pending → quarantine with a `.reason` sidecar. Throws, leaving the file pending, when it may be a
+    /// re-queued file whose record can't be read or completed (the move would let it be re-queued twice).
     public func quarantine(_ name: String, reason: String) throws {
         lock.lock(); defer { lock.unlock() }
         let src = dirs.outboxPending.appendingPathComponent(name)
@@ -212,7 +213,7 @@ public final class Outbox: @unchecked Sendable {
         guard FileIO.exists(src) else { return }
         let freshPending = isFreshLocked(dirs.outboxPending), freshQuarantine = isFreshLocked(dirs.outboxQuarantine)
         if FileIO.exists(dst) { try? FileManager.default.removeItem(at: dst) }
-        noteQuarantinedAgainLocked(name, reason: reason)  // before the move: a crash between them can't requeue it twice
+        try noteQuarantinedAgainLocked(name, reason: reason)  // before the move: a crash between them can't requeue it twice
         try FileManager.default.moveItem(at: src, to: dst)
         try? Data(reason.utf8).write(to: dst.appendingPathExtension("reason"))
         updateLocked(dirs.outboxPending, wasFresh: freshPending) { $0[name] = nil }
@@ -331,12 +332,16 @@ public final class Outbox: @unchecked Sendable {
     }
 
     /// A file quarantined again after a re-queue whose "done" a crash lost: recorded as done (with the new
-    /// reason), so it is never moved back a second time. Caller holds the lock.
-    private func noteQuarantinedAgainLocked(_ name: String, reason: String) {
-        guard FileIO.exists(requeuedLedger) else { return }
-        guard var ledger = try? readRequeueLedger(), ledger[name]?.state == .intent else { return }
+    /// reason), so it is never moved back a second time. Throws when the ledger can't be read or saved:
+    /// the caller then leaves the file where it is. Caller holds the lock.
+    private func noteQuarantinedAgainLocked(_ name: String, reason: String) throws {
+        var ledger = try readRequeueLedger()
+        guard ledger[name]?.state == .intent else { return }
         ledger[name] = RequeueEntry(state: .done, reason: (ledger[name]?.reason ?? "") + "\nquarantined again: " + reason)
-        do { try saveRequeueLedger(ledger) } catch { log(.error, "outbox", "couldn't record \(name) quarantined again: \(error)") }
+        do { try saveRequeueLedger(ledger) } catch {
+            log(.error, "outbox", "couldn't record \(name) quarantined again: \(error)")
+            throw error
+        }
     }
 
     /// Debug: move a quarantined file back to pending for another attempt.
