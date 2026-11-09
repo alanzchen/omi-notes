@@ -467,10 +467,11 @@ class SpeakerStore:
     def _publish_sample(self, person_id: str, sample_id: str, data: dict) -> None:
         """A changed sample file, then its index row. The index is marked as possibly behind the files first, and
         unmarked only after its row is written: a crash in between leaves the mark, and `sync_samples` reloads."""
-        self.db.set_meta("samples_dirty", "1")
+        key = f"samples_dirty:{sample_id}:{int(data.get('revision') or 0)}"  # this change only
+        self.db.set_meta(key, "1")
         Vault.write_json(self.sample_path(person_id, sample_id), data)
         self._index_sample(data)
-        self.db.set_meta("samples_dirty", None)
+        self.db.set_meta(key, None)
 
     # -- review flags (`speakers.flags`) ----------------------------------------------------------
 
@@ -917,10 +918,12 @@ class SpeakerStore:
         """Re-index voice samples if the index lost any (or kept a deleted one)."""
         files = {p.stem for p in self.vault.people.glob("*/samples/*.json")} if self.vault.people.exists() else set()
         indexed = {r["id"] for r in self.db.query("SELECT id FROM samples")}
-        if files == indexed and self.db.meta("samples_dirty") is None:
+        dirty = [r["key"] for r in self.db.query("SELECT key FROM meta WHERE key LIKE 'samples_dirty:%'")]
+        if files == indexed and not dirty:
             return False
         self.load_samples()  # a file the index lost or kept, or a change whose index write never happened
-        self.db.set_meta("samples_dirty", None)
+        for key in dirty:  # exactly the changes this reload covered (a later one marks itself again)
+            self.db.set_meta(key, None)
         return True
 
     def reference_voices(self, conv_id: str, name: str) -> None:
