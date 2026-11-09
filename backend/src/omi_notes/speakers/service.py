@@ -385,7 +385,8 @@ class SpeakerService:
         models = self.store.models(*key, self.pipeline.operating) if key else {}
         dismissed = {k: float(v) for k, v in prefs["dismissed"].items()}
         found = speaker_suggest.suggestions(candidates, models, me_exists=self.store.me() is not None, dismissed=dismissed,
-                                            now=now, limit=len(candidates) or 1)  # fmt: skip
+                                            now=now, limit=len(candidates) or 1,
+                                            space=self.store.rm_space(*key) if key else None)  # fmt: skip
         del excerpts
         return found, prefs
 
