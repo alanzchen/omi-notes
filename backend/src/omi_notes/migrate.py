@@ -149,7 +149,8 @@ def migrate(settings: Settings, notes_dir: Path, data_dir: Path, vault_dir: Path
             _conversations(conn, settings, data_dir, vault, report)
             vault.info = new_vault_info(settings) | {"format": FORMAT, "migrated_from": {"notes_dir": str(notes_dir),
                                                                                          "data_dir": str(data_dir)}}  # fmt: skip
-            Vault.write_json(vault.vault_json, vault.info)
+            with vault.meta_lock():  # the one lock every VAULT.json writer takes
+                Vault.write_json(vault.vault_json, vault.info)
             if check:
                 _check(conn, settings, vault, report)
         finally:

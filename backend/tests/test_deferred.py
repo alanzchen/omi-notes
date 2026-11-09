@@ -479,3 +479,31 @@ def test_hundreds_of_reruns_never_hide_the_deferred_lane(client, worker):
     assert picks[-1] == "deferred", picks
     excluded = {f"r{i:03d}" for i in range(205)}
     assert worker.pipeline.next_claim(10**6, exclude=excluded)["id"] == "deferred"
+
+
+def test_format_raises_from_separate_handles_are_serialized_and_never_go_down(client, worker, settings, monkeypatch):
+    import threading
+
+    from omi_notes.vault import Vault
+
+    a, b = Vault.open(settings), Vault.open(settings)
+    a.raise_format(3)
+    written: list[int] = []
+    real = Vault.write_json
+    in_write = threading.Event()
+
+    def slow_write(path, data):
+        if path.name == "VAULT.json":
+            if data.get("format") == 4:
+                in_write.set()
+                threading.Event().wait(0.3)  # the speaker request is slow to write its 4
+            written.append(data.get("format"))
+        return real(path, data)
+
+    monkeypatch.setattr(Vault, "write_json", staticmethod(slow_write))
+    t = threading.Thread(target=a.raise_format, args=(4,))
+    t.start()
+    in_write.wait(2)
+    b.raise_format(5)  # the worker deferring a session meanwhile
+    t.join()
+    assert written == sorted(written) and vault_format(settings) == 5, written

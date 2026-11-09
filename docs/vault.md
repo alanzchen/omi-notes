@@ -44,8 +44,12 @@ state), the first keep from the phone raises it to 3 (records may carry `resolut
 first "keep unknown" of a voice raises it to 4 (`speakers.json` label states may be
 `source: "unknown"`), and the first deferred short session or transcription request raises it to 5
 (records may carry `deferral`, `_omi/operations/` may hold `kind: "transcribe"`); an older backend
-refuses a newer vault instead of rewriting records without that state. A raise re-reads `VAULT.json`
-first, so a handle with a stale copy never lowers it.
+refuses a newer vault instead of rewriting records without that state. Every `VAULT.json`
+read-modify-write (a format raise, render settings, creation, migration) holds `vault-meta.lock`:
+a process-wide lock shared by all handles on the vault plus a `flock` under LOCK_DIR. That covers
+the API, the worker and the CLI as separate processes on this host, and it also covers commands
+that run inline because they took the worker lock. A raise re-reads the file under the lock, so
+concurrent raises never lower the format. Other hosts are kept out by the writer lease.
 
 **Rollback:** once the vault is format 5, roll back only to a release that reads format 5 (this
 deferral work or later); an older one refuses to start rather than erase deferral and request

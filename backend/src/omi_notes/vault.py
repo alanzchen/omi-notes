@@ -196,8 +196,12 @@ class Vault:
             )
         if not create:
             raise VaultError(f"{vault.root} is not an omi-notes vault (no _omi/VAULT.json)")
-        vault.info = new_vault_info(settings)
-        vault.write_json(vault.vault_json, vault.info)
+        with vault.meta_lock():
+            if vault.vault_json.exists():  # another process created it meanwhile
+                vault.info = json.loads(vault.vault_json.read_text())
+                return vault
+            vault.info = new_vault_info(settings)
+            vault.write_json(vault.vault_json, vault.info)
         log.info("initialized vault %s (%s)", vault.root, vault.vault_id)
         return vault
 
@@ -205,26 +209,45 @@ class Vault:
     def format(self) -> int:
         return int(self.info.get("format", 1))
 
-    def raise_format(self, fmt: int) -> None:
-        """Mark the vault as using a newer format's data (durably, before that data is written), so
-        an older backend refuses it instead of silently dropping what it doesn't understand."""
+    def meta_lock(self):
+        """Serializes every read-modify-write of VAULT.json: one lock per vault path, shared by every handle in this
+        process (a process-wide RLock) and by other processes on this host (a `flock` under LOCK_DIR, outside the
+        synced vault). The API, the worker and CLI commands each open their own handles; without it, one raising
+        to 4 from a stale read could write over another's 5."""
+        from .lock import SpeakerLock
+
+        return SpeakerLock(self, name="vault-meta.lock")
+
+    def _reload_info(self) -> None:
         on_disk = self.read_json(self.vault_json) or {}
         if isinstance(on_disk, dict) and on_disk:
-            self.info = on_disk  # another handle may have raised it already: never lower it from a stale copy
-        if self.format >= fmt:
-            return
-        info = dict(self.info) | {"format": fmt}
-        self.write_json(self.vault_json, info)
-        self.info = info
+            self.info = on_disk  # another handle may have changed it: never write from a stale copy
+
+    def raise_format(self, fmt: int) -> None:
+        """Mark the vault as using a newer format's data (durably, before that data is written), so
+        an older backend refuses it instead of silently dropping what it doesn't understand. The read,
+        check and write happen under `meta_lock`, so concurrent raises never lower the format."""
+        with self.meta_lock():
+            self._reload_info()
+            if self.format >= fmt:
+                return
+            info = dict(self.info) | {"format": fmt}
+            self.write_json(self.vault_json, info)
+            self.info = info
 
     def sync_render_settings(self, settings: Settings) -> None:
         """Record explicitly configured render-affecting settings (TIMEZONE, OWNER_NAME) in
         VAULT.json, so another machine pointed at this vault renders the same notes."""
-        changed = {key: getattr(settings, key) for key in ("timezone", "owner_name")
-                   if key in settings.model_fields_set and self.info.get(key) != getattr(settings, key)}  # fmt: skip
-        if changed:
-            self.info |= changed
-            self.write_json(self.vault_json, self.info)
+        if not any(key in settings.model_fields_set and self.info.get(key) != getattr(settings, key)
+                   for key in ("timezone", "owner_name")):  # fmt: skip
+            return
+        with self.meta_lock():
+            self._reload_info()
+            changed = {key: getattr(settings, key) for key in ("timezone", "owner_name")
+                       if key in settings.model_fields_set and self.info.get(key) != getattr(settings, key)}  # fmt: skip
+            if changed:
+                self.info = dict(self.info) | changed
+                self.write_json(self.vault_json, self.info)
 
     # -- files -----------------------------------------------------------------------------------
 
