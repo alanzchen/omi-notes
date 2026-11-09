@@ -945,15 +945,25 @@ class SpeakerStore:
 
     def sync_samples(self) -> bool:
         """Re-index voice samples if the index lost any (or kept a deleted one)."""
+        if not self._samples_stale():  # the lock-free fast path (a GET)
+            return False
+        # a rebuild reads every sample file and rewrites the index: never concurrently with a sample change (which
+        # holds the lock), or a stale read would overwrite it; decided again under the lock
+        with self.lock:
+            dirty = self._samples_stale()
+            if not dirty:
+                return False
+            self.load_samples()  # a file the index lost or kept, or a change whose index write never happened
+            for key in dirty[1]:  # exactly the changes this reload covered (a later one marks itself again)
+                self.db.set_meta(key, None)
+            return True
+
+    def _samples_stale(self) -> tuple[bool, list[str]] | None:
+        """(True, dirty markers) when the samples index is behind the sample files, else None."""
         files = {p.stem for p in self.vault.people.glob("*/samples/*.json")} if self.vault.people.exists() else set()
         indexed = {r["id"] for r in self.db.query("SELECT id FROM samples")}
         dirty = [r["key"] for r in self.db.query("SELECT key FROM meta WHERE key LIKE 'samples_dirty:%'")]
-        if files == indexed and not dirty:
-            return False
-        self.load_samples()  # a file the index lost or kept, or a change whose index write never happened
-        for key in dirty:  # exactly the changes this reload covered (a later one marks itself again)
-            self.db.set_meta(key, None)
-        return True
+        return (True, dirty) if files != indexed or dirty else None
 
     def reference_voices(self, conv_id: str, name: str) -> None:
         """Record which voices file the (unchanged) label states now go with."""
