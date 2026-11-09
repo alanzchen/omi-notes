@@ -543,6 +543,23 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         if supported { UserDefaults.standard.set(generation, forKey: Self.watchAACKey) } else { UserDefaults.standard.removeObject(forKey: Self.watchAACKey) }
     }
 
+    /// The server answers the same audio sent again (another encoding of a stored chunk) with 200
+    /// (`same_audio_resend`): chunks quarantined for a 409 go back to the upload queue, each once ever.
+    public func noteServerSameAudioResend(_ supported: Bool) {
+        guard supported else { return }
+        queue.async {
+            do {
+                let moved = try self.outbox.requeueConflicts()
+                guard !moved.isEmpty else { return }
+                log(.info, "upload", "re-queued \(moved.count) chunk(s) quarantined for a 409: the server now takes the same audio sent again")
+                self.refreshOutboxStats()
+                self.uploader.reconcile()
+            } catch {
+                log(.error, "upload", "couldn't re-queue quarantined chunks: \(error)")
+            }
+        }
+    }
+
     var serverTakesWatchAAC: Bool {
         (UserDefaults.standard.object(forKey: Self.watchAACKey) as? Int) == settings.serverConfig().generation
     }

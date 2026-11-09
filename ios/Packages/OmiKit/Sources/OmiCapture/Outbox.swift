@@ -91,6 +91,9 @@ public struct OutboxStats: Sendable, Equatable {
     public var sentCount = 0
     public var sentBytes: Int64 = 0
     public var quarantineCount = 0
+    /// Of those, the Apple Watch's (chunks and seals with source `watch_mic`): the Devices screen shows
+    /// each problem on the device it concerns.
+    public var quarantineWatchCount = 0
     /// The waiting and kept-aside folders could be listed (false: counts are unknown, not zero).
     public var inventoryReadable = true
     public init() {}
@@ -123,6 +126,8 @@ public final class Outbox: @unchecked Sendable {
     /// Injectable for tests: system uptime in seconds.
     var uptime: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     private var listings: [URL: Listing] = [:]
+    /// Whether each quarantined file is the Watch's, read once from its header (the folder is small).
+    private var quarantineFromWatch: [String: Bool] = [:]
 
     public init(dirs: CaptureDirectories) { self.dirs = dirs }
 
@@ -220,6 +225,39 @@ public final class Outbox: @unchecked Sendable {
         return (try? Data(contentsOf: url)).flatMap { String(data: $0, encoding: .utf8) }
     }
 
+    /// Where `requeueConflicts` remembers what it moved back (and each one's quarantine reason).
+    var requeuedLedger: URL { dirs.outboxQuarantine.deletingLastPathComponent().appendingPathComponent("requeued-conflicts.json") }
+
+    /// Moves files quarantined for a 409 (`reason` starting "409") back to pending, each at most once ever:
+    /// for a server that takes the same audio sent again (`same_audio_resend`), where a re-encoded copy is
+    /// answered 200. A real conflict comes back as 409 and stays quarantined after that. Nothing is deleted:
+    /// the reason moves into the ledger. Returns the names moved.
+    @discardableResult
+    public func requeueConflicts() throws -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        var ledger = (try? JSONDecoder().decode([String: String].self, from: Data(contentsOf: requeuedLedger))) ?? [:]
+        var moved: [String] = []
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dirs.outboxQuarantine.path)) ?? []
+        for name in names.sorted() where OutboxKind.parse(name) != nil && ledger[name] == nil {
+            let src = dirs.outboxQuarantine.appendingPathComponent(name)
+            let reasonURL = src.appendingPathExtension("reason")
+            guard let reason = (try? Data(contentsOf: reasonURL)).flatMap({ String(data: $0, encoding: .utf8) }), reason.hasPrefix("409") else { continue }
+            let dst = dirs.outboxPending.appendingPathComponent(name)
+            guard !FileIO.exists(dst) else { continue }
+            ledger[name] = reason
+            // the ledger first: a crash after it never moves the file twice; before it, nothing has moved
+            try FileIO.atomicWrite(try JSONEncoder().encode(ledger), to: requeuedLedger)
+            try FileManager.default.moveItem(at: src, to: dst)
+            try? FileManager.default.removeItem(at: reasonURL)
+            moved.append(name)
+        }
+        if !moved.isEmpty {
+            listings[dirs.outboxPending] = nil
+            listings[dirs.outboxQuarantine] = nil
+        }
+        return moved
+    }
+
     /// Debug: move a quarantined file back to pending for another attempt.
     public func requeueQuarantined(_ name: String) throws {
         lock.lock(); defer { lock.unlock() }
@@ -258,8 +296,24 @@ public final class Outbox: @unchecked Sendable {
             s.sentBytes += item.size
         }
         s.quarantineCount = quarantineList?.count ?? 0
+        s.quarantineWatchCount = (quarantineList ?? []).filter { isFromWatch($0.name) }.count
         s.inventoryReadable = pendingList != nil && quarantineList != nil  // the inventory these counts came from
         return s
+    }
+
+    private func isFromWatch(_ name: String) -> Bool {
+        if let known = lock.withLock({ quarantineFromWatch[name] }) { return known }
+        struct Source: Decodable { var source: CaptureSource }
+        let data = try? Data(contentsOf: dirs.outboxQuarantine.appendingPathComponent(name))
+        let source: CaptureSource?
+        switch OutboxKind.parse(name) {
+        case .chunk: source = data.flatMap { try? Envelope.parse($0).header.source }
+        case .seal: source = data.flatMap { try? JSONDecoder().decode(Source.self, from: $0).source }
+        case .event, nil: source = nil
+        }
+        let watch = source == .watchMic
+        if data != nil { lock.withLock { quarantineFromWatch[name] = watch } }  // unreadable: asked again next time
+        return watch
     }
 
     /// nil: the folder couldn't be read (nothing cached; the next call reads it again).

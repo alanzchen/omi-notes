@@ -116,3 +116,7 @@ def test_different_audio_under_a_stored_identity_is_still_a_conflict_but_its_byt
     path = worker.db.one("SELECT path FROM chunks WHERE capture_id=? AND chunk_sequence=0", (capture,))["path"]
     kept = list(((worker.pipeline.settings.vault_dir / path).parent / "alternates").glob("0-*.omnc"))
     assert len(kept) == 1 and kept[0].read_bytes() == other[0]
+
+
+def test_the_server_advertises_that_it_takes_the_same_audio_sent_again(client):
+    assert "same_audio_resend" in client.get("/v1/status", headers=AUTH).json()["features"]
