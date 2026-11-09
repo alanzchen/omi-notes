@@ -54,7 +54,36 @@ import OmiProtocol
         let t = TestEnv()
         let name = try quarantined(t, seq: 3, reason: "409: x")
         try t.outbox.requeueConflicts()
-        let ledger = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: t.outbox.requeuedLedger))
-        #expect(ledger == [name: "409: x"])
+        #expect(try t.outbox.readRequeueLedger() == [name: .init(state: .done, reason: "409: x")])
+    }
+
+    @Test func aCrashAfterTheIntentIsRedoneNotLeftOutForever() throws {
+        let t = TestEnv()
+        let name = try quarantined(t, seq: 4, reason: "409: x")
+        // the intent was saved, then the app died before the move
+        let intent = [name: Outbox.RequeueEntry(state: .intent, reason: "409: x")]
+        try FileIO.atomicWrite(try JSONEncoder().encode(intent), to: t.outbox.requeuedLedger)
+        #expect(try t.outbox.requeueConflicts() == [name])
+        #expect(t.outbox.pending().map(\.name) == [name] && t.outbox.quarantined().isEmpty)
+        #expect(try t.outbox.readRequeueLedger()[name]?.state == .done)
+    }
+
+    @Test func aCrashAfterTheMoveIsCompleted() throws {
+        let t = TestEnv()
+        let item = try t.outbox.write(Data("chunk 5".utf8), kind: .chunk(captureId: "cap", sequence: 5))
+        let intent = [item.name: Outbox.RequeueEntry(state: .intent, reason: "409: x")]
+        try FileIO.atomicWrite(try JSONEncoder().encode(intent), to: t.outbox.requeuedLedger)
+        #expect(try t.outbox.requeueConflicts() == [], "already pending: nothing moves")
+        #expect(try t.outbox.readRequeueLedger()[item.name]?.state == .done)
+        #expect(t.outbox.pending().map(\.name) == [item.name])
+    }
+
+    @Test func anUnreadableLedgerMovesNothingAndIsNotTakenAsEmpty() throws {
+        let t = TestEnv()
+        let name = try quarantined(t, seq: 6, reason: "409: x")
+        try FileIO.atomicWrite(Data("{not json".utf8), to: t.outbox.requeuedLedger)
+        #expect(throws: Outbox.RequeueError.self) { try t.outbox.requeueConflicts() }
+        #expect(t.outbox.quarantined().map(\.name) == [name] && t.outbox.pending().isEmpty)
+        #expect(try Data(contentsOf: t.outbox.requeuedLedger) == Data("{not json".utf8), "left for a person to look at")
     }
 }

@@ -1,5 +1,5 @@
 import OmiBLE
-import OmiProtocol
+@testable import OmiProtocol
 import Testing
 
 /// Home folds short and skipped recordings into one collapsed row per day; nothing is dropped.
@@ -26,6 +26,22 @@ import Testing
         #expect(day.shortClips.map(\.id) == ["short", "skipped"])
         #expect(day.lessUseful.map(\.id) == ["demoted"])
         #expect(day.rows.count + day.shortClips.count + day.lessUseful.count == all.count)
+    }
+
+    @Test func anythingWrongStaysInViewHoweverShort() {
+        var transcriptOnly = conversation("t", "failed", seconds: 5)
+        transcriptOnly.notePath = "Notes/old.md"
+        #expect(transcriptOnly.displayState.code == "transcript_only")
+        #expect(!HomeDay.isShortClip(transcriptOnly), "a failed reprocess beside an older note")
+        var conflict = conversation("c", "done", seconds: 5)
+        conflict.issues = [ConversationFlag(code: "note_conflict", message: "Edited in both places")]
+        #expect(!HomeDay.isShortClip(conflict))
+        var retrying = conversation("r", "done", seconds: 5)
+        retrying.state = ConversationFlag(code: "render_retrying", message: "Saving the note again")
+        #expect(!HomeDay.isShortClip(retrying))
+        var skippedWithIssue = conversation("s", "discarded", seconds: 5)
+        skippedWithIssue.issues = [ConversationFlag(code: "x", message: "y")]
+        #expect(!HomeDay.isShortClip(skippedWithIssue))
     }
 
     @Test func thirtySecondsIsNotShort() {

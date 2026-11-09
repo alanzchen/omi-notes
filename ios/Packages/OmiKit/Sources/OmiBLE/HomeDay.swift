@@ -21,13 +21,14 @@ public struct HomeDay: Equatable, Sendable {
         }
     }
 
-    /// Skipped by the server, or a finished recording under 30 s. Still listening, processing or failed
-    /// stays in view (it may grow, or needs attention), and so does anything marked important.
+    /// Skipped by the server, or a finished note under 30 s, with nothing wrong. Anything still listening
+    /// or processing (it may grow), failed (transcript only, or a failed reprocess beside an older note),
+    /// carrying any issue (a note conflict, a render retrying…), or marked important stays in view.
     public static func isShortClip(_ c: ConversationSummary, priority: String = "auto") -> Bool {
-        guard priority != "important" else { return false }
-        switch c.displayState.code {
-        case "discarded": return true
-        case "ready", "transcript_only": return (c.durationS ?? .infinity) < shortSeconds
+        guard priority != "important", (c.issues ?? []).isEmpty else { return false }
+        switch (c.status, c.displayState.code) {
+        case ("discarded", "discarded"): return true
+        case ("done", "ready"): return (c.durationS ?? .infinity) < shortSeconds
         default: return false
         }
     }

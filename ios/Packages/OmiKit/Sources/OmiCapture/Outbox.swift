@@ -225,33 +225,81 @@ public final class Outbox: @unchecked Sendable {
         return (try? Data(contentsOf: url)).flatMap { String(data: $0, encoding: .utf8) }
     }
 
-    /// Where `requeueConflicts` remembers what it moved back (and each one's quarantine reason).
+    /// Where `requeueConflicts` remembers what it moves back (and each one's quarantine reason).
     var requeuedLedger: URL { dirs.outboxQuarantine.deletingLastPathComponent().appendingPathComponent("requeued-conflicts.json") }
+
+    /// One file `requeueConflicts` moves back: the intent is recorded before the move and completed after
+    /// it, so a crash in between is redone (or completed) next time, never left excluded.
+    struct RequeueEntry: Codable, Equatable {
+        enum State: String, Codable { case intent, done }
+        var state: State
+        var reason: String
+    }
+
+    public enum RequeueError: Error, CustomStringConvertible {
+        /// The ledger exists but can't be read: nothing is moved (its entries might say a file was moved once already).
+        case unreadableLedger(String)
+        public var description: String {
+            switch self { case .unreadableLedger(let why): return "the re-queue ledger can't be read (\(why)); nothing re-queued" }
+        }
+    }
+
+    /// The ledger; empty only when there is none. An unreadable one throws rather than being taken as empty.
+    func readRequeueLedger() throws -> [String: RequeueEntry] {
+        guard FileIO.exists(requeuedLedger) else { return [:] }
+        do {
+            return try JSONDecoder().decode([String: RequeueEntry].self, from: Data(contentsOf: requeuedLedger))
+        } catch {
+            log(.error, "outbox", "re-queue ledger unreadable: \(error)")
+            throw RequeueError.unreadableLedger("\(error)")
+        }
+    }
 
     /// Moves files quarantined for a 409 (`reason` starting "409") back to pending, each at most once ever:
     /// for a server that takes the same audio sent again (`same_audio_resend`), where a re-encoded copy is
     /// answered 200. A real conflict comes back as 409 and stays quarantined after that. Nothing is deleted:
-    /// the reason moves into the ledger. Returns the names moved.
+    /// the reason moves into the ledger. Each move is intent (fsync'd) → move (directories fsync'd) → done;
+    /// an intent whose file is still in quarantine is redone. Returns the names moved.
     @discardableResult
     public func requeueConflicts() throws -> [String] {
         lock.lock(); defer { lock.unlock() }
-        var ledger = (try? JSONDecoder().decode([String: String].self, from: Data(contentsOf: requeuedLedger))) ?? [:]
-        var moved: [String] = []
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: dirs.outboxQuarantine.path)) ?? []
-        for name in names.sorted() where OutboxKind.parse(name) != nil && ledger[name] == nil {
+        var ledger = try readRequeueLedger()
+        func save() throws { try FileIO.atomicWrite(try JSONEncoder().encode(ledger), to: requeuedLedger) }
+        var moved: [String] = [], changed = false
+        let names = Set((try? FileManager.default.contentsOfDirectory(atPath: dirs.outboxQuarantine.path)) ?? [])
+        let candidates = names.filter { OutboxKind.parse($0) != nil }.union(ledger.filter { $0.value.state == .intent }.keys)
+        for name in candidates.sorted() {
             let src = dirs.outboxQuarantine.appendingPathComponent(name)
-            let reasonURL = src.appendingPathExtension("reason")
-            guard let reason = (try? Data(contentsOf: reasonURL)).flatMap({ String(data: $0, encoding: .utf8) }), reason.hasPrefix("409") else { continue }
             let dst = dirs.outboxPending.appendingPathComponent(name)
-            guard !FileIO.exists(dst) else { continue }
-            ledger[name] = reason
-            // the ledger first: a crash after it never moves the file twice; before it, nothing has moved
-            try FileIO.atomicWrite(try JSONEncoder().encode(ledger), to: requeuedLedger)
-            try FileManager.default.moveItem(at: src, to: dst)
-            try? FileManager.default.removeItem(at: reasonURL)
-            moved.append(name)
+            let reasonURL = src.appendingPathExtension("reason")
+            switch ledger[name]?.state {
+            case .done?:
+                continue  // moved back once already: a second 409 is a real conflict
+            case nil:
+                guard names.contains(name), !FileIO.exists(dst),
+                      let reason = (try? Data(contentsOf: reasonURL)).flatMap({ String(data: $0, encoding: .utf8) }),
+                      reason.hasPrefix("409") else { continue }
+                ledger[name] = RequeueEntry(state: .intent, reason: reason)
+                try save()
+            case .intent?:
+                break  // a move interrupted by a crash: redo or complete it
+            }
+            if names.contains(name) {
+                guard !FileIO.exists(dst) else {
+                    log(.warning, "outbox", "\(name) is both quarantined and pending; left as it is")
+                    continue
+                }
+                try FileManager.default.moveItem(at: src, to: dst)
+                FileIO.fsyncDirectory(dirs.outboxPending)
+                FileIO.fsyncDirectory(dirs.outboxQuarantine)
+                moved.append(name)
+            }  // else: already out of quarantine (moved before the crash, or uploaded since): only complete it
+            ledger[name]?.state = .done
+            try save()
+            try? FileManager.default.removeItem(at: reasonURL)  // its text is in the ledger
+            changed = true
         }
-        if !moved.isEmpty {
+        if changed {
             listings[dirs.outboxPending] = nil
             listings[dirs.outboxQuarantine] = nil
         }
