@@ -123,12 +123,17 @@ extension ServerStatus {
     }
 
     /// Seconds since the server last checked the local engine: by the server's clock at the answer
-    /// (this phone's when the server didn't say), plus the answer's own age. nil when it can't be told.
+    /// (this phone's when the server didn't say), plus the answer's own age. nil when it can't be told:
+    /// no or a malformed `checked_at`, or one dated after the answer (by more than the usual phone
+    /// clock skew when it is this phone's clock).
     func engineCheckAge(answeredAt: Date?, now: Date?) -> TimeInterval? {
-        guard let checked = localTranscription?.checkedAt.flatMap(ISO8601UTC.parse),
-              let answer = serverTime.flatMap(ISO8601UTC.parse) ?? answeredAt else { return nil }
+        guard let checked = localTranscription?.checkedAt.flatMap(ISO8601UTC.parse) else { return nil }
+        let serverClock = serverTime.flatMap(ISO8601UTC.parse)
+        guard let answer = serverClock ?? answeredAt else { return nil }
+        let age = answer.timeIntervalSince(checked)
+        guard age >= (serverClock != nil ? 0 : -60) else { return nil }
         let since = answeredAt.flatMap { a in now.map { max(0, $0.timeIntervalSince(a)) } } ?? 0
-        return max(0, answer.timeIntervalSince(checked)) + since
+        return max(0, age) + since
     }
 
     static func label(_ p: Provider?, local: LocalTranscription?, checkAge: TimeInterval?, current: Bool) -> ServiceLabel {
@@ -137,8 +142,9 @@ extension ServerStatus {
         let engine = p.engine
         var health: ServiceLabel.Health
         if provider == "local" || engine != nil {
-            // answering needs a health check (the engine's own, or the worker's recent one); configured isn't enough
-            let available = (checkAge.map { $0 <= ServiceLabel.currentFor } ?? true) ? local?.available : nil
+            // answering needs a health check (the engine's own, or the worker's recent, validly dated one);
+            // configured isn't enough
+            let available = checkAge.map { $0 <= ServiceLabel.currentFor } == true ? local?.available : nil
             health = engine?.healthy == false || available == false || p.ready == false ? .down
                 : engine?.healthy == true || available == true ? .ok : .unknown
         } else {
