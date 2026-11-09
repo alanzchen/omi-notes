@@ -132,7 +132,7 @@ class Engine:
             t0 = time.perf_counter()
             duration = len(pcm) / plan.SR
             stats = {"windows": 0, "resplits": 0, "truncated_unresolved": 0, "unlabeled_windows": 0, "qwen_chunks": 0,
-                     "qwen_split": 0, "qwen_without_context": 0, "qwen_capped": 0, "units": 0, "units_outside_lines": 0, "lines_with_moss_text": 0}  # fmt: skip
+                     "qwen_split": 0, "qwen_without_context": 0, "qwen_capped": 0, "qwen_unaligned": 0, "units": 0, "units_outside_lines": 0, "lines_with_moss_text": 0}  # fmt: skip
             lines: list[dict] = []
             languages: list[str] = []
             windows: list[dict] = []  # where MOSS ran: its labels restart in each (the backend links them by voice)
@@ -222,7 +222,14 @@ class Engine:
         if not text:
             return []
         res = aligner.generate(chunk, text=text, language=ALIGN_LANGUAGE)
-        return spans_for(text, [(it.text, float(it.start_time), float(it.end_time)) for it in res.items], a)
+        units = spans_for(text, [(it.text, float(it.start_time), float(it.end_time)) for it in res.items], a)
+        if not units:
+            # words that can't be placed (e.g. a punctuation-only "…?!") aren't a transcript of this speech:
+            # the piece failed, so MOSS's words cover it or the request is incomplete
+            stats["qwen_unaligned"] += 1
+            capped.append((a, b))
+            log.warning("Qwen's text for a %.0f s chunk aligned to nothing: keeping MOSS text there", b - a)
+        return units
 
     def _text(self, qwen, aligner, pcm: np.ndarray, start: float, stop: float, lines: list[dict], context: list[str],
               stats: dict, languages: list[str], prefix: str = "", truncated: bool = False) -> list[dict]:  # fmt: skip
