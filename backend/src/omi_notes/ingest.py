@@ -14,6 +14,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import logging
 import shutil
 import threading
 import time
@@ -21,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
+import numpy as np
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationError
 
 from .audio import aac
@@ -30,6 +32,8 @@ from .settings import Settings
 from .spool import atomic_write_bytes, make_dirs_durable
 from .util import UUID_RE, canonical_json, sha256_hex
 from .vault import Vault
+
+log = logging.getLogger(__name__)
 
 MIN_FREE_BYTES = 256 * 1024 * 1024
 _lock = threading.Lock()
@@ -381,7 +385,7 @@ class Ingest:
             if existing is not None:
                 if existing["sha256"] == digest:
                     return ok(200, True)
-                raise ApiError(409, "chunk_conflict", "different content is already stored under this identity")
+                return ok(200, True) if self._same_audio_again(capture_id, seq, body, digest) else self._conflict()
 
             try:
                 env = parse_envelope(body, capture_id=capture_id, chunk_sequence=seq)
@@ -400,7 +404,7 @@ class Ingest:
                 if existing is not None:
                     if existing["sha256"] == digest:
                         return ok(200, True)
-                    raise ApiError(409, "chunk_conflict", "different content is already stored under this identity")
+                    return ok(200, True) if self._same_audio_again(capture_id, seq, body, digest) else self._conflict()
 
             capture = db.one("SELECT * FROM captures WHERE capture_id=?", (capture_id,))
             started = header.capture_started_at.timestamp()
@@ -436,6 +440,43 @@ class Ingest:
                 self._dirty.add((header.device_id, capture_id))
                 raise
         return ok(201, False)
+
+    @staticmethod
+    def _conflict():
+        raise ApiError(409, "chunk_conflict", "different content is already stored under this identity")
+
+    def _same_audio_again(self, capture_id: str, seq: int, body: bytes, digest: str) -> bool:
+        """Other bytes under a stored chunk's identity (caller holds the lock). They are always kept, beside the
+        stored chunk in `alternates/` (vault first; nothing is overwritten or dropped). True when they are the
+        same audio encoded another way, e.g. a Watch part stored as PCM by an old phone build and relayed
+        again as the Watch's own AAC after its acknowledgement was lost: same timing, and the decoded audio
+        matches. Then the stored (lossless) chunk stays the chunk and the sender is told it is stored."""
+        row = self.db.one("SELECT path FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq))
+        try:
+            env = parse_envelope(body, capture_id=capture_id, chunk_sequence=seq)
+        except EnvelopeError:
+            return False
+        if row is None:
+            return False
+        stored_path = self.vault.root / row["path"]
+        alternate = stored_path.parent / "alternates" / f"{seq}-{digest[:16]}.omnc"
+        if not alternate.exists():
+            self._writable()
+            self._ensure_space()
+            atomic_write_bytes(alternate, body)
+            Vault.append_jsonl(self.vault.receipts_path(env.header.device_id, capture_id),
+                               {"alternate_of_seq": seq, "sha256": digest, "received_at": self.clock()})  # fmt: skip
+        if not stored_path.exists():  # audio deleted before 2026-11-08: nothing to compare with
+            return False
+        try:
+            stored = parse_envelope(stored_path.read_bytes(), capture_id=capture_id, chunk_sequence=seq)
+            same = same_audio(stored, env)
+        except (EnvelopeError, OSError, aac.AacError, ValueError) as exc:
+            log.warning("chunk %s/%d: could not compare a second copy with the stored one: %s", capture_id, seq, exc)
+            return False
+        log.warning("chunk %s/%d: other bytes under a stored identity (%s → %s): %s", capture_id, seq,
+                    stored.header.payload_format, env.header.payload_format, "same audio" if same else "different audio")  # fmt: skip
+        return same
 
     def _adopt_orphan(self, env, digest: str, size: int, path, tomb_path) -> tuple[int, bool]:
         """A durable file for this identity exists without an index row: same bytes → index it
@@ -571,3 +612,40 @@ def seal_end_epoch(capture) -> float | None:
     if offset is not None and capture["capture_started_at"] is not None:
         return capture["capture_started_at"] + offset / 1e6
     return capture["ended_at"]
+
+
+SAME_AUDIO_CORRELATION = 0.9  # decoded copies of one recording (lossless vs 32 kbit/s AAC) correlate well above this
+SAME_AUDIO_MAX_LAG = 2400  # samples (0.15 s): codec priming and padding
+
+
+def _samples(env) -> np.ndarray:
+    if env.header.payload_format == "aac_m4a_v1":
+        return aac.decode(env.payload, env.header.record_count).astype(np.float64)
+    if env.header.payload_format == "pcm16le_v1":
+        return np.frombuffer(env.payload, dtype="<i2").astype(np.float64)
+    raise ValueError(f"no audio comparison for {env.header.payload_format}")
+
+
+def same_audio(a, b) -> bool:
+    """Whether two envelopes under one identity hold the same recording: same device, source, start and timing
+    (within 20 ms / 100 ms), and decoded audio of the same length whose best alignment within 0.15 s
+    correlates at least SAME_AUDIO_CORRELATION (two silent copies are the same)."""
+    ha, hb = a.header, b.header
+    if (ha.device_id, ha.source) != (hb.device_id, hb.source) or abs((ha.capture_started_at - hb.capture_started_at).total_seconds()) > 0.0015:
+        return False
+    if abs(ha.chunk_start_offset_us - hb.chunk_start_offset_us) > 20_000 or abs(ha.chunk_end_offset_us - hb.chunk_end_offset_us) > 100_000:
+        return False
+    x, y = _samples(a), _samples(b)
+    if abs(len(x) - len(y)) > 1600:
+        return False
+    n = min(len(x), len(y))
+    x, y = x[:n] - x[:n].mean(), y[:n] - y[:n].mean()
+    ex, ey = float(np.sqrt((x**2).mean())), float(np.sqrt((y**2).mean()))
+    if ex < 1.0 and ey < 1.0:
+        return True
+    if ex < 1.0 or ey < 1.0:
+        return False
+    size = 1 << (2 * n - 1).bit_length()
+    corr = np.fft.irfft(np.fft.rfft(x, size) * np.conj(np.fft.rfft(y, size)), size)
+    lags = np.concatenate([corr[: SAME_AUDIO_MAX_LAG + 1], corr[-SAME_AUDIO_MAX_LAG:]])
+    return float(lags.max()) / (n * ex * ey) >= SAME_AUDIO_CORRELATION

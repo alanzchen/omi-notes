@@ -85,3 +85,34 @@ def test_the_phones_apple_encoded_aac_fixture_decodes_to_its_frame_count(client,
     r = put_chunk(client, env.header.capture_id, env.header.chunk_sequence, body)
     assert r.status_code == 201, r.text
     assert hashlib.sha256(stored_payload(worker, env.header.capture_id, env.header.chunk_sequence)).hexdigest() == expected["aac_sha256"]
+
+
+def test_a_part_stored_as_pcm_and_relayed_again_as_aac_is_the_same_audio_kept_twice(client, worker):
+    # field case (2026-11-08): an October Watch part stored as PCM by an old phone build came back as the
+    # Watch's AAC after its acknowledgement was lost; the same audio, other bytes, same identity
+    capture = str(uuid.uuid4())
+    pcm = np.concatenate([talk(20, 3), silence(10)])
+    as_pcm = pcm_envelopes(pcm, capture_id=capture, device_id=WATCH, started_at=STARTED, source="watch_mic")
+    as_aac = aac_envelopes(pcm, capture_id=capture, device_id=WATCH, started_at=STARTED)
+    assert put_chunk(client, capture, 0, as_pcm[0]).status_code == 201
+    stored = worker.db.one("SELECT sha256, path FROM chunks WHERE capture_id=? AND chunk_sequence=0", (capture,))
+    r = put_chunk(client, capture, 0, as_aac[0])
+    assert r.status_code == 200 and r.json()["duplicate"] is True, r.json()
+    again = worker.db.one("SELECT sha256, path FROM chunks WHERE capture_id=? AND chunk_sequence=0", (capture,))
+    assert dict(again) == dict(stored), "the stored (lossless) copy stays the chunk"
+    cap_dir = (worker.pipeline.settings.vault_dir / stored["path"]).parent
+    kept = list((cap_dir / "alternates").glob("0-*.omnc"))
+    assert len(kept) == 1 and kept[0].read_bytes() == as_aac[0], "the relayed copy is kept too, never dropped"
+    assert put_chunk(client, capture, 0, as_aac[0]).status_code == 200, "and again: still the same"
+
+
+def test_different_audio_under_a_stored_identity_is_still_a_conflict_but_its_bytes_are_kept(client, worker):
+    capture = str(uuid.uuid4())
+    first = pcm_envelopes(np.concatenate([talk(20, 3), silence(10)]), capture_id=capture, device_id=WATCH,
+                          started_at=STARTED, source="watch_mic")  # fmt: skip
+    other = aac_envelopes(np.concatenate([silence(10), talk(20, 9)]), capture_id=capture, device_id=WATCH, started_at=STARTED)
+    assert put_chunk(client, capture, 0, first[0]).status_code == 201
+    assert put_chunk(client, capture, 0, other[0]).status_code == 409
+    path = worker.db.one("SELECT path FROM chunks WHERE capture_id=? AND chunk_sequence=0", (capture,))["path"]
+    kept = list(((worker.pipeline.settings.vault_dir / path).parent / "alternates").glob("0-*.omnc"))
+    assert len(kept) == 1 and kept[0].read_bytes() == other[0]
