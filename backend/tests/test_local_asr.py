@@ -857,3 +857,42 @@ def test_voiceprint_clips_from_labelled_words_come_from_the_diarizers_own_turns(
     clips = transcript.get("speaker_clips", {}).get("S1", [])
     assert all(clean[0] <= start and end <= clean[1] for start, end in clips), clips
     assert clips or clean == (0.0, 6.0), "a clean turn of its own still gives a clip"
+
+
+def mixed_then_reprocessed(client, worker, later_turns):
+    """Astra IT2-02: a conversation whose voices were embedded from a mixed clip [0.25, 9.75] (as before
+    42cfe29: the whole utterance) is reprocessed with corrected evidence and the same words and labels."""
+    from omi_notes.speakers.service import SpeakerService
+
+    from .test_speaker_learning import PRIYA, FakeEmbedder, name_label, new_person
+
+    def response(request, n):
+        return httpx.Response(200, json={"segments": [{"start": 0.0, "end": 10.0, "speaker_id": "UNKNOWN", "text": "a synthetic utterance"}]})
+
+    worker.providers._local_stt, _ = sidecar(response)
+    worker.providers._diarizer = TurnsDiarizer([(0.0, 10.0, 0)])  # one voice heard over all of it: [0.25, 9.75]
+    worker.providers._embedder = FakeEmbedder()
+    client.app.state.speakers = SpeakerService(worker.pipeline)
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(6, ALAN, 7), voice(14, PRIYA, 8), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    person = new_person(client, "Wearer", me=True)
+    assert name_label(client, row["id"], "S1", person).json()["sample"] == "created"
+    assert client.app.state.speakers._clips(row["id"], json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text()))["S1"] == [[0.25, 9.75]]
+    worker.providers._diarizer = TurnsDiarizer(later_turns)
+    for p in worker.pipeline.conv_dir(row["id"]).glob("diarization-*.json"):
+        p.unlink()  # the corrected diarization (a cache of derived data, not audio)
+    worker.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1, force_restt = 1 WHERE id=?", (row["id"],))
+    worker.tick(T0 + 800)
+    (after,) = convs(worker)
+    assert after["status"] == "done", after["error"]
+    transcript = json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text())
+    return client.app.state.speakers._clips(row["id"], transcript), transcript
+
+
+@pytest.mark.parametrize("later_turns", [[(0.0, 6.0, 0), (7.0, 10.0, 1)], [(0.0, 6.0, 0), (6.0, 10.0, 1)]],
+                         ids=["clean-clip", "no-clean-clip"])
+def test_reprocessed_evidence_replaces_voices_embedded_from_other_clip_bounds(client, worker, later_turns):
+    served, transcript = mixed_then_reprocessed(client, worker, later_turns)
+    assert all(end <= 6.0 for _, end in served.get("S1", [])), served
+    assert served.get("S1", []) == transcript["speaker_clips"].get("S1", [])

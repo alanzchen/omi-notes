@@ -320,7 +320,7 @@ class SpeakerService:
         voices = embed_voices(all_clips, audio.pcm, embedder)
         # `label` is about to be confirmed for someone who passed the consent checks (`_sample_for`)
         keep = {label} | self.store.vector_labels(self.store.labels(row["id"]), set(voices), raw=True)
-        name = voices_name(embedder, row["audio_sha"], row["transcript_sha"])
+        name = voices_name(embedder, row["audio_sha"], row["transcript_sha"], clips)
         self.store.write_voices(row["id"], name, embedder.model, embedder.model_sha, voices, keep)
         self.store.reference_voices(row["id"], name)
         self.store.remove_other_voices(row["id"], name)

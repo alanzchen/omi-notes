@@ -7,7 +7,7 @@ Vault files (the index tables `people`, `samples`, `voices`, `speaker_labels` ar
   vector_b64, source, seconds, created_at, ...}; `consent.json`: the person-level attestation;
   `enrollment/<id>.omiaudio` + `enrollments/<id>.json`: the wearer's enrollment.
 - `_omi/speakers/settings.json`: acknowledgment, unknown-voice opt-in, auto naming, dismissals.
-- per conversation: `voices-<model>-<audio_sha16>.json` (clips, and vectors of assigned labels —
+- per conversation: `voices-<model>-<model_sha8>-<audio_sha16>-c<clip bounds8>-<transcript_sha8>.json` (clips, and vectors of assigned labels —
   of every label only with unknown-voice storage) and `speakers.json` (assignments + evidence).
 """
 
@@ -73,11 +73,14 @@ def read_frontmatter(text: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def voices_name(embedder, audio_sha: str, transcript_sha: str) -> str:
-    """A conversation's voices file, keyed by everything the voices depend on (a new transcript
-    may number the voices differently)."""
+def voices_name(embedder, audio_sha: str, transcript_sha: str, clips: dict[str, list[list[float]]]) -> str:
+    """A conversation's voices file, keyed by everything the voices depend on: a new transcript may
+    number the voices differently, and other clip bounds (a corrected selection, same words and labels)
+    make other voices. The transcript's part stays last (`voices-*-<transcript8>.json` finds it)."""
     model = re.sub(r"[^A-Za-z0-9._-]+", "-", embedder.model).strip("-")[:40]
-    return f"voices-{model}-{embedder.model_sha[:8]}-{(audio_sha or '')[:16]}-{(transcript_sha or '')[:8]}.json"
+    spans = {label: [[round(float(a), 3), round(float(b), 3)] for a, b in v] for label, v in sorted(clips.items()) if v}
+    bounds = hashlib.sha256(json.dumps(spans, sort_keys=True).encode()).hexdigest()[:8]
+    return f"voices-{model}-{embedder.model_sha[:8]}-{(audio_sha or '')[:16]}-c{bounds}-{(transcript_sha or '')[:8]}.json"
 
 
 _KEEP = object()

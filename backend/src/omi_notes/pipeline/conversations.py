@@ -705,7 +705,8 @@ class ConversationPipeline:
         return out
 
     def identify(self, conv_id: str, audio: ConversationAudio | None, audio_sha: str | None, clips: dict,
-                 transcript_sha: str, labels: set[str], *, consistent: bool = True) -> None:  # fmt: skip
+                 transcript_sha: str, labels: set[str], *, consistent: bool = True,
+                 clip_spans: dict | None = None) -> None:  # fmt: skip
         """Voices stage: label voiceprints while the PCM is in memory, then the pure assignment.
         Voices are inert until someone is enrolled or named and skipped without a speaker model;
         label states always move to a new transcript (`_carry_over`), voices or not."""
@@ -713,10 +714,12 @@ class ConversationPipeline:
         voices, name, fresh = None, None, False
         if embedder is not None and consistent and audio_sha and self.speakers.any_samples():
             # keyed by everything the voices depend on: a new transcript may number the voices differently
-            name = voices_name(embedder, audio_sha, transcript_sha)
+            spans = clip_spans if clip_spans is not None else {label: [[c.start, c.end] for c in cs] for label, cs in clips.items()}
+            name = voices_name(embedder, audio_sha, transcript_sha, spans)
             fresh = not (self.conv_dir(conv_id) / name).exists()
-            if fresh and audio is not None and clips:
-                voices = embed_voices(clips, audio.pcm, embedder)  # outside the lock: the slow part
+            if fresh and audio is not None:
+                # no clean clip at all is evidence too: an empty file replaces voices from other bounds
+                voices = embed_voices(clips, audio.pcm, embedder) if clips else {}  # outside the lock: the slow part
             elif fresh:
                 name, fresh = None, False  # no audio in hand (a recovery path): nothing to compute
         with self.speakers.lock:
@@ -755,7 +758,8 @@ class ConversationPipeline:
         sha = sha256_hex(canonical_json(segments).encode())
         if self.speakers.labels_transcript(conv_id) not in (None, sha):
             self.identify(conv_id, None, transcript.get("audio_sha"), {}, sha, {s["speaker"] for s in segments},
-                          consistent=transcript.get("speaker_labels_consistent", True))  # fmt: skip
+                          consistent=transcript.get("speaker_labels_consistent", True),
+                          clip_spans=transcript.get("speaker_clips") or {})  # fmt: skip
 
     def _carry_over(self, current: dict, old_voices: dict, new_voices: dict | None, labels: set[str],
                     had_forgotten: bool = False) -> dict:  # fmt: skip
