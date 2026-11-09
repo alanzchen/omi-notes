@@ -62,12 +62,35 @@ public final class ClipPlayback {
         }
     }
 
-    /// Prepares a clip without playing it.
-    public func load(_ id: String, fetch: @escaping (String) async throws -> Data) async {
-        if loadedId == id, audio != nil { return }
-        if loading == id { return }  // already on its way
-        let intent = begin(id)  // a different clip: the old one's intent ends here
-        await prepare(id, fetch, intent: intent)
+    /// The identity a clip is cached and shown under: its id, and the generation it was listed in
+    /// (a review item id with its revision). A re-transcription can give `conv.S1.0` another voice,
+    /// so the same id from a newer generation is a different clip.
+    public static func key(_ id: String, version: String?) -> String {
+        version.map { "\($0)#\(id)" } ?? id
+    }
+
+    /// Prepares a clip without playing it. `playing`, `loading` and `loadedId` hold its `key`.
+    public func load(_ id: String, version: String? = nil, fetch: @escaping (String) async throws -> Data) async {
+        let key = Self.key(id, version: version)
+        if loadedId == key, audio != nil { return }
+        if loading == key { return }  // already on its way
+        let intent = begin(key)  // a different clip: the old one's intent ends here
+        await prepare(key, Self.fetching(id, fetch), intent: intent)
+    }
+
+    /// The list was fetched again: no clip it had is trusted any more.
+    public func invalidate() {
+        stop()
+        cache.removeAll()
+        inflight.removeAll()
+        loadedId = nil
+        audio = nil
+        data = nil
+    }
+
+    /// The server is asked with the clip id, whatever generation it is cached under.
+    private static func fetching(_ id: String, _ fetch: @escaping (String) async throws -> Data) -> (String) async throws -> Data {
+        { _ in try await fetch(id) }
     }
 
     /// A new intent for `id`, taken synchronously (before any task runs): earlier work is void.
@@ -93,7 +116,9 @@ public final class ClipPlayback {
         }
     }
 
-    public func toggle(_ id: String, fetch: @escaping (String) async throws -> Data) {
+    public func toggle(_ clipId: String, version: String? = nil, fetch: @escaping (String) async throws -> Data) {
+        let id = Self.key(clipId, version: version)
+        let fetch = Self.fetching(clipId, fetch)
         if playing == id {
             if tap == .stop { stop() } else { pause() }
             return

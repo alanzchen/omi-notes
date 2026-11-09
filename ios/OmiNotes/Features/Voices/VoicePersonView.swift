@@ -13,6 +13,7 @@ struct VoicePersonView: View {
     @State private var moving: VoiceSample?
     @State private var forgetting = false
     @State private var showEnrollment = false
+    @State private var forgetError: String?
     @Environment(\.dismiss) private var dismiss
 
     init(model: AppModel, personId: String, samples: VoiceSamplesModel? = nil) {
@@ -31,6 +32,9 @@ struct VoicePersonView: View {
         List {
             if let person {
                 Section { header(person) }.listRowBackground(Color.clear).listRowInsets(.init())
+                if let forgetError {
+                    Section { Label(forgetError, systemImage: "exclamationmark.triangle").font(.footnote).foregroundStyle(.orange) }
+                }
                 if speakers.serverSupportsVoiceReview {
                     Section {
                         Picker("", selection: $samples.tab) {
@@ -77,7 +81,9 @@ struct VoicePersonView: View {
             if speakers.serverSupportsVoiceReview { await samples.load() }
         }
         .onChange(of: samples.undoable) { Task { await speakers.refresh() } }
+        .onChange(of: samples.generation) { player.invalidate() }
         .onDisappear { player.stop() }
+        .personConsent(model, personId: samples.consentNeeded) { samples.clearConsentNeeded() }
         .confirmationDialog("移给谁？", isPresented: .init(get: { moving != nil }, set: { if !$0 { moving = nil } }),
                             titleVisibility: .visible, presenting: moving) { s in
             ForEach(speakers.people.filter { $0.id != personId }) { p in
@@ -87,13 +93,23 @@ struct VoicePersonView: View {
         .confirmationDialog(person?.isMe == true ? "忘记你的声音？" : "忘记 \(person?.name ?? "") 的声音？",
                             isPresented: $forgetting, titleVisibility: .visible) {
             if let person {
-                Button("忘记声音", role: .destructive) { Task { await speakers.forgetVoice(person); dismiss() } }
-                Button("忘记声音并删除笔记", role: .destructive) { Task { await speakers.forgetVoice(person, deleteNote: true); dismiss() } }
+                Button("忘记声音", role: .destructive) { forget(person, deleteNote: false) }
+                Button("忘记声音并删除笔记", role: .destructive) { forget(person, deleteNote: true) }
             }
         } message: {
             Text("声纹从服务器删除，过去的笔记回到“Speaker N”。不能撤销。")
         }
         .sheet(isPresented: $showEnrollment) { EnrollmentView(model: model) }
+    }
+
+    /// Leaves the page only once the server confirmed; otherwise says why under the header.
+    private func forget(_ person: Person, deleteNote: Bool) {
+        forgetError = nil
+        Task {
+            if await speakers.forgetVoice(person, deleteNote: deleteNote) { dismiss() } else {
+                forgetError = "没能忘记：\(speakers.error ?? "请稍后再试")"
+            }
+        }
     }
 
     private func tabTitle(_ title: String, _ count: Int?) -> String {
@@ -179,16 +195,17 @@ struct VoicePersonView: View {
 
     @ViewBuilder private func playButton(_ s: VoiceSample) -> some View {
         if s.canPlay, let clip = s.clip {
-            Button { player.toggle(clip.id, speakers: speakers) } label: {
-                if player.loadingId == clip.id {
+            let key = ClipPlayback.key(clip.id, version: VoiceSamplesModel.clipVersion(s))
+            Button { player.toggle(clip.id, version: VoiceSamplesModel.clipVersion(s), speakers: speakers) } label: {
+                if player.loadingId == key {
                     ProgressView().frame(width: 30, height: 30)
                 } else {
-                    Image(systemName: player.playingId == clip.id ? "pause.circle.fill" : "play.circle.fill")
+                    Image(systemName: player.playingId == key ? "pause.circle.fill" : "play.circle.fill")
                         .font(.title).foregroundStyle(Color.accentColor)
                 }
             }
             .buttonStyle(.borderless)
-            .accessibilityLabel(player.playingId == clip.id ? "暂停" : "播放")
+            .accessibilityLabel(player.playingId == key ? "暂停" : "播放")
         } else {
             Image(systemName: "speaker.slash.circle").font(.title).foregroundStyle(.tertiary)
                 .accessibilityLabel("无法试听")

@@ -7,15 +7,25 @@ import OmiProtocol
 /// first). Every answer goes to the server at once and can be undone for a few seconds through its
 /// undo token; "Skip" only moves on in this session. A changed item (`409 stale_review`) is never
 /// answered: the queue is fetched again.
+///
+/// The backend has no offset or cursor, so each fetch asks for its whole window (`ReviewBatch.window`)
+/// and the phone pages it, leaving out what was skipped: skipping a batch shows the next one, and
+/// "nothing left" is said only when the server's answer has nothing else.
 @MainActor
 @Observable
 public final class VoiceReviewQueue {
     public enum Phase: Equatable, Sendable {
         case loading
         case ready
-        /// This batch is done (or the server had nothing left).
-        case finished
+        /// This batch is done and more is waiting ("下一批").
+        case batchDone
+        /// Only skipped items are left in what the server answered.
+        case onlySkipped
+        /// The server has nothing to review.
+        case empty
         case failed(String)
+
+        public var isOver: Bool { self == .batchDone || self == .onlySkipped || self == .empty }
     }
 
     public enum Decision: String, Sendable {
@@ -48,11 +58,19 @@ public final class VoiceReviewQueue {
     public private(set) var busy = false
     /// Answers that still stand, this session.
     public private(set) var decided = 0
+    /// The person whose consent (acknowledgment + attestation) the last answer needed.
+    public private(set) var consentNeeded: String?
+    /// Bumped by every fetch: clips cached from an older one are not trusted.
+    public private(set) var generation = 0
     public var undoWindow: Duration = .seconds(6)
 
     private let speakers: SpeakersModel
     /// Skipped this session: not asked again until the screen opens anew.
     private var skipped: Set<String> = []
+    /// What the last fetch had beyond this batch (not skipped).
+    private var remaining = 0
+    /// The last fetch filled the server's window, so there may be more behind it.
+    private var windowFull = false
     private var undoTimer: Task<Void, Never>?
 
     public init(speakers: SpeakersModel) {
@@ -61,14 +79,22 @@ public final class VoiceReviewQueue {
 
     public var current: ReviewItem? { items.indices.contains(index) ? items[index] : nil }
 
-    /// Fetches the next batch.
+    /// What a clip of `item` is cached under: its id carries the sample's revision or, for a label, the
+    /// speakers revision and the evidence digest, so a re-transcribed `conv.S1.0` is another clip.
+    public static func clipVersion(_ item: ReviewItem) -> String { item.id }
+
+    /// Fetches the window again and takes the next batch from it.
     public func load() async {
         phase = .loading
+        generation += 1
         do {
-            let fresh = try await speakers.reviewItems(limit: ReviewBatch.size)
-            items = ReviewBatch.make(fresh, excluding: skipped)
+            let fresh = try await speakers.reviewItems(limit: ReviewBatch.window)
+            let open = ReviewBatch.make(fresh, excluding: skipped, limit: fresh.count)
+            items = Array(open.prefix(ReviewBatch.size))
+            remaining = open.count - items.count
+            windowFull = fresh.count >= ReviewBatch.window
             index = 0
-            phase = items.isEmpty ? .finished : .ready
+            phase = items.isEmpty ? (fresh.isEmpty ? .empty : .onlySkipped) : .ready
         } catch {
             phase = .failed(SpeakersModel.describe(error))
         }
@@ -85,10 +111,14 @@ public final class VoiceReviewQueue {
         do {
             answer = try await speakers.decideReview(item.id, decision: decision.rawValue, personId: personId, requestId: requestId)
         } catch APIError.http(409, let detail) {
-            undoable = nil
-            error = detail.hasPrefix("consent_required") ? VoiceSamplesModel.consentMessage : nil
-            notice = .refreshed
-            await load()
+            let conflict = VoiceConflict(detail)
+            error = conflict == .staleReview ? nil : conflict.message
+            if conflict == .consentRequired { consentNeeded = personId ?? item.personId }
+            if conflict.reloads {
+                undoable = nil
+                notice = .refreshed
+                await load()
+            }
             return false
         } catch {
             self.error = "没能保存：\(SpeakersModel.describe(error))"
@@ -99,8 +129,7 @@ public final class VoiceReviewQueue {
         decided += 1
         let done = Done(item: item, decision: decision, personId: personId, undoToken: answer.undoToken ?? answer.requestId ?? requestId)
         undoable = done
-        index += 1
-        if index >= items.count { phase = .finished }
+        advance()
         armUndoTimer(for: done)
         return true
     }
@@ -109,9 +138,18 @@ public final class VoiceReviewQueue {
     public func skip() {
         guard let item = current else { return }
         skipped.insert(item.id)
-        index += 1
         error = nil
-        if index >= items.count { phase = .finished }
+        advance()
+    }
+
+    private func advance() {
+        index += 1
+        guard index >= items.count else { return }
+        if remaining > 0 || windowFull {
+            phase = .batchDone
+        } else {
+            phase = skipped.isEmpty ? .empty : .onlySkipped
+        }
     }
 
     /// Puts the last answer back. The item's id is bound to its revision, which the undo changes, so
@@ -126,6 +164,8 @@ public final class VoiceReviewQueue {
             undoable = nil
             guard r.undidAnything else {
                 notice = .undoFailed
+                let why = r.skipReasons
+                error = "没能撤销" + (why.isEmpty ? "" : "：" + why.joined(separator: "、"))
                 return
             }
             decided -= 1
@@ -134,11 +174,12 @@ public final class VoiceReviewQueue {
             await load()
         } catch {
             self.error = "没能撤销：\(SpeakersModel.describe(error))"
-            armUndoTimer(for: last)
+            armUndoTimer(for: last)  // still undoable: try again
         }
     }
 
     public func clearNotice() { notice = nil }
+    public func clearConsentNeeded() { consentNeeded = nil }
 
     private func armUndoTimer(for done: Done) {
         undoTimer?.cancel()
@@ -153,7 +194,7 @@ public final class VoiceReviewQueue {
 
 /// One person's samples by state: listen, remove (restorable), restore, move to someone else, or
 /// confirm a flagged one. Each change is sent at once with the revision it was listed at, and the
-/// last one can be undone; a refused change lists the samples again.
+/// last one can be undone; a changed sample lists the samples again.
 @MainActor
 @Observable
 public final class VoiceSamplesModel {
@@ -169,8 +210,6 @@ public final class VoiceSamplesModel {
         public var undoToken: String
     }
 
-    public static let consentMessage = "这个人还没有同意识别声音，先在识别设置里确认。"
-
     public let personId: String
     public var tab: Tab
     public private(set) var samples: [VoiceSample] = []
@@ -179,18 +218,23 @@ public final class VoiceSamplesModel {
     public private(set) var error: String?
     public private(set) var undoable: Done?
     public private(set) var busy = false
+    /// The person whose consent (acknowledgment + attestation) the last change needed.
+    public private(set) var consentNeeded: String?
+    /// Bumped by every list: clips cached from an older one are not trusted.
+    public private(set) var generation = 0
     public var undoWindow: Duration = .seconds(6)
 
     private let speakers: SpeakersModel
     private var undoTimer: Task<Void, Never>?
-    /// A newer load (another tab) wins over one still on its way.
-    private var generation = 0
 
     public init(speakers: SpeakersModel, personId: String, tab: Tab = .active) {
         self.speakers = speakers
         self.personId = personId
         self.tab = tab
     }
+
+    /// What a sample's clip is cached under: its review id carries the sample's revision.
+    public static func clipVersion(_ s: VoiceSample) -> String { s.reviewId ?? "\(s.id).\(s.revision ?? 0)" }
 
     public func load() async {
         generation += 1
@@ -220,23 +264,29 @@ public final class VoiceSamplesModel {
     @discardableResult
     public func confirm(_ s: VoiceSample) async -> Bool {
         guard let reviewId = s.reviewId else { return false }
-        return await perform(s, .confirm) { requestId in
+        return await perform(s, .confirm, target: nil) { requestId in
             let a = try await self.speakers.decideReview(reviewId, decision: "confirm", personId: nil, requestId: requestId)
             return a.undoToken ?? a.requestId
         }
     }
 
+    public func clearConsentNeeded() { consentNeeded = nil }
+
+    /// Undoes the last change. A failed request keeps its token, so it can be tried again.
     public func undo() async {
         guard let last = undoable, !busy else { return }
         busy = true
         defer { busy = false }
         undoTimer?.cancel()
-        undoable = nil
         do {
             let r = try await speakers.undo(token: last.undoToken)
-            error = r.undidAnything ? nil : "没能撤销：这个样本之后又改过了。"
+            undoable = nil
+            let why = r.skipReasons
+            error = r.undidAnything ? nil : "没能撤销" + (why.isEmpty ? "" : "：" + why.joined(separator: "、"))
         } catch {
             self.error = "没能撤销：\(SpeakersModel.describe(error))"
+            arm(last)
+            return
         }
         await load()
     }
@@ -249,14 +299,14 @@ public final class VoiceSamplesModel {
         case .move: name = "move"
         case .confirm: return false
         }
-        return await perform(s, action) { requestId in
+        return await perform(s, action, target: personId) { requestId in
             let a = try await self.speakers.sampleAction(s.id, action: name, personId: personId, expectedRevision: s.revision,
                                                          requestId: requestId)
             return a.undoToken ?? a.requestId
         }
     }
 
-    private func perform(_ s: VoiceSample, _ action: Action, send: (String) async throws -> String?) async -> Bool {
+    private func perform(_ s: VoiceSample, _ action: Action, target: String?, send: (String) async throws -> String?) async -> Bool {
         guard !busy else { return false }
         busy = true
         defer { busy = false }
@@ -265,8 +315,10 @@ public final class VoiceSamplesModel {
         do {
             token = try await send(requestId)
         } catch APIError.http(409, let detail) {
-            error = detail.hasPrefix("consent_required") ? Self.consentMessage : "这个样本刚刚变过，已重新载入。"
-            await load()
+            let conflict = VoiceConflict(detail)
+            error = conflict.message
+            if conflict == .consentRequired { consentNeeded = target ?? personId }
+            if conflict.reloads { await load() }
             return false
         } catch {
             self.error = "没能保存：\(SpeakersModel.describe(error))"
@@ -275,7 +327,11 @@ public final class VoiceSamplesModel {
         error = nil
         // it leaves this tab unless it stays in the same state (a confirm on the active tab)
         if !(action == .confirm && tab == .active) { samples.removeAll { $0.id == s.id } }
-        let done = Done(sampleId: s.id, action: action, undoToken: token ?? requestId)
+        arm(Done(sampleId: s.id, action: action, undoToken: token ?? requestId))
+        return true
+    }
+
+    private func arm(_ done: Done) {
         undoable = done
         undoTimer?.cancel()
         let window = undoWindow
@@ -284,6 +340,5 @@ public final class VoiceSamplesModel {
             guard !Task.isCancelled else { return }
             if self?.undoable == done { self?.undoable = nil }
         }
-        return true
     }
 }

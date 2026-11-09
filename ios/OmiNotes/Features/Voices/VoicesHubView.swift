@@ -75,8 +75,9 @@ struct VoicesHubView: View {
                     .frame(width: 52, height: 52).background(.white.opacity(0.2), in: .circle)
                 Text("待确认").font(.title3.bold())
                 Spacer(minLength: 0)
-                if pending > 0 {
-                    Text("\(pending)").font(.title.bold().monospacedDigit())
+                // the backend gives no queue total: this counts flagged samples, and says so
+                if let badge = VoicesHub.reviewBadge(pending) {
+                    Text(badge).font(.title2.bold().monospacedDigit())
                         .padding(.horizontal, 12).padding(.vertical, 4)
                         .background(.white.opacity(0.22), in: .capsule)
                 }
@@ -88,7 +89,7 @@ struct VoicesHubView: View {
                         in: .rect(cornerRadius: 22))
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(pending > 0 ? "待确认 \(pending) 个" : "待确认")
+        .accessibilityLabel(pending > 0 ? "待确认，可疑样本 \(pending) 个" : "待确认")
     }
 
     /// No wearer yet: teaching your voice comes first.

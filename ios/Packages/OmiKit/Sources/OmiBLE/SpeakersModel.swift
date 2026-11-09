@@ -213,13 +213,35 @@ public final class SpeakersModel {
         }
     }
 
-    public func forgetVoice(_ person: Person, deleteNote: Bool = false) async {
+    /// True only once the server confirmed it; otherwise `error` says why.
+    @discardableResult
+    public func forgetVoice(_ person: Person, deleteNote: Bool = false) async -> Bool {
         do {
             try await api().deletePerson(id: person.id, deleteNote: deleteNote)
-            await refresh()
+            error = nil
+        } catch APIError.http(409, let detail) {
+            error = VoiceConflict(detail).message
+            return false
         } catch {
             self.error = Self.describe(error)
+            return false
         }
+        await refresh()
+        return true
+    }
+
+    /// The owner attests this person knows their voice is recognized (`PUT /v1/people/{id}` with
+    /// `attest_knows`); with the acknowledgment, that is the person's consent for voice samples.
+    @discardableResult
+    public func attest(_ person: Person) async -> Bool {
+        do {
+            try await api().putPerson(id: person.id, PutPersonRequest(name: person.name, attestKnows: true))
+        } catch {
+            self.error = Self.describe(error)
+            return false
+        }
+        await refresh()
+        return true
     }
 
     public func assign(_ suggestion: SpeakerSuggestion, to person: Person) async {

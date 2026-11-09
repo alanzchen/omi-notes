@@ -531,22 +531,30 @@ final class VoicePlayer {
     }
     var duration: Double? { core.audio?.duration }
     var isPlaying: Bool { core.playing != nil }
-    /// Which clip is playing / downloading (a list of clips shows it on that row only).
+    /// Which clip is playing / downloading / prepared, as `ClipPlayback.key(id, version:)` (a list of
+    /// clips shows it on that row only).
     var playingId: String? { core.playing }
     var loadingId: String? { core.loading }
-    /// The prepared clip (its bars and progress).
     var currentId: String? { core.loadedId }
     var loading: Bool { core.loading != nil }
     var unavailable: String? { core.message }
     var progress: Double { duration.map { $0 > 0 ? elapsed / $0 : 0 } ?? 0 }
 
-    func load(_ clipId: String, speakers: SpeakersModel) async {
-        await core.load(clipId) { try await speakers.clip($0) }
+    /// `version`: the generation the clip was listed in (`ClipPlayback.key`); the same id from another is another clip.
+    func load(_ clipId: String, version: String? = nil, speakers: SpeakersModel) async {
+        await core.load(clipId, version: version) { try await speakers.clip($0) }
     }
 
-    func toggle(_ clipId: String, speakers: SpeakersModel) {
-        core.toggle(clipId) { try await speakers.clip($0) }
+    func toggle(_ clipId: String, version: String? = nil, speakers: SpeakersModel) {
+        core.toggle(clipId, version: version) { try await speakers.clip($0) }
         tick()
+    }
+
+    /// The list was fetched again: forget every cached clip.
+    func invalidate() {
+        ticker?.cancel()
+        core.invalidate()
+        elapsed = 0
     }
 
     func seek(to fraction: Double) {

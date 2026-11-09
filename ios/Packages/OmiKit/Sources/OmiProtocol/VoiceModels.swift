@@ -63,8 +63,16 @@ public struct VoiceSample: Decodable, Identifiable, Equatable, Hashable, Sendabl
     public var day: String?
     public var label: String?
     public var flag: SampleFlag?
-    public var movedTo: String?
-    public var movedFrom: String?
+    /// A moved sample's copy (`{person_id, sample_id}`).
+    public var movedTo: SampleRef?
+    /// Where this copy came from (`{person_id, sample_id, import_id?}`).
+    public var movedFrom: SampleRef?
+
+    /// One sample of one person.
+    public struct SampleRef: Decodable, Equatable, Hashable, Sendable {
+        public var personId: String?
+        public var sampleId: String?
+    }
     /// The server can cut this sample's clip from raw audio; false keeps only the caption.
     public var playable: Bool?
     public var clip: SpeakerClip?
@@ -199,6 +207,11 @@ public enum VoicesHub {
         return "\(c.year ?? 0)-\(two(c.month))-\(two(c.day))"
     }
 
+    /// The review card's count: the backend gives no queue total, only flagged samples per person.
+    public static func reviewBadge(_ flagged: Int) -> String? {
+        flagged > 0 ? "可疑 \(flagged)" : nil
+    }
+
     /// A flag or review reason in a word or two.
     public static func reasonLabel(_ reason: String) -> String {
         switch reason {
@@ -212,9 +225,79 @@ public enum VoicesHub {
     }
 }
 
+/// A 409 from a voices endpoint, by its error code (`"<code>: <detail>"`, as `APIError.http` carries it).
+public enum VoiceConflict: Equatable, Sendable {
+    /// The item or sample changed since it was listed (`review.py`).
+    case staleReview
+    /// The person lacks the acknowledgment or their attestation (`review.py`, `imports.py`).
+    case consentRequired
+    /// An earlier journaled change is still being recovered (`journal.py`, `service.py`).
+    case recoveryPending
+    /// Forgetting this person hasn't finished (`journal.py`).
+    case forgetInProgress
+    /// An import of the same audio holds it (`review.py`).
+    case superseded
+    case other(String)
+
+    public init(_ detail: String) {
+        let code = String(detail.prefix { $0 != ":" }).trimmingCharacters(in: .whitespaces)
+        switch code {
+        case "stale_review": self = .staleReview
+        case "consent_required": self = .consentRequired
+        case "recovery_pending": self = .recoveryPending
+        case "forget_in_progress": self = .forgetInProgress
+        case "superseded": self = .superseded
+        default: self = .other(code)
+        }
+    }
+
+    public var message: String {
+        switch self {
+        case .staleReview: return "刚刚有变化，已重新载入"
+        case .consentRequired: return "需要先确认这个人知道声音会被识别"
+        case .recoveryPending: return "正在恢复，稍后再试"
+        case .forgetInProgress: return "这个人的声音正在忘记，完成后再试"
+        case .superseded: return "有一段导入的同一音频占用着它，先移除那一段"
+        case .other: return "这个样本刚刚变过，已重新载入"
+        }
+    }
+
+    /// The list is out of date: fetch it again (the rest wait, or need the owner first).
+    public var reloads: Bool {
+        switch self {
+        case .staleReview, .superseded, .other: return true
+        case .consentRequired, .recoveryPending, .forgetInProgress: return false
+        }
+    }
+}
+
+extension UndoNamingResponse {
+    /// Why parts of an undo were left as they are, in the backend's words (known ones in Chinese).
+    public var skipReasons: [String] {
+        let labels = skipped.isEmpty ? [] : ["之后又改过"]
+        let samples = (samples?.skipped ?? []).map { s -> String in
+            switch s.reason ?? "" {
+            case "changed since", "the label changed since", "a moved sample changed since", "a rejected sample changed since",
+                 "the moved copy changed since": return "之后又改过"
+            case "that person's consent is withdrawn": return "这个人的同意已撤回"
+            case "that person was forgotten", "the moved copy was forgotten since": return "已被忘记"
+            case "that person's forget hasn't finished": return "正在忘记这个人"
+            case "nothing to undo": return "没有可撤销的"
+            case "an active import holds overlapping audio from the same source": return "被导入的同一音频占用"
+            case let other: return other.isEmpty ? "之后又改过" : other
+            }
+        }
+        var seen = Set<String>()
+        return (labels + samples).filter { seen.insert($0).inserted }
+    }
+}
+
 /// One batch of the review queue.
 public enum ReviewBatch {
     public static let size = 10
+    /// The most `GET /v1/speakers/review` answers at once. It has no offset or cursor, so the phone
+    /// asks for the whole window and pages it in batches of `size`.
+    public static let window = 50
 
     /// The server's order (it puts suspicious items first), without repeats or what was skipped.
     public static func make(_ items: [ReviewItem], excluding skipped: Set<String>, limit: Int = size) -> [ReviewItem] {

@@ -76,7 +76,7 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
         let queue = VoiceReviewQueue(speakers: try speakers())
         VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, Self.first)]
         await queue.load()
-        #expect(sent("GET", "/v1/speakers/review").first?.query == "limit=10")
+        #expect(sent("GET", "/v1/speakers/review").first?.query == "limit=50")  // the backend has no paging: one window, paged here
         #expect(queue.items.map(\.id) == ["s.a.1", "s.b.1", "l.c.S1.2.p-gigi.x"] && queue.current?.id == "s.a.1")
         #expect(queue.phase == .ready && queue.current?.isSuspicious == true)
     }
@@ -167,7 +167,7 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
         VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, Self.batch([Self.item("s.a.1", sample: "a")])), (200, second)]
         await queue.load()
         queue.skip()
-        #expect(queue.phase == .finished && VoicesHubStub.requests.filter { $0.method == "POST" }.isEmpty)
+        #expect(queue.phase == .onlySkipped && VoicesHubStub.requests.filter { $0.method == "POST" }.isEmpty)
         await queue.load()
         #expect(queue.items.map(\.id) == ["s.d.1"] && queue.phase == .ready)
     }
@@ -178,7 +178,7 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
         await queue.load()
         queue.skip()
         await queue.load()
-        #expect(queue.items.isEmpty && queue.phase == .finished)
+        #expect(queue.items.isEmpty && queue.phase == .onlySkipped)
     }
 
     @Test func aFailedLoadSaysWhy() async throws {
@@ -235,13 +235,14 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
         #expect(m.samples.isEmpty && m.undoable?.action == .move)
     }
 
-    @Test func aMoveWithoutConsentSaysWhyAndListsAgain() async throws {
+    @Test func aMoveWithoutConsentAsksForTheirConsentAndKeepsTheList() async throws {
         let m = VoiceSamplesModel(speakers: try speakers(), personId: "p-alan", tab: .active)
         VoicesHubStub.routes["GET /v1/people/p-alan/samples"] = [(200, Self.samples)]
         VoicesHubStub.routes["POST /v1/samples/a/move"] = [(409, #"{"error":"consent_required","detail":"no attestation"}"#)]
         await m.load()
         #expect(await m.move(m.samples[0], to: "p-gigi") == false)
-        #expect(m.error == VoiceSamplesModel.consentMessage && sent("GET", "/samples").count == 2 && m.samples.count == 2)
+        #expect(m.error == VoiceConflict.consentRequired.message && m.consentNeeded == "p-gigi" && m.samples.count == 2)
+        #expect(sent("GET", "/samples").count == 1)  // nothing changed: no reload
     }
 
     @Test func confirmingAFlaggedSampleUsesItsReviewItem() async throws {
@@ -252,6 +253,120 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
         #expect(await m.confirm(m.samples[0]))
         #expect(sent("POST", "/review/s.a.2").first?.body["decision"] as? String == "confirm")
         #expect(m.samples.map(\.id) == ["b"] && m.undoable?.action == .confirm)  // no longer flagged
+    }
+
+    // MARK: Astra review (deployed backend 1b7ef4e)
+
+    /// Skipping a whole batch must not end the queue while more is pending: the backend has no offset
+    /// or cursor (`GET /v1/speakers/review?limit≤50`), so the phone asks for the whole window and pages it.
+    @Test func skippingABatchShowsTheNextOneNotAnEmptyQueue() async throws {
+        let queue = VoiceReviewQueue(speakers: try speakers())
+        let twelve = Self.batch((1...12).map { Self.item("s.x\($0).1", sample: "x\($0)") })
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, twelve)]
+        await queue.load()
+        #expect(queue.items.count == 10)
+        for _ in 0..<10 { queue.skip() }
+        #expect(queue.phase == .batchDone)  // more is waiting, not "没有待确认的了"
+        await queue.load()
+        #expect(queue.items.map(\.id) == ["s.x11.1", "s.x12.1"])
+        queue.skip(); queue.skip()
+        #expect(queue.phase == .onlySkipped)
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, #"{"items":[]}"#)]
+        await queue.load()
+        #expect(queue.phase == .empty)
+    }
+
+    @Test func answeringAFullWindowLeavesMoreToFetch() async throws {
+        let queue = VoiceReviewQueue(speakers: try speakers())
+        let fifty = Self.batch((1...50).map { Self.item("s.y\($0).1", sample: "y\($0)") })
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, fifty)]
+        await queue.load()
+        #expect(queue.items.count == 10 && queue.phase == .ready)
+    }
+
+    @Test func aRecoveringVaultSaysSoAndStaysOnTheItem() async throws {
+        let queue = VoiceReviewQueue(speakers: try speakers())
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, Self.first)]
+        VoicesHubStub.routes["POST /v1/speakers/review/s.a.1"] = [(409, #"{"error":"recovery_pending","detail":"try again later"}"#)]
+        await queue.load()
+        #expect(await queue.decide(.confirm) == false)
+        #expect(queue.current?.id == "s.a.1" && queue.error == "正在恢复，稍后再试" && sent("GET", "/v1/speakers/review").count == 1)
+    }
+
+    @Test func aMoveWithoutConsentAsksForThatPersonsConsent() async throws {
+        let queue = VoiceReviewQueue(speakers: try speakers())
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, Self.first)]
+        VoicesHubStub.routes["POST /v1/speakers/review/s.a.1"] = [(409, #"{"error":"consent_required","detail":"no attestation"}"#)]
+        await queue.load()
+        #expect(await queue.decide(.move, personId: "p-gigi") == false)
+        #expect(queue.consentNeeded == "p-gigi" && queue.current?.id == "s.a.1")
+        queue.clearConsentNeeded()
+        #expect(queue.consentNeeded == nil)
+    }
+
+    @Test func aFailedUndoShowsTheBackendsReasons() async throws {
+        let queue = VoiceReviewQueue(speakers: try speakers())
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, Self.first)]
+        VoicesHubStub.routes["POST /v1/speakers/review/s.a.1"] = [(200, #"{"undo_token":"tok-a"}"#)]
+        VoicesHubStub.routes["POST /v1/speakers/undo"] = [(200, #"{"undone":[],"skipped":[],"samples":{"undone":[],"skipped":[{"id":"a","reason":"changed since"}]}}"#)]
+        await queue.load()
+        await queue.decide(.reject)
+        await queue.undo()
+        #expect(queue.error?.contains("之后又改过") == true)
+    }
+
+    @Test func everyLoadIsANewClipGeneration() async throws {
+        let queue = VoiceReviewQueue(speakers: try speakers())
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, Self.first)]
+        await queue.load()
+        let first = queue.generation
+        await queue.load()
+        #expect(queue.generation != first)
+        // the item id carries its revision (and, for a label, the transcript's speakers revision)
+        #expect(VoiceReviewQueue.clipVersion(queue.items[2]) == "l.c.S1.2.p-gigi.x")
+    }
+
+    @Test func aSampleUndoThatFailsKeepsItsTokenToRetry() async throws {
+        let m = VoiceSamplesModel(speakers: try speakers(), personId: "p-alan", tab: .active)
+        VoicesHubStub.routes["GET /v1/people/p-alan/samples"] = [(200, Self.samples)]
+        VoicesHubStub.routes["POST /v1/samples/a/remove"] = [(200, #"{"sample":{"id":"a","state":"removed"},"undo_token":"tok-rm"}"#)]
+        VoicesHubStub.routes["POST /v1/speakers/undo"] = [(503, #"{"error":"vault_read_only","detail":"x"}"#),
+                                                          (200, #"{"undone":[],"skipped":[],"samples":{"undone":["a"],"skipped":[]}}"#)]
+        await m.load()
+        await m.remove(m.samples[0])
+        await m.undo()
+        #expect(m.undoable?.undoToken == "tok-rm" && m.error != nil)  // still undoable
+        await m.undo()
+        #expect(m.undoable == nil && sent("POST", "/v1/speakers/undo").allSatisfy { $0.body["request_id"] as? String == "tok-rm" })
+    }
+
+    @Test func aSampleConflictKeepsItsOwnExplanation() async throws {
+        let m = VoiceSamplesModel(speakers: try speakers(), personId: "p-alan", tab: .active)
+        VoicesHubStub.routes["GET /v1/people/p-alan/samples"] = [(200, Self.samples)]
+        VoicesHubStub.routes["POST /v1/samples/a/remove"] = [(409, #"{"error":"forget_in_progress","detail":"x"}"#)]
+        await m.load()
+        #expect(await m.remove(m.samples[0]) == false)
+        #expect(m.error == VoiceConflict.forgetInProgress.message && sent("GET", "/samples").count == 1)
+        VoicesHubStub.routes["POST /v1/samples/a/move"] = [(409, #"{"error":"consent_required","detail":"x"}"#)]
+        #expect(await m.move(m.samples[0], to: "p-gigi") == false)
+        #expect(m.consentNeeded == "p-gigi")
+    }
+
+    @Test func forgettingReportsWhetherItWorked() async throws {
+        let speakers = try speakers()
+        VoicesHubStub.routes["DELETE /v1/people/p-gigi"] = [(409, #"{"error":"recovery_pending","detail":"x"}"#),
+                                                            (200, #"{"person_id":"p-gigi","voice_forgotten":true}"#)]
+        #expect(await speakers.forgetVoice(Person(id: "p-gigi", name: "Gigi")) == false)
+        #expect(speakers.error != nil)
+        #expect(await speakers.forgetVoice(Person(id: "p-gigi", name: "Gigi")))
+    }
+
+    @Test func attestingSendsTheNameAndTheAttestation() async throws {
+        let speakers = try speakers()
+        VoicesHubStub.routes["PUT /v1/people/p-gigi"] = [(200, #"{"id":"p-gigi","name":"Gigi"}"#)]
+        #expect(await speakers.attest(Person(id: "p-gigi", name: "Gigi")))
+        let body = try #require(sent("PUT", "/v1/people/p-gigi").first?.body)
+        #expect(body["attest_knows"] as? Bool == true && body["name"] as? String == "Gigi")
     }
 
     // MARK: Capabilities

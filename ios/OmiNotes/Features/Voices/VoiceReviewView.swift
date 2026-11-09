@@ -50,9 +50,14 @@ struct VoiceReviewView: View {
         .task { if queue.items.isEmpty, queue.phase == .loading { await queue.load() } }
         .task(id: queue.current?.id) {
             player.stop()
-            if let item = queue.current, item.canPlay, let clip = item.clip { await player.load(clip.id, speakers: speakers) }
+            if let item = queue.current, item.canPlay, let clip = item.clip {
+                await player.load(clip.id, version: VoiceReviewQueue.clipVersion(item), speakers: speakers)
+            }
         }
+        // a fetched queue may name the same clip id after a re-transcription: no old audio is reused
+        .onChange(of: queue.generation) { player.invalidate() }
         .onDisappear { player.stop() }
+        .personConsent(model, personId: queue.consentNeeded) { queue.clearConsentNeeded() }
     }
 
     // MARK: Top
@@ -121,7 +126,7 @@ struct VoiceReviewView: View {
             }
             if item.canPlay, let clip = item.clip {
                 HStack(spacing: 14) {
-                    Button { player.toggle(clip.id, speakers: speakers) } label: {
+                    Button { player.toggle(clip.id, version: VoiceReviewQueue.clipVersion(item), speakers: speakers) } label: {
                         ZStack {
                             Circle().fill(Color.accentColor).frame(width: 64, height: 64)
                                 .shadow(color: .accentColor.opacity(0.35), radius: 10, y: 4)
@@ -261,13 +266,21 @@ struct VoiceReviewView: View {
 
     // MARK: Done
 
+    private var doneTitle: String {
+        switch queue.phase {
+        case .batchDone: return "这批完成了"
+        case .onlySkipped: return "剩下的都跳过了"
+        default: return "没有待确认的了"
+        }
+    }
+
     private var finished: some View {
         VStack(spacing: 18) {
             Spacer()
             Image(systemName: "checkmark.seal.fill").font(.system(size: 56)).foregroundStyle(.green)
-            Text(queue.items.isEmpty ? "没有待确认的了" : "这批完成了").font(.title.bold())
+            Text(doneTitle).font(.title.bold())
             Spacer()
-            if !queue.items.isEmpty {
+            if queue.phase == .batchDone {
                 Button { Task { await queue.load() } } label: {
                     Text("下一批").font(.headline).frame(maxWidth: .infinity).padding(.vertical, 12)
                 }

@@ -172,4 +172,59 @@ import Testing
         #expect(ReviewBatch.make(items, excluding: [], limit: 2).map(\.id) == ["s.a.1", "s.b.1"])
         #expect(ReviewBatch.size == 10)
     }
+
+    // MARK: Astra review (deployed backend 1b7ef4e)
+
+    /// `POST /v1/samples/{id}/move` answers the original sample, now `moved`, pointing at its copy
+    /// (`journal.py`: `moved_to: {person_id, sample_id}`); the copy carries `moved_from` (with `import_id`
+    /// for an enrollment). Both are objects, never strings.
+    @Test func aMoveAnswerAndTheMovedCopyDecode() throws {
+        let answer = #"""
+        {"sample":{"id":"5b0c2a52-0000-4000-8000-000000000001","person_id":"p-alan","state":"moved","revision":4,"source":"user",
+          "seconds":5.2,"created_at":"2026-10-10T02:14:00.000Z","day":"2026-10-09","label":"S2","f0":180.2,"f0_source":"voices",
+          "flag":{"reasons":["pitch"],"open":false,"resolved":{"decision":"move","at":"2026-11-09T18:00:00.000Z","fingerprint":"ab"}},
+          "moved_to":{"person_id":"p-gigi","sample_id":"5b0c2a52-0000-4000-8000-000000000002"},"moved_from":null,
+          "playable":true,"clip":{"id":"sample.5b0c2a52-0000-4000-8000-000000000001.0","seconds":5.2,"started_at":null},
+          "text":"下一集马上开始","conversation":{"id":"c12","started_at":"2026-11-03T02:05:00.000Z","title":"客厅"},
+          "device":"omi-1","review_id":"s.5b0c2a52-0000-4000-8000-000000000001.4"},
+         "request_id":"r-9","undo_token":"r-9"}
+        """#
+        let a = try decode(SampleActionAnswer.self, answer)
+        #expect(a.sample?.sampleState == .moved && a.sample?.movedTo?.personId == "p-gigi")
+        #expect(a.sample?.movedTo?.sampleId == "5b0c2a52-0000-4000-8000-000000000002" && a.sample?.movedFrom == nil)
+        let copy = try decode(VoiceSamplesResponse.self, #"""
+        {"samples":[{"id":"5b0c2a52-0000-4000-8000-000000000002","person_id":"p-gigi","state":"active","revision":0,
+          "moved_to":null,"moved_from":{"person_id":"p-alan","sample_id":"5b0c2a52-0000-4000-8000-000000000001","import_id":null},
+          "playable":false,"text":"下一集马上开始"}]}
+        """#)
+        #expect(copy.samples.first?.movedFrom?.personId == "p-alan")
+        #expect(copy.samples.first?.movedFrom?.sampleId == "5b0c2a52-0000-4000-8000-000000000001")
+    }
+
+    /// The 409 codes the backend sends for voices (`journal.py`, `review.py`, `service.py`), each with its own words.
+    @Test func eachConflictCodeHasItsOwnExplanation() {
+        #expect(VoiceConflict("stale_review: this sample changed") == .staleReview)
+        #expect(VoiceConflict("consent_required: no attestation") == .consentRequired)
+        #expect(VoiceConflict("recovery_pending: still recovering") == .recoveryPending)
+        #expect(VoiceConflict("forget_in_progress: finish it first") == .forgetInProgress)
+        #expect(VoiceConflict("superseded: an active import holds overlapping audio") == .superseded)
+        #expect(VoiceConflict("sample_not_active: the sample is removed") == .other("sample_not_active"))
+        #expect(VoiceConflict.recoveryPending.message == "正在恢复，稍后再试")
+        #expect(VoiceConflict.staleReview.reloads && VoiceConflict.superseded.reloads && !VoiceConflict.recoveryPending.reloads)
+        #expect(!VoiceConflict.forgetInProgress.reloads && !VoiceConflict.consentRequired.reloads)
+    }
+
+    /// A failed undo says why, in the backend's own reasons (known ones in Chinese).
+    @Test func aFailedUndoListsTheBackendsReasons() throws {
+        let u = try decode(UndoNamingResponse.self, #"{"undone":[],"skipped":[],"samples":{"undone":[],"skipped":[{"id":"a","reason":"changed since"},{"id":"b","reason":"that person's consent is withdrawn"},{"id":"c","reason":"something new"}]}}"#)
+        #expect(!u.undidAnything)
+        #expect(u.skipReasons == ["之后又改过", "这个人的同意已撤回", "something new"])
+        #expect(try decode(UndoNamingResponse.self, #"{"undone":[],"skipped":["c1"]}"#).skipReasons == ["之后又改过"])
+    }
+
+    /// The backend returns no queue total; the badge counts flagged samples and says so.
+    @Test func theReviewBadgeSaysWhatItCounts() {
+        #expect(VoicesHub.reviewBadge(148) == "可疑 148")
+        #expect(VoicesHub.reviewBadge(0) == nil)
+    }
 }

@@ -1,3 +1,4 @@
+import OmiBLE
 import OmiProtocol
 import SwiftUI
 
@@ -108,6 +109,37 @@ struct VoiceToast: View {
         .padding(.horizontal, 16).padding(.vertical, 14)
         .background(Color(white: 0.17).opacity(0.96), in: .rect(cornerRadius: 16))
         .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+}
+
+/// A voice change needed this person's consent (`409 consent_required`): first the one-time
+/// acknowledgment, then the owner's attestation that the person knows. Then the owner tries again.
+struct PersonConsentFlow: ViewModifier {
+    @Bindable var model: AppModel
+    let personId: String?
+    let done: () -> Void
+
+    private var person: Person? { personId.flatMap { id in model.speakers.people.first { $0.id == id } } }
+    private var acknowledged: Bool { model.speakers.settings?.acknowledged == true }
+
+    func body(content: Content) -> some View {
+        content
+            .alert("\(person?.name ?? "TA") 知道吗？", isPresented: .init(get: { person != nil && acknowledged }, set: { if !$0 { done() } }),
+                   presenting: person) { p in
+                Button("取消", role: .cancel) {}
+                Button("TA 知道") { Task { await model.speakers.attest(p) } }
+            } message: { p in
+                Text("确认 \(p.name) 知道 Omi Notes 会识别 TA 的声音，然后再试一次。")
+            }
+            .sheet(isPresented: .init(get: { person != nil && !acknowledged }, set: { if !$0 { done() } })) {
+                RecognitionConsentView(model: model)
+            }
+    }
+}
+
+extension View {
+    func personConsent(_ model: AppModel, personId: String?, done: @escaping () -> Void) -> some View {
+        modifier(PersonConsentFlow(model: model, personId: personId, done: done))
     }
 }
 

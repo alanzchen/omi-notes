@@ -50,6 +50,31 @@ final class ClipServer {
 
     func settle() async { for _ in 0..<30 { await Task.yield() } }
 
+    /// Astra review: a re-transcription can change whose voice `conv.S1.0` is, so the same clip id from a
+    /// newer review item (or after a refresh) is fetched again, never played from the old bytes.
+    @Test func theSameClipIdFromAnotherGenerationIsFetchedAgain() async {
+        let r = rig(.pause)
+        Task { await r.playback.load("c.S1.0", version: "l.c.S1.2.p.x", fetch: r.fetch) }
+        await settle()
+        r.server.answer("c.S1.0")
+        await settle()
+        #expect(r.playback.loadedId == ClipPlayback.key("c.S1.0", version: "l.c.S1.2.p.x"))
+        Task { await r.playback.load("c.S1.0", version: "l.c.S1.3.p.x", fetch: r.fetch) }
+        await settle()
+        #expect(r.server.requests == ["c.S1.0", "c.S1.0"])  // the server is asked with the clip id
+        r.server.answer("c.S1.0")
+        await settle()
+        Task { await r.playback.load("c.S1.0", version: "l.c.S1.2.p.x", fetch: r.fetch) }
+        await settle()
+        #expect(r.server.requests.count == 2)  // that generation is still cached
+        r.playback.invalidate()
+        #expect(r.playback.loadedId == nil)
+        Task { await r.playback.load("c.S1.0", version: "l.c.S1.2.p.x", fetch: r.fetch) }
+        await settle()
+        #expect(r.server.requests.count == 3)  // a refresh forgets every cached clip
+        #expect(ClipPlayback.key("a", version: nil) == "a")
+    }
+
     @Test func closingWhileTheClipDownloadsPlaysNothingAfterwards() async {
         let r = rig()
         r.playback.toggle("a", fetch: r.fetch)
