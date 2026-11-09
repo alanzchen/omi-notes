@@ -38,7 +38,10 @@ public final class ClipPlayback {
     private let center: NotificationCenter
     private var cache: [String: Data] = [:]
     /// One request per clip, shared by every caller waiting for it.
-    private var inflight: [String: Task<Data, Error>] = [:]
+    private var inflight: [String: (request: Int, task: Task<Data, Error>)] = [:]
+    /// Bumped by `invalidate`: a download that started before then publishes nothing.
+    private var cacheEpoch = 0
+    private var lastRequest = 0
     /// The current intent. Stop, Close, another clip or another sound move it on; work that awaited
     /// across a change must not start audio or report anything afterwards.
     private var generation = 0
@@ -81,6 +84,7 @@ public final class ClipPlayback {
     /// The list was fetched again: no clip it had is trusted any more.
     public func invalidate() {
         stop()
+        cacheEpoch += 1
         cache.removeAll()
         inflight.removeAll()
         loadedId = nil
@@ -157,12 +161,16 @@ public final class ClipPlayback {
 
     private func data(_ id: String, _ fetch: @escaping (String) async throws -> Data) async throws -> Data {
         if let cached = cache[id] { return cached }
-        if let shared = inflight[id] { return try await shared.value }
+        if let shared = inflight[id] { return try await shared.task.value }
         let task = Task { try await fetch(id) }
-        inflight[id] = task
-        defer { inflight[id] = nil }
+        lastRequest += 1
+        let request = lastRequest, epoch = cacheEpoch
+        inflight[id] = (request, task)
+        // only this request's own entry is cleared (a newer one for the same clip may have replaced it)
+        defer { if inflight[id]?.request == request { inflight[id] = nil } }
         let bytes = try await task.value
-        cache[id] = bytes
+        // bytes asked for before an invalidation are not this list's clip: never cached
+        if epoch == cacheEpoch { cache[id] = bytes }
         return bytes
     }
 
