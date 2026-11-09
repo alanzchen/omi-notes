@@ -802,3 +802,58 @@ def test_unattributed_words_without_a_voice_heard_under_them_stay_speakers_unkno
     worker.tick(T0 + 400)
     (row,) = convs(worker)
     assert row["status"] == "failed" and row["error_kind"] == "speakers_unknown"
+
+
+def voices_heard(turns, utterances=None):
+    """`_voices_under_words` on a 10 s unattributed utterance (Astra IT1-02's harness)."""
+    from types import SimpleNamespace
+
+    from omi_notes.audio.diarize import Turn
+    from omi_notes.pipeline.conversations import ConversationPipeline
+
+    p = object.__new__(ConversationPipeline)
+    p.providers = SimpleNamespace(diarizer=object())
+    p._local_turns = lambda *_: [Turn(*t) for t in turns]
+    utterances = utterances or [{"start": 0.0, "end": 10.0, "transcript": "words", "speaker": None, "unattributed": True}]
+    out = p._voices_under_words("c", {"results": {"utterances": utterances}}, None, "sha")
+    return out and out[0]
+
+
+@pytest.mark.parametrize("turns", [
+    [(0.0, 3.0, 0), (7.0, 10.0, 1)],  # 30% + 30%: neither voice is evidence for the whole
+    [(0.0, 3.0, 0), (0.0, 3.0, 1)],  # overlapping turns count once, not 60%
+    [(0.0, 5.0, 0), (5.0, 10.0, 1)],  # 50/50: ambiguous, never decided by input order
+    [(0.0, 6.0, 0), (0.0, 6.0, 1)],  # two voices over the same majority: ambiguous
+    [(0.0, 3.0, 0), (2.0, 4.0, 0)],  # one voice, overlapping turns: 40% by union, not 50%
+])
+def test_unattributed_words_take_a_voice_only_when_it_alone_covers_half(turns):
+    # Astra IT1-02: combined coverage of all voices was taken as evidence for whichever came first
+    assert voices_heard(turns) is None
+
+
+def test_the_one_voice_covering_most_of_the_words_labels_them():
+    assert voices_heard([(0.0, 6.0, 1), (6.0, 10.0, 0)])["results"]["utterances"][0]["speaker"] == 1
+    assert voices_heard([(0.0, 5.0, 7)])["results"]["utterances"][0]["speaker"] == 7
+
+
+@pytest.mark.parametrize("turns, clean", [
+    ([(0.0, 6.0, 0), (6.0, 10.0, 1)], (0.0, 6.0)),
+    # B holds no words of its own, yet its audio inside A's first turn keeps that turn out of A's voiceprint
+    ([(0.0, 4.0, 0), (3.5, 4.5, 1), (5.0, 9.0, 0)], (5.0, 9.0)),
+])
+def test_voiceprint_clips_from_labelled_words_come_from_the_diarizers_own_turns(client, worker, turns, clean):
+    # Astra IT1-03: A 0-6 s, B 6-10 s; A labels the whole utterance, but its clip must not take in B's 4 s
+    def response(request, n):
+        return httpx.Response(200, json={"segments": [{"start": 0.0, "end": 10.0, "speaker_id": "UNKNOWN", "text": "a synthetic utterance"}]})
+
+    worker.providers._local_stt, _ = sidecar(response)
+    worker.providers._diarizer = TurnsDiarizer(turns)
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(20, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    assert row["status"] == "done", row["error"]
+    transcript = json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text())
+    # (a turn next to another voice's, within the overlap guard, yields no clip at all: never a mixed one)
+    clips = transcript.get("speaker_clips", {}).get("S1", [])
+    assert all(clean[0] <= start and end <= clean[1] for start, end in clips), clips
+    assert clips or clean == (0.0, 6.0), "a clean turn of its own still gives a clip"
