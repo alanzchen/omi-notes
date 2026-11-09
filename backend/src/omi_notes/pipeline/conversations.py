@@ -38,7 +38,7 @@ from ..envelope import OPUS_CODECS, parse_envelope
 from ..ingest import seal_end_epoch
 from ..notes import daily as daily_mod
 from ..notes.render import NoteData, owner_display, render_note, render_stub, title_of
-from ..notes.schema import NOTES_JSON_SCHEMA, ConversationNotes
+from ..notes.schema import CLEANED_TEXT_MAX_S, NOTES_JSON_SCHEMA, ConversationNotes
 from ..notes.status import StatusSnapshot, render_status
 from ..notes.writer import (
     UserRegionError,
@@ -94,7 +94,7 @@ _PROMPT_IN_NAME = re.compile(r"-p(\d+)-[0-9a-f]{16}\.json$")
 
 STATUS_INTERVAL = 60.0  # `_status.md` and stubs are rewritten at most once a minute
 EDITED_RETRY = 600.0
-MONOLOGUE_CLEANED_MAX_S = 600.0  # a monologue up to this much speech also gets a cleaned near-verbatim text
+MONOLOGUE_CLEANED_MAX_S = CLEANED_TEXT_MAX_S  # a monologue up to this much speech also gets a cleaned text
 TOO_SHORT_S = 1.5  # detected speech below this is set aside without a note (not a failure)
 TOO_SHORT_REASON = "too short: under 1.5 s of speech"
 LOCAL_STT_DOWN = "local transcription (the omi-asr sidecar) is unavailable; waiting for it"
@@ -853,6 +853,32 @@ class ConversationPipeline:
                                 "(next_attempt_at IS NULL OR next_attempt_at <= ?)", (conv_id, now))  # fmt: skip
         return any(self._class_rank.get(r["id"], 1) < mine for r in waiting)
 
+    def reconcile_classes(self, now: float) -> int:
+        """Apply owners' class choices newer than their notes (a new summary, never from a render): the choice's
+        revision in `class.json` against the one recorded in the note's render index. Driven by vault state alone,
+        so a choice that arrived during an earlier summary, or before a restart or rebuild, is still applied.
+        Frozen notes are left as they are. Returns how many conversations were queued."""
+        queued, unreadable = 0, []
+        for path in self.vault.conversations.glob("*/*/class.json"):
+            conv_id = path.parent.name
+            row = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
+            if row is None or not row["note_path"] or row["frozen"] or row["status"] not in ("done", "discarded"):
+                continue
+            try:
+                choice = rclass.read(self, conv_id)
+            except rclass.UnreadableChoice as exc:
+                unreadable.append(conv_id)
+                log.error("%s", exc)
+                continue
+            applied = json.loads(row["index_json"] or "{}").get("recording_class") or {}
+            if rclass.pending(choice, applied):
+                log.info("conversation %s: the owner chose %s (revision %s): summarizing again", conv_id,
+                         (choice or {}).get("class"), (choice or {}).get("revision"))  # fmt: skip
+                self._set(conv_id, status="summarizing", next_attempt_at=None, updated_at=now)
+                queued += 1
+        self.db.set_meta("class_unreadable", json.dumps(sorted(unreadable)) if unreadable else None)
+        return queued
+
     def recording(self, conv_id: str, transcript: dict, transcript_sha: str | None, *, interaction: str | None = None) -> dict:
         """The recording class this conversation is treated as (`recording_class`): the owner's choice, else the
         automatic one from the wearer's share of the speech, with what decided it."""
@@ -887,15 +913,16 @@ class ConversationPipeline:
             except Exception:
                 log.exception("could not score voices against the wearer for %s", conv_id)
         confirmed = ("user", "auto")
-        voices = [
-            rclass.Voice(label, seconds,
-                         named_wearer=me is not None and (states.get(label) or {}).get("person_id") == me["id"]
-                         and (states.get(label) or {}).get("source") in confirmed,
-                         named_other=bool((states.get(label) or {}).get("person_id")) and (me is None or (states.get(label) or {}).get("person_id") != me["id"])
-                         and (states.get(label) or {}).get("source") in confirmed,
-                         score=None if label not in scores else round(scores[label], 3))
-            for label, seconds in per.items()
-        ]  # fmt: skip
+        spans = rclass.speech_spans(segments)
+        voices = []
+        for label, seconds in per.items():
+            state = states.get(label) or {}
+            person = state.get("person_id") if state.get("source") in confirmed else None
+            voices.append(rclass.Voice(
+                label, seconds, named_wearer=me is not None and person == me["id"],
+                named_other=bool(person) and (me is None or person != me["id"]),
+                score=None if label not in scores else round(scores[label], 3),
+                spans=tuple(spans.get(label, ())), person=person))  # fmt: skip
         out = rclass.classify(voices, total, interaction=interaction, coarse_timing=transcript.get("timing_source") != "provider")
         evidence = [[v.label, round(v.seconds, 1), v.named_wearer, v.named_other, v.score] for v in voices]
         out["fingerprint"] = sha256_hex(canonical_json(evidence).encode())[:16]
@@ -1068,7 +1095,7 @@ class ConversationPipeline:
         )
 
     def llm_notes(self, row: sqlite3.Row, segments: list[dict], language: str, now: float, *, cache_only: bool,
-                  recording_class: str = "dialogue") -> dict:  # fmt: skip
+                  recording_class: str = "dialogue", confident: bool = True, preceded_by: dict | None = None) -> dict:  # fmt: skip
         conv_dir = self.conv_dir(row["id"])
         if cache_only:
             # Re-render from exactly what the note was made with, whatever the current model/prompt.
@@ -1086,8 +1113,8 @@ class ConversationPipeline:
             keyed += sorted(("~" + k, v[0], v[1]) for k, v in possible.items())
         speakers_sha = sha256_hex(canonical_json(keyed).encode())[:8]
         base = f"llm-{_slug(self.providers.llm_model)}-p{prompt.PROMPT_VERSION}-{row['transcript_sha'][:16]}-s{speakers_sha}"
-        if recording_class != "dialogue":  # a different summary for monologues and passive recordings
-            base += f"-c{recording_class[0]}{rclass.RULE_VERSION}"
+        if recording_class != "dialogue":  # a different summary for a monologue (stated as fact, or as likely)
+            base += f"-c{recording_class[0]}{rclass.RULE_VERSION}{'' if confident else 'u'}"
         name = _reusable(conv_dir, base, row["llm_ref"], row["skip_llm"])
         path = conv_dir / name
         if path.exists():
@@ -1097,14 +1124,16 @@ class ConversationPipeline:
             timezone_name=self.timezone, language=language,
             owner_name=self.owner_name, bookmarks=self.bookmarks(row),
             provisional=bool(row["provisional"]), audio_gaps=json.loads(row["gaps_json"]), now=now,
-            speaker_names=names, possible_names=possible, recording_class=recording_class,
+            speaker_names=names, possible_names=possible, recording_class=recording_class, class_confident=confident,
         )  # fmt: skip
         result = self.providers.llm.summarize(
             LlmRequest(system=prompt.SYSTEM_PROMPT, user=user, schema=NOTES_JSON_SCHEMA, segments=segments)
         )
         cached = {"created_at": now, "model": result.model, "prompt_version": prompt.PROMPT_VERSION,
                   "usage": result.usage, "fallback_used": result.fallback_used, "data": result.data,
-                  **({"recording_class": recording_class} if recording_class != "dialogue" else {})}  # fmt: skip
+                  **({"recording_class": recording_class} if recording_class != "dialogue" else {}),
+                  # the summary call this one followed (a monologue's cleaned text): its usage counts too
+                  **({"preceded_by": preceded_by} if preceded_by else {})}  # fmt: skip
         atomic_write_bytes(path, json.dumps(cached, ensure_ascii=False).encode())
         return cached | {"file": name}
 
@@ -1119,17 +1148,9 @@ class ConversationPipeline:
         language = transcript.get("language") or self.settings.stt_language
         verdict, rule = deterministic_relevance([s["text"] for s in segments], row["speech_seconds"])
         if cache_only:
-            # a re-render reproduces the class the note was made for (no fresh inference: a rebuild gives the same
-            # note); only the owner's choosing another class asks for a new summary
+            # a re-render reproduces the class the note was made for, without inference (a rebuild gives the same
+            # note); an owner's newer choice is applied by `reconcile_classes`, never from a render
             recording = json.loads(row["index_json"] or "{}").get("recording_class") or {}
-            try:
-                choice = rclass.read(self, conv_id)
-            except rclass.UnreadableChoice as exc:
-                raise ProviderError(str(exc), kind="io") from exc
-            chosen = (choice or {}).get("class")
-            if chosen in rclass.CLASSES and chosen != recording.get("class"):
-                self._set(conv_id, status="summarizing", needs_render=0, updated_at=now)
-                return
         else:
             recording = {}  # decided after the summary: its `interaction` is one of the two cues
         notes: ConversationNotes | None = None
@@ -1159,8 +1180,11 @@ class ConversationPipeline:
             if not cache_only:
                 recording = self.recording(conv_id, transcript, row["transcript_sha"], interaction=notes.interaction)
                 if recording["class"] == "monologue" and row["speech_seconds"] <= MONOLOGUE_CLEANED_MAX_S:
-                    # the owner's own words: a cleaned near-verbatim text, then ideas, tasks and questions
-                    llm_cached = self.llm_notes(row, segments, language, now, cache_only=False, recording_class="monologue")
+                    # the owner's own words: a cleaned near-verbatim text, then ideas, tasks and questions; the
+                    # first call's file and usage are recorded with it (cost totals, and kept from collection)
+                    first = {"file": llm_cached["file"], "model": llm_cached["model"], "usage": llm_cached.get("usage", {})}
+                    llm_cached = self.llm_notes(row, segments, language, now, cache_only=False, recording_class="monologue",
+                                                confident=recording.get("confidence") in rclass.CONFIDENT, preceded_by=first)  # fmt: skip
                     notes = ConversationNotes.model_validate(llm_cached["data"])
             treated = recording.get("class") or "dialogue"
             # a monologue (Alan talking to the assistant) or a passive recording is never discarded by the
@@ -1240,9 +1264,12 @@ class ConversationPipeline:
         index = {
             "kind": kind,
             "emoji": notes.emoji if notes else "",
-            "action_items": [_action_text(i, snap["owner_name"]) for i in notes.action_items if not i.directed_at_ai] if notes else [],
+            "action_items": [_action_text(i, snap["owner_name"]) for i in rclass.visible_items(notes.action_items, recording.get("class"))
+                             if not i.directed_at_ai] if notes else [],  # fmt: skip
             "llm_model": llm_cached["model"] if llm_cached else None,
-            "llm_usage": llm_cached.get("usage", {}) if llm_cached else {},
+            "llm_usage": _usage_sum(llm_cached.get("usage", {}), (llm_cached.get("preceded_by") or {}).get("usage", {})) if llm_cached else {},
+            # a monologue's first summary call (its file is kept, its cost counted)
+            **({"llm_preceded_by": llm_cached["preceded_by"]["file"]} if llm_cached and llm_cached.get("preceded_by") else {}),
             "stt_seconds": transcript.get("submitted_seconds", 0),
             "discard_reason": discard_reason,
             "relevance": [verdict, rule],
@@ -1349,7 +1376,7 @@ class ConversationPipeline:
         """Delete provider results no record references any more (e.g. after a forced reprocess)."""
         row = self._row(conv_id)
         conv_dir = self.conv_dir(conv_id)
-        keep = {row["stt_ref"], row["llm_ref"]}
+        keep = {row["stt_ref"], row["llm_ref"], json.loads(row["index_json"] or "{}").get("llm_preceded_by")}
         audio = (row["audio_sha"] or "")[:16]
         for path in list(conv_dir.glob("stt-*.json")) + list(conv_dir.glob("llm-*.json")):
             if path.name not in keep:
@@ -1785,13 +1812,31 @@ def possible_names(voices: dict[str, np.ndarray], states: dict[str, dict], centr
     return {label: pid for pid, (_, label) in best.items()}
 
 
+def _same_identity(name: str, base: str) -> bool:
+    return name == f"{base}.json" or re.fullmatch(re.escape(base) + r"-\d+\.json", name) is not None
+
+
+def _usage_sum(*usages: dict) -> dict:
+    """Token counts of several calls added up (non-numeric fields from the first)."""
+    out: dict = {}
+    for usage in usages:
+        for key, value in (usage or {}).items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                out[key] = out.get(key, 0) + value
+            else:
+                out.setdefault(key, value)
+    return out
+
+
 def _reusable(directory: Path, base: str, ref: str | None, skip: str | None) -> str:
     """The result file to use for `base`: the referenced one or `<base>.json` when present and not
     excluded by a forced reprocess; otherwise a free name (`<base>-2.json`, ...: results are
     write-once, never overwritten)."""
     excluded = set(json.loads(skip)) if skip else set()
     for name in (ref, f"{base}.json"):
-        if name and name.startswith(base) and name not in excluded and (directory / name).exists():
+        # exactly this identity, or one of its write-once retries (`-2`, `-3`, …): never a longer base that only
+        # starts the same (a monologue's `…-cm3.json` is not the plain summary)
+        if name and _same_identity(name, base) and name not in excluded and (directory / name).exists():
             return name
     name, n = f"{base}.json", 2
     while (directory / name).exists():

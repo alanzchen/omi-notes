@@ -89,3 +89,46 @@ def test_the_owners_choice_wins_and_auto_goes_back():
     assert effective(auto, {"class": "auto", "revision": 3})["class"] == "passive"
     assert effective(auto, None) == {"class": "passive", "auto": "passive", "confidence": "high", "overridden": False,
                                      "wearer_share": 0.0, "revision": 0}
+
+
+def test_any_confirmed_wearer_speech_keeps_media_out_of_passive():
+    voices = [Voice("S1", 4.0, named_wearer=True), Voice("S2", 96.0, score=-0.5)]
+    out = classify(voices, 100.0, interaction="media")
+    assert out["class"] == "dialogue", "Alan said something over the video: not background"
+    assert classify([Voice("S1", 4.0, score=0.6), Voice("S2", 96.0, score=-0.5)], 100.0, interaction="media")["class"] == "dialogue"
+
+
+def test_a_lone_voice_assigned_to_someone_else_is_never_a_monologue_even_when_it_sounds_like_dictation():
+    out = classify([Voice("S1", 30.0, named_other=True, person="p-gigi", score=0.1)], 30.0, interaction="dictation")
+    assert out["class"] == "dialogue"
+
+
+def test_overlapping_wearer_labels_are_counted_once():
+    voices = [Voice("S1", 60, named_wearer=True, spans=((0, 60),), person="p-alan"),
+              Voice("S2", 50, named_wearer=True, spans=((10, 60),), person="p-alan")]  # fmt: skip
+    out = classify(voices, 60.0, interaction="dictation")
+    assert out["wearer_share"] <= 1.0 and out["wearer_s"] == 60.0
+    assert out["class"] == "monologue", "two labels of one person are one voice, not a second speaker"
+
+
+def test_wearer_union_without_a_person_still_never_exceeds_the_speech():
+    voices = [Voice("S1", 60, score=0.8, spans=((0, 60),)), Voice("S2", 50, score=0.7, spans=((10, 60),))]
+    assert classify(voices, 60.0)["wearer_share"] == 1.0
+
+
+def _monologue_prompt(confident: bool) -> str:
+    from zoneinfo import ZoneInfo
+
+    from omi_notes.pipeline import prompt
+
+    return prompt.build_user_message(segments=[{"start": 0, "end": 2, "speaker": "S1", "text": "remind me to call"}],
+                                     start=0, end=2, tz=ZoneInfo("UTC"), timezone_name="UTC", language="en",
+                                     owner_name="Alan", bookmarks=[], provisional=False, audio_gaps=[], now=0,
+                                     recording_class="monologue", class_confident=confident)  # fmt: skip
+
+
+def test_the_summary_is_told_the_owner_is_alone_only_when_that_is_certain():
+    assert "The owner is talking alone" in _monologue_prompt(True)
+    unsure = _monologue_prompt(False)
+    assert "The owner is talking alone" not in unsure and "not confirmed" in unsure
+    assert "exempt from the density guidance" in unsure

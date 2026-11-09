@@ -349,10 +349,8 @@ def create_app(
         def apply() -> dict:
             row = db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
             applied = (json.loads(row["index_json"] or "{}").get("recording_class") or {}) if row else {}
-            result = rclass.put(pipeline, conv_id, body, applied.get("auto_detail") or applied)
-            if result.get("applied") and row is not None and row["note_path"]:
-                db.execute("UPDATE conversations SET needs_render=1 WHERE id=?", (conv_id,))  # the worker re-summarizes
-            return result
+            # stored in the vault only: the worker sees the newer choice and summarizes again (reconcile_classes)
+            return rclass.put(pipeline, conv_id, body, applied)
 
         return await run_in_threadpool(apply)
 

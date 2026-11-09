@@ -350,17 +350,14 @@ def recording_view(pipeline, row: sqlite3.Row) -> dict | None:
     from . import recording_class as rclass
 
     applied = _index(row).get("recording_class") if row["note_path"] else None
+    unreadable = None
     try:
         choice = rclass.read(pipeline, row["id"])
-    except rclass.UnreadableChoice:
-        choice = None
-    if not applied:
+    except rclass.UnreadableChoice as exc:  # shown, never taken as "no choice"; the last applied class stands
+        choice, unreadable = None, str(exc)
+    if not applied and not unreadable:
         return None
-    out = {k: applied.get(k) for k in ("class", "auto", "confidence", "overridden", "wearer_share")}
-    chosen = (choice or {}).get("class")
-    out["updating"] = bool(chosen in rclass.CLASSES and chosen != applied.get("class")) or bool(
-        chosen == "auto" and applied.get("overridden"))
-    return out
+    return rclass.view(applied, choice, unreadable=unreadable)
 
 
 def parse_cursor(cursor: str) -> tuple[float, str] | None:
@@ -408,18 +405,22 @@ def detail(pipeline, row: sqlite3.Row, *, segments_from: int = 0) -> dict:
     if row["status"] == "failed" and summary_state == "failed":
         body["summary_error"] = failure_message(row["error_kind"], "summarizing")
     if notes is not None:
+        from .recording_class import visible_items
+
         owner = _owner_name(pipeline, row)
+        treated = (idx.get("recording_class") or {}).get("class")
+        passive = treated == "passive"  # the same brief treatment as the note: gist, tags, owner-addressed items
         body["summary"] = {
             "overview": notes.overview,
-            "sections": [{"heading": s.heading, "bullets": s.bullets} for s in notes.sections],
+            "sections": [] if passive else [{"heading": s.heading, "bullets": s.bullets} for s in notes.sections],
             "action_items": [
                 {"description": a.description, "owner": a.owner,
                  "owner_name": owner if a.owner == "me" and owner else a.owner_name,
                  "due_date": a.due_date.isoformat() if a.due_date else None}  # fmt: skip
-                for a in notes.action_items
+                for a in visible_items(notes.action_items, treated)
             ],
-            "decisions": notes.decisions,
-            "open_questions": notes.open_questions,
+            "decisions": [] if passive else notes.decisions,
+            "open_questions": [] if passive else notes.open_questions,
         }
     if segments is not None:
         labels = sorted({s["speaker"] for s in segments}, key=_label_key)
@@ -487,6 +488,14 @@ def server_issues(db, *, read_only: str | None, worker: bool, limit: int = ISSUE
                     "next_step": "This needs a fix on the server.",
                     "server_step": "Check the omi-asr service on the server (`sidecar/asr/scripts/launchagent.sh status`, "
                                    "log `~/Library/Logs/omi-notes-asr.log`)."})  # fmt: skip
+    unreadable = json.loads(db.meta("class_unreadable") or "[]")
+    if unreadable:  # the last applied class stands for these until the file is fixed
+        out.append({"code": "class_choice_unreadable", "severity": "action", "count": len(unreadable),
+                    "message": f"Your recording-kind choice for {len(unreadable)} conversation{'s' if len(unreadable) != 1 else ''} "
+                               "can't be read on the server; their notes keep the kind they were made with.",
+                    "next_step": "This needs a fix on the server.",
+                    "server_step": "Fix or remove class.json in those conversations' _omi folders: "
+                                   + ", ".join(unreadable[:5])})  # fmt: skip
     if read_only:
         out.append({"code": "read_only", "severity": "action", "message": "The server stopped writing to the vault.",
                     "detail": read_only, "next_step": "This needs a fix on the server.",

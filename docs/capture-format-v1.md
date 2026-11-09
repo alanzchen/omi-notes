@@ -602,23 +602,32 @@ Every summarized conversation is one of three kinds, each treated differently: `
 talking alone: dictation, a thought dump, requests for an assistant; never discarded by the summary's
 judgement, a cleaned near-verbatim text first when it is up to 10 minutes, `assistant_input: true` in the
 note), `dialogue` (the owner and someone else: the full notes) or `passive` (the owner not speaking: a
-video, broadcast or background talk; a brief note with the transcript folded, action items only when
-addressed to the owner, listed under "Background" in the daily note). The class comes from two cues, the
-voices (a confirmed owner's share of the speech) and the content (the summary's `interaction`); passive
-needs both, and any doubt keeps the fuller treatment.
+video, broadcast or background talk; a brief note with the transcript folded, listed under "Background"
+in the daily note). A passive note keeps only the action items addressed to the owner (`owner: "me"`) and
+no sections, decisions or open questions, in the Markdown, `/{id}`, `/recent` and the daily note alike.
+The class comes from two cues, the voices (a confirmed owner's share of the speech) and the content (the
+summary's `interaction`); passive needs media content and no confirmed owner speech at all, a lone voice
+assigned to someone else is never a monologue, and any doubt keeps the fuller treatment.
 
 `/recent` and `/{id}` entries carry `recording_class`: `{class, auto, confidence, overridden,
-wearer_share, updating}` or `null` (not classified yet). `confidence` is `high`, `medium`, `low` or
-`owner`; `updating` is true while an owner's newer choice waits for its new summary.
-`GET /v1/conversations/recent?class=monologue|dialogue|passive` filters before paging (start the cursor
-again when the filter changes).
+wearer_share, updating, requested?, set_at?, choice_unreadable?}` or `null` (not classified yet).
+`class` is always the kind the current note was made for, never a requested one. `confidence` is `high`,
+`medium`, `low` or `owner`; `overridden` is true while an owner's choice (including pinning the automatic
+class) applies. `updating` is true while an owner's newer choice waits for its new summary, and
+`requested` is then the chosen kind (`auto` for a reset). `choice_unreadable` (a message) means the stored
+choice can't be read; the note keeps its kind and the Server page shows `class_choice_unreadable`.
+`GET /v1/conversations/recent?class=monologue|dialogue|passive` filters by the applied class before
+paging (start the cursor again when the filter changes).
 
 `PUT /v1/conversations/{id}/class` with `{"class": "monologue"|"dialogue"|"passive"|"auto", "request_id":
-"<uuid>", "set_at": "<ISO-8601 with zone>"}` stores the owner's choice in the vault (`class.json`);
-`auto` goes back to the automatic class. The same `request_id` again is applied once; an older `set_at`
-than the stored one is not applied (`applied: false`). `200` with the resulting `recording_class` view plus
-`applied`; `404` unknown, `409 in_progress` while recording, `409 unreadable` when the stored choice can't
-be read (never treated as no choice), `422` invalid body, `503` read-only vault.
+"<uuid>", "set_at": "<ISO-8601 with zone>"}` stores the owner's choice in the vault (`class.json`, with a
+revision raised by every choice); `auto` goes back to the automatic class. The server's worker applies it
+(a new summary) within about 30 seconds, including a choice made while a summary is being written. The
+same `request_id` again is applied once; an older `set_at` than the stored one is not applied
+(`applied: false`). `200` with the `recording_class` view (still the applied class, `updating: true`,
+`requested`) plus `applied`; `404` unknown, `409 in_progress` while recording, `409 frozen` for a frozen
+note (its own version stands), `409 unreadable` when the stored choice can't be read (never treated as no
+choice), `422` invalid body, `503` read-only vault.
 
 ### `PUT /v1/conversations/{id}/priority`
 

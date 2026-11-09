@@ -143,6 +143,7 @@ _STRING_LISTS = ("decisions", "open_questions", "memorable_facts", "tags")
 
 
 CLEANED_TEXT = "Cleaned text"  # a monologue's near-verbatim section heading (rendered as paragraphs)
+CLEANED_TEXT_MAX_S = 600.0  # a monologue up to this much speech also gets a cleaned near-verbatim text
 
 
 class ConversationNotes(BaseModel):

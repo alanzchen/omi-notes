@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from .schema import CLEANED_TEXT, ActionItem, ConversationNotes
+from .schema import CLEANED_TEXT, CLEANED_TEXT_MAX_S, ActionItem, ConversationNotes
 from .writer import MY_NOTES_END, MY_NOTES_START
 
 NoteStatus = Literal["completed", "discarded", "transcript_only"]
@@ -275,10 +275,16 @@ def render_note(d: NoteData, my_notes: str | None = None) -> str:
                 "Reclassify it in the app for full notes.", ""]
     if notes:
         sections = list(notes.sections)
-        if d.recording_class.get("class") == "monologue" and sections and sections[0].heading.strip().lower() == CLEANED_TEXT.lower():
+        monologue = d.recording_class.get("class") == "monologue"
+        if monologue and sections and sections[0].heading.strip().lower() == CLEANED_TEXT.lower():
             out += ["## Cleaned Text", ""]
             for paragraph in sections.pop(0).bullets:
                 out += [paragraph, ""]
+        elif monologue and d.speech_seconds <= CLEANED_TEXT_MAX_S and d.segments:
+            # the summary left out the cleaned text it was asked for: the words as transcribed, said plainly
+            out += ["## Cleaned Text", "", "> [!note] The summary didn't return a cleaned text; these are the words as "
+                    "transcribed.", ""]
+            out += [p for seg in d.segments for p in (seg["text"], "")]
         if sections and not passive:
             out += ["## Key Points", ""]
             for section in sections:

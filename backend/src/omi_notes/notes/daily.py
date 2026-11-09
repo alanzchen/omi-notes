@@ -94,7 +94,8 @@ def render_daily(day: date, entries: list[DailyEntry], tz: ZoneInfo) -> str:
     else:
         out += ["_No conversations yet._", ""]
 
-    items = [(e, item) for e in kept for item in e.action_items]
+    # a passive recording's index holds only items addressed to the owner: those count like any others
+    items = [(e, item) for e in kept + background for item in e.action_items]
     if items:
         out += ["## Action Items", ""]
         # Plain bullets on purpose: checkboxes here would duplicate the notes' tasks in Obsidian Tasks.
