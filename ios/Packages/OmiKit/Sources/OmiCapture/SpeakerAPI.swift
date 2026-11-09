@@ -69,6 +69,16 @@ extension APIClient {
                               body: Body(state: state, requestId: requestId, setAt: ISO8601UTC.format(setAt)))
     }
 
+    /// The owner's recording class (monologue, dialogue, passive or auto); the later choice wins on the server.
+    public func putRecordingClass(_ conversationId: String, kind: String, requestId: String, setAt: Date) async throws -> RecordingClassView {
+        struct Body: Encodable {
+            var kind: String; var requestId: String; var setAt: String
+            enum CodingKeys: String, CodingKey { case kind = "class", requestId, setAt }
+        }
+        return try await json("PUT", "/v1/conversations/\(conversationId)/class",
+                              body: Body(kind: kind, requestId: requestId, setAt: ISO8601UTC.format(setAt)))
+    }
+
     public func speakerSettings() async throws -> SpeakerSettings { try await json("GET", "/v1/speakers/settings") }
 
     @discardableResult

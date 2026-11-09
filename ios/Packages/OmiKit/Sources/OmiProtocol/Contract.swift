@@ -442,6 +442,7 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
     public var supportsRecording: Bool { features?.contains("recording") == true }
     /// Value assessments, highlights and the owner's priority choice.
     public var supportsValueNotes: Bool { features?.contains("value_notes") == true }
+    public var supportsRecordingClass: Bool { features?.contains("recording_class") == true }
     public var supportsSearch: Bool { features?.contains("search") == true }
     /// Accepts the phone's diagnostic log tail (`PUT /v1/diagnostics/phone-log`).
     public var supportsPhoneLog: Bool { features?.contains("phone_log") == true }
@@ -471,6 +472,27 @@ public struct ConversationFlag: Codable, Equatable, Sendable, Hashable {
     public var message: String
 }
 
+/// The owner talking alone (`monologue`), a conversation (`dialogue`) or background (`passive`), as the
+/// note was made (capture-format-v1.md, "Recording class").
+public struct RecordingClassView: Codable, Equatable, Hashable, Sendable {
+    public var kind: String?
+    public var auto: String?
+    /// `high`, `medium`, `low`, or `owner` (the owner chose it).
+    public var confidence: String?
+    public var overridden: Bool?
+    public var wearerShare: Double?
+    /// The owner's newer choice is waiting for its new summary.
+    public var updating: Bool?
+
+    enum CodingKeys: String, CodingKey { case kind = "class", auto, confidence, overridden, wearerShare, updating }
+
+    public init(kind: String?, auto: String? = nil, confidence: String? = nil, overridden: Bool? = nil,
+                wearerShare: Double? = nil, updating: Bool? = nil) {
+        self.kind = kind; self.auto = auto; self.confidence = confidence
+        self.overridden = overridden; self.wearerShare = wearerShare; self.updating = updating
+    }
+}
+
 public struct ConversationSummary: Codable, Equatable, Hashable, Sendable, Identifiable {
     public var id: String
     public var status: String
@@ -489,6 +511,8 @@ public struct ConversationSummary: Codable, Equatable, Hashable, Sendable, Ident
     public var speakersReady: Bool?
     /// What the summary says it's worth, and the owner's own choice (servers with `value_notes`).
     public var value: ConversationValue?
+    /// What kind of recording it is (servers with `recording_class`); nil until summarized.
+    public var recordingClass: RecordingClassView?
 
     /// A placeholder until the server's answer arrives (e.g. opened from an issue).
     public init(id: String, status: String, startedAt: String? = nil, title: String? = nil) {

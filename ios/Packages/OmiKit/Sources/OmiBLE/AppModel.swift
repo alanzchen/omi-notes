@@ -57,6 +57,8 @@ public final class AppModel {
     public internal(set) var retryMessages: [String: String] = [:]
     /// Why a priority choice couldn't be saved, per conversation.
     public internal(set) var priorityMessages: [String: String] = [:]
+    /// Why the owner's last recording-class change didn't go through, per conversation.
+    public internal(set) var classMessages: [String: String] = [:]
     /// Bumped when a priority choice changes, so views showing it update.
     public internal(set) var priorityRevision = 0
     /// The latest choice made in this session, per conversation (its answer is the one shown).
