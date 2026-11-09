@@ -196,6 +196,33 @@ def test_a_move_interrupted_after_its_copy_is_finished_and_the_copy_never_counte
     assert again.status_code == 200 and again.json()["sample"]["state"] == "moved"
 
 
+def test_worker_startup_and_forget_finish_an_interrupted_operation_first(env, monkeypatch):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    priya = consented_priya(client)
+    store = worker.pipeline.speakers
+    real = store.set_sample_state
+    monkeypatch.setattr(store, "set_sample_state", lambda *a, **k: (_ for _ in ()).throw(OSError("power cut"))
+                        if k.get("action") == "move" else real(*a, **k))  # fmt: skip
+    with pytest.raises(OSError):
+        client.post(f"/v1/samples/{ids[0]}/move", json={"person_id": priya, "request_id": "mv-s"}, headers=AUTH)
+    monkeypatch.setattr(store, "set_sample_state", real)
+    from omi_notes.db import Database
+    from omi_notes.pipeline.worker import Worker
+
+    fresh = Worker(settings, Database(settings.db_path))
+    fresh.tick(T0 + 9000)
+    assert journal_files(settings) == [] and sample_file(settings, me, ids[0])["state"] == "moved"
+    # forget: an operation interrupted again is finished before the person's data goes
+    monkeypatch.setattr(store, "set_sample_state", lambda *a, **k: (_ for _ in ()).throw(OSError("power cut"))
+                        if k.get("action") == "move" else real(*a, **k))  # fmt: skip
+    with pytest.raises(OSError):
+        client.post(f"/v1/samples/{ids[1]}/move", json={"person_id": priya, "request_id": "mv-t"}, headers=AUTH)
+    monkeypatch.setattr(store, "set_sample_state", real)
+    assert client.delete(f"/v1/people/{priya}", headers=AUTH).status_code == 200
+    assert journal_files(settings) == [] and not Vault.open(settings).person_dir(priya).exists()
+
+
 def test_an_interrupted_undo_of_a_move_is_finished_without_both_copies_counting(env, monkeypatch):
     settings, client, worker = env
     me, rows, ids = me_with_samples(client, worker)

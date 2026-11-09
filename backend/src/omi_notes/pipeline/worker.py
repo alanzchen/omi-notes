@@ -111,6 +111,10 @@ class Worker:
         if not self._reconciled:
             self.pipeline.reconcile_days()  # daily indexes may be stale after a crash
             try:
+                self.pipeline.speakers.reconcile()  # a journaled sample operation a crash interrupted finishes first
+            except Exception:
+                log.exception("could not finish interrupted speaker operations")
+            try:
                 self.calibrator.reconcile()  # a missing or stale speaker calibration (a rebuild, a restart) is redone
             except Exception:
                 log.exception("could not check the speaker calibration")

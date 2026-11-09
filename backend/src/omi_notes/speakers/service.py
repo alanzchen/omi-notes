@@ -152,7 +152,8 @@ class SpeakerService:
             # forgotten, before anything can move them (a pending or in-flight move to a new
             # transcript carries the marker instead of dropping the association); 3. pending moves
             # finish and voices generations nothing depends on go; 4. vectors, then the voice data.
-            # A retry after a crash finishes whatever is left.
+            # A retry after a crash finishes whatever is left. An interrupted journaled operation finishes first.
+            self.store.reconcile()
             self.pipeline.sync_labels_everywhere()
             affected = self.store.labeled_with(person_id)
             for conv_id in affected:
