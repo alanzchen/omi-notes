@@ -8,6 +8,7 @@ public struct WatchBackgroundBudget: Sendable {
     public static let cpuSeconds = 1.0
     /// CPU time at the start of the current background period; 0: launched into it.
     private var periodStart: Double? = 0
+    private var wakes = 0
 
     public init() {}
 
@@ -19,6 +20,14 @@ public struct WatchBackgroundBudget: Sendable {
         let start = periodStart ?? cpu
         periodStart = start
         return cpu - start < Self.cpuSeconds
+    }
+
+    /// A WatchConnectivity background wake begins: its own budget, except that the first wake of a process
+    /// launched into the background also pays for the launch (the watchdog counts it).
+    public mutating func beginWake(cpu: Double) {
+        wakes += 1
+        if wakes == 1, periodStart == 0 { return }
+        periodStart = cpu
     }
 
     /// User plus system CPU time of this process, in seconds.
