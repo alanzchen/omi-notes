@@ -27,6 +27,99 @@ def crash_on(monkeypatch, store, name: str, action: str | None = None):
     return lambda: monkeypatch.setattr(store, name, real)
 
 
+# -- 1: recovery that can't finish blocks what it touches; forget cancels; replay re-validates ------------------------
+
+
+def interrupted_merge(client, worker, monkeypatch, me, row):
+    store = worker.pipeline.speakers
+    restore = crash_on(monkeypatch, store, "set_sample_state", "merge")
+    with pytest.raises(OSError):
+        import_range(client, me, row["id"], 0, 70)
+    restore()
+
+
+def test_forget_cancels_a_journaled_merge_that_recovery_could_not_finish(env, monkeypatch):
+    from omi_notes.speakers import journal
+
+    settings, client, worker = env
+    me = new_person(client, "Alan", me=True)
+    row = monologue_row(client, worker)
+    import_range(client, me, row["id"], 0, 60)
+    interrupted_merge(client, worker, monkeypatch, me, row)
+    assert len(journal_files(settings)) == 1
+    real = journal._merge
+    monkeypatch.setattr(journal, "_merge", lambda store, op: (_ for _ in ()).throw(OSError("still broken")))
+    assert client.delete(f"/v1/people/{me}", headers=AUTH).status_code == 200
+    assert journal_files(settings) == [], "the journal held the forgotten voice: cancelled and purged"
+    monkeypatch.setattr(journal, "_merge", real)
+    store = worker.pipeline.speakers
+    store.samples(*MODEL)  # any later recovery
+    assert not Vault.open(settings).person_dir(me).exists()
+    assert worker.db.one("SELECT COUNT(*) AS n FROM samples")["n"] == 0
+
+
+def test_replay_cancels_an_operation_whose_person_lost_consent(env, monkeypatch):
+    from omi_notes.speakers import journal
+
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    priya = consented_priya(client)
+    store = worker.pipeline.speakers
+    real = journal._set_pending
+
+    def crash(store_, person_id, sample_id, op_id):  # after the label step, before the copy counts
+        if op_id is None:
+            raise OSError("power cut")
+        return real(store_, person_id, sample_id, op_id)
+
+    monkeypatch.setattr(journal, "_set_pending", crash)
+    with pytest.raises(OSError):
+        client.post(f"/v1/samples/{ids[0]}/move", json={"person_id": priya, "request_id": "c-1"}, headers=AUTH)
+    monkeypatch.setattr(journal, "_set_pending", real)
+    assert len(journal_files(settings)) == 1 and store.labels(rows[0]["id"])["S1"]["person_id"] == priya
+    (store.person_dir(priya) / "consent.json").unlink()  # Priya's attestation withdrawn before recovery
+    store.scan_people()
+    store.samples(*MODEL)  # recovery: no voice is given to Priya without consent; everything is put back
+    assert journal_files(settings) == []
+    assert not list((store.person_dir(priya) / "samples").glob("*.json"))
+    assert sample_file(settings, me, ids[0])["state"] == "active"
+    assert store.labels(rows[0]["id"])["S1"]["person_id"] == me
+
+
+def test_a_merge_journaled_before_a_forget_by_another_process_is_never_replayed(env, monkeypatch):
+    settings, client, worker = env
+    me = new_person(client, "Alan", me=True)
+    row = monologue_row(client, worker)
+    import_range(client, me, row["id"], 0, 60)
+    interrupted_merge(client, worker, monkeypatch, me, row)
+    store = worker.pipeline.speakers
+    first = [r["id"] for r in worker.db.query("SELECT id FROM samples WHERE person_id=? AND state='active'", (me,))]
+    # another (older) process forgot Alan's voice meanwhile and never saw this journal
+    store.update_settings(forgotten_voices={me: store.forget_count(me) + 1})
+    store.samples(*MODEL)  # recovery
+    assert journal_files(settings) == []
+    assert [r["id"] for r in worker.db.query("SELECT id FROM samples WHERE person_id=?", (me,))] == first, "nothing replayed"
+
+
+def test_an_unfinishable_operation_blocks_decisions_about_its_samples(env, monkeypatch):
+    from omi_notes.speakers import journal
+
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    priya = consented_priya(client)
+    store = worker.pipeline.speakers
+    restore = crash_on(monkeypatch, store, "set_sample_state", "move")
+    with pytest.raises(OSError):
+        client.post(f"/v1/samples/{ids[0]}/move", json={"person_id": priya, "request_id": "b-1"}, headers=AUTH)
+    restore()
+    monkeypatch.setattr(journal, "_move", lambda store, op: (_ for _ in ()).throw(OSError("still broken")))
+    blocked = client.post(f"/v1/samples/{ids[1]}/remove", json={"request_id": "b-2"}, headers=AUTH)
+    assert blocked.status_code == 409 and blocked.json()["error"] == "recovery_pending"
+    assert sample_file(settings, me, ids[1]).get("state", "active") == "active"
+    undo = client.post("/v1/speakers/undo", json={"request_id": "b-1", "undo_request_id": "u-b"}, headers=AUTH)
+    assert undo.status_code == 409 and undo.json()["error"] == "recovery_pending"
+
+
 # -- 2: one sample's successful write never hides another's failed index write ------------------------------------
 
 

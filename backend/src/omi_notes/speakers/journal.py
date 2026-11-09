@@ -26,9 +26,11 @@ import threading
 import time
 import uuid
 
+from ..ingest import ApiError
 from ..notes.writer import remove
 from ..spool import fsync_dir
 from ..vault import Vault
+from .store import consent_ok
 from .voices import decode_vector
 
 log = logging.getLogger(__name__)
@@ -66,9 +68,45 @@ def reconcile(store) -> int:
     return done
 
 
+def involved(op: dict) -> set[str]:
+    """The people whose voice data an operation touches."""
+    return {p for p in (op.get("from"), op.get("to"), op.get("person")) if p}
+
+
+def gaining(op: dict) -> str | None:
+    """Whose voice an operation puts (back) into use: they need current consent whenever it is applied."""
+    return {"move": op.get("to"), "merge": op.get("person"), "unmove": op.get("from"), "unreject": op.get("person")}.get(op["kind"])
+
+
+def _samples_of(op: dict) -> set[str]:
+    ids = {sid for pair in op.get("pairs") or [] for sid in pair} | set(op.get("samples") or []) | set(op.get("replaced") or [])
+    return ids | ({op["sample"]["sample_id"]} if op.get("sample") else set())
+
+
+def blocking(store, persons: set, samples: set = frozenset()) -> None:
+    """Refuse a change while an operation recovery couldn't finish touches the same people or samples (call after
+    `reconcile`, under the speaker lock): acting on top of a half-applied operation could be overwritten by it."""
+    for op in pending(store):
+        if involved(op) & {p for p in persons if p} or _samples_of(op) & set(samples):
+            raise ApiError(409, "recovery_pending", "an earlier change to these voices is still being recovered; try again later")
+
+
+def cancel_for(store, person_id: str) -> int:
+    """Forget: every operation touching this person is cancelled (rolled back where it changed someone else) and its
+    intent, which may hold the voice, is deleted. Raises if any can't be: forget must not proceed past it."""
+    n = 0
+    for op in pending(store):
+        if person_id in involved(op):
+            cancel(store, op, forgotten={person_id})
+            n += 1
+    return n
+
+
 def run(store, op: dict) -> dict:
     """Journal `op` and apply it (call under the speaker lock, after checking its preconditions)."""
     op = {"id": str(uuid.uuid4()), "at": time.time()} | op
+    # every involved person's forget generation: a replay after any of them was forgotten cancels instead
+    op["generations"] = {p: store.forget_count(p) for p in sorted(involved(op))}
     store.vault.raise_format(6)  # pending copies and moved records: an older backend must refuse the vault
     Vault.write_json(directory(store) / f"{op['id']}.json", op)
     apply(store, op)
@@ -81,7 +119,23 @@ def complete(store, op: dict) -> None:
         fsync_dir(path.parent)
 
 
+def _invalid(store, op: dict) -> str:
+    """Why replaying this operation now would be wrong ("" when it isn't)."""
+    for person_id, generation in (op.get("generations") or {}).items():
+        if store.forget_count(person_id) != generation:
+            return "a person's voice was forgotten since"
+    target = gaining(op)
+    if target and not consent_ok(store.person(target), store.settings()):
+        return "consent was withdrawn since"
+    return ""
+
+
 def apply(store, op: dict) -> None:
+    why = _invalid(store, op)
+    if why:
+        log.warning("cancelling the journaled speaker operation %s: %s", op["id"], why)
+        cancel(store, op)
+        return
     _busy.op = op["id"]
     try:
         {"move": _move, "unmove": _unmove, "reject": _reject, "unreject": _unreject, "merge": _merge}[op["kind"]](store, op)
@@ -236,3 +290,84 @@ def _merge(store, op: dict) -> None:
     if Vault.read_json(result) is None:  # 3. the import's answer
         Vault.write_json(result, op["result"])
     _set_pending(store, person, sample["sample_id"], None)  # 4. it counts
+
+
+# -- cancelling (forget, withdrawn consent) --------------------------------------------------------------
+
+
+def cancel(store, op: dict, forgotten: set = frozenset()) -> None:
+    """Undo whatever part of `op` was applied (idempotently; nothing is written for a forgotten person, whose data
+    goes anyway), then delete its intent."""
+    _busy.op = op["id"]
+    try:
+        kind, rid = op["kind"], f"rollback:{op['id']}"
+        if kind == "move":
+            a, b = op["from"], op["to"]
+            for src, new in op["pairs"]:
+                store.remove_sample_ids(b, [new])
+                data = store.read_sample(a, src)
+                if a not in forgotten and data and data.get("state") == "moved" and (data.get("moved_to") or {}).get("sample_id") == new:
+                    store.update_sample(a, src, {"state": "active", "moved_to": None}, action="rollback", by="recovery",
+                                        request_id=rid, record={"op": op["id"], "from": "moved", "to": "active"})  # fmt: skip
+            _label_revert(store, op, op["request_id"])
+        elif kind == "merge":
+            person = op["person"]
+            store.remove_sample_ids(person, [op["sample"]["sample_id"]])
+            for sid in op["replaced"]:
+                data = store.read_sample(person, sid)
+                last = ((data or {}).get("history") or [{}])[-1]
+                if person not in forgotten and data and data.get("state") == "removed" and last.get("op") == op["id"]:
+                    store.update_sample(person, sid, {"state": "active"}, action="rollback", by="recovery", request_id=rid,
+                                        record={"op": op["id"], "from": "removed", "to": "active"})  # fmt: skip
+            for extra in (store.person_dir(person) / "enrollments" / f"{op['import_id']}.json",
+                          store.person_dir(person) / "enrollment" / f"{op['import_id']}.omiaudio"):  # fmt: skip
+                remove(extra)
+        elif kind == "unmove":
+            a, b = op["from"], op["to"]
+            for src, new in op["pairs"]:
+                data = store.read_sample(a, src)
+                last = ((data or {}).get("history") or [{}])[-1]
+                if a not in forgotten and data and data.get("state") == "active" and last.get("op") == op["id"]:
+                    store.update_sample(a, src, {"state": "moved", "moved_to": {"person_id": b, "sample_id": new}}, action="rollback",
+                                        by="recovery", request_id=rid, record={"op": op["id"], "from": "active", "to": "moved"})  # fmt: skip
+                if b not in forgotten:
+                    _set_pending(store, b, new, None)  # still B's
+            _label_revert(store, op, f"{op['request_id']}:{op['undo_of']}", undo_of=op["undo_of"])
+        elif kind == "unreject":
+            x = op["person"]
+            for sid in op["samples"]:
+                data = store.read_sample(x, sid)
+                last = ((data or {}).get("history") or [{}])[-1]
+                if x not in forgotten and data and data.get("state") == "active" and last.get("op") == op["id"]:
+                    store.update_sample(x, sid, {"state": "removed"}, action="rollback", by="recovery", request_id=rid,
+                                        record={"op": op["id"], "from": "active", "to": "removed"})  # fmt: skip
+            _label_revert(store, op, f"{op['request_id']}:{op['undo_of']}", undo_of=op["undo_of"])
+        # a reject only removes voice data: whatever part of it happened stands
+    finally:
+        _busy.op = None
+    store.db.set_meta("relabel_pending", "1")
+    store.samples_changed()
+    complete(store, op)
+
+
+def _label_revert(store, op: dict, key: str, undo_of: str | None = None) -> None:
+    """Put the label back as it was before the request `key` changed it, if that change still stands."""
+    where = op.get("label")
+    if not where or store.db.one("SELECT 1 FROM conversations WHERE id=?", (where["conversation_id"],)) is None:
+        return
+    conv_id, label = where["conversation_id"], where["label"]
+    store.sync_conversation(conv_id)
+    rec = store.request_result(conv_id, key)
+    if rec is None or store.request_result(conv_id, f"rollback:{op['id']}") is not None:
+        return
+    if undo_of is not None:  # an undo restored `before` of `undo_of`; its rollback puts that request's `after` back
+        original = store.request_result(conv_id, undo_of) or {}
+        made, back = original.get("before"), original.get("after")
+    else:
+        made, back = rec.get("after"), rec.get("before")
+    states = store.labels(conv_id)
+    if store.persisted({label: states.get(label) or {}}).get(label) != made or back is None:
+        return
+    states[label] = back
+    store.write_labels(conv_id, states, request=(f"rollback:{op['id']}", {"label": label, "rollback_of": key}))
+    store.db.execute("UPDATE conversations SET needs_render=1, next_attempt_at=NULL WHERE id=? AND note_path IS NOT NULL", (conv_id,))

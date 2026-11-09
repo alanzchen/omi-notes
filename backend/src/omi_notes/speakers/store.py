@@ -348,12 +348,7 @@ class SpeakerStore:
     def forget_voice(self, person_id: str, *, delete_note: bool = False) -> None:
         """Delete the person's voice data (samples, enrollment audio, consent). A global enrollment
         result keeps only its decision, so the reading is not learned again."""
-        # a durable mark that this voice was forgotten (first), so work begun before it (an import being judged)
-        # can tell and never writes the voice back
-        current = Vault.read_json(self.settings_path) or {}
-        forgotten = dict(current.get("forgotten_voices") or {})
-        forgotten[person_id] = int(forgotten.get(person_id) or 0) + 1
-        self.update_settings(forgotten_voices=forgotten)
+        self.begin_forget(person_id)
         results = self.vault.speakers / "enrollments"
         for path in sorted(results.glob("*.json")) if results.exists() else []:
             data = Vault.read_json(path) or {}
@@ -414,6 +409,22 @@ class SpeakerStore:
             remove(path)
             if path.parent.name == "samples":
                 self.db.execute("DELETE FROM samples WHERE id=?", (path.stem,))
+
+    def begin_forget(self, person_id: str) -> None:
+        """The start of a forget, durable and idempotent (a retry continues the same forget): the per-person forget
+        count goes up once (work begun before it, an import being judged or a journaled operation, can tell and never
+        writes the voice back), then every journaled operation touching the person is cancelled and its intent
+        deleted. Raises rather than let the forget proceed past an operation it couldn't cancel."""
+        from . import journal
+
+        plan = self.forgetting_path(person_id)
+        if Vault.read_json(plan) is None:
+            current = Vault.read_json(self.settings_path) or {}
+            forgotten = dict(current.get("forgotten_voices") or {})
+            forgotten[person_id] = int(forgotten.get(person_id) or 0) + 1
+            self.update_settings(forgotten_voices=forgotten)
+            Vault.write_json(plan, {"person_id": person_id, "paths": []})
+        journal.cancel_for(self, person_id)
 
     def forgetting_path(self, person_id: str) -> Path:
         """A forget's recorded purge set (removed when the forget is complete)."""

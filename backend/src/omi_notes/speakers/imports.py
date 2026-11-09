@@ -250,6 +250,7 @@ class Importer:
             done = self._answer(person_id, iid)
             if done is not None:
                 return 200, done
+            journal.blocking(self.store, {person_id})
             # what was judged must still hold: the person and their consent (a forget meanwhile is final), and the
             # imports the union replaces
             current = self._consent(person_id)

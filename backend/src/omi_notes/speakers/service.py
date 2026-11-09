@@ -25,6 +25,7 @@ from ..util import UUID_RE, iso_utc_epoch
 from . import enroll
 from . import match as speaker_match
 from . import suggest as speaker_suggest
+from . import journal
 from .review import Review, status_line
 from .store import same_clips, sample_eligible, voices_name
 from ..vault import Vault
@@ -152,8 +153,10 @@ class SpeakerService:
             # forgotten, before anything can move them (a pending or in-flight move to a new
             # transcript carries the marker instead of dropping the association); 3. pending moves
             # finish and voices generations nothing depends on go; 4. vectors, then the voice data.
-            # A retry after a crash finishes whatever is left. An interrupted journaled operation finishes first.
+            # A retry after a crash finishes whatever is left. An interrupted journaled operation finishes first; one
+            # touching this person that can't is cancelled (with the forget's durable start), or the forget stops.
             self.store.reconcile()
+            self.store.begin_forget(person_id)
             self.pipeline.sync_labels_everywhere()
             affected = self.store.labeled_with(person_id)
             for conv_id in affected:
@@ -563,6 +566,8 @@ class SpeakerService:
         skipped: set[str] = set()
         with self.store.lock:
             self.store.reconcile()
+            if journal.pending(self.store):  # an undo reads the state those operations would still change
+                raise ApiError(409, "recovery_pending", "an earlier change to voices is still being recovered; try again later")
             for path in sorted(self.vault.conversations.glob("*/*/speakers.json")):
                 conv_id = path.parent.name
                 requests = (Vault.read_json(path) or {}).get("requests") or {}

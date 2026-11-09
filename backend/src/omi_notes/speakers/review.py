@@ -315,6 +315,7 @@ class Review:
             data = self.store.find_sample(sample_id)
             if data is None:
                 raise ApiError(404, "not_found", "unknown sample")
+            journal.blocking(self.store, {data["person_id"], person_id}, {sample_id})
             if expected_revision is not None and int(data.get("revision") or 0) != expected_revision:
                 raise ApiError(409, "stale_review", "this sample changed since the review item was made")
             state = data.get("state") or ACTIVE
