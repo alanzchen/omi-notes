@@ -42,8 +42,15 @@ operational index. Copy the folder anywhere, point a backend at it, and it rebui
 `VAULT.json` `format` is 1 until the first app retry raises it to 2 (records may then carry retry
 state), the first keep from the phone raises it to 3 (records may carry `resolution`), and the
 first "keep unknown" of a voice raises it to 4 (`speakers.json` label states may be
-`source: "unknown"`); an older backend refuses a newer vault instead of rewriting records without
-that state.
+`source: "unknown"`), and the first deferred short session or transcription request raises it to 5
+(records may carry `deferral`, `_omi/operations/` may hold `kind: "transcribe"`); an older backend
+refuses a newer vault instead of rewriting records without that state. A raise re-reads `VAULT.json`
+first, so a handle with a stale copy never lowers it.
+
+**Rollback:** once the vault is format 5, roll back only to a release that reads format 5 (this
+deferral work or later); an older one refuses to start rather than erase deferral and request
+history. Never lower the marker by hand. Setting `DEFER_SPEECH_SECONDS=0` stops new deferrals but
+does not lower the format.
 
 `<conversation dir>/priority.json` `{format, state: important|less_useful|auto, set_at, revision,
 request_id, requests, source: app|pendant, event_id?}` is the owner's explicit choice (made in the app,
@@ -56,9 +63,8 @@ changes nothing else (note, path, keep/discard, statistics). Older backends igno
 conversation with under `DEFER_SPEECH_SECONDS` (60) of speech (not an enrollment, not under 1.5 s). The
 status stays `closed`; the index column `deferral` is derived from it, so a rebuild reproduces the deferred
 state, and `requested` (the owner's transcription request) survives restarts, rebuilds and retries. The
-block stays after the session is transcribed, as history. No format raise: an older backend ignores the
-key, transcribes deferred sessions normally and drops the block when it rewrites the record, and logs the
-`transcribe` operation files it doesn't know (never overwritten). The render index's `recording_class` may
+block stays after the session is transcribed, as history. The vault is raised to format 5 before the first block (or `transcribe` operation) is
+written, so a release that would drop it refuses the vault (see the format note above). The render index's `recording_class` may
 be `{revision, outcome: "not_applicable"}` for a deterministic discard: the owner's choice it handled
 without applying.
 

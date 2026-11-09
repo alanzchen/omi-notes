@@ -388,3 +388,65 @@ def test_a_requested_or_retried_deferred_session_is_ordinary_work(client, worker
     insert(worker, "retried", 110, deferral=DEFERRED, retry_op=str(uuid.uuid4()))
     insert(worker, "rerun", 50, stt_ref="stt-old.json")
     assert [worker.pipeline.next_claim(1000, exclude=set(x))["id"] for x in ([], ["asked"])] == ["asked", "retried"]
+
+
+# -- Astra review of e1e7576..ce07e32 -----------------------------------------------------------------------------------
+
+
+def vault_format(settings) -> int:
+    return json.loads((settings.vault_dir / "_omi" / "VAULT.json").read_text())["format"]
+
+
+def test_the_first_deferral_raises_the_vault_format_so_older_writers_refuse_it(client, worker, settings, monkeypatch):
+    from omi_notes import records
+    from omi_notes.vault import FORMAT, Vault, VaultError
+
+    fakes(worker)
+    busy(worker, monkeypatch)
+    assert vault_format(settings) < 5
+    seen = []
+    real = records.write_record
+
+    def spy(vault, record):
+        if record.get("deferral"):
+            seen.append(vault_format(settings))
+        return real(vault, record)
+
+    monkeypatch.setattr("omi_notes.pipeline.worker.write_record", spy)
+    short(client)
+    worker.tick(T0 + 400)
+    assert seen == [5], "raised before the first record with a deferral block is written"
+    assert FORMAT >= 5
+    monkeypatch.setattr("omi_notes.vault.FORMAT", 4)  # a release from before deferral
+    try:
+        Vault.open(settings)
+    except VaultError as exc:
+        assert "newer" in str(exc)
+    else:
+        raise AssertionError("an older release opened a vault with deferral state")
+
+
+def test_a_stale_vault_handle_never_lowers_the_format(client, worker, settings):
+    from omi_notes.vault import Vault
+
+    stale = Vault.open(settings)
+    worker.vault.raise_format(5)
+    stale.raise_format(3)
+    assert vault_format(settings) == 5
+
+
+def test_a_transcription_request_raises_the_vault_format_before_its_operation_file(client, worker, settings, monkeypatch):
+    fakes(worker)
+    worker.settings.defer_speech_seconds = 0  # a closed conversation without a deferral block
+    busy(worker, monkeypatch)
+    short(client)
+    worker.db.execute("UPDATE conversations SET next_attempt_at=? WHERE 1", (T0 + 10**6,))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    worker.db.execute("UPDATE conversations SET status='closed', next_attempt_at=? WHERE id=?", (T0 + 10**6, row["id"]))
+    (settings.vault_dir / "_omi" / "VAULT.json").write_text(json.dumps(
+        json.loads((settings.vault_dir / "_omi" / "VAULT.json").read_text()) | {"format": 2}))
+    worker.pipeline.vault.info["format"] = 2
+    client.app.state.speakers.pipeline.vault.info["format"] = 2
+    assert transcribe(client, row["id"]).status_code in (200, 202)
+    assert vault_format(settings) == 5

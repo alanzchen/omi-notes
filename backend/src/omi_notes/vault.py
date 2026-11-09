@@ -40,7 +40,7 @@ log = logging.getLogger(__name__)
 # 3: conversation records may carry `resolution` (kept from the phone with the speaker unknown).
 # 4: speakers.json label states may be `source: "unknown"` (the owner kept a voice unknown); an older
 # backend would recompute them away.
-FORMAT = 4
+FORMAT = 5  # 5: conversation.json `deferral` and `transcribe` operations (deferred short sessions)
 OMI = "_omi"
 LEASE_RENEW_SECONDS = 5 * 60
 LEASE_STALE_SECONDS = 15 * 60
@@ -208,6 +208,9 @@ class Vault:
     def raise_format(self, fmt: int) -> None:
         """Mark the vault as using a newer format's data (durably, before that data is written), so
         an older backend refuses it instead of silently dropping what it doesn't understand."""
+        on_disk = self.read_json(self.vault_json) or {}
+        if isinstance(on_disk, dict) and on_disk:
+            self.info = on_disk  # another handle may have raised it already: never lower it from a stale copy
         if self.format >= fmt:
             return
         info = dict(self.info) | {"format": fmt}

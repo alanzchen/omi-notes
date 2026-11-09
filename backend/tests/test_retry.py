@@ -88,7 +88,7 @@ def test_retry_of_a_failed_summary_is_durable_and_closed_by_its_attempt(client, 
     row = failed_summary(client, worker)
     r = retry(client, row["id"], rid := str(uuid.uuid4()))
     assert r.status_code == 202 and r.json()["operation"]["state"] == "queued", r.text
-    assert json.loads((settings.vault_dir / "_omi" / "VAULT.json").read_text())["format"] == 2
+    assert json.loads((settings.vault_dir / "_omi" / "VAULT.json").read_text())["format"] >= 2  # (5 once a short session was deferred)
     stored = json.loads((settings.vault_dir / "_omi" / "operations" / f"{rid}.json").read_text())
     assert stored["state"] == "accepted" and stored["stage"] == "summarizing" and stored["conversation_id"] == row["id"]
     assert record(worker, row["id"])["retry"] == {"op": rid, "stage": "summarizing"}

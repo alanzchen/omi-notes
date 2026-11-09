@@ -416,6 +416,7 @@ def request_transcription(pipeline, conv_id: str, request_id: str, *, read_only:
         op = {"format": FORMAT, "id": request_id, "kind": "transcribe", "conversation_id": conv_id,
               "stage": "transcribing", "failure_kind": None, "failure_id": None, "record_sha": row["record_sha"],
               "requested_at": now, "state": "accepted"}  # fmt: skip
+        vault.raise_format(deferral.VAULT_FORMAT)  # an older release must refuse the operation files it can't read
         if row["status"] in FINISHED or row["note_path"]:
             # nothing to do: it already has its result (the idle lane got there first)
             op.update(state="done", outcome="already", finished_at=now)

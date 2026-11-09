@@ -78,7 +78,7 @@ def test_keeping_makes_a_transcript_only_note_with_the_speaker_unknown_and_clear
     assert rec["resolution"]["kind"] == "kept_speaker_unknown" and rec["resolution"]["op"] == rid
     assert rec["resolution"]["failure"]["kind"] == "speakers_unknown"
     # an older backend would drop `resolution` when it rewrote the record: it must refuse the vault
-    assert json.loads((settings.vault_dir / "_omi" / "VAULT.json").read_text())["format"] == 3
+    assert json.loads((settings.vault_dir / "_omi" / "VAULT.json").read_text())["format"] >= 3  # (5 once a short session was deferred)
 
     worker.tick(T0 + 300)
     (after,) = convs(worker)

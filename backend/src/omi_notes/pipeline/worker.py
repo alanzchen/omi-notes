@@ -781,6 +781,8 @@ class Worker:
                 block = None if verdict else deferral.decide(self.settings.defer_speech_seconds, c.speech_seconds, now,
                                                              too_short_s=TOO_SHORT_S)  # fmt: skip
                 fields["deferral"] = json.dumps(block, sort_keys=True) if block else None
+                if block:  # an older release would drop the block on its next rewrite: it must refuse the vault
+                    self.vault.raise_format(deferral.VAULT_FORMAT)
                 if verdict and verdict[0] == "inside":
                     # the wearer's enrollment reading: finalized as discarded, never transcribed
                     fields |= {"status": "discarded", "enrollment_id": verdict[1], "stub_path": None}

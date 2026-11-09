@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 
 POLICY = "short_speech"
+VAULT_FORMAT = 5  # raised before the first `deferral` block or `transcribe` operation is written
 UNDETERMINED = "undetermined"
 RULE_NONE = "none-v1"  # no transcription-free classifier yet
 # The identity of the model a provisional rule depends on (e.g. the wearer's voice model: a rule like "monologue only
