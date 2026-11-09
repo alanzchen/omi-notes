@@ -240,3 +240,39 @@ def test_the_smallest_piece_is_tried_once_without_the_context_before_mosss_text(
     e.models = (FakeMoss([]), LoopsWithContext(), FakeAligner())
     out = e.transcribe(speech(15), ["Freedom"])
     assert out["omi_asr"]["qwen_capped"] == 0 and out["omi_asr"]["qwen_without_context"] == 1
+
+
+def test_an_empty_answer_from_the_context_free_retry_is_still_incomplete_not_silence():
+    # Astra IT1-01: the retry came back short of the cap but with no words; with no MOSS words there, the
+    # span's speech vanished as an empty success instead of IncompleteTranscription
+    from omi_asr.engine import IncompleteTranscription
+
+    class EmptyWithoutContext(FakeQwen):
+        def generate(self, audio, hotwords=None, max_tokens=0, **_):
+            r = super().generate(audio, hotwords, max_tokens)
+            if hotwords:
+                r.generation_tokens = max_tokens
+            else:
+                r.text, r.generation_tokens = "  ", 1
+            return r
+
+    e = Engine()
+    e.models = (FakeMoss([]), EmptyWithoutContext(), FakeAligner())
+    with pytest.raises(IncompleteTranscription):
+        e.transcribe(speech(15), ["Freedom"])
+
+
+def test_an_empty_context_free_retry_under_moss_words_keeps_mosss_text():
+    class EmptyWithoutContext(FakeQwen):
+        def generate(self, audio, hotwords=None, max_tokens=0, **_):
+            r = super().generate(audio, hotwords, max_tokens)
+            if hotwords:
+                r.generation_tokens = max_tokens
+            else:
+                r.text, r.generation_tokens = "", 0
+            return r
+
+    e = Engine()
+    e.models = (FakeMoss(lines_every(5, 15)), EmptyWithoutContext(), FakeAligner())
+    out = e.transcribe(speech(15), ["Freedom"])
+    assert out["omi_asr"]["qwen_capped"] == 1 and [s["text"] for s in out["segments"]] == ["moss0", "moss5", "moss10"]

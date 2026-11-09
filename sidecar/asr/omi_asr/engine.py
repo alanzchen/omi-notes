@@ -207,7 +207,8 @@ class Engine:
                 r = qwen.generate(mx.array(padded), hotwords=None, max_tokens=cap)
                 stats["qwen_chunks"] += 1
                 stats["qwen_without_context"] += 1
-            if not context or int(getattr(r, "generation_tokens", 0) or 0) >= cap:
+            # still looping, or an answer with no words (speech here isn't silence): MOSS's text, or incomplete
+            if not context or int(getattr(r, "generation_tokens", 0) or 0) >= cap or not (r.text or "").strip():
                 stats["qwen_capped"] += 1
                 capped.append((a, b))
                 log.warning("Qwen hit its cap on a %.0f s chunk: keeping MOSS text there", b - a)
