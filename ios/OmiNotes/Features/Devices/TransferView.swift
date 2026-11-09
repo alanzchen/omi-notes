@@ -296,8 +296,8 @@ struct TransferDetailView: View {
             Card {
                 VStack(spacing: 0) {
                     row("Watch report", w.reportAt.map { (w.reportFresh ? "" : "Old · ") + Fmt.relative($0) })
-                    if let seconds = w.newSeconds, w.reportAt != nil { row("Audio on the Watch", TransferText.duration(Double(seconds))) }
-                    if w.recheckParts > 0, w.reportAt != nil { row("Re-checking older parts", TransferText.plural(w.recheckParts, "part", "parts")) }
+                    if let seconds = w.waitingSeconds, w.reportAt != nil { row("Audio on the Watch", TransferText.duration(Double(seconds))) }
+                    if w.recheckParts > 0, w.reportAt != nil { row("Of it, re-checking", TransferText.plural(w.recheckParts, "older part", "older parts")) }
                     row("Received from Watch", TransferText.plural(w.receivedOnPhone, "part", "parts"))
                     row("Last received", w.lastReceivedAt.map { Fmt.relative($0) } ?? "Not since launch")
                     if w.converting > 0 { row("Preparing", TransferText.plural(w.converting, "part", "parts")) }

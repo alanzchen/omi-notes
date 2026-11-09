@@ -595,6 +595,11 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         return answer
     }
 
+    /// The Watch's sync ping: verified (id, sha256) receipts only.
+    public func watchReceipts(_ items: [WatchInventoryItem], binding: String?) throws -> [WatchInventoryItem] {
+        try watchInbox.receipts(items: items, binding: binding)
+    }
+
     public func acceptWatchEnd(_ data: Data?) throws -> String {
         guard let end = WatchWire.decode(WatchRecordingEnd.self, data) else { throw WatchRelayError.damaged("end") }
         try watchInbox.accept(end: end)

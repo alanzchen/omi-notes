@@ -27,14 +27,14 @@ public struct TransferSummary: Equatable, Sendable {
         public var waitingForServer: Int
         /// Audio parts the Watch keeps but can't send (from its report): never "all sent" while > 0.
         public var keptOnWatch: Int = 0
-        /// Of the waiting parts, re-checks: audio an older iPhone build already converted (almost always on
-        /// the server already), which the Watch sends after any new audio. Not counted as "on the Watch".
+        /// Of the waiting parts, re-checks: parts the iPhone had no checksum receipt for (mostly converted by
+        /// an older build), sent after new audio. Still unacknowledged: they stay in every total and nothing
+        /// says "all sent" while any remain; they are only named apart.
         public var recheckParts: Int = 0
         public var recheckSeconds: Int = 0
 
-        /// Waiting audio that isn't a re-check (what "on the Watch" means).
+        /// Waiting parts that aren't re-checks.
         public var newParts: Int? { waitingParts.map { max(0, $0 - recheckParts) } }
-        public var newSeconds: Int? { waitingSeconds.map { max(0, $0 - recheckSeconds) } }
     }
 
     // MARK: iPhone → server

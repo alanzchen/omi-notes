@@ -51,10 +51,16 @@ public struct WatchResendPolicy: Codable, Equatable, Sendable {
     public private(set) var pendingInventory: PendingInventory?
     /// The next attempt number (only ever grows, saved).
     public private(set) var nextAttempt: Int?
-    /// Parts an inventory answer called missing: re-checks of audio an older iPhone build already converted
-    /// (it kept no checksum receipt), almost always on the server already. They go after new audio
-    /// (`sendOrder`) and are reported apart (absent in older saved state).
+    /// Parts an inventory answer called missing: re-checks, mostly audio an older iPhone build converted
+    /// without keeping a checksum receipt. Nothing proves the server has them, so they stay unacknowledged
+    /// audio in every total; they only go after new audio (`sendOrder`), for at most `recheckDefer`
+    /// (absent in older saved state).
     public private(set) var recheck: Set<String>?
+    /// When each re-check became due (absent in older saved state: such a re-check is served as new audio).
+    public private(set) var recheckSince: [String: Date]?
+
+    /// How long new audio may keep a re-check waiting before it is sent in recording order like the rest.
+    public static let recheckDefer: TimeInterval = 10 * 60
 
     public init() {}
 
@@ -88,12 +94,14 @@ public struct WatchResendPolicy: Codable, Equatable, Sendable {
     public mutating func acknowledged(_ ids: [String]) {
         for id in ids { entries[id] = nil }
         if recheck != nil { recheck?.subtract(ids) }
+        for id in ids { recheckSince?[id] = nil }
     }
 
     /// Drops entries for items no longer waiting (acknowledged before this state was saved).
     public mutating func keep(only ids: Set<String>) {
         entries = entries.filter { ids.contains($0.key) }
         if recheck != nil { recheck?.formIntersection(ids) }
+        recheckSince = recheckSince?.filter { ids.contains($0.key) }
     }
 
     /// Whether `id` is a re-check (see `recheck`).
@@ -101,9 +109,16 @@ public struct WatchResendPolicy: Codable, Equatable, Sendable {
 
     public var recheckCount: Int { recheck?.count ?? 0 }
 
-    /// New audio first (never handed over, or resent after a failure), re-checks after it; stable within each.
-    public func sendOrder<T>(_ items: [T], id: (T) -> String) -> [T] {
-        items.filter { !isRecheck(id($0)) } + items.filter { isRecheck(id($0)) }
+    /// Whether `id` is a re-check still deferred behind new audio at `now` (it waits at most `recheckDefer`).
+    public func isDeferred(_ id: String, now: Date) -> Bool {
+        guard isRecheck(id), let since = recheckSince?[id] else { return false }
+        return now.timeIntervalSince(since) < Self.recheckDefer
+    }
+
+    /// New audio first (never handed over, or resent after a failure), deferred re-checks after it; stable
+    /// within each. A re-check waiting longer than `recheckDefer` goes with new audio, so it is never starved.
+    public func sendOrder<T>(_ items: [T], now: Date, id: (T) -> String) -> [T] {
+        items.filter { !isDeferred(id($0), now: now) } + items.filter { isDeferred(id($0), now: now) }
     }
 
     public var awaitingAck: Int { entries.values.filter(\.delivered).count }
@@ -134,7 +149,7 @@ public struct WatchResendPolicy: Codable, Equatable, Sendable {
 
     /// The answer to question `id`: its missing items that are still as they were when asked become due
     /// at once (returned). Any other or repeated answer changes nothing.
-    public mutating func answeredInventory(id: String, missing: [String]) -> [String] {
+    public mutating func answeredInventory(id: String, missing: [String], now: Date = Date()) -> [String] {
         guard let pending = pendingInventory, pending.id == id else { return [] }
         pendingInventory = nil
         var due: [String] = []
@@ -144,7 +159,12 @@ public struct WatchResendPolicy: Codable, Equatable, Sendable {
             entries[item] = nil
             due.append(item)
         }
-        if !due.isEmpty { recheck = (recheck ?? []).union(due) }
+        if !due.isEmpty {
+            recheck = (recheck ?? []).union(due)
+            var since = recheckSince ?? [:]
+            for item in due where since[item] == nil { since[item] = now }
+            recheckSince = since
+        }
         return due
     }
 }

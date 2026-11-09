@@ -70,7 +70,7 @@ import OmiWatchKit
                                        stats: ["recheck_parts": 7, "recheck_s": 420])
         let w = TransferSummary.evaluate(snapshot: snap, server: reachable(), status: nil, statusAt: nil, watchInstalled: true, nowMono: s, now: now).watch
         #expect(w.recheckParts == 7 && w.recheckSeconds == 420)
-        #expect(w.newParts == 3 && w.newSeconds == 180)
+        #expect(w.newParts == 3 && w.waitingParts == 10 && w.waitingSeconds == 600, "re-checks stay in the totals")
         snap.watchReport = WatchReport(state: .idle, since: nil, waitingParts: 2, waitingSeconds: 60, at: now)
         let old = TransferSummary.evaluate(snapshot: snap, server: reachable(), status: nil, statusAt: nil, watchInstalled: true, nowMono: s, now: now).watch
         #expect(old.recheckParts == 0 && old.newParts == 2, "an older Watch app reports no re-checks")

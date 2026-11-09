@@ -14,15 +14,22 @@ import Testing
             p.delivered(id, now: t0)
         }
         p.askInventory(id: "q", ids: ids, now: t0)
-        _ = p.answeredInventory(id: "q", missing: ids)
+        _ = p.answeredInventory(id: "q", missing: ids, now: t0)
         return p
     }
 
     @Test func partsAnInventoryCalledMissingGoAfterNewAudio() {
         let p = askedAndAnsweredMissing(["old-1", "old-2"])
         #expect(p.recheckCount == 2 && p.isRecheck("old-1"))
-        let order = p.sendOrder(["old-1", "new-1", "old-2", "new-2"]) { $0 }
+        let order = p.sendOrder(["old-1", "new-1", "old-2", "new-2"], now: t0.addingTimeInterval(60)) { $0 }
         #expect(order == ["new-1", "new-2", "old-1", "old-2"])
+    }
+
+    @Test func newAudioCanNotStarveARecheck() {
+        let p = askedAndAnsweredMissing(["old-1"])
+        let later = t0.addingTimeInterval(WatchResendPolicy.recheckDefer + 1)
+        #expect(p.sendOrder(["old-1", "new-1"], now: later) { $0 } == ["old-1", "new-1"], "waited long enough: recording order")
+        #expect(p.isRecheck("old-1"), "still reported as a re-check (and still unacknowledged audio)")
     }
 
     @Test func aReceiptOrADroppedPartLeavesTheRecheckLane() {
@@ -38,7 +45,7 @@ import Testing
         var json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(p)) as! [String: Any]
         json.removeValue(forKey: "recheck")
         let back = try JSONDecoder().decode(WatchResendPolicy.self, from: JSONSerialization.data(withJSONObject: json))
-        #expect(back.recheckCount == 0 && back.sendOrder(["a"]) { $0 } == ["a"])
+        #expect(back.recheckCount == 0 && back.sendOrder(["a"], now: t0) { $0 } == ["a"])
     }
 
     @Test func onlyMovingTransfersCountAgainstTheWindowWithinABound() {
@@ -49,13 +56,38 @@ import Testing
         #expect(WatchTransferWindow.room(maxInFlight: 4, transferring: 0, outstanding: 9) == 0)
     }
 
-    @Test func theSyncPingGoesOnlyWhileRecordingReachableAndWaitingAtMostOncePerInterval() {
-        #expect(WatchSyncPing.due(now: t0, last: nil, recording: true, reachable: true, unacknowledged: 3))
-        #expect(!WatchSyncPing.due(now: t0, last: nil, recording: false, reachable: true, unacknowledged: 3))
-        #expect(!WatchSyncPing.due(now: t0, last: nil, recording: true, reachable: false, unacknowledged: 3))
-        #expect(!WatchSyncPing.due(now: t0, last: nil, recording: true, reachable: true, unacknowledged: 0))
-        #expect(!WatchSyncPing.due(now: t0.addingTimeInterval(30), last: t0, recording: true, reachable: true, unacknowledged: 3))
-        #expect(WatchSyncPing.due(now: t0.addingTimeInterval(56), last: t0, recording: true, reachable: true, unacknowledged: 3))
+    @Test func theSyncPingGoesWhilePartsWaitAndTheiPhoneIsReachableAtMostOncePerInterval() {
+        #expect(WatchSyncPing.due(now: t0, last: nil, reachable: true, waitingParts: 3), "waiting parts, none delivered yet: still asks")
+        #expect(!WatchSyncPing.due(now: t0, last: nil, reachable: false, waitingParts: 3))
+        #expect(!WatchSyncPing.due(now: t0, last: nil, reachable: true, waitingParts: 0))
+        #expect(!WatchSyncPing.due(now: t0.addingTimeInterval(30), last: t0, reachable: true, waitingParts: 3))
+        #expect(WatchSyncPing.due(now: t0.addingTimeInterval(56), last: t0, reachable: true, waitingParts: 3))
+    }
+
+    @Test func aTransferWithoutProgressStopsHoldingASlotAndIsNeverDropped() {
+        var stalls = WatchTransferStalls()
+        typealias O = WatchTransferStalls.Observation
+        let start = [O(id: "a", transferring: true, completedBytes: 0), O(id: "b", transferring: true, completedBytes: 0),
+                     O(id: "c", transferring: false, completedBytes: 0)]
+        #expect(stalls.observe(start, now: t0) == .init(moving: 2, stalled: 0, queued: 1))
+        // "a" keeps moving, "b" reports transferring with no byte sent for longer than the stall time
+        let later = t0.addingTimeInterval(WatchTransferStalls.stallAfter + 1)
+        let next = [O(id: "a", transferring: true, completedBytes: 4096), O(id: "b", transferring: true, completedBytes: 0),
+                    O(id: "c", transferring: false, completedBytes: 0)]
+        #expect(stalls.observe(next, now: later) == .init(moving: 1, stalled: 1, queued: 1))
+        // the window counts only "a"; everything outstanding (3) still counts against the bound
+        #expect(WatchTransferWindow.room(maxInFlight: 4, transferring: 1, outstanding: 3) == 3)
+        // progress again: moving again
+        #expect(stalls.observe([O(id: "b", transferring: true, completedBytes: 10)], now: later.addingTimeInterval(1)) == .init(moving: 1))
+    }
+
+    @Test func callbackWorkIsIdleOnlyWhenEveryQueuedCallbackFinished() {
+        let work = WatchCallbackWork()
+        #expect(work.isIdle)
+        work.begin(); work.begin(); work.end()
+        #expect(!work.isIdle)
+        work.end()
+        #expect(work.isIdle)
     }
 
     @Test func theSyncPingCarriesChecksummedItemsAndNoQuestion() {

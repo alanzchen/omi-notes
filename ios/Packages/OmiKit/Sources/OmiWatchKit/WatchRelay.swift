@@ -488,6 +488,18 @@ public final class PhoneWatchInbox: @unchecked Sendable {
         return (acks, missing)
     }
 
+    /// Receipts for a sync ping: only the (id, sha256) pairs this phone holds with that checksum. An id asked
+    /// with two different checksums gets no receipt at all (the Watch can't have both), and each pair is
+    /// returned once.
+    public func receipts(items: [WatchInventoryItem], binding asked: String?) throws -> [WatchInventoryItem] {
+        var hashes: [String: Set<String>] = [:]
+        for item in items { hashes[item.id, default: []].insert(item.sha256) }
+        let unique = hashes.compactMap { id, set in set.count == 1 ? WatchInventoryItem(id: id, sha256: set.first!) : nil }
+            .sorted { $0.id < $1.id }
+        let held = Set(try answer(items: unique, binding: asked).acks)
+        return unique.filter { held.contains($0.id) }
+    }
+
     public func accept(end: WatchRecordingEnd) throws {
         guard let binding = binding() else { throw WatchRelayError.identityUnreadable }
         guard end.binding == binding else { throw WatchRelayError.wrongPhone }
