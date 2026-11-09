@@ -460,6 +460,10 @@ class Ingest:
             return False
         stored_path = self.vault.root / row["path"]
         alternate = stored_path.parent / "alternates" / f"{seq}-{digest[:16]}.omnc"
+        if alternate.exists() and sha256_hex(alternate.read_bytes()) != digest:  # damaged: these bytes again, durably
+            log.warning("chunk %s/%d: alternate copy %s was damaged; writing it again", capture_id, seq, alternate.name)
+            self._writable()
+            atomic_write_bytes(alternate, body)
         if not alternate.exists():
             self._writable()
             self._ensure_space()
@@ -616,6 +620,8 @@ def seal_end_epoch(capture) -> float | None:
 
 SAME_AUDIO_CORRELATION = 0.9  # decoded copies of one recording (lossless vs 32 kbit/s AAC) correlate well above this
 SAME_AUDIO_MAX_LAG = 2400  # samples (0.15 s): codec priming and padding
+SAME_AUDIO_WINDOW = 16000  # every aligned second with sound must match on its own...
+SAME_AUDIO_WINDOW_CORRELATION = 0.8  # ... at least this well (32 kbit/s AAC of the same second is far above)
 
 
 def _samples(env) -> np.ndarray:
@@ -648,4 +654,19 @@ def same_audio(a, b) -> bool:
     size = 1 << (2 * n - 1).bit_length()
     corr = np.fft.irfft(np.fft.rfft(x, size) * np.conj(np.fft.rfft(y, size)), size)
     lags = np.concatenate([corr[: SAME_AUDIO_MAX_LAG + 1], corr[-SAME_AUDIO_MAX_LAG:]])
-    return float(lags.max()) / (n * ex * ey) >= SAME_AUDIO_CORRELATION
+    if float(lags.max()) / (n * ex * ey) < SAME_AUDIO_CORRELATION:
+        return False
+    # the whole can match while a part differs (two replaced seconds of sixty still correlate 0.97 overall):
+    # aligned, every second where either copy has sound must match too
+    best = int(np.argmax(lags))
+    lag = best if best <= SAME_AUDIO_MAX_LAG else best - len(lags)
+    xa, ya = (x[lag:], y[: n - lag]) if lag >= 0 else (x[: n + lag], y[-lag:])
+    floor = 0.05 * max(ex, ey)
+    for k in range(0, len(xa) - SAME_AUDIO_WINDOW + 1, SAME_AUDIO_WINDOW):
+        wx, wy = xa[k : k + SAME_AUDIO_WINDOW], ya[k : k + SAME_AUDIO_WINDOW]
+        rx, ry = float(np.sqrt((wx**2).mean())), float(np.sqrt((wy**2).mean()))
+        if rx < floor and ry < floor:
+            continue
+        if min(rx, ry) < 0.5 * max(rx, ry) or float(wx @ wy) / (len(wx) * rx * ry) < SAME_AUDIO_WINDOW_CORRELATION:
+            return False
+    return True
