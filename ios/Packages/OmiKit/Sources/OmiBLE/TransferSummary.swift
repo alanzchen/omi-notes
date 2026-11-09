@@ -234,7 +234,10 @@ public struct TransferSummary: Equatable, Sendable {
             if let kept = w.keptOnWatch, kept > 0 { return "\(plural(kept, "part", "parts")) kept on the Watch, can't be sent" }
             if let parts = w.newParts {
                 let recheck = w.recheckParts > 0 ? "re-checking \(plural(w.recheckParts, "older part", "older parts"))" : nil
-                return parts == 0 ? (recheck.map { "R" + $0.dropFirst() } ?? "Nothing left on the Watch")
+                // "Nothing left" needs the Watch to have reported its kept parts (0); an older Watch app
+                // that doesn't say gets the Watch detail's wording, never an empty Watch.
+                let empty = w.keptOnWatch == 0 ? "Nothing left on the Watch" : "Nothing waiting; kept parts not reported"
+                return parts == 0 ? (recheck.map { "R" + $0.dropFirst() } ?? empty)
                     : "\(plural(parts, "part", "parts")) left on the Watch" + (recheck.map { " · \($0)" } ?? "")
             }
             return "Last Watch report \(SystemHealth.relative(at, now))"

@@ -2,6 +2,7 @@ import OmiProtocol
 import SwiftUI
 
 /// One configured service on one line: a health dot and its short name (full names in the details).
+/// The dot is grey when the health is only last-known (no current server answer).
 struct ServiceRow: View {
     let title: String
     let label: ServiceLabel
@@ -21,6 +22,7 @@ struct ServiceRow: View {
         case .ok: return .green
         case .down: return .red
         case .notSetUp: return .orange
+        case .lastKnown: return .gray  // the server hasn't answered lately: no claim about now
         case .unknown: return nil
         }
     }
@@ -28,6 +30,7 @@ struct ServiceRow: View {
     private var healthWords: String? {
         switch label.health {
         case .ok: return "configured"
+        case .lastKnown: return "not checked recently"
         case .down, .notSetUp, .unknown: return nil  // already in the text, or nothing known
         }
     }

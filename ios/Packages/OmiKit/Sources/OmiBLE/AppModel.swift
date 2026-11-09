@@ -32,6 +32,9 @@ public final class AppModel {
     public private(set) var serverStatus: ServerStatus?
     /// When `serverStatus` was received (a failed refresh leaves it alone).
     public private(set) var serverStatusAt: Date?
+    /// The last completed refresh got no status answer (unreachable, refused, or no server). A refresh
+    /// still in flight doesn't change it; only a successful answer clears it, and a change of server forgets it.
+    public private(set) var lastRefreshFailed = false
     public private(set) var issues: [ServerIssue] = []
     /// Dismiss request ids sent without a settled answer, reused on the next tap (per conversation).
     var dismissRequestIds: [String: String] = [:]
@@ -141,6 +144,13 @@ public final class AppModel {
                               watchAppInstalled: watchAppInstalled)
     }
 
+    /// The Server page's service rows as of now: the last answer's names, with a health only while that
+    /// answer is current (a failed latest request or an old answer makes it last-known). nil before any answer.
+    public func serviceLabels(now: Date = Date()) -> (transcription: ServiceLabel, summaries: ServiceLabel)? {
+        guard let serverStatus else { return nil }
+        return serverStatus.serviceLabels(answeredAt: serverStatusAt, latestRequestFailed: lastRefreshFailed, now: now)
+    }
+
     // MARK: Server
 
     /// Forgets everything a previous server said (another server, or none), people included.
@@ -164,6 +174,7 @@ public final class AppModel {
         speakers.serverChanged()
         serverStatus = nil
         serverStatusAt = nil
+        lastRefreshFailed = false
         issues = []
         recent = []
         recentCursor = nil
@@ -229,6 +240,7 @@ public final class AppModel {
         adopt(config)
         guard let endpoint = config.endpoint else {
             server = .notConfigured
+            lastRefreshFailed = true
             return
         }
         server = .checking
@@ -249,6 +261,7 @@ public final class AppModel {
         }
         guard isCurrent(config), data == dataEpoch else { return }  // the server changed while we were asking
         server = reach
+        lastRefreshFailed = status == nil
         guard let status else {
             // Shown conversations (if any) are now of unknown freshness; an empty list isn't "none yet".
             recentError = Self.describeReach(reach)

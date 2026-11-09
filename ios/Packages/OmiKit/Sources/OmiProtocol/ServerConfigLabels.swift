@@ -10,7 +10,13 @@ public struct ServiceLabel: Equatable, Sendable {
         case down
         case notSetUp
         case unknown
+        /// From an answer that isn't current (the latest request failed, or it is older than
+        /// `currentFor`): the names still hold, the health may not.
+        case lastKnown
     }
+    /// A status answer, and the local engine's last check, count as current this long (the app's
+    /// `SystemHealth.staleAfter`: an older server answer is unknown).
+    public static let currentFor: TimeInterval = 5 * 60
     public struct Detail: Equatable, Sendable, Hashable {
         public var title: String
         public var value: String
@@ -99,20 +105,52 @@ public enum ServiceNames {
 }
 
 extension ServerStatus {
-    public var transcriptionLabel: ServiceLabel { Self.label(stt, local: localTranscription) }
-    public var summariesLabel: ServiceLabel { Self.label(llm, local: nil) }
+    /// The rows as of the answer itself (the engine check's age by the server's clock only).
+    public var transcriptionLabel: ServiceLabel {
+        Self.label(stt, local: localTranscription, checkAge: engineCheckAge(answeredAt: nil, now: nil), current: true)
+    }
+    public var summariesLabel: ServiceLabel { Self.label(llm, local: nil, checkAge: nil, current: true) }
 
-    static func label(_ p: Provider?, local: LocalTranscription?) -> ServiceLabel {
+    /// The rows as of `now`, for this answer received at `answeredAt`. The names always come from it, but
+    /// a health only while it is current: the latest request got an answer, no more than `currentFor`
+    /// ago (and not dated ahead of this phone); otherwise any health is `lastKnown`. The local engine's
+    /// last check (`local_transcription.checked_at`) counts only while it is that recent too.
+    public func serviceLabels(answeredAt: Date?, latestRequestFailed: Bool, now: Date) -> (transcription: ServiceLabel, summaries: ServiceLabel) {
+        let age = answeredAt.map { now.timeIntervalSince($0) }
+        let current = !latestRequestFailed && age.map { $0 <= ServiceLabel.currentFor && $0 >= -60 } == true
+        return (Self.label(stt, local: localTranscription, checkAge: engineCheckAge(answeredAt: answeredAt, now: now), current: current),
+                Self.label(llm, local: nil, checkAge: nil, current: current))
+    }
+
+    /// Seconds since the server last checked the local engine: by the server's clock at the answer
+    /// (this phone's when the server didn't say), plus the answer's own age. nil when it can't be told:
+    /// no or a malformed `checked_at`, or one dated after the answer (by more than the usual phone
+    /// clock skew when it is this phone's clock).
+    func engineCheckAge(answeredAt: Date?, now: Date?) -> TimeInterval? {
+        guard let checked = localTranscription?.checkedAt.flatMap(ISO8601UTC.parse) else { return nil }
+        let serverClock = serverTime.flatMap(ISO8601UTC.parse)
+        guard let answer = serverClock ?? answeredAt else { return nil }
+        let age = answer.timeIntervalSince(checked)
+        guard age >= (serverClock != nil ? 0 : -60) else { return nil }
+        let since = answeredAt.flatMap { a in now.map { max(0, $0.timeIntervalSince(a)) } } ?? 0
+        return max(0, age) + since
+    }
+
+    static func label(_ p: Provider?, local: LocalTranscription?, checkAge: TimeInterval?, current: Bool) -> ServiceLabel {
         guard let p, let provider = p.provider else { return ServiceLabel(text: "—", health: .unknown, details: []) }
         if provider == "none" { return ServiceLabel(text: "Turned off", health: .unknown, details: []) }
         let engine = p.engine
-        let health: ServiceLabel.Health
+        var health: ServiceLabel.Health
         if provider == "local" || engine != nil {
-            health = engine?.healthy == false || local?.available == false || p.ready == false ? .down
-                : p.ready == true || engine?.healthy == true ? .ok : .unknown
+            // answering needs a health check (the engine's own, or the worker's recent, validly dated one);
+            // configured isn't enough
+            let available = checkAge.map { $0 <= ServiceLabel.currentFor } == true ? local?.available : nil
+            health = engine?.healthy == false || available == false || p.ready == false ? .down
+                : engine?.healthy == true || available == true ? .ok : .unknown
         } else {
             health = p.ready == false ? .notSetUp : p.ready == true ? .ok : .unknown
         }
+        if !current, health != .unknown { health = .lastKnown }
         let name = ServiceNames.provider(provider)
         let roleOrder = ["diarization", "text", "aligner"]
         let engineModels = (engine?.models ?? [:]).sorted {
@@ -124,7 +162,7 @@ extension ServerStatus {
         switch health {
         case .down: text = "\(name ?? "OpenAI-compatible") · not responding"
         case .notSetUp: text = "\(name ?? "OpenAI-compatible") · not set up"
-        case .ok, .unknown:
+        case .ok, .unknown, .lastKnown:
             let parts = [name, model].compactMap { $0 }.filter { !$0.isEmpty }
             text = parts.isEmpty ? "OpenAI-compatible" : parts.joined(separator: " · ")
         }

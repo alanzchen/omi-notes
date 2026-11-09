@@ -1,8 +1,8 @@
 import Foundation
 
-/// A conversation's speakers for the note screen: a few as chips (named people first, then by talk
-/// time), the rest folded behind "+N more". Unnamed voices with very little talk time are folded even
-/// when there is room, so a recording split into dozens of labels doesn't read as dozens of people.
+/// A conversation's speakers for the note screen: every named person as a chip, then a few unnamed
+/// voices by talk time, the rest folded behind "+N more". Unnamed voices with very little talk time are
+/// folded even when there is room, so a recording split into dozens of labels doesn't read as dozens of people.
 /// Talk time comes from the transcript segments loaded so far.
 public struct SpeakerRoster: Equatable, Sendable {
     public struct Entry: Equatable, Sendable, Identifiable {
@@ -20,7 +20,7 @@ public struct SpeakerRoster: Equatable, Sendable {
     public var rest: [Entry]
 
     /// - Parameters:
-    ///   - maxShown: chips at most.
+    ///   - maxShown: chips at most, unless more people are named (named people are never folded).
     ///   - minShare, minSeconds: an unnamed voice with less talk than `max(minSeconds, minShare × total)` is folded.
     public static func make(speakers: [ConversationDetail.Speaker], segments: [ConversationDetail.Segment],
                             maxShown: Int = 3, minShare: Double = 0.05, minSeconds: Double = 10) -> SpeakerRoster {
@@ -44,9 +44,10 @@ public struct SpeakerRoster: Equatable, Sendable {
             }
         let total = entries.reduce(0) { $0 + $1.seconds }
         let tiny = total > 0 ? max(minSeconds, minShare * total) : 0
-        var top: [Entry] = [], rest: [Entry] = []
-        for e in entries {
-            if top.count < maxShown, e.name != nil || e.seconds >= tiny { top.append(e) } else { rest.append(e) }
+        // Named people are always chips; the budget and the low-talk threshold fold unnamed voices only.
+        var top = entries.filter { $0.name != nil }, rest: [Entry] = []
+        for e in entries where e.name == nil {
+            if top.count < maxShown, e.seconds >= tiny { top.append(e) } else { rest.append(e) }
         }
         if top.isEmpty { top = Array(rest.prefix(maxShown)); rest.removeFirst(top.count) }
         if rest.count == 1 { top += rest; rest = [] }  // a chip, not "+1 more"

@@ -571,6 +571,7 @@ class ConversationPipeline:
             # words: none ⇒ discarded as no speech; words ⇒ `speakers_unknown`, a terminal status that
             # keeps the audio and invents no speaker (docs/architecture.md #11).
         unlabeled = windowed and not turns
+        heard_turns: list[Turn] | None = None  # local turns that labelled words the sidecar left unattributed
         assembly = f"a{WINDOW_ASSEMBLY_FORMAT}" if WINDOW_ASSEMBLY_FORMAT > 1 else ""
         base = self._stt_base(stt, audio_sha)
         conv_dir = self.conv_dir(conv_id)
@@ -615,8 +616,10 @@ class ConversationPipeline:
             heard := self._voices_under_words(conv_id, cached["response"], audio, audio_sha)
         ):
             # MOSS attributed none of its words (it can, on a short single utterance), but local diarization
-            # heard voices under all of them: those turns label the words, as for text-only STT
-            speakers = SpeakerResult(heard, "local", True)
+            # heard one voice under each utterance: it labels the words, and its own turns (not the coarse
+            # utterances) are the voiceprint evidence, as for text-only STT
+            speakers = SpeakerResult(heard[0], "local", True)
+            heard_turns = heard[1]
         elif linking and not has_speakers(cached["response"]):
             # words, but none the sidecar or local diarization could attribute: no speaker is invented
             unlabeled = True
@@ -649,8 +652,18 @@ class ConversationPipeline:
             overlaps = overlap_spans((speakers.response.get("results") or {}).get("utterances") or [])
         else:
             overlaps = []
-        clips = {} if unlabeled else select_clips(label_turns(speakers.response, local_turns=turns),
-                                                  usable_spans(audio.blocks_out, self._losses_out(row, audio) + overlaps))
+        usable = usable_spans(audio.blocks_out, self._losses_out(row, audio) + overlaps)
+        if unlabeled:
+            clips = {}
+        elif heard_turns is not None:
+            # clips from the diarizer's own turns; a voice that labelled no words still keeps its audio out
+            spoke = {u.get("speaker") for u in (speakers.response.get("results") or {}).get("utterances") or []}
+            evidence = label_turns(speakers.response, local_turns=heard_turns)
+            evidence[" unlabelled"] = [(t.start, t.end) for t in heard_turns if t.speaker not in spoke and t.end > t.start]
+            clips = select_clips(evidence, usable)
+            clips.pop(" unlabelled", None)
+        else:
+            clips = select_clips(label_turns(speakers.response, local_turns=turns), usable)
         language = self.settings.stt_language
         if language == "multi" or linking:  # the local sidecar gets no language hint: use what it heard
             language = detected_language(cached["response"]) or language
@@ -692,7 +705,8 @@ class ConversationPipeline:
         return out
 
     def identify(self, conv_id: str, audio: ConversationAudio | None, audio_sha: str | None, clips: dict,
-                 transcript_sha: str, labels: set[str], *, consistent: bool = True) -> None:  # fmt: skip
+                 transcript_sha: str, labels: set[str], *, consistent: bool = True,
+                 clip_spans: dict | None = None) -> None:  # fmt: skip
         """Voices stage: label voiceprints while the PCM is in memory, then the pure assignment.
         Voices are inert until someone is enrolled or named and skipped without a speaker model;
         label states always move to a new transcript (`_carry_over`), voices or not."""
@@ -700,10 +714,12 @@ class ConversationPipeline:
         voices, name, fresh = None, None, False
         if embedder is not None and consistent and audio_sha and self.speakers.any_samples():
             # keyed by everything the voices depend on: a new transcript may number the voices differently
-            name = voices_name(embedder, audio_sha, transcript_sha)
+            spans = clip_spans if clip_spans is not None else {label: [[c.start, c.end] for c in cs] for label, cs in clips.items()}
+            name = voices_name(embedder, audio_sha, transcript_sha, spans)
             fresh = not (self.conv_dir(conv_id) / name).exists()
-            if fresh and audio is not None and clips:
-                voices = embed_voices(clips, audio.pcm, embedder)  # outside the lock: the slow part
+            if fresh and audio is not None:
+                # no clean clip at all is evidence too: an empty file replaces voices from other bounds
+                voices = embed_voices(clips, audio.pcm, embedder) if clips else {}  # outside the lock: the slow part
             elif fresh:
                 name, fresh = None, False  # no audio in hand (a recovery path): nothing to compute
         with self.speakers.lock:
@@ -742,7 +758,8 @@ class ConversationPipeline:
         sha = sha256_hex(canonical_json(segments).encode())
         if self.speakers.labels_transcript(conv_id) not in (None, sha):
             self.identify(conv_id, None, transcript.get("audio_sha"), {}, sha, {s["speaker"] for s in segments},
-                          consistent=transcript.get("speaker_labels_consistent", True))  # fmt: skip
+                          consistent=transcript.get("speaker_labels_consistent", True),
+                          clip_spans=transcript.get("speaker_clips") or {})  # fmt: skip
 
     def _carry_over(self, current: dict, old_voices: dict, new_voices: dict | None, labels: set[str],
                     had_forgotten: bool = False) -> dict:  # fmt: skip
@@ -969,9 +986,11 @@ class ConversationPipeline:
         return resolve_speakers(response, mode or self.settings.stt_diarization,
                                 lambda: self._local_turns(conv_id, audio, audio_sha))  # fmt: skip
 
-    def _voices_under_words(self, conv_id: str, response: dict, audio: ConversationAudio, audio_sha: str) -> dict | None:
-        """The sidecar's unattributed words labelled by local diarization, when its turns cover at least
-        half of every utterance; else None (no diarizer, no turns, or words where it heard nobody)."""
+    def _voices_under_words(self, conv_id: str, response: dict, audio: ConversationAudio,
+                            audio_sha: str) -> tuple[dict, list[Turn]] | None:  # fmt: skip
+        """The sidecar's unattributed words labelled by local diarization, with its turns (the voiceprint
+        evidence), when for every utterance one voice alone covers at least half of it and no other voice
+        does too; else None (no diarizer, no turns, words where nobody or two voices alike were heard)."""
         if self.providers.diarizer is None:
             return None
         try:
@@ -983,13 +1002,26 @@ class ConversationPipeline:
                       for u in (response.get("results") or {}).get("utterances") or []]  # fmt: skip
         if not turns or not utterances:
             return None
+        labelled = []
         for u in utterances:
-            span = float(u["end"]) - float(u["start"])
-            covered = sum(max(0.0, min(t.end, u["end"]) - max(t.start, u["start"])) for t in turns)
-            if span <= 0 or covered < 0.5 * span:
+            start, end = float(u["start"]), float(u["end"])
+            if end <= start:
                 return None
-        results = dict(response.get("results") or {}, utterances=assign_speakers(utterances, turns))
-        return dict(response, results=results)
+            # each voice's own coverage, its overlapping turns counted once (the union)
+            covered = {}
+            for speaker in {t.speaker for t in turns}:
+                spans = sorted((max(t.start, start), min(t.end, end)) for t in turns if t.speaker == speaker and t.end > start and t.start < end)
+                total, reach = 0.0, start
+                for a, b in spans:
+                    a = max(a, reach)
+                    if b > a:
+                        total, reach = total + b - a, b
+                covered[speaker] = total
+            majority = [speaker for speaker, seconds in covered.items() if seconds >= 0.5 * (end - start)]
+            if len(majority) != 1:
+                return None  # nobody, or two voices alike: no speaker is chosen by turn order
+            labelled.append(dict(u, speaker=majority[0]))
+        return dict(response, results=dict(response.get("results") or {}, utterances=labelled)), turns
 
     def _local_turns(self, conv_id: str, audio: ConversationAudio, audio_sha: str) -> list[Turn] | None:
         diarizer = self.providers.diarizer
