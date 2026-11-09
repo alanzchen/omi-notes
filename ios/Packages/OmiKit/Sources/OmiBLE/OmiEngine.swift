@@ -223,6 +223,13 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         let dirs = config.dirs
         do { try dirs.create() } catch { log(.error, "engine", "cannot create data directories: \(error)") }
         outbox = Outbox(dirs: dirs)
+        // before any upload can run: a re-queue a crash interrupted is told apart from a second 409
+        do {
+            let moved = try outbox.recoverRequeueIntents()
+            if !moved.isEmpty { log(.info, "upload", "finished re-queueing \(moved.count) chunk(s) a restart interrupted") }
+        } catch {
+            log(.error, "upload", "couldn't recover interrupted re-queues: \(error)")
+        }
         env = CaptureEnvironment(dirs: dirs, outbox: outbox, clock: config.clock, appVersion: config.appVersion, timezone: config.timezone)
         deviceMemory = DeviceMemory(stateDir: dirs.state)
         cursors = RingCursorStore(stateDir: dirs.state)

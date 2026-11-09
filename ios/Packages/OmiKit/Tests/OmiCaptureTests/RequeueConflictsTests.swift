@@ -57,25 +57,62 @@ import OmiProtocol
         #expect(try t.outbox.readRequeueLedger() == [name: .init(state: .done, reason: "409: x")])
     }
 
-    @Test func aCrashAfterTheIntentIsRedoneNotLeftOutForever() throws {
-        let t = TestEnv()
-        let name = try quarantined(t, seq: 4, reason: "409: x")
-        // the intent was saved, then the app died before the move
+    func saveIntent(_ t: TestEnv, _ name: String) throws {
         let intent = [name: Outbox.RequeueEntry(state: .intent, reason: "409: x")]
         try FileIO.atomicWrite(try JSONEncoder().encode(intent), to: t.outbox.requeuedLedger)
-        #expect(try t.outbox.requeueConflicts() == [name])
+    }
+
+    @Test func aCrashAfterTheIntentIsRedoneAtStartupNotLeftOutForever() throws {
+        let t = TestEnv()
+        let name = try quarantined(t, seq: 4, reason: "409: x")
+        try saveIntent(t, name)  // the intent was saved, then the app died before the move
+        #expect(try t.outbox.recoverRequeueIntents() == [name], "no upload has run since: the move wasn't made")
         #expect(t.outbox.pending().map(\.name) == [name] && t.outbox.quarantined().isEmpty)
         #expect(try t.outbox.readRequeueLedger()[name]?.state == .done)
     }
 
-    @Test func aCrashAfterTheMoveIsCompleted() throws {
+    @Test func aCrashAfterTheMoveIsCompletedAtStartup() throws {
         let t = TestEnv()
         let item = try t.outbox.write(Data("chunk 5".utf8), kind: .chunk(captureId: "cap", sequence: 5))
-        let intent = [item.name: Outbox.RequeueEntry(state: .intent, reason: "409: x")]
-        try FileIO.atomicWrite(try JSONEncoder().encode(intent), to: t.outbox.requeuedLedger)
-        #expect(try t.outbox.requeueConflicts() == [], "already pending: nothing moves")
+        try saveIntent(t, item.name)
+        #expect(try t.outbox.recoverRequeueIntents() == [], "already pending: nothing moves")
         #expect(try t.outbox.readRequeueLedger()[item.name]?.state == .done)
         #expect(t.outbox.pending().map(\.name) == [item.name])
+    }
+
+    @Test func anIntentWithoutEvidenceOfTheMoveStaysAnIntent() throws {
+        let t = TestEnv()
+        try saveIntent(t, "chunk_gone_000001.omnc")
+        #expect(try t.outbox.recoverRequeueIntents() == [])
+        #expect(try t.outbox.readRequeueLedger()["chunk_gone_000001.omnc"]?.state == .intent)
+    }
+
+    @Test func anUnlistableQuarantineThrowsAndCompletesNothing() throws {
+        let t = TestEnv()
+        let name = try quarantined(t, seq: 7, reason: "409: x")
+        try saveIntent(t, name)
+        try FileManager.default.moveItem(at: t.dirs.outboxQuarantine, to: t.dirs.outboxQuarantine.appendingPathExtension("away"))
+        #expect(throws: (any Error).self) { try t.outbox.recoverRequeueIntents() }
+        #expect(throws: (any Error).self) { try t.outbox.requeueConflicts() }
+        #expect(try t.outbox.readRequeueLedger()[name]?.state == .intent, "an unreadable folder is not an empty one")
+    }
+
+    @Test func aRequeuedFileQuarantinedAgainIsNeverRequeuedTwice() throws {
+        let t = TestEnv()
+        let item = try t.outbox.write(Data("chunk 8".utf8), kind: .chunk(captureId: "cap", sequence: 8))
+        try saveIntent(t, item.name)  // moved back, then the app died before "done"; uploads ran first
+        try t.outbox.quarantine(item.name, reason: "409: real conflict")
+        #expect(try t.outbox.readRequeueLedger()[item.name]?.state == .done, "the second quarantine is recorded")
+        #expect(try t.outbox.recoverRequeueIntents() == [] && (try t.outbox.requeueConflicts()) == [])
+        #expect(t.outbox.quarantined().map(\.name) == [item.name])
+    }
+
+    @Test func requeueAtRuntimeNeverRedoesAnIntentFromQuarantine() throws {
+        let t = TestEnv()
+        let name = try quarantined(t, seq: 9, reason: "409: x")
+        try saveIntent(t, name)
+        #expect(try t.outbox.requeueConflicts() == [], "only startup recovery, before uploads, can tell an unmade move")
+        #expect(t.outbox.quarantined().map(\.name) == [name])
     }
 
     @Test func anUnreadableLedgerMovesNothingAndIsNotTakenAsEmpty() throws {

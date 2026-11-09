@@ -212,6 +212,7 @@ public final class Outbox: @unchecked Sendable {
         guard FileIO.exists(src) else { return }
         let freshPending = isFreshLocked(dirs.outboxPending), freshQuarantine = isFreshLocked(dirs.outboxQuarantine)
         if FileIO.exists(dst) { try? FileManager.default.removeItem(at: dst) }
+        noteQuarantinedAgainLocked(name, reason: reason)  // before the move: a crash between them can't requeue it twice
         try FileManager.default.moveItem(at: src, to: dst)
         try? Data(reason.utf8).write(to: dst.appendingPathExtension("reason"))
         updateLocked(dirs.outboxPending, wasFresh: freshPending) { $0[name] = nil }
@@ -258,52 +259,84 @@ public final class Outbox: @unchecked Sendable {
     /// Moves files quarantined for a 409 (`reason` starting "409") back to pending, each at most once ever:
     /// for a server that takes the same audio sent again (`same_audio_resend`), where a re-encoded copy is
     /// answered 200. A real conflict comes back as 409 and stays quarantined after that. Nothing is deleted:
-    /// the reason moves into the ledger. Each move is intent (fsync'd) → move (directories fsync'd) → done;
-    /// an intent whose file is still in quarantine is redone. Returns the names moved.
+    /// the reason moves into the ledger. Each move is intent (fsync'd) → move (directories fsync'd) → done,
+    /// all under the lock. An intent left by a crash is never redone here, where uploads run (its file may
+    /// have been moved, uploaded and quarantined again): `recoverRequeueIntents` handles it at startup.
+    /// Throws when the quarantine folder can't be listed. Returns the names moved.
     @discardableResult
     public func requeueConflicts() throws -> [String] {
         lock.lock(); defer { lock.unlock() }
         var ledger = try readRequeueLedger()
-        func save() throws { try FileIO.atomicWrite(try JSONEncoder().encode(ledger), to: requeuedLedger) }
-        var moved: [String] = [], changed = false
-        let names = Set((try? FileManager.default.contentsOfDirectory(atPath: dirs.outboxQuarantine.path)) ?? [])
-        let candidates = names.filter { OutboxKind.parse($0) != nil }.union(ledger.filter { $0.value.state == .intent }.keys)
-        for name in candidates.sorted() {
+        let names = try FileManager.default.contentsOfDirectory(atPath: dirs.outboxQuarantine.path)
+        var moved: [String] = []
+        for name in names.sorted() where OutboxKind.parse(name) != nil && ledger[name] == nil {
             let src = dirs.outboxQuarantine.appendingPathComponent(name)
             let dst = dirs.outboxPending.appendingPathComponent(name)
             let reasonURL = src.appendingPathExtension("reason")
-            switch ledger[name]?.state {
-            case .done?:
-                continue  // moved back once already: a second 409 is a real conflict
-            case nil:
-                guard names.contains(name), !FileIO.exists(dst),
-                      let reason = (try? Data(contentsOf: reasonURL)).flatMap({ String(data: $0, encoding: .utf8) }),
-                      reason.hasPrefix("409") else { continue }
-                ledger[name] = RequeueEntry(state: .intent, reason: reason)
-                try save()
-            case .intent?:
-                break  // a move interrupted by a crash: redo or complete it
-            }
-            if names.contains(name) {
-                guard !FileIO.exists(dst) else {
-                    log(.warning, "outbox", "\(name) is both quarantined and pending; left as it is")
-                    continue
-                }
-                try FileManager.default.moveItem(at: src, to: dst)
-                FileIO.fsyncDirectory(dirs.outboxPending)
-                FileIO.fsyncDirectory(dirs.outboxQuarantine)
-                moved.append(name)
-            }  // else: already out of quarantine (moved before the crash, or uploaded since): only complete it
+            guard !FileIO.exists(dst), let reason = (try? Data(contentsOf: reasonURL)).flatMap({ String(data: $0, encoding: .utf8) }),
+                  reason.hasPrefix("409") else { continue }
+            ledger[name] = RequeueEntry(state: .intent, reason: reason)
+            try saveRequeueLedger(ledger)
+            try moveBackLocked(name)
             ledger[name]?.state = .done
-            try save()
+            try saveRequeueLedger(ledger)
             try? FileManager.default.removeItem(at: reasonURL)  // its text is in the ledger
-            changed = true
-        }
-        if changed {
-            listings[dirs.outboxPending] = nil
-            listings[dirs.outboxQuarantine] = nil
+            moved.append(name)
         }
         return moved
+    }
+
+    /// At startup, before any upload can run: finishes re-queue moves a crash interrupted. An intent whose
+    /// file is pending (or already sent) was moved: it is marked done. One whose file is still quarantined
+    /// wasn't (no upload has run since the crash to quarantine it again): it is moved now. One with no file
+    /// in either place stays an intent (no evidence either way). Throws when a folder can't be listed.
+    @discardableResult
+    public func recoverRequeueIntents() throws -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        var ledger = try readRequeueLedger()
+        let intents = ledger.filter { $0.value.state == .intent }.keys.sorted()
+        guard !intents.isEmpty else { return [] }
+        let quarantined = Set(try FileManager.default.contentsOfDirectory(atPath: dirs.outboxQuarantine.path))
+        let pending = Set(try FileManager.default.contentsOfDirectory(atPath: dirs.outboxPending.path))
+        let sent = Set(try FileManager.default.contentsOfDirectory(atPath: dirs.outboxSent.path))
+        var moved: [String] = []
+        for name in intents {
+            if pending.contains(name) || sent.contains(name) {
+                // moved before the crash
+            } else if quarantined.contains(name) {
+                try moveBackLocked(name)
+                moved.append(name)
+            } else {
+                log(.warning, "outbox", "re-queue of \(name) unfinished and its file is in neither folder; left as an intent")
+                continue
+            }
+            ledger[name]?.state = .done
+            try saveRequeueLedger(ledger)
+            try? FileManager.default.removeItem(at: dirs.outboxQuarantine.appendingPathComponent(name).appendingPathExtension("reason"))
+        }
+        return moved
+    }
+
+    private func saveRequeueLedger(_ ledger: [String: RequeueEntry]) throws {
+        try FileIO.atomicWrite(try JSONEncoder().encode(ledger), to: requeuedLedger)
+    }
+
+    /// quarantine → pending, both directories fsync'd. Caller holds the lock.
+    private func moveBackLocked(_ name: String) throws {
+        try FileManager.default.moveItem(at: dirs.outboxQuarantine.appendingPathComponent(name), to: dirs.outboxPending.appendingPathComponent(name))
+        FileIO.fsyncDirectory(dirs.outboxPending)
+        FileIO.fsyncDirectory(dirs.outboxQuarantine)
+        listings[dirs.outboxPending] = nil
+        listings[dirs.outboxQuarantine] = nil
+    }
+
+    /// A file quarantined again after a re-queue whose "done" a crash lost: recorded as done (with the new
+    /// reason), so it is never moved back a second time. Caller holds the lock.
+    private func noteQuarantinedAgainLocked(_ name: String, reason: String) {
+        guard FileIO.exists(requeuedLedger) else { return }
+        guard var ledger = try? readRequeueLedger(), ledger[name]?.state == .intent else { return }
+        ledger[name] = RequeueEntry(state: .done, reason: (ledger[name]?.reason ?? "") + "\nquarantined again: " + reason)
+        do { try saveRequeueLedger(ledger) } catch { log(.error, "outbox", "couldn't record \(name) quarantined again: \(error)") }
     }
 
     /// Debug: move a quarantined file back to pending for another attempt.
