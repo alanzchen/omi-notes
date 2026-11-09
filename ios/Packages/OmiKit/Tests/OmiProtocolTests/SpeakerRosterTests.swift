@@ -37,6 +37,26 @@ import Testing
         #expect(r.rest.count == 38 && !r.rest.contains { $0.label == "S7" })
     }
 
+    /// ASTRA-20261109-IT1-06: five named people showed three chips and "+2 more". The chip budget and the
+    /// low-talk threshold fold unnamed voices only; every named person stays visible.
+    @Test func everyNamedPersonStaysVisible() {
+        let five = (1...5).map { ConversationDetail.Speaker(label: "S\($0)", name: "Person \($0)") }
+        let r = SpeakerRoster.make(speakers: five, segments: [])
+        #expect(r.top.count == 5 && r.rest.isEmpty)
+        #expect(r.top.map(\.label) == ["S1", "S2", "S3", "S4", "S5"], "ties keep label order")
+        let talked = SpeakerRoster.make(speakers: five, segments: [seg("S4", 0, 300), seg("S2", 300, 3)])
+        #expect(talked.top.map(\.label) == ["S4", "S2", "S1", "S3", "S5"], "named by talk time, a little talk included")
+        let mixed = SpeakerRoster.make(speakers: five + [.init(label: "S6", name: nil), .init(label: "S7", name: nil)],
+                                       segments: [seg("S6", 0, 600), seg("S7", 600, 500)])
+        #expect(mixed.top.count == 5 && mixed.rest.map(\.label) == ["S6", "S7"], "the budget is spent; unnamed voices fold")
+        let twoNamed = call(named: ["S7": "Alan", "S9": "Bea"])
+        #expect(twoNamed.top.map(\.displayName) == ["Alan", "Bea", "Speaker 1"] && twoNamed.rest.count == 38)
+        for n in [0, 1, 2] {
+            let r = SpeakerRoster.make(speakers: n == 0 ? [] : speakers(n), segments: [])
+            #expect(r.count == n && r.rest.isEmpty)
+        }
+    }
+
     @Test func atMostAFewChipsAndTheRestInTalkOrder() {
         let segments = (1...6).map { seg("S\($0)", Double($0) * 100, Double(100 - $0 * 10)) }
         let r = SpeakerRoster.make(speakers: speakers(6), segments: segments)

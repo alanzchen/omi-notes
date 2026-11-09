@@ -438,6 +438,23 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         await m.refreshServer()
         #expect(m.noteCache.lastScope == nil || m.noteCache.lastScope?.serverURL == "https://other.ts.net")
     }
+
+    /// ASTRA-20261109-IT1-05: after a healthy answer, a refresh that fails kept the Server page's service
+    /// dots green from the cached status. The cached names stay; the health becomes last-known.
+    @Test func serviceDotsAreLastKnownAfterARefreshFails() async throws {
+        let (m, _) = try model()
+        AppServerStub.routes["/v1/status"] = [(200, #"{"ok":true,"stt":{"provider":"local","model":"Qwen3-ASR-1.7B-bf16","ready":true,"engine":{"healthy":true}},"llm":{"provider":"openai","model":"gpt-6-luna","ready":true}}"#)]
+        await m.refreshServer()
+        let answered = try #require(m.serverStatusAt)
+        #expect(m.serviceLabels(now: answered)?.transcription.health == .ok && m.serviceLabels(now: answered)?.summaries.health == .ok)
+        #expect(m.serviceLabels(now: answered.addingTimeInterval(ServiceLabel.currentFor + 1))?.transcription.health == .lastKnown,
+                "green expires without another answer")
+        AppServerStub.offline = true
+        await m.refreshServer()
+        let labels = try #require(m.serviceLabels(now: answered), "the cached configuration stays")
+        #expect(labels.transcription.health == .lastKnown && labels.summaries.health == .lastKnown)
+        #expect(labels.transcription.text == "Local · Qwen3-ASR-1.7B" && labels.summaries.text == "gpt-6-luna")
+    }
 }
 
 @Suite struct RetryStoreTests {

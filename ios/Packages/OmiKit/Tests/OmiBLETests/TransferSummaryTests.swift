@@ -232,6 +232,21 @@ import OmiWatchKit
         #expect(WatchSummary.onWatchLine(zero, lastReceivedAt: now, now: now).hasPrefix("Everything sent to this iPhone"))
     }
 
+    /// ASTRA-20261109-IT1-04: the Transfers line still said "Nothing left on the Watch" for a fresh report
+    /// with no waiting parts and no kept-parts count, while the Watch detail said kept parts weren't
+    /// reported. A missing count never implies empty storage; an explicit 0 still completes normally.
+    @Test func aMissingKeptPartsCountNeverSaysNothingLeftOnTheWatch() {
+        let legacy = WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now, deviceId: "watch-1")
+        let t = summary(legacy)
+        #expect(t.watch.keptOnWatch == nil)
+        #expect(t.watchLine(now: now) == "Nothing waiting; kept parts not reported")
+        #expect(WatchSummary.onWatchLine(legacy, lastReceivedAt: nil, now: now).hasPrefix(t.watchLine(now: now)), "both screens agree")
+        let zero = summary(WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now, stats: ["orphan_parts": 0]))
+        #expect(zero.watchLine(now: now) == "Nothing left on the Watch" && zero.everythingSent)
+        let waiting = summary(WatchReport(state: .idle, since: nil, waitingParts: 2, waitingSeconds: 120, at: now))
+        #expect(waiting.watchLine(now: now) == "2 parts left on the Watch")
+    }
+
     /// ASTRA-IT11-02: at the cap, any kept audio made the reason say there's no room because it can't be
     /// sent, even when sendable audio over the cap would free room once the iPhone takes it. The
     /// "can't be sent" reason is only for kept audio that fills the cap (or the disk) by itself.
