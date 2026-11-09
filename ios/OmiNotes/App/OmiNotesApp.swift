@@ -60,8 +60,8 @@ struct RootView: View {
             NavigationStack { DevicesView(model: model, onFix: fix) }
                 .tabItem { Label("Devices", systemImage: "wave.3.right.circle") }
                 .tag(Tab.devices)
-            NavigationStack { PeopleView(model: model) }
-                .tabItem { Label("People", systemImage: "person.2") }
+            NavigationStack { VoicesHubView(model: model) }
+                .tabItem { Label("声纹", systemImage: "person.wave.2") }
                 .tag(Tab.people)
             NavigationStack(path: $serverPath) { ServerView(model: model, onFix: fix) }
                 .tabItem { Label("Server", systemImage: "server.rack") }

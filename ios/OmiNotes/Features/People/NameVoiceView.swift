@@ -531,6 +531,11 @@ final class VoicePlayer {
     }
     var duration: Double? { core.audio?.duration }
     var isPlaying: Bool { core.playing != nil }
+    /// Which clip is playing / downloading (a list of clips shows it on that row only).
+    var playingId: String? { core.playing }
+    var loadingId: String? { core.loading }
+    /// The prepared clip (its bars and progress).
+    var currentId: String? { core.loadedId }
     var loading: Bool { core.loading != nil }
     var unavailable: String? { core.message }
     var progress: Double { duration.map { $0 > 0 ? elapsed / $0 : 0 } ?? 0 }
