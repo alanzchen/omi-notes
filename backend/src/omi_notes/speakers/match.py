@@ -167,6 +167,13 @@ def activation(model: PersonModel, models: dict[str, PersonModel], op: Operating
         best_other = min((cosine_distance(sample.vector, m.centroid) for m in others), default=None)
         if own >= op.threshold or (best_other is not None and best_other - own < op.margin):
             return False, "leave-one-out check failed: a sample does not match the others"
+    if model.enrollment_only and model.centroid is not None:
+        # names come from the enrollment-only centroid: every confirmation must match that model too
+        for sample in beyond:
+            own = cosine_distance(sample.vector, model.centroid)
+            best_other = min((cosine_distance(sample.vector, m.centroid) for m in others), default=None)
+            if own >= op.threshold or (best_other is not None and best_other - own < op.margin):
+                return False, "confirmations don't match the enrollment-only model"
     return True, ""
 
 

@@ -85,3 +85,19 @@ def test_ga_counts_each_voice_once_and_only_what_vector_labels_allows(env):
     assert store.rm_space(*MODEL).count == len(named) + 1
     client.put("/v1/speakers/settings", json={"acknowledged_at": None}, headers=AUTH)
     assert store.rm_space(*MODEL).count == len(named)
+
+
+# -- 11: activation validates the model that is actually matched -------------------------------------------------
+
+
+def test_an_enrollment_only_model_is_active_only_if_the_confirmations_match_it():
+    # an orthogonal 80 s enrollment, older than 20 confirmations (the newest-20 cap leaves it out of leave-one-out)
+    other = [sm.Sample(f"e{i}", "alan", vec(RAVI, i), "enrollment", "2026-09-20", f"imp{i}", float(i), seconds=20.0) for i in range(4)]
+    mine = [sm.Sample(f"u{i}", "alan", vec(ALAN, i % 9), "user", f"2026-09-2{i % 3}", f"c{i}", 10.0 + i, seconds=8.0)
+            for i in range(sm.SAMPLE_CAP)]  # fmt: skip
+    model = sm.build_models(other + mine)["alan"]
+    assert model.enrollment_only
+    assert not model.active and "enrollment" in model.why_inactive, "an enrollment unlike every confirmation is no model"
+    same = [sm.Sample(s.id, s.person_id, vec(ALAN, 5 + i), s.source, s.day, s.session, s.created_at, seconds=20.0)
+            for i, s in enumerate(other)]  # fmt: skip
+    assert sm.build_models(same + mine)["alan"].active, "the gates themselves are unchanged"
