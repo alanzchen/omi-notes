@@ -157,19 +157,8 @@ struct WatchDetailView: View {
     #endif
 
     @ViewBuilder private func places(_ f: Flow, _ now: Date) -> some View {
-        place("applewatch", "On the Watch", f.report.map { r in
-            // the recorded length (from the Watch's own parts), never a count of parts; re-checks are named
-            // but still unacknowledged, so never "everything sent" while any remain
-            let newParts = max(0, r.waitingParts - r.recheckParts)
-            let parts = r.keptParts > 0 ? "\(r.keptParts) part\(r.keptParts == 1 ? "" : "s") kept on the Watch, can't be sent"
-                : r.waitingParts == 0 ? "Everything sent to this iPhone"
-                : newParts == 0 ? "Re-checking \(r.recheckParts) older part\(r.recheckParts == 1 ? "" : "s") with this iPhone"
-                : (r.waitingSeconds ?? 0) > 0 ? "\(WaitingAudio.text(r.waitingSeconds!).capitalizedFirst) of audio not on this iPhone yet"
-                : "Some audio not on this iPhone yet"
-            // waiting, and nothing has arrived for a while: what helps
-            let stuck = r.waitingParts > 0 && (f.lastReceivedAt.map { now.timeIntervalSince($0) > 15 * 60 } ?? true)
-            return "\(parts) · reported \(SystemHealth.relative(r.at, now))" + (stuck ? ". They move when both are nearby with Omi Notes open." : "")
-        } ?? "Unknown until the Watch app reports")
+        place("applewatch", "On the Watch", f.report.map { WatchSummary.onWatchLine($0, lastReceivedAt: f.lastReceivedAt, now: now) }
+              ?? "Unknown until the Watch app reports")
         Divider().padding(.leading, 50)
         place("iphone", "On this iPhone", {
             guard let at = f.lastReceivedAt else { return "Nothing received yet" }
@@ -263,8 +252,4 @@ private struct WatchAlertToggle: View {
         .padding(.horizontal, 12).padding(.vertical, 10)
         .onAppear { on = model.problemAlerts.enabled }
     }
-}
-
-private extension String {
-    var capitalizedFirst: String { prefix(1).uppercased() + dropFirst() }
 }

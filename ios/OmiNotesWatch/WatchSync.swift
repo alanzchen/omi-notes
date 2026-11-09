@@ -129,9 +129,9 @@ final class WatchSync: NSObject, WCSessionDelegate {
         let r = WatchReport(state: recorderState.state, since: recorderState.since, waitingParts: pending, waitingSeconds: pendingSeconds, at: now,
                             deviceId: WatchRecorder.deviceId,
                             stats: counters.merging(captureStats) { a, _ in a }.merging(["awaiting_ack": resend.awaitingAck]) { a, _ in a }
-                                .merging(orphans > 0 ? ["orphan_parts": orphans] : [:]) { a, _ in a }
+                                .merging(["orphan_parts": orphans]) { a, _ in a }  // 0 too: an absent count is unknown
                                 .merging(linkStats) { a, _ in a })
-        if let l = lastReport, l.state == r.state, l.since == r.since, l.waitingParts == r.waitingParts, l.recheckParts == r.recheckParts,
+        if let l = lastReport, l.state == r.state, l.since == r.since, l.waitingParts == r.waitingParts, l.recheckParts == r.recheckParts, l.keptParts == r.keptParts,
            now.timeIntervalSince(l.at) < 300 { return }
         do {
             try WCSession.default.updateApplicationContext([WatchWire.report: WatchWire.encode(r)])

@@ -80,7 +80,8 @@ public struct WatchReport: Codable, Equatable, Sendable {
     /// compare builds; absent from older Watch apps.
     public var stats: [String: Int]?
     /// Audio parts kept on the Watch that it can't send (no manifest matches them; `orphan_parts`).
-    public var keptParts: Int { stats?["orphan_parts"] ?? 0 }
+    /// nil when the report doesn't say (older Watch apps): unknown, never taken as none.
+    public var keptParts: Int? { stats?["orphan_parts"] }
     /// Of the waiting parts, those being re-checked: audio an older iPhone build already converted, which
     /// the Watch sends again after any new audio (`recheck_parts`, `recheck_s`; absent from older Watch apps).
     public var recheckParts: Int { stats?["recheck_parts"] ?? 0 }
