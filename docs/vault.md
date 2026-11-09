@@ -38,7 +38,8 @@ operational index. Copy the folder anywhere, point a backend at it, and it rebui
     people/<person_id>/enrollments/<id>.json       enrollment result (an import's: its source and what it merged)
     speakers/settings.json                         recognition acknowledgment, unknown-voice opt-in, dismissed suggestions
     speakers/calibration.json                      the last published (informational) speaker calibration + its input fingerprint
-    speakers/calibration-log.jsonl                 one line per published calibration — append-only
+    speakers/calibration-log.jsonl                 one line per published calibration — append-only (rewritten only to forget a person)
+    speakers/journal/<op_id>.json                  an unfinished multi-file sample operation (move, reject, merge, undo) — removed on completion
     displaced/<sha>.md                             user-edited note versions set aside by an explicit "overwrite"
     operations/<request_id>.json                   app retries: accepted → done | failed | superseded (see "Operations")
 ```
