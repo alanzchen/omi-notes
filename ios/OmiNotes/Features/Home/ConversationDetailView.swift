@@ -356,7 +356,7 @@ struct ConversationDetailView: View {
         if !d.speakers.isEmpty || d.entry.canReviewSpeakers {
             Section {
                 if !d.speakers.isEmpty {
-                    Text(d.speakers.map { $0.name ?? ConversationDetail.anonymous($0.label) }.joined(separator: ", "))
+                    SpeakerChips(roster: roster(d), showTalkTime: d.transcriptComplete && d.transcript != nil)
                 }
                 if d.entry.canReviewSpeakers, model.speakers.serverSupportsNameVoice,
                    d.speakers.contains(where: { $0.name == nil && $0.label != "unknown" }) {
@@ -369,13 +369,18 @@ struct ConversationDetailView: View {
                     }
                 }
             } header: {
-                Text("Speakers")
+                let count = d.speakers.isEmpty ? 0 : roster(d).count
+                Text(count > 1 ? "Speakers · \(count)" : "Speakers")
             } footer: {
                 if d.entry.canReviewSpeakers, d.speakers.contains(where: { $0.name == nil && $0.label != "unknown" }) {
                     Text("Naming a speaker teaches the server their voice for future conversations.")
                 }
             }
         }
+    }
+
+    private func roster(_ d: ConversationDetail) -> SpeakerRoster {
+        SpeakerRoster.make(speakers: d.speakers, segments: d.transcript?.segments ?? [])
     }
 
     @ViewBuilder private func transcriptSection(_ d: ConversationDetail) -> some View {

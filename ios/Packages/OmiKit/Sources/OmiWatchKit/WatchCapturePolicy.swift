@@ -37,16 +37,20 @@ public enum WatchStorage {
     public static let maximumWaiting: Int64 = 600_000_000
 
     /// Why recording can't continue, or nil.
-    /// `keptBytes`: audio kept on the Watch that it can't send (part of `waitingBytes`); when that is
-    /// what fills the cap, opening the iPhone wouldn't help, so the reason doesn't say it would.
+    /// `keptBytes`: audio kept on the Watch that it can't send (part of `waitingBytes`). Only when that
+    /// alone fills the cap (or is all that's waiting on a full Watch) would opening the iPhone not
+    /// help, so only then does the reason say so; any sendable audio frees room once the iPhone has it.
     public static func pauseReason(freeBytes: Int64?, waitingBytes: Int64, keptBytes: Int64 = 0) -> String? {
         if waitingBytes >= maximumWaiting {
-            if waitingBytes - keptBytes < maximumWaiting {
+            if keptBytes >= maximumWaiting {
                 return "Paused: audio kept on this Watch can't be sent, so there's no room."
             }
             return "Paused: too much is waiting for your iPhone. Open Omi Notes on the iPhone, then tap Resume."
         }
         if let freeBytes, freeBytes < minimumFree {
+            if keptBytes > 0, waitingBytes <= keptBytes {
+                return "Paused: the Watch is almost full, and the audio kept on it can't be sent."
+            }
             return "Paused: the Watch is almost full. Open Omi Notes on your iPhone to send what's waiting, then tap Resume."
         }
         return nil
