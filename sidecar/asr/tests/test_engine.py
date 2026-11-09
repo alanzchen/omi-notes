@@ -217,3 +217,26 @@ def test_a_half_that_still_hits_the_cap_is_halved_once_more_before_mosss_gaps_ma
     out = e.transcribe(speech(92), [])
     assert out["omi_asr"]["qwen_capped"] == 0 and out["omi_asr"]["qwen_split"] == 2
     assert "moss" not in out["text"]
+
+
+def test_a_quarter_that_still_hits_the_cap_is_halved_again_down_to_twenty_seconds():
+    # 01a13ccd again (2026-11-09 00:25): the 46 s span's 29 s quarter still looped; MOSS lacked 8 s there
+    e = Engine()
+    e.models = (FakeMoss(lines_every(10, 40)), CappingQwen(limit=20), FakeAligner())
+    out = e.transcribe(speech(92), [])
+    assert out["omi_asr"]["qwen_capped"] == 0
+    assert "moss" not in out["text"]
+
+
+def test_the_smallest_piece_is_tried_once_without_the_context_before_mosss_text():
+    class LoopsWithContext(FakeQwen):  # a hotword prompt can set off the repetition loop
+        def generate(self, audio, hotwords=None, max_tokens=0, **_):
+            r = super().generate(audio, hotwords, max_tokens)
+            if hotwords:
+                r.generation_tokens = max_tokens
+            return r
+
+    e = Engine()
+    e.models = (FakeMoss([]), LoopsWithContext(), FakeAligner())
+    out = e.transcribe(speech(15), ["Freedom"])
+    assert out["omi_asr"]["qwen_capped"] == 0 and out["omi_asr"]["qwen_without_context"] == 1
