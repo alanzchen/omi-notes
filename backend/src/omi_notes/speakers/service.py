@@ -27,7 +27,7 @@ from . import match as speaker_match
 from . import suggest as speaker_suggest
 from . import journal
 from .review import Review, status_line
-from .store import same_clips, sample_eligible, voices_name
+from .store import consent_ok, same_clips, sample_eligible, voices_name
 from ..vault import Vault
 from .voices import Clip, embed_voices
 
@@ -209,6 +209,7 @@ class SpeakerService:
 
     def conversation_speakers(self, conv_id: str) -> dict:
         self._conversation(conv_id)
+        self.store.reconcile()  # the revision shown is the one after recovery (what a change will be checked against)
         transcript = self._transcript(conv_id)
         # the recovery a change runs first, when there is any (checked without waiting for the lock), so the
         # revision shown is the one a change will meet; decided again under the lock on the transcript then
@@ -293,8 +294,9 @@ class SpeakerService:
             raise ApiError(422, "invalid_body", "keep_unknown is a boolean and excludes person_id")
         with self.store.lock:
             self.store.sync_conversation(conv_id)  # an earlier attempt may have failed after its file write
-            self.store.sync_samples()
-            row = self._conversation(conv_id)
+            # recovery first: it may change this label (and its revision); everything below reads after it
+            self.store.reconcile()
+            self._conversation(conv_id)
             transcript = self._transcript(conv_id)
             self.pipeline.move_labels(conv_id, transcript)  # states of an earlier transcript don't apply
             row = self._conversation(conv_id)
@@ -302,7 +304,6 @@ class SpeakerService:
                 raise ApiError(404, "not_found", f"conversation has no speaker {label}")
             # before anything (a retry's answer included): an unfinished operation on this label or these people, or
             # an unfinished forget of the person named, must not be built on or raced
-            self.store.reconcile()
             current = (self.store.labels(conv_id).get(label) or {}).get("person_id")
             journal.blocking(self.store, {not_person, current}, labels={(conv_id, label)})
             journal.forgetting(self.store, {person_id})
@@ -599,8 +600,14 @@ class SpeakerService:
                         continue
                     before = dict(rec["before"] or {})
                     withdrawn = rec.get("withdrawn") or {}
+                    if any(self.store.forgetting_path(p).exists() for p in (before.get("person_id"), withdrawn.get("person_id")) if p):
+                        skipped.add(conv_id)  # that person's forget hasn't finished: nothing of theirs comes back
+                        continue
                     if before.get("person_id") and self.store.person(before["person_id"]) is None:
                         skipped.add(conv_id)  # that person was forgotten since: never brought back
+                        continue
+                    if withdrawn.get("samples") and not consent_ok(self.store.person(withdrawn["person_id"]), self.store.settings()):
+                        skipped.add(conv_id)  # their voiceprints come back only with their current consent
                         continue
                     if withdrawn.get("samples") and not self.store.can_restore(withdrawn["person_id"], withdrawn["samples"], key):
                         skipped.add(conv_id)  # their voiceprints are gone (forgotten, or past the window): no partial undo

@@ -187,6 +187,38 @@ def _set_pending(store, person_id: str, sample_id: str, op_id: str | None) -> No
     store._publish_sample(person_id, sample_id, data)
 
 
+def _moved_import(store, data: dict, b: str, new: str) -> str:
+    """A moved imported enrollment becomes an import of the person it moved to: its own import id (from the same
+    source and range, so dedupe and merges see it), its own copy of the speech audio and its own result, in that
+    person's folder (forgetting either person then removes exactly their own audio)."""
+    from ..spool import atomic_write_bytes
+    from .imports import import_id
+
+    source = data["import"]
+    iid = import_id(b, source["sha256"], float(source["start"]), float(source["end"]))
+    audio = store.person_dir(data["person_id"]) / "enrollment" / f"{data.get('enrollment_id')}.omiaudio"
+    target = store.person_dir(b) / "enrollment" / f"{iid}.omiaudio"
+    if not target.exists() and audio.exists():
+        atomic_write_bytes(target, audio.read_bytes())
+    result_path = store.person_dir(b) / "enrollments" / f"{iid}.json"
+    if Vault.read_json(result_path) is None:
+        result = Vault.read_json(store.person_dir(data["person_id"]) / "enrollments" / f"{data.get('enrollment_id')}.json") or {}
+        Vault.write_json(result_path, result | {"import_id": iid, "enrollment_id": iid, "person_id": b, "sample_id": new,
+                                                "merged": [], "moved_from": {"person_id": data["person_id"], "sample_id": data["sample_id"],
+                                                                             "import_id": data.get("enrollment_id")}})  # fmt: skip
+    return iid
+
+
+def drop_copy(store, person_id: str, sample_id: str) -> None:
+    """Remove a copy a move made, with the import files a moved enrollment got (`_moved_import`)."""
+    data = store.read_sample(person_id, sample_id)
+    if data and data.get("moved_from") and data.get("import") and data.get("enrollment_id"):
+        for extra in (store.person_dir(person_id) / "enrollments" / f"{data['enrollment_id']}.json",
+                      store.person_dir(person_id) / "enrollment" / f"{data['enrollment_id']}.omiaudio"):  # fmt: skip
+            remove(extra)
+    store.remove_sample_ids(person_id, [sample_id])
+
+
 def _label_step(store, op: dict, request_id: str, change) -> None:
     """Apply `change(before) -> (after, record) | None` to the operation's label once (a request entry)."""
     where = op.get("label")
@@ -250,10 +282,11 @@ def _move(store, op: dict) -> None:
         extra = {k: data[k] for k in PROVENANCE if data.get(k) is not None}
         extra |= {"pending_op": op["id"], "moved_from": {"person_id": a, "sample_id": src}}
         person = store.person(b)
+        iid = _moved_import(store, data, b, new) if data.get("import") else None
         store.add_sample(b, decode_vector(data["vector_b64"]), model=data["model"], model_sha=data["model_sha"], source=data["source"],
                          seconds=data.get("seconds") or 0.0, day=data.get("day"), session=data.get("session"),
                          conversation_id=data.get("conversation_id"), label=data.get("label"), request_id=f"{rid}:move:{src}",
-                         enrollment_id=None, now=op["at"], extra=extra, sample_id=new,
+                         enrollment_id=iid, now=op["at"], extra=extra, sample_id=new,
                          attested=bool(person and (person["me"] or person["attested_at"])))  # fmt: skip
     for src, new in op["pairs"]:  # 2. the originals are marked moved
         data = store.read_sample(a, src)
@@ -292,7 +325,7 @@ def _unmove(store, op: dict) -> None:
     _label_step(store, op, f"{uid}:{op['undo_of']}", _restore(store, op))
     commit_point(store, op)  # the originals count again: from here it only rolls forward
     for _, new in op["pairs"]:  # 3. the copies go
-        store.remove_sample_ids(b, [new])
+        drop_copy(store, b, new)
 
 
 def _reject(store, op: dict) -> None:
@@ -355,7 +388,7 @@ def cancel(store, op: dict, forgotten: set = frozenset()) -> None:
         if kind == "move":
             a, b = op["from"], op["to"]
             for src, new in op["pairs"]:
-                store.remove_sample_ids(b, [new])
+                drop_copy(store, b, new)
                 data = store.read_sample(a, src)
                 if a not in forgotten and data and data.get("state") == "moved" and (data.get("moved_to") or {}).get("sample_id") == new:
                     store.update_sample(a, src, {"state": "active", "moved_to": None}, action="rollback", by="recovery",

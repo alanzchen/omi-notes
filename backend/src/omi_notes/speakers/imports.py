@@ -222,6 +222,7 @@ class Importer:
         iid = import_id(person_id, sha, start, end)
         with self.store.lock:
             self.store.reconcile()  # an interrupted import finishes before it is answered
+            journal.blocking(self.store, {person_id})  # never answered over one recovery couldn't finish
             done = self._answer(person_id, iid)
             if done is not None:
                 return 200, done
@@ -248,10 +249,10 @@ class Importer:
         now = time.time()
         with self.store.lock:
             self.store.reconcile()
+            journal.blocking(self.store, {person_id})
             done = self._answer(person_id, iid)
             if done is not None:
                 return 200, done
-            journal.blocking(self.store, {person_id})
             # what was judged must still hold: the person and their consent (a forget meanwhile is final), and the
             # imports the union replaces
             current = self._consent(person_id)

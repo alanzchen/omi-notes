@@ -474,6 +474,9 @@ class Review:
         return ""
 
     def _consent_why(self, person_id: str) -> str:
+        """Why this person's voice data can't be put back into use now ("" when it can)."""
+        if self.store.forgetting_path(person_id).exists():
+            return "that person's forget hasn't finished"
         person = self.store.person(person_id)
         if person is None:
             return "that person was forgotten"

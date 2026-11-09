@@ -806,6 +806,8 @@ class SpeakerStore:
             if state.get("forgotten"):
                 continue
             person = people.get(state.get("person_id"))
+            if person is not None and self.forgetting_path(person["id"]).exists():
+                continue  # their forget hasn't finished: nothing of their voice is kept
             if consent_ok(person, prefs):
                 keep.add(label)
             elif raw and prefs["unknown_voices_enabled"]:
