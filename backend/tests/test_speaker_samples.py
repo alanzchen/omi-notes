@@ -4,19 +4,24 @@ from __future__ import annotations
 
 import json
 import shutil
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
 from omi_notes.api import create_app
 from omi_notes.pipeline.worker import Worker
+from omi_notes.speakers import match as sm
 from omi_notes.speakers.service import SpeakerService
 from omi_notes.speakers.store import sample_eligible
 from omi_notes.vault import Vault
 
 from .conftest import AUTH
 from .helpers import T0
-from .test_speaker_learning import ALAN, PRIYA, RAVI, FakeEmbedder, dialogue, env, name_label, new_person, talk  # noqa: F401
+from .test_speaker_learning import (  # noqa: F401
+    ALAN, PRIYA, RAVI, FakeEmbedder, dialogue, env, label, name_label, new_person, sample, talk, vec,
+)
 
 MODEL = ("fake-voice", "0" * 64)
 
@@ -125,3 +130,59 @@ def test_forget_purges_removed_samples_and_moved_copies_of_the_voice(env):
     client.delete(f"/v1/people/{me}", headers=AUTH)
     assert not Vault.open(settings).person_dir(me).exists()
     assert worker.db.one("SELECT COUNT(*) AS n FROM samples")["n"] == 0
+
+
+# -- M2: the owner restriction (Revision 4) ------------------------------------------------------------
+
+
+def owner_models(**kw):
+    samples = [sample("alan", ALAN, 0, source="enrollment")] + [sample("alan", ALAN, i, day=f"2026-09-2{i}") for i in (1, 2, 3)]
+    return sm.build_models(samples, wearer_id="alan", **kw)
+
+
+def at_cosine(centroid, cos: float, axis: int = 31):
+    """A unit vector at this raw cosine to `centroid`."""
+    c = centroid / np.linalg.norm(centroid)
+    other = np.zeros_like(c)
+    other[axis] = 1.0
+    other = other - (other @ c) * c
+    other /= np.linalg.norm(other)
+    return (cos * c + np.sqrt(1 - cos**2) * other).astype("float32")
+
+
+def test_an_over_split_second_owner_label_stays_unnamed():
+    models = owner_models()
+    assert models["alan"].wearer and models["alan"].active
+    states = sm.assign({"S1": label(vec(ALAN, 8)), "S2": label(vec(ALAN, 9))}, {}, models, auto_assign=True)
+    named = sorted(lab for lab, s in states.items() if s["person_id"] == "alan")
+    assert len(named) == 1, "only the top raw-ranked label can be the owner"
+    assert all(s["distance"] is not None for s in states.values())
+    # not the wearer: the existing over-split rule keeps both
+    plain = sm.build_models([sample("alan", ALAN, 0, source="enrollment")]
+                            + [sample("alan", ALAN, i, day=f"2026-09-2{i}") for i in (1, 2, 3)])  # fmt: skip
+    both = sm.assign({"S1": label(vec(ALAN, 8)), "S2": label(vec(ALAN, 9))}, {}, plain, auto_assign=True)
+    assert both["S1"]["person_id"] == both["S2"]["person_id"] == "alan"
+
+
+def test_a_single_owner_label_needs_raw_cosine_080():
+    models = owner_models()
+    c = models["alan"].centroid
+    below = sm.assign({"S1": label(at_cosine(c, 0.79))}, {}, models, auto_assign=True)["S1"]
+    assert below["person_id"] is None and below["distance"] == pytest.approx(0.21, abs=1e-3)
+    above = sm.assign({"S1": label(at_cosine(c, 0.81))}, {}, models, auto_assign=True)["S1"]
+    assert above["person_id"] == "alan" and above["source"] == "auto"
+
+
+def test_a_multi_label_owner_label_needs_the_top_raw_rank_and_raw_cosine_088():
+    models = owner_models()
+    c = models["alan"].centroid
+    other = label(vec(RAVI))
+    low = sm.assign({"S1": label(at_cosine(c, 0.87)), "S2": other}, {}, models, auto_assign=True)
+    assert low["S1"]["person_id"] is None
+    high = sm.assign({"S1": label(at_cosine(c, 0.89)), "S2": other}, {}, models, auto_assign=True)
+    assert high["S1"]["person_id"] == "alan" and high["S2"]["person_id"] is None
+    # a stored label whose vector wasn't kept still makes the conversation multi-label
+    stored = SimpleNamespace(vector=None, seconds=8.0, turns=2, mixed=False, clips=[[0, 4], [10, 14]])
+    assert sm.assign({"S1": label(at_cosine(c, 0.85)), "S2": stored}, {}, models, auto_assign=True)["S1"]["person_id"] is None
+    assert sm.OWNER_RULE.version >= 1
+    assert (sm.OWNER_RULE.multi_min_cosine, sm.OWNER_RULE.single_min_cosine) == (0.88, 0.80)

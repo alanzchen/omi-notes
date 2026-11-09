@@ -11,6 +11,8 @@
   with confirmations from ≥ 3 distinct recordings on one day. Enrollment alone never activates.
 - An active enrolled wearer may match one continuous turn with ≥ 10 s, two disjoint ≥ 3 s clips,
   and distance < 0.25; margin and mixed-voice checks still apply.
+- The wearer is additionally restricted by `OwnerRule`: only the top raw-ranked label of a
+  multi-label conversation at raw cosine ≥ 0.88, or a single label at ≥ 0.80.
 - `source: user` assignments and `source: unknown` ("keep unknown") are sticky; `not` blocks a person for that label. Several labels may
   map to one person (diarization over-splits), but only when they are about as close: within one
   conversation the closest label is the runner-up for the others (margin 0.10).
@@ -38,6 +40,23 @@ SAMPLE_CAP = 20
 ACTIVE_SAMPLES = 3
 ACTIVE_DAYS = 2
 CONFIRMED = ("enrollment", "user")
+
+
+@dataclass(frozen=True)
+class OwnerRule:
+    """A pure restriction on automatically naming the wearer ("me"), on top of everything else here
+    (spk/a0-20261109/REPORT.md, recommendations 3 and 4; voices-hub plan, Revision 4). Diarization
+    over-splits the wearer, who is closest to the microphone, so within a conversation only the label
+    with the highest raw cosine to the wearer's centroid may be named, at raw ≥ 0.88; a conversation
+    with a single label has nothing to rank against and needs raw ≥ 0.80. A second over-split wearer
+    label stays unnamed, which is the safe side. `version` goes into the calibration fingerprint."""
+
+    version: int = 1
+    multi_min_cosine: float = 0.88
+    single_min_cosine: float = 0.80
+
+
+OWNER_RULE = OwnerRule()
 
 
 @dataclass(frozen=True)
@@ -70,6 +89,7 @@ class PersonModel:
     active: bool = False
     why_inactive: str = ""
     enrolled_wearer: bool = False
+    wearer: bool = False  # this is "me" (`OwnerRule`)
 
 
 @dataclass(frozen=True)
@@ -95,7 +115,8 @@ def build_models(samples: list[Sample], op: Operating = Operating(), *, wearer_i
     for pid, items in by_person.items():
         chosen = confirmed(items)
         models[pid] = PersonModel(pid, centroid([s.vector for s in chosen]) if chosen else None, chosen,
-                                  enrolled_wearer=pid == wearer_id and any(s.source == "enrollment" for s in items))
+                                  enrolled_wearer=pid == wearer_id and any(s.source == "enrollment" for s in items),
+                                  wearer=pid == wearer_id)  # fmt: skip
     for model in models.values():
         model.active, model.why_inactive = activation(model, models, op)
     return models
@@ -170,10 +191,35 @@ def _independent_clips(voice) -> int:
     return count
 
 
+def raw_cosine(a: np.ndarray, b: np.ndarray) -> float:
+    return 1.0 - cosine_distance(a, b)
+
+
+def owner_refusal(label: str, voices: dict[str, object], model: PersonModel, rule: OwnerRule = OWNER_RULE) -> str:
+    """Why `OwnerRule` keeps this label from being named the wearer ("" when it may be). A label counts
+    towards a multi-label conversation when it had a voice (a stored one whose vector wasn't kept too);
+    the ranking is over the vectors at hand."""
+    present = [lab for lab, v in voices.items() if v is not None
+               and (getattr(v, "vector", None) is not None or (getattr(v, "seconds", 0) or 0) > 0)]  # fmt: skip
+    scored = {lab: raw_cosine(voices[lab].vector, model.centroid) for lab in present if getattr(voices[lab], "vector", None) is not None}
+    mine = scored.get(label)
+    if mine is None:
+        return "no voice"
+    if len(present) >= 2:
+        top = min(scored, key=lambda lab: (-scored[lab], _label_key(lab)))
+        if top != label:
+            return f"another label ({top}) is closer to the wearer"
+        if mine < rule.multi_min_cosine:
+            return f"raw cosine {mine:.2f} < {rule.multi_min_cosine} for the wearer"
+        return ""
+    return f"raw cosine {mine:.2f} < {rule.single_min_cosine} for the wearer" if mine < rule.single_min_cosine else ""
+
+
 def assign(voices: dict[str, object], current: dict[str, dict], models: dict[str, PersonModel], *, auto_assign: bool,
-           op: Operating = Operating()) -> dict[str, dict]:  # fmt: skip
+           op: Operating = Operating(), owner: OwnerRule = OWNER_RULE) -> dict[str, dict]:  # fmt: skip
     """Label states after (re)assignment. User assignments and `not` lists are kept; automatic
-    ones are recomputed from the stored voices (only for active people, when auto naming is on)."""
+    ones are recomputed from the stored voices (only for active people, when auto naming is on;
+    the wearer only within `OwnerRule`)."""
     out: dict[str, dict] = {}
     for label in sorted(set(voices) | set(current), key=_label_key):
         state = dict(current.get(label) or {})
@@ -186,7 +232,8 @@ def assign(voices: dict[str, object], current: dict[str, dict], models: dict[str
                  "evidence_s": getattr(voices.get(label), "seconds", None), "not": sorted(blocked),
                  "forgotten": bool(state.get("forgotten")), "samples": list(state.get("samples") or [])}  # fmt: skip
         model = models.get(found.person_id) if found.person_id else None
-        if auto_assign and found.accepted and model is not None and model.active:
+        if auto_assign and found.accepted and model is not None and model.active and not (
+                model.wearer and owner_refusal(label, voices, model, owner)):  # fmt: skip
             fresh |= {"person_id": found.person_id, "source": "auto"}
         out[label] = fresh
     # The diarizer already heard these labels as different voices, so the closest label to a person
