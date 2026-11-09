@@ -450,3 +450,147 @@ def test_a_confirmed_flag_never_returns_on_unchanged_evidence_and_flags_never_ex
     with store.lock:
         assert store.apply_flags(T0 + 3) == 1
     assert flag_open(sample_file(settings, me, ids[-1]).get("flag"))
+
+
+# -- M5: the review queue and sample APIs ------------------------------------------------------------------
+
+
+def review(client, limit: int = 10) -> list[dict]:
+    r = client.get(f"/v1/speakers/review?limit={limit}", headers=AUTH)
+    assert r.status_code == 200, r.text
+    return r.json()["items"]
+
+
+def decide(client, item_id: str, decision: str, request_id: str, **extra):
+    return client.post(f"/v1/speakers/review/{item_id}", json={"decision": decision, "request_id": request_id} | extra,
+                       headers=AUTH)  # fmt: skip
+
+
+def flag_one(worker, person_id: str, sample_id: str, reasons=("pitch",)) -> None:
+    store = worker.pipeline.speakers
+    with store.lock:
+        store.update_sample(person_id, sample_id, {"flag": {"reasons": list(reasons), "evidence_fingerprint": "fp1"}},
+                            action="flag", by="calibration", request_id=None, recalibrate=False)  # fmt: skip
+
+
+def test_the_review_queue_puts_flagged_samples_first_with_playable_clips_and_captions(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    flag_one(worker, me, ids[1])
+    items = review(client)
+    first = items[0]
+    assert (first["kind"], first["person_id"], first["sample_id"], first["reasons"]) == ("sample", me, ids[1], ["pitch"])
+    assert first["id"] == f"s.{ids[1]}.1", "bound to the sample's revision"
+    assert first["playable"] is True and first["clip"]["id"] == f"sample.{ids[1]}.0" and first["text"]
+    assert first["conversation"] == {"id": rows[1]["id"], "started_at": first["conversation"]["started_at"],
+                                     "title": rows[1]["title"]} and first["device"]  # fmt: skip
+    wav = client.get(f"/v1/clips/{first['clip']['id']}", headers=AUTH)
+    assert wav.status_code == 200 and wav.headers["content-type"] == "audio/wav"
+    assert {i["sample_id"] for i in items if i["kind"] == "sample"} == set(ids), "then the rest"
+    assert len(review(client, limit=2)) == 2
+    alan = people(client)["Alan"]
+    assert (alan["samples"], alan["samples_active"], alan["samples_flagged"], alan["samples_removed"]) == (3, 3, 1, 0)
+    assert alan["review_count"] == 1 and alan["status_line"] == "已启用"
+    assert "voice_review" in client.get("/v1/status", headers=AUTH).json()["features"]
+
+
+def test_a_review_confirm_resolves_the_flag_once_stale_ids_are_refused_and_retries_answer_the_same(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    flag_one(worker, me, ids[0])
+    item = review(client)[0]
+    r = decide(client, item["id"], "confirm", "rq-1")
+    assert r.status_code == 200, r.text
+    assert sample_file(settings, me, ids[0])["flag"]["resolved"]["fingerprint"] == "fp1"
+    again = decide(client, item["id"], "confirm", "rq-1")
+    assert again.status_code == 200 and again.json() == r.json(), "a retry is answered, not redone"
+    stale = decide(client, item["id"], "reject", "rq-2")
+    assert stale.status_code == 409 and stale.json()["error"] == "stale_review"
+    assert review(client)[0]["reasons"] == [] and people(client)["Alan"]["review_count"] == 0
+
+
+def test_a_review_reject_soft_removes_and_undo_puts_it_back(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    item = next(i for i in review(client) if i.get("sample_id") == ids[2])
+    r = decide(client, item["id"], "reject", "rq-rej")
+    assert r.status_code == 200, r.text
+    assert sample_file(settings, me, ids[2])["state"] == "removed"
+    alan = people(client)["Alan"]
+    assert (alan["samples_active"], alan["samples_removed"], alan["auto_active"]) == (2, 1, False)
+    assert [s["id"] for s in client.get(f"/v1/people/{me}/samples?state=removed", headers=AUTH).json()["samples"]] == [ids[2]]
+    undo = client.post("/v1/speakers/undo", json={"request_id": "rq-rej", "undo_request_id": "u-1"}, headers=AUTH).json()
+    assert undo["samples"]["undone"] == [ids[2]]
+    assert sample_file(settings, me, ids[2])["state"] == "active"
+    repeat = client.post("/v1/speakers/undo", json={"request_id": "rq-rej", "undo_request_id": "u-1"}, headers=AUTH).json()
+    assert repeat == undo
+    assert people(client)["Alan"]["auto_active"] is True
+
+
+def test_sample_endpoints_remove_restore_and_list_by_state(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    r = client.post(f"/v1/samples/{ids[0]}/remove", json={"request_id": "x-1"}, headers=AUTH)
+    assert r.status_code == 200 and r.json()["sample"]["state"] == "removed"
+    assert client.post(f"/v1/samples/{ids[0]}/remove", json={"request_id": "x-1"}, headers=AUTH).json() == r.json()
+    listed = client.get(f"/v1/people/{me}/samples?state=active", headers=AUTH).json()["samples"]
+    assert {s["id"] for s in listed} == {ids[1], ids[2]}
+    shape = listed[0]
+    assert {"id", "state", "revision", "source", "seconds", "f0", "flag", "playable", "text", "conversation", "review_id"} <= set(shape)
+    assert people(client)["Alan"]["status_line"] == "需要更多样本"
+    back = client.post(f"/v1/samples/{ids[0]}/restore", json={"request_id": "x-2"}, headers=AUTH)
+    assert back.status_code == 200 and back.json()["sample"]["state"] == "active"
+    bad = client.post(f"/v1/samples/{ids[0]}/restore", json={"request_id": "x-3"}, headers=AUTH)
+    assert bad.status_code == 409
+    assert client.post("/v1/samples/00000000-0000-4000-8000-000000000000/remove", json={"request_id": "x"}, headers=AUTH).status_code == 404
+
+
+def test_moving_a_sample_corrects_its_label_and_undo_restores_both(env):
+    settings, client, worker = env
+    client.put("/v1/speakers/settings", json={"acknowledged_at": "2026-09-27T10:00:00Z"}, headers=AUTH)
+    me, rows, ids = me_with_samples(client, worker)
+    stranger = new_person(client, "Stranger")
+    refused = client.post(f"/v1/samples/{ids[0]}/move", json={"person_id": stranger, "request_id": "m-0"}, headers=AUTH)
+    assert refused.status_code == 409 and refused.json()["error"] == "consent_required"
+    priya = new_person(client, "Priya", attest_knows=True)
+    item = next(i for i in review(client) if i.get("sample_id") == ids[0])
+    r = decide(client, item["id"], "move", "m-1", person_id=priya)
+    assert r.status_code == 200, r.text
+    old = sample_file(settings, me, ids[0])
+    new_id = old["moved_to"]["sample_id"]
+    assert old["state"] == "moved" and old["moved_to"]["person_id"] == priya
+    copy = sample_file(settings, priya, new_id)
+    assert copy["moved_from"] == {"person_id": me, "sample_id": ids[0]} and copy["vector_b64"] == old["vector_b64"]
+    labels = worker.pipeline.speakers.labels(rows[0]["id"])
+    assert labels["S1"]["person_id"] == priya and labels["S1"]["source"] == "user" and labels["S1"]["samples"] == [new_id]
+    assert decide(client, item["id"], "move", "m-1", person_id=priya).json() == r.json()
+    undo = client.post("/v1/speakers/undo", json={"request_id": "m-1", "undo_request_id": "u-m"}, headers=AUTH).json()
+    assert undo["undone"] == [rows[0]["id"]], undo
+    assert sample_file(settings, me, ids[0])["state"] == "active"
+    assert not (Vault.open(settings).person_dir(priya) / "samples" / f"{new_id}.json").exists()
+    labels = worker.pipeline.speakers.labels(rows[0]["id"])
+    assert labels["S1"]["person_id"] == me and labels["S1"]["samples"] == [ids[0]]
+
+
+def test_a_label_review_item_names_or_rules_out_through_the_naming_path(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    fresh = talk(client, worker, dialogue(ALAN, PRIYA, seed=40), day=1)
+    assert worker.pipeline.speakers.labels(fresh["id"])["S1"]["source"] == "auto"
+    item = next(i for i in review(client) if i["kind"] == "label")
+    assert (item["conversation"]["id"], item["label"], item["person_id"], item["reasons"]) == (fresh["id"], "S1", me, ["auto"])
+    r = decide(client, item["id"], "confirm", "lab-1")
+    assert r.status_code == 200, r.text
+    state = worker.pipeline.speakers.labels(fresh["id"])["S1"]
+    assert state["source"] == "user" and state["person_id"] == me and len(state["samples"]) == 1
+    assert decide(client, item["id"], "confirm", "lab-1").status_code == 200
+    assert decide(client, item["id"], "reject", "lab-2").json()["error"] == "stale_review"
+
+
+def test_a_review_item_without_raw_audio_keeps_its_caption_and_is_not_playable(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker, days=(6,))
+    worker.db.execute("UPDATE chunks SET raw_deleted=1")  # an older vault's audio, deleted before raw was kept for good
+    (item,) = [i for i in review(client) if i.get("sample_id") == ids[0]]
+    assert item["playable"] is False and "clip" not in item and item["text"]
+    assert client.get(f"/v1/clips/sample.{ids[0]}.0", headers=AUTH).status_code == 410

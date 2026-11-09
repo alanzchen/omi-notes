@@ -25,6 +25,7 @@ from ..util import UUID_RE, iso_utc_epoch
 from . import enroll
 from . import match as speaker_match
 from . import suggest as speaker_suggest
+from .review import Review, status_line
 from .store import same_clips, sample_eligible, voices_name
 from ..vault import Vault
 from .voices import Clip, embed_voices
@@ -50,25 +51,63 @@ class SpeakerService:
         self.store = pipeline.speakers
         self.db = pipeline.db
         self.vault = pipeline.vault
+        self.review = Review(self)
 
     # -- people ----------------------------------------------------------------------------------
 
     def people(self) -> list[dict]:
         self.store.scan_people()
+        self.store.sync_samples()
         embedder = self.pipeline.providers.embedder
         key = (embedder.model, embedder.model_sha) if embedder else None
         models = self.store.models(*key, self.pipeline.operating) if key else {}
+        auto_assign = self.store.settings()["auto_assign"]
+        calibration = self.calibration_people()
         out = []
         for p in self.store.people():
             rows = [r for r in self.db.query("SELECT * FROM samples WHERE person_id=?", (p["id"],)) if sample_eligible(r)]
             model = models.get(p["id"])
+            counts = self.review.counts(p["id"])
+            measured = calibration.get("people", {}).get(p["id"], {}).get("measured")
             out.append({
                 "id": p["id"], "name": p["name"], "me": bool(p["me"]), "note_path": p["note_path"],
                 "samples": len(rows), "sessions": len({r["session"] for r in rows if r["session"]}),
                 "auto_active": bool(model and model.active),
                 "voice_ready": bool(model and model.centroid is not None),
+                **counts, "status_line": status_line(model, counts["samples_active"], auto_assign),
+                "calibrated_at": calibration.get("computed_at"), "measured": measured,
             })  # fmt: skip
         return out
+
+    def calibration_people(self) -> dict:
+        """The last published calibration (`speakers.calibration`), {} before the first."""
+        return {}
+
+    # -- review and samples (`speakers.review`) ---------------------------------------------------
+
+    def review_items(self, limit: int) -> list[dict]:
+        return self.review.items(limit)
+
+    def review_decide(self, item_id: str, body: dict) -> dict:
+        return self.review.decide(item_id, body)
+
+    def person_samples(self, person_id: str, state: str | None) -> list[dict]:
+        return self.review.person_samples(person_id, state)
+
+    def sample_action(self, sample_id: str, action: str, body: dict) -> dict:
+        if not UUID_RE.match(sample_id):
+            raise ApiError(404, "not_found", "unknown sample")
+        request_id = body.get("request_id")
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 100:
+            raise ApiError(422, "invalid_body", "request_id is required")
+        expected = body.get("expected_revision")
+        if expected is not None and (not isinstance(expected, int) or isinstance(expected, bool)):
+            raise ApiError(422, "invalid_body", "expected_revision must be an integer")
+        person_id = body.get("person_id")
+        if action == "move" and (not isinstance(person_id, str) or not UUID_RE.match(person_id)):
+            raise ApiError(422, "invalid_body", "a move needs person_id (a lowercase UUID)")
+        result = self.review.sample_decision(sample_id, action, request_id, expected_revision=expected, person_id=person_id)
+        return result | {"request_id": request_id, "undo_token": request_id}
 
     def put_person(self, person_id: str, body: dict) -> tuple[int, dict]:
         if not UUID_RE.match(person_id):
@@ -532,20 +571,27 @@ class SpeakerService:
                     if withdrawn.get("samples") and not self.store.can_restore(withdrawn["person_id"], withdrawn["samples"], key):
                         skipped.add(conv_id)  # their voiceprints are gone (forgotten, or past the window): no partial undo
                         continue
+                    moved = rec.get("moved") or {}
+                    if moved and not self.review.can_revert_moved(moved):
+                        skipped.add(conv_id)  # the moved sample changed or was forgotten since
+                        continue
                     created = set((after.get("samples") or [])) - set(before.get("samples") or [])
                     if created and after.get("person_id"):
                         self.store.remove_sample_ids(after["person_id"], sorted(created))
                     if withdrawn.get("samples"):
                         self.store.restore_samples(withdrawn["person_id"], withdrawn["samples"], key)
+                    if moved:
+                        self.review.revert_moved(moved, undo_id, key)
                     states[label] = before
                     self.store.write_labels(conv_id, states, request=(done_key, {"label": label, "undo_of": key}))
                     row = self.db.one("SELECT note_path FROM conversations WHERE id=?", (conv_id,))
                     if row and row["note_path"]:
                         self.pipeline._set(conv_id, needs_render=1, next_attempt_at=None)
                     undone.add(conv_id)
-            if undone:
+            samples = self.review.undo(request_id, undo_id)  # sample decisions (review, remove, restore, move)
+            if undone or samples["undone"]:
                 self._relabel()
-        return {"undone": sorted(undone), "skipped": sorted(skipped - undone)}
+        return {"undone": sorted(undone), "skipped": sorted(skipped - undone), "samples": samples}
 
     # -- settings --------------------------------------------------------------------------------
 
@@ -588,6 +634,8 @@ class SpeakerService:
     # -- clips -----------------------------------------------------------------------------------
 
     def clip_wav(self, clip_id: str) -> bytes:
+        if clip_id.startswith("sample."):
+            return self.review.clip_wav(clip_id)
         conv_id, _, rest = clip_id.partition(".")
         label, _, index = rest.partition(".")
         if not UUID_RE.match(conv_id) or not label or not index.isdigit():

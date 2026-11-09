@@ -210,7 +210,7 @@ def create_app(
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes
-            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star", "watch_performance", "phone_log", "dismiss", "same_audio_resend"] + (["watch_aac"] if aac.available() else []),
+            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star", "watch_performance", "phone_log", "dismiss", "same_audio_resend", "voice_review"] + (["watch_aac"] if aac.available() else []),
             "vault_id": vault.vault_id,
         }
 
@@ -496,6 +496,32 @@ def create_app(
         if result is None:
             raise ApiError(404, "unknown_enrollment", "no voice enrollment with this id")
         return result
+
+    @app.get("/v1/speakers/review")
+    def review_items(request: Request, limit: int = 10) -> dict:
+        return {"items": speakers(request).review_items(max(1, min(limit, 50)))}
+
+    @app.post("/v1/speakers/review/{item_id}")
+    async def review_decide(item_id: str, request: Request) -> dict:
+        body = await read_json(request)
+        if not isinstance(body, dict):
+            raise ApiError(422, "invalid_body", "expected a JSON object")
+        writable()
+        return await run_in_threadpool(speakers(request).review_decide, item_id, body)
+
+    @app.get("/v1/people/{person_id}/samples")
+    def person_samples(person_id: str, request: Request, state: str | None = None) -> dict:
+        return {"samples": speakers(request).person_samples(person_id, state)}
+
+    @app.post("/v1/samples/{sample_id}/{action}")
+    async def sample_action(sample_id: str, action: str, request: Request) -> dict:
+        if action not in ("remove", "restore", "move"):
+            raise ApiError(404, "not_found", "unknown sample action")
+        body = await read_json(request)
+        if not isinstance(body, dict):
+            raise ApiError(422, "invalid_body", "expected a JSON object")
+        writable()
+        return await run_in_threadpool(speakers(request).sample_action, sample_id, action, body)
 
     @app.get("/v1/clips/{clip_id}")
     def clip(clip_id: str, request: Request) -> Response:

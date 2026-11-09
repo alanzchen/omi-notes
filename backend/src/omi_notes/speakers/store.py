@@ -498,12 +498,13 @@ class SpeakerStore:
         return data
 
     def set_sample_state(self, person_id: str, sample_id: str, state: str, *, action: str, by: str,
-                         request_id: str | None, now: float | None = None, extra: dict | None = None) -> dict:  # fmt: skip
+                         request_id: str | None, now: float | None = None, extra: dict | None = None,
+                         record: dict | None = None) -> dict:  # fmt: skip
         if state not in SAMPLE_STATES:
             raise ValueError(state)
         before = (self.read_sample(person_id, sample_id) or {}).get("state") or ACTIVE
         return self.update_sample(person_id, sample_id, {"state": state} | (extra or {}), action=action, by=by,
-                                  request_id=request_id, now=now, record={"from": before, "to": state})  # fmt: skip
+                                  request_id=request_id, now=now, record={"from": before, "to": state} | (record or {}))  # fmt: skip
 
     def samples_changed(self, now: float | None = None) -> None:
         """People's voice evidence changed (a sample, a state, consent): recalibrate (debounced, `calibration`)."""
