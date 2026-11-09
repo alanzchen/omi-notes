@@ -762,3 +762,43 @@ def test_the_server_waits_for_a_maintenance_command_to_release_the_worker_lock()
 
     assert acquire_worker_lock(Lock(3), wait=5.0, step=0.01) is True
     assert acquire_worker_lock(Lock(10**6), wait=0.05, step=0.01) is False
+
+
+def all_unknown(request, n):
+    return httpx.Response(200, json={"segments": [{"start": 0.0, "end": 3.0, "speaker_id": "UNKNOWN", "text": "words"}]})
+
+
+class TurnsDiarizer:
+    tag = "fake-turns"
+
+    def __init__(self, turns):
+        self.turns = turns
+
+    def diarize(self, pcm):
+        from omi_notes.audio.diarize import Turn
+
+        return [Turn(*t) for t in self.turns]
+
+
+def test_words_moss_left_unattributed_take_the_one_voice_local_diarization_heard_under_them(client, worker):
+    # 01a119d4 (2026-11-08 22:13): MOSS gave one 9 s utterance no speaker, while the local diarizer heard one
+    # voice over all of it; the conversation failed as speakers_unknown though a speaker was in evidence
+    worker.providers._local_stt, _ = sidecar(all_unknown)
+    worker.providers._diarizer = TurnsDiarizer([(0.0, 9.0, 0)])
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    assert row["status"] == "done", row["error"]
+    transcript = json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text())
+    assert [s["speaker"] for s in transcript["segments"]] == ["S1"] and transcript["speaker_source"] == "local"
+
+
+@pytest.mark.parametrize("turns", [[], [(0.0, 0.5, 0)]], ids=["no-turns", "turns-not-under-the-words"])
+def test_unattributed_words_without_a_voice_heard_under_them_stay_speakers_unknown(client, worker, turns):
+    # 01a13b7a: the diarizer heard nobody; a speaker is never invented, nor taken from a turn beside the words
+    worker.providers._local_stt, _ = sidecar(all_unknown)
+    worker.providers._diarizer = TurnsDiarizer(turns)
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    assert row["status"] == "failed" and row["error_kind"] == "speakers_unknown"

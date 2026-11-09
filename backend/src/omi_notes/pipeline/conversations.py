@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 from .. import operations
-from ..audio.diarize import LocalDiarizer, Turn, local_diarization_status
+from ..audio.diarize import LocalDiarizer, Turn, assign_speakers, local_diarization_status
 from ..audio.timeline import CaptureTimeline, Piece
 from ..db import Database
 from ..envelope import OPUS_CODECS, parse_envelope
@@ -611,8 +611,14 @@ class ConversationPipeline:
             speakers = SpeakerResult(cached["response"], "unlabeled", False)
         elif windowed:
             speakers = SpeakerResult(cached["response"], "local", True)
+        elif linking and not has_speakers(cached["response"]) and (
+            heard := self._voices_under_words(conv_id, cached["response"], audio, audio_sha)
+        ):
+            # MOSS attributed none of its words (it can, on a short single utterance), but local diarization
+            # heard voices under all of them: those turns label the words, as for text-only STT
+            speakers = SpeakerResult(heard, "local", True)
         elif linking and not has_speakers(cached["response"]):
-            # words, but none the sidecar could attribute: no speaker is invented (as for text-only STT)
+            # words, but none the sidecar or local diarization could attribute: no speaker is invented
             unlabeled = True
             speakers = SpeakerResult(cached["response"], "unlabeled", False)
         elif linking:
@@ -962,6 +968,28 @@ class ConversationPipeline:
 
         return resolve_speakers(response, mode or self.settings.stt_diarization,
                                 lambda: self._local_turns(conv_id, audio, audio_sha))  # fmt: skip
+
+    def _voices_under_words(self, conv_id: str, response: dict, audio: ConversationAudio, audio_sha: str) -> dict | None:
+        """The sidecar's unattributed words labelled by local diarization, when its turns cover at least
+        half of every utterance; else None (no diarizer, no turns, or words where it heard nobody)."""
+        if self.providers.diarizer is None:
+            return None
+        try:
+            turns = self._local_turns(conv_id, audio, audio_sha)
+        except Exception as exc:  # sherpa/onnx failures come in assorted types: no evidence, not an error here
+            log.warning("conversation %s: local diarization failed: %s", conv_id, exc)
+            return None
+        utterances = [{k: v for k, v in u.items() if k != "unattributed"}
+                      for u in (response.get("results") or {}).get("utterances") or []]  # fmt: skip
+        if not turns or not utterances:
+            return None
+        for u in utterances:
+            span = float(u["end"]) - float(u["start"])
+            covered = sum(max(0.0, min(t.end, u["end"]) - max(t.start, u["start"])) for t in turns)
+            if span <= 0 or covered < 0.5 * span:
+                return None
+        results = dict(response.get("results") or {}, utterances=assign_speakers(utterances, turns))
+        return dict(response, results=results)
 
     def _local_turns(self, conv_id: str, audio: ConversationAudio, audio_sha: str) -> list[Turn] | None:
         diarizer = self.providers.diarizer
