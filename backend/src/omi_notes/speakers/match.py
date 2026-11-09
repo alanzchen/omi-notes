@@ -57,6 +57,9 @@ class Sample:
     day: str | None = None  # local date of the audio
     session: str | None = None  # conversation or enrollment id
     created_at: float = 0.0
+    seconds: float = 0.0
+    state: str = "active"  # only eligible samples are ever passed in (`store.sample_eligible`)
+    f0: float | None = None
 
 
 @dataclass

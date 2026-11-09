@@ -40,7 +40,9 @@ log = logging.getLogger(__name__)
 # 3: conversation records may carry `resolution` (kept from the phone with the speaker unknown).
 # 4: speakers.json label states may be `source: "unknown"` (the owner kept a voice unknown); an older
 # backend would recompute them away.
-FORMAT = 4
+# 6: voice samples may carry a `state` (removed | moved), `history` and a review `flag`; an older backend
+# would train on a removed or moved voiceprint again. (5 is left unused: no vault was ever written with it.)
+FORMAT = 6
 OMI = "_omi"
 LEASE_RENEW_SECONDS = 5 * 60
 LEASE_STALE_SECONDS = 15 * 60
@@ -210,9 +212,18 @@ class Vault:
         an older backend refuses it instead of silently dropping what it doesn't understand."""
         if self.format >= fmt:
             return
-        info = dict(self.info) | {"format": fmt}
-        self.write_json(self.vault_json, info)
-        self.info = info
+        from .lock import SpeakerLock  # (lock imports this module)
+
+        # the API and a worker process may raise it at once: re-read under the per-vault meta lock, never lower it
+        with SpeakerLock(self, "vault-meta.lock"):
+            on_disk = self.read_json(self.vault_json) or {}
+            current = max(int(on_disk.get("format", 1)), self.format)
+            if current >= fmt:
+                self.info = dict(self.info) | {"format": current}
+                return
+            info = dict(on_disk or self.info) | {"format": fmt}
+            self.write_json(self.vault_json, info)
+            self.info = info
 
     def sync_render_settings(self, settings: Settings) -> None:
         """Record explicitly configured render-affecting settings (TIMEZONE, OWNER_NAME) in

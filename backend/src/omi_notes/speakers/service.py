@@ -24,7 +24,7 @@ from ..util import UUID_RE, iso_utc_epoch
 from . import enroll
 from . import match as speaker_match
 from . import suggest as speaker_suggest
-from .store import same_clips, voices_name
+from .store import same_clips, sample_eligible, voices_name
 from ..vault import Vault
 from .voices import Clip, embed_voices
 
@@ -59,7 +59,7 @@ class SpeakerService:
         models = self.store.models(*key, self.pipeline.operating) if key else {}
         out = []
         for p in self.store.people():
-            rows = self.db.query("SELECT * FROM samples WHERE person_id=?", (p["id"],))
+            rows = [r for r in self.db.query("SELECT * FROM samples WHERE person_id=?", (p["id"],)) if sample_eligible(r)]
             model = models.get(p["id"])
             out.append({
                 "id": p["id"], "name": p["name"], "me": bool(p["me"]), "note_path": p["note_path"],

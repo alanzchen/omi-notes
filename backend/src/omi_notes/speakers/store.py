@@ -4,7 +4,8 @@ Vault files (the index tables `people`, `samples`, `voices`, `speaker_labels` ar
 - `People/<Name>.md`: frontmatter `omi_person_id`, `name`, `aliases`, `omi_me`; created once by
   the server, then the user's (rename freely: identity is the id, the file name is the link).
 - `_omi/people/<id>/samples/<sample_id>.json`: a confirmed voiceprint {model, model_sha, dim,
-  vector_b64, source, seconds, created_at, ...}; `consent.json`: the person-level attestation;
+  vector_b64, source, seconds, created_at, ...}, from vault format 6 also `state` (active | removed |
+  moved), `revision`, `history` and a review `flag`; `consent.json`: the person-level attestation;
   `enrollment/<id>.omiaudio` + `enrollments/<id>.json`: the wearer's enrollment.
 - `_omi/speakers/settings.json`: acknowledgment, unknown-voice opt-in, auto naming, dismissals.
 - per conversation: `voices-<model>-<model_sha8>-<audio_sha16>-c<clip bounds8>-<transcript_sha8>.json` (clips, and vectors of assigned labels —
@@ -19,8 +20,10 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,7 +43,30 @@ log = logging.getLogger(__name__)
 
 PEOPLE_DIR = "People"
 REQUEST_MEMORY = 200
+ACTIVE, REMOVED, MOVED = "active", "removed", "moved"
+SAMPLE_STATES = (ACTIVE, REMOVED, MOVED)
+SAMPLE_FORMAT = 6  # vault format whose samples may carry a state, history and flag
 _FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
+
+
+def sample_eligible(sample) -> bool:
+    """The one rule for which voiceprints teach anything (matching, activation, hints, suggestions and
+    calibration): an active sample. A review flag never changes it; only the owner's remove or move does."""
+    if isinstance(sample, Mapping):
+        state = sample.get("state")
+    elif isinstance(sample, sqlite3.Row):
+        state = sample["state"] if "state" in sample.keys() else None
+    else:
+        state = getattr(sample, "state", None)
+    return (state or ACTIVE) == ACTIVE
+
+
+def flag_open(flag: dict | None) -> bool:
+    """A review flag the owner hasn't resolved for this evidence."""
+    if not flag or not flag.get("reasons"):
+        return False
+    resolved = flag.get("resolved") or {}
+    return resolved.get("fingerprint") != flag.get("evidence_fingerprint")
 
 
 @dataclass
@@ -279,6 +305,15 @@ class SpeakerStore:
                 for key in ("person_id", "sample_id", "model", "model_sha"):
                     data.pop(key, None)
                 Vault.write_json(path, data | {"forgotten": True})
+        # a sample moved to this person left a `moved` record (with the vector) in the old person's folder:
+        # it is this person's voice, so it goes with them (history and all)
+        for path in sorted(self.vault.people.glob("*/samples/*.json")) if self.vault.people.exists() else []:
+            if path.parent.parent.name == person_id:
+                continue
+            data = Vault.read_json(path) or {}
+            if data.get("state") == MOVED and (data.get("moved_to") or {}).get("person_id") == person_id:
+                remove(path)
+                self.db.execute("DELETE FROM samples WHERE id=?", (path.stem,))
         folder = self.person_dir(person_id)
         if folder.exists():
             shutil.rmtree(folder)
@@ -315,12 +350,65 @@ class SpeakerStore:
     def _index_sample(self, data: dict) -> None:
         self.db.execute(
             """INSERT OR REPLACE INTO samples (id, person_id, model, model_sha, vector, source, seconds, day, session,
-                   conversation_id, label, request_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   conversation_id, label, request_id, created_at, state, revision, flag_json, f0)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (data["sample_id"], data["person_id"], data["model"], data["model_sha"],
              np.asarray(decode_vector(data["vector_b64"]), dtype="<f4").tobytes(), data["source"], data.get("seconds"),
              data.get("day"), data.get("session"), data.get("conversation_id"), data.get("label"), data.get("request_id"),
-             data.get("created_at") or 0.0),
+             data.get("created_at") or 0.0, data.get("state") or ACTIVE, int(data.get("revision") or 0),
+             json.dumps(data["flag"], sort_keys=True) if data.get("flag") else None, data.get("f0")),
         )  # fmt: skip
+
+    def sample_path(self, person_id: str, sample_id: str) -> Path:
+        return self.person_dir(person_id) / "samples" / f"{sample_id}.json"
+
+    def read_sample(self, person_id: str, sample_id: str) -> dict | None:
+        return Vault.read_json(self.sample_path(person_id, sample_id))
+
+    def find_sample(self, sample_id: str) -> dict | None:
+        """A sample file by id (the index says whose; the folders are the truth if it is behind)."""
+        row = self.db.one("SELECT person_id FROM samples WHERE id=?", (sample_id,))
+        if row is not None and (data := self.read_sample(row["person_id"], sample_id)) is not None:
+            return data
+        if not re.fullmatch(r"[0-9a-f-]{36}", sample_id or "") or not self.vault.people.exists():
+            return None
+        return next((Vault.read_json(p) for p in self.vault.people.glob(f"*/samples/{sample_id}.json")), None)
+
+    def update_sample(self, person_id: str, sample_id: str, changes: dict, *, action: str, by: str,
+                      request_id: str | None, now: float | None = None, record: dict | None = None) -> dict:  # fmt: skip
+        """Change a sample file (the vault first, then the index; call under the speaker lock): `changes`
+        are merged (None removes a key), the revision goes up, and `history` gains {at, action, by,
+        request_id, ...record}. The vault is raised to format 6 before the first such write."""
+        now = time.time() if now is None else now
+        data = self.read_sample(person_id, sample_id)
+        if data is None:
+            raise KeyError(sample_id)
+        self.vault.raise_format(SAMPLE_FORMAT)
+        data = dict(data)
+        for key, value in changes.items():
+            if value is None:
+                data.pop(key, None)
+            else:
+                data[key] = value
+        data["revision"] = int(data.get("revision") or 0) + 1
+        data["history"] = list(data.get("history") or []) + [{"at": now, "action": action, "by": by,
+                                                               "request_id": request_id} | (record or {})]  # fmt: skip
+        Vault.write_json(self.sample_path(person_id, sample_id), data)
+        self._index_sample(data)
+        self.samples_changed(now)
+        return data
+
+    def set_sample_state(self, person_id: str, sample_id: str, state: str, *, action: str, by: str,
+                         request_id: str | None, now: float | None = None, extra: dict | None = None) -> dict:  # fmt: skip
+        if state not in SAMPLE_STATES:
+            raise ValueError(state)
+        before = (self.read_sample(person_id, sample_id) or {}).get("state") or ACTIVE
+        return self.update_sample(person_id, sample_id, {"state": state} | (extra or {}), action=action, by=by,
+                                  request_id=request_id, now=now, record={"from": before, "to": state})  # fmt: skip
+
+    def samples_changed(self, now: float | None = None) -> None:
+        """People's voice evidence changed (a sample, a state, consent): recalibrate (debounced, `calibration`)."""
+        self.db.set_meta("calibrate_pending", repr(time.time() if now is None else now))
 
     def load_samples(self) -> int:
         """Rebuild the `samples` cache from the vault."""
@@ -334,11 +422,13 @@ class SpeakerStore:
                     count += 1
         return count
 
-    def samples(self, model: str, model_sha: str) -> list[Sample]:
+    def samples(self, model: str, model_sha: str, *, every_state: bool = False) -> list[Sample]:
+        """This model's samples that may teach anything (`sample_eligible`); `every_state`: removed and moved ones too."""
         return [
             Sample(r["id"], r["person_id"], np.frombuffer(r["vector"], dtype="<f4").astype(np.float32), r["source"],
-                   r["day"], r["session"], r["created_at"])
+                   r["day"], r["session"], r["created_at"], seconds=r["seconds"] or 0.0, state=r["state"], f0=r["f0"])
             for r in self.db.query("SELECT * FROM samples WHERE model=? AND model_sha=? ORDER BY created_at, id", (model, model_sha))
+            if every_state or sample_eligible(r)
         ]  # fmt: skip
 
     def remove_sample_ids(self, person_id: str, sample_ids: list[str]) -> int:

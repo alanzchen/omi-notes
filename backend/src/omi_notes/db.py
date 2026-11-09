@@ -22,7 +22,7 @@ from pathlib import Path
 
 from .spool import make_dirs_durable
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -283,7 +283,11 @@ CREATE TABLE IF NOT EXISTS samples (
     conversation_id TEXT,
     label TEXT,
     request_id TEXT,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    state TEXT NOT NULL DEFAULT 'active',
+    revision INTEGER NOT NULL DEFAULT 0,
+    flag_json TEXT,
+    f0 REAL
 );
 CREATE INDEX IF NOT EXISTS samples_person ON samples(person_id);
 CREATE INDEX IF NOT EXISTS samples_request ON samples(request_id);
@@ -479,7 +483,7 @@ COLUMN_SOURCES: dict[str, dict[str, str]] = {
     "samples": {
         c: "_omi/people/<person_id>/samples/<sample_id>.json"
         for c in ("id", "person_id", "model", "model_sha", "vector", "source", "seconds", "day", "session",
-                  "conversation_id", "label", "request_id", "created_at")
+                  "conversation_id", "label", "request_id", "created_at", "state", "revision", "flag_json", "f0")
     },
     "voices": {
         c: "<conversation dir>/voices-<model>-<audio_sha16>.json" for c in (
