@@ -910,6 +910,17 @@ class ConversationPipeline:
             return True  # its summary would fail on the unreadable choice: the note stands meanwhile
         return rclass.pending(choice, json.loads(row["index_json"] or "{}").get("recording_class") or {})
 
+    def _choice_not_applicable(self, conv_id: str) -> dict:
+        """A deterministic discard (a relevance rule, another device's copy) has no summary a class could change: the
+        owner's choice, if any, is recorded as handled with that outcome (in the render index, like an applied class),
+        so `reconcile_classes` doesn't queue it again. The discard policy itself is unchanged."""
+        try:
+            choice = rclass.read(self, conv_id)
+        except rclass.UnreadableChoice:
+            return {}  # reported as an issue and never queued: nothing to record
+        revision = int((choice or {}).get("revision", 0))
+        return {"revision": revision, "outcome": "not_applicable"} if revision else {}
+
     def recording(self, conv_id: str, transcript: dict, transcript_sha: str | None, *, interaction: str | None = None) -> dict:
         """The recording class this conversation is treated as (`recording_class`): the owner's choice, else the
         automatic one from the wearer's share of the speech, with what decided it."""
@@ -1226,6 +1237,8 @@ class ConversationPipeline:
                 discard_reason = notes.discard_reason or "judged not worth keeping"
         if not cache_only and not recording and kind != "discarded":  # no summary to judge the content: voices only
             recording = self.recording(conv_id, transcript, row["transcript_sha"])
+        if not cache_only and kind == "discarded" and not recording.get("class"):
+            recording = self._choice_not_applicable(conv_id)
         self.render(row, kind, segments, language, transcript, notes, llm_cached, discard_reason, summary_error,
                     verdict, rule, now, cache_only=cache_only, recording=recording)  # fmt: skip
 
@@ -1305,7 +1318,8 @@ class ConversationPipeline:
             "discard_reason": discard_reason,
             "relevance": [verdict, rule],
             # the class this note was made for, with what decided it (persisted in conversation.json's render index)
-            **({"recording_class": recording} if recording.get("class") else {}),
+            # (or, for a deterministic discard, the owner's choice it handled without applying: see _choice_not_applicable)
+            **({"recording_class": recording} if recording.get("class") or recording.get("outcome") else {}),
             # only when true, so the records of every other note stay byte-identical
             **({"speakers_unknown": True} if data.speakers_unknown else {}),
         }

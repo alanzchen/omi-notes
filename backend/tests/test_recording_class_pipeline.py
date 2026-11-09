@@ -366,3 +366,82 @@ def test_a_passive_recording_has_no_requests_for_an_assistant_anywhere(client, w
     assert summary["assistant_requests"] == []
     text = note_text(settings, row)
     assert "Draft the hotel email" not in text and "Draft the hotel email" not in row["index_json"]
+
+
+# -- discards no class can change (Astra review of b6d8123) ---------------------------------------------------
+
+
+def hand_written_choice(worker, conv_id: str, cls: str = "monologue", revision: int = 1) -> None:
+    """A choice that reached the vault without the API's checks (written before the discard, or by sync)."""
+    (worker.pipeline.conv_dir(conv_id) / "class.json").write_text(
+        json.dumps({"format": 1, "class": cls, "revision": revision, "set_at": 1, "requests": []}))
+
+
+def test_a_rule_discard_refuses_a_class_change_and_a_stored_choice_is_handled_once(client, worker, settings):
+    from .test_pipeline import FillerStt
+    from omi_notes.devtools import synth_speech_like
+
+    worker.providers._stt = FillerStt()
+    worker.providers._llm = llm = ScriptedLlm("conversation")
+    replay(client, np.concatenate([np.zeros(SR, np.int16), synth_speech_like(5), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    assert row["status"] == "discarded" and row["note_path"].startswith("_discarded/")
+    r = choose(client, row["id"], "monologue", "r1", "2026-11-08T20:00:00Z")
+    assert r.status_code == 409 and r.json()["error"] == "not_applicable", r.text
+    assert not (worker.pipeline.conv_dir(row["id"]) / "class.json").exists()
+    hand_written_choice(worker, row["id"])
+    assert worker.pipeline.reconcile_classes(T0 + 450) == 1
+    worker.tick(T0 + 460)
+    (after,) = convs(worker)
+    assert after["status"] == "discarded" and llm.calls == [], "the deterministic discard stands, without a summary"
+    handled = json.loads(after["index_json"])["recording_class"]
+    assert handled["revision"] == 1 and handled["outcome"] == "not_applicable" and handled.get("class") is None
+    assert worker.pipeline.reconcile_classes(T0 + 500) == 0, "the owner's revision is recorded as handled: no loop"
+    assert worker.pipeline.reconcile_classes(T0 + 600) == 0
+    shown = listed(client)
+    assert shown["updating"] is False and shown["class"] is None
+    worker.pipeline.summarize_and_render(after["id"], T0 + 700, cache_only=True)
+    assert worker.pipeline.reconcile_classes(T0 + 800) == 0, "a re-render keeps the handled revision"
+
+
+def test_a_watch_alternate_handles_a_stored_choice_once(client, worker, settings):
+    from .test_watch_sources import WATCH, by_device, heard_by_watch, run, talk
+    from .helpers import live, silence
+
+    speech = np.concatenate([silence(1), talk(45, 1), silence(2)])
+    live(client, speech, offline_storage=False)
+    replay(client, heard_by_watch(speech), start=STARTED + timedelta(seconds=4), source="watch_mic", device=WATCH)
+    run(worker, T0 + 1200)
+    _, (watch,) = by_device(worker)
+    assert watch["status"] == "discarded"
+    r = choose(client, watch["id"], "monologue", "r1", "2026-11-08T20:00:00Z")
+    assert r.status_code == 409 and r.json()["error"] == "not_applicable", r.text
+    hand_written_choice(worker, watch["id"], revision=3)
+    assert worker.pipeline.reconcile_classes(T0 + 1300) == 1
+    worker.tick(T0 + 1310)
+    _, (after,) = by_device(worker)
+    assert after["status"] == "discarded"
+    assert json.loads(after["index_json"])["recording_class"]["revision"] == 3
+    assert worker.pipeline.reconcile_classes(T0 + 1400) == 0
+
+
+def test_a_choice_time_that_is_not_finite_or_not_a_date_is_unreadable_and_the_list_still_loads(client, worker):
+    worker.providers._llm = ScriptedLlm("media")
+    one_voice(client)
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    path = worker.pipeline.conv_dir(row["id"]) / "class.json"
+    for bad in ("1e20", "Infinity", "1e300", "-Infinity"):
+        path.write_text('{"format": 1, "class": "monologue", "revision": 1, "set_at": %s, "requests": []}' % bad)
+        try:
+            rclass.read(worker.pipeline, row["id"])
+        except rclass.UnreadableChoice:
+            pass
+        else:
+            raise AssertionError(f"set_at {bad} was read as a choice")
+        r = client.get("/v1/conversations/recent", headers=AUTH)
+        assert r.status_code == 200, (bad, r.text)
+        assert r.json()["conversations"][0]["recording_class"]["choice_unreadable"]
+        assert client.get(f"/v1/conversations/{row['id']}", headers=AUTH).status_code == 200
+    assert worker.pipeline.reconcile_classes(T0 + 450) == 0

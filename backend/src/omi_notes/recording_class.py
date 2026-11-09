@@ -15,6 +15,7 @@ is an error, never "no choice".
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -175,6 +176,17 @@ def _path(pipeline, conv_id: str):
     return pipeline.conv_dir(conv_id) / "class.json"
 
 
+def _representable(epoch: float) -> bool:
+    """A finite, non-negative time that is a real date (`view` formats it): never NaN, infinity or 1e20."""
+    if not math.isfinite(epoch) or epoch < 0:
+        return False
+    try:
+        iso_utc_epoch(epoch)
+    except (OverflowError, OSError, ValueError):
+        return False
+    return True
+
+
 def read(pipeline, conv_id: str) -> dict | None:
     path = _path(pipeline, conv_id)
     if not path.exists():
@@ -189,7 +201,7 @@ def read(pipeline, conv_id: str) -> dict | None:
     revision, set_at, requests = data.get("revision", 0), data.get("set_at", 0), data.get("requests", [])
     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
         raise UnreadableChoice(f"{path.name} of {conv_id} has an invalid revision")
-    if isinstance(set_at, bool) or not isinstance(set_at, int | float) or set_at != set_at or set_at < 0:
+    if isinstance(set_at, bool) or not isinstance(set_at, int | float) or not _representable(set_at):
         raise UnreadableChoice(f"{path.name} of {conv_id} has an invalid set_at")
     if not isinstance(requests, list) or not all(isinstance(r, str) for r in requests):
         raise UnreadableChoice(f"{path.name} of {conv_id} has an invalid request history")
@@ -237,7 +249,7 @@ def put(pipeline, conv_id: str, body: dict, applied: dict | None) -> dict:
             raise ValueError
     except ValueError as exc:
         raise ApiError(422, "invalid_body", "set_at must be an ISO-8601 time with a timezone") from exc
-    row = pipeline.db.one(f"SELECT status, frozen FROM conversations WHERE id=? AND {LISTED}", (conv_id,))
+    row = pipeline.db.one(f"SELECT status, frozen, llm_status FROM conversations WHERE id=? AND {LISTED}", (conv_id,))
     if row is None:
         raise ApiError(404, "not_found", "unknown conversation")
     if row["status"] == "open":
@@ -246,6 +258,10 @@ def put(pipeline, conv_id: str, body: dict, applied: dict | None) -> dict:
         raise ApiError(409, "frozen", "the note is frozen; unfreeze it on the server to change its kind")
     if row["status"] == "failed":  # no summary to rewrite: the retry makes one, and reads a choice made after it
         raise ApiError(409, "failed", "this conversation's processing failed; retry it first, then change its kind")
+    if row["status"] == "discarded" and row["llm_status"] != "ok":
+        # set aside by a deterministic rule (filler, no words, too short) or as another device's copy, before any
+        # summary: no kind changes that, so the choice is refused rather than stored and never applied
+        raise ApiError(409, "not_applicable", "this recording was set aside without a summary; its kind can't be changed")
     when_epoch = when.astimezone(UTC).timestamp()
     auto = (applied or {}).get("auto_detail") or applied or {}
     with SpeakerLock(pipeline.vault, name="class.lock"):
