@@ -430,6 +430,32 @@ def test_a_hint_confirmation_is_bound_to_the_person_and_evidence_it_showed(env, 
     assert decide(client, fresh["id"], "confirm", "h-2").status_code == 200
 
 
+def test_bench_f0_import_needs_positive_matches_complete_bounds_and_enough_voiced_frames(env, tmp_path):
+    from .test_speaker_samples import bench_dir, run_cli, strip_f0
+
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker, days=(6,))
+    data = sample_file(settings, me, ids[0])
+    strip_f0(settings, worker, me, ids[0])
+    cases = {
+        "no-generation": (dict(voices_file=None), "skipped (no voices generation to match) 1"),
+        "other-generation": (dict(voices_file="voices-x-00000000-0000000000000000-c00000000-00000000.json"),
+                             "skipped (voices generation differs) 1"),
+        "ends": (dict(end_shift=0.4), "skipped (clip bounds differ) 1"),
+        "voiced": (dict(voiced=(19, 19)), "skipped (too little voiced speech) 1"),
+        "few": (dict(voiced=(30, 30)), "skipped (too little voiced speech) 1") if len(data["clips"]) < 4 else (
+            dict(voiced=(19, 19)), "skipped (too little voiced speech) 1"),
+    }
+    for name, (kwargs, expected) in cases.items():
+        out = run_cli(settings, "import-f0", bench_dir(tmp_path / name, settings, rows, data, **kwargs))
+        assert "imported 0" in out and expected in out, (name, out)
+    assert "f0" not in sample_file(settings, me, ids[0])
+    # a sample with no recorded bounds or audio: bounds from the voices file whose vector is exactly its own
+    strip_f0(settings, worker, me, ids[0], clips=True)
+    out = run_cli(settings, "import-f0", bench_dir(tmp_path / "derived", settings, rows, data))
+    assert "imported 1" in out, out
+
+
 def test_a_reject_leaves_a_label_alone_that_no_longer_lists_the_sample(env):
     settings, client, worker = env
     me, rows, ids = me_with_samples(client, worker)

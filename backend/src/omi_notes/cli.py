@@ -805,16 +805,18 @@ def speakers_measure_f0() -> None:
 
 @speakers_app.command("import-f0")
 def speakers_import_f0(
-    bench_dir: Path = typer.Argument(..., help="The bench data folder with pitch.json, clips.json and manifest.json"),
+    bench_dir: Path = typer.Argument(..., help="The speaker bench (~/Developer/omi-asr-bench/spk) or its data folder"),
+    f0_file: Path = typer.Option(None, "--f0-file", help="Clip F0 values (default: <bench>/a0-20261109/q3_clip_f0_numpy.json)"),
     tag: str = typer.Option("bench-20261108", help="Recorded as each imported sample's f0_source"),
 ) -> None:
-    """Import F0 measured by the speaker bench, only for samples whose conversation, label, voices
-    generation, audio and clip bounds match the bench's clips. Never overwrites; reports what it skipped."""
+    """Import F0 the production estimator measured on the speaker bench's clips, only for samples whose
+    conversation, label, voices generation, audio and clip bounds positively match, with the measurement's
+    voiced-frame gates. Never overwrites; reports what it skipped."""
     from .speakers import f0
 
     settings = _settings()
     w = _worker(settings)
-    counts = f0.import_bench(w.pipeline.speakers, w.db, bench_dir, tag=tag)
+    counts = f0.import_bench(w.pipeline.speakers, w.db, bench_dir, tag=tag, f0_file=f0_file)
     if counts["imported"]:
         w.pipeline.speakers.samples_changed()
     typer.echo(f"F0 import from {bench_dir}:")

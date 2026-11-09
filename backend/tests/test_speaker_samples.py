@@ -365,19 +365,26 @@ def test_measure_f0_backfills_from_raw_audio_once_and_only_adds_fields(env):
     assert "measured 0" in run_cli(settings, "measure-f0"), "idempotent"
 
 
-def bench_dir(tmp_path, settings, rows, sample_data, *, shift: float = 0.0, pitches=(111.0, 113.0)) -> str:
-    """A bench data dir (clips.json + pitch.json + manifest.json) for one sample's conversation and label."""
+def bench_dir(tmp_path, settings, rows, sample_data, *, shift: float = 0.0, end_shift: float | None = None,
+              f0s=(111.0, 113.0), voiced=(150, 150), voices_file: str | None = "same") -> str:
+    """A bench like ~/Developer/omi-asr-bench/spk: data/{clips,manifest}.json and the production estimator's clip
+    values in a0-20261109/q3_clip_f0_numpy.json, for one sample's conversation and label."""
     conv = rows[0]
-    bench = tmp_path / "bench" / "data"
-    bench.mkdir(parents=True, exist_ok=True)
+    bench = tmp_path / "spk"
+    (bench / "data").mkdir(parents=True, exist_ok=True)
+    (bench / "a0-20261109").mkdir(parents=True, exist_ok=True)
     spans = sample_data["clips"]
+    end_shift = shift if end_shift is None else end_shift
     clips = [{"i": i, "cid": conv["id"], "label": sample_data["label"], "j": i, "start": conv["start"], "person": "Alan"}
              for i in range(len(spans))]  # fmt: skip
-    manifest = [{"id": conv["id"], "start": conv["start"], "voices_file": sample_data["voices_file"],
-                 "labels": {sample_data["label"]: {"clips": [[a + shift, b + shift] for a, b in spans]}}}]  # fmt: skip
-    (bench / "clips.json").write_text(json.dumps(clips))
-    (bench / "manifest.json").write_text(json.dumps(manifest))
-    (bench / "pitch.json").write_text(json.dumps({str(i): pitches[i % len(pitches)] for i in range(len(spans))}))
+    entry = {"id": conv["id"], "start": conv["start"],
+             "labels": {sample_data["label"]: {"clips": [[a + shift, b + end_shift] for a, b in spans]}}}  # fmt: skip
+    if voices_file:
+        entry["voices_file"] = sample_data["voices_file"] if voices_file == "same" else voices_file
+    (bench / "data" / "clips.json").write_text(json.dumps(clips))
+    (bench / "data" / "manifest.json").write_text(json.dumps([entry]))
+    values = {str(i): {"f0": f0s[i % len(f0s)], "voiced": voiced[i % len(voiced)], "frames": 400} for i in range(len(spans))}
+    (bench / "a0-20261109" / "q3_clip_f0_numpy.json").write_text(json.dumps(values))
     return str(bench)
 
 
@@ -390,13 +397,16 @@ def test_import_f0_adds_bench_values_only_where_conversation_label_and_clip_boun
     out = run_cli(settings, "import-f0", off)
     assert "imported 0" in out and "skipped (clip bounds differ) 1" in out, out
     assert "f0" not in sample_file(settings, me, ids[0])
-    good = bench_dir(tmp_path / "good", settings, rows, data, shift=0.03, pitches=(111.0, 113.0, 115.0))
+    good = bench_dir(tmp_path / "good", settings, rows, data, shift=0.03, f0s=(111.0, 113.0, 115.0))
     out = run_cli(settings, "import-f0", good)
     assert "imported 1" in out, out
     imported = sample_file(settings, me, ids[0])
     assert imported["f0_source"] == "bench-20261108" and imported["f0_clips"] == list(range(len(data["clips"])))
-    assert imported["f0"] == pytest.approx(float(np.median([(111.0, 113.0, 115.0)[i % 3] for i in range(len(data["clips"]))])))
-    assert "torchaudio" in imported["f0_estimator"] and imported["f0_aggregation"]
+    weights = [b - a for a, b in data["clips"]]
+    assert imported["f0"] == pytest.approx(pitch.label_f0([{"f0": (111.0, 113.0, 115.0)[i % 3], "voiced": 150}
+                                                          for i in range(len(weights))], weights), abs=0.01)  # fmt: skip
+    assert pitch.ESTIMATOR in imported["f0_estimator"] and "q3_clip_f0_numpy.json" in imported["f0_estimator"]
+    assert imported["f0_voiced"] == 150 * len(weights) and "duration-weighted" in imported["f0_aggregation"]
     out = run_cli(settings, "import-f0", good)
     assert "imported 0" in out and "skipped (already measured) 1" in out, "never overwrites"
     assert sample_file(settings, me, ids[0]) == imported

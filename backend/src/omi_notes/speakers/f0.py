@@ -2,9 +2,11 @@
 
 - `measure`: from raw audio where it still exists (or from a person's stored enrollment audio), with the
   production estimator (`audio.pitch`), on the sample's own clip bounds.
-- `import_bench`: once, from the 2026-11-08 speaker bench (`pitch.json` + `clips.json` + `manifest.json`),
-  for samples whose audio was measured there: only where the sample's conversation, label, voices
-  generation, audio and clip bounds (starts within 0.05 s) match the bench's clips.
+- `import_bench`: once, from the 2026-11-08 speaker bench: the production estimator's clip values the evidence
+  study computed (`a0-20261109/q3_clip_f0_numpy.json`, with voiced-frame counts) for the bench's clips
+  (`data/clips.json` + `data/manifest.json`), only where the sample's conversation, label, voices generation and
+  audio positively match and every clip's start and end match within 0.05 s; the same gates as a measurement
+  (≥ 20 voiced frames per clip, ≥ 100 per sample) and a duration-weighted median.
 
 Both only add fields: an existing measurement is never overwritten, a sample's state and revision are
 untouched, and anything that doesn't match is skipped and counted. F0 is review evidence, never identity.
@@ -28,8 +30,6 @@ from .voices import cosine_distance, decode_vector
 
 START_TOLERANCE = 0.05
 BENCH_TAG = "bench-20261108"
-BENCH_ESTIMATOR = ("torchaudio.functional.detect_pitch_frequency (bench scripts/pitch.py: 30 ms frames, 70-400 Hz, "
-                   "median of energetic frames within 75-380 Hz, >= 5 frames)")  # fmt: skip
 ENROLLMENT_WINDOW = 10.0
 _AUDIO16 = re.compile(r"-([0-9a-f]{16})-(?:c[0-9a-f]{8}-)?[0-9a-f]{0,8}\.json$")
 
@@ -113,19 +113,29 @@ def measure(pipeline, now: float | None = None) -> Counter:
     return counts
 
 
-def _bench_files(directory: Path) -> Path:
-    if not (directory / "pitch.json").exists() and (directory / "data" / "pitch.json").exists():
-        return directory / "data"
-    return directory
+Q3_FILE = "q3_clip_f0_numpy.json"
+BENCH_ESTIMATOR = f"{pitch.ESTIMATOR} (spk/a0-20261109/f0_numpy.py; clip values from a0-20261109/{Q3_FILE})"
 
 
-def import_bench(store, db, directory: Path, *, tag: str = BENCH_TAG, now: float | None = None) -> Counter:
+def bench_paths(directory: Path, f0_file: Path | None = None) -> tuple[Path, Path]:
+    """(the bench data folder with clips.json and manifest.json, the production estimator's clip values): `directory`
+    is the bench (`spk`) or its `data` folder."""
+    directory = Path(directory).expanduser()
+    data = directory / "data" if (directory / "data" / "clips.json").exists() else directory
+    if f0_file is None:
+        candidates = [data.parent / "a0-20261109" / Q3_FILE, directory / "a0-20261109" / Q3_FILE, directory / Q3_FILE]
+        f0_file = next((c for c in candidates if c.exists()), candidates[0])
+    return data, Path(f0_file).expanduser()
+
+
+def import_bench(store, db, directory: Path, *, tag: str = BENCH_TAG, f0_file: Path | None = None,
+                 now: float | None = None) -> Counter:  # fmt: skip
     """Import bench F0 (see the module docstring). Returns counts by outcome."""
     now = time.time() if now is None else now
-    directory = _bench_files(Path(directory).expanduser())
-    pitches = json.loads((directory / "pitch.json").read_text())
-    clips = json.loads((directory / "clips.json").read_text())
-    manifest_path = directory / "manifest.json"
+    data_dir, f0_path = bench_paths(directory, f0_file)
+    values = json.loads(f0_path.read_text())  # clip index → {f0, voiced, frames, …} from the production estimator
+    clips = json.loads((data_dir / "clips.json").read_text())
+    manifest_path = data_dir / "manifest.json"
     manifest = {m["id"]: m for m in json.loads(manifest_path.read_text())} if manifest_path.exists() else {}
     by_key: dict[tuple[str, str], list[dict]] = {}
     for clip in clips:
@@ -144,12 +154,21 @@ def import_bench(store, db, directory: Path, *, tag: str = BENCH_TAG, now: float
         if why:
             counts[f"skipped ({why})"] += 1
             continue
-        values = [float(pitches[str(c["i"])]) for c in matched if pitches.get(str(c["i"])) is not None]
-        if not values:
-            counts["skipped (no pitch in the bench)"] += 1
+        results, weights = [], []
+        for clip, (a, b) in matched:
+            value = values.get(str(clip["i"])) or {}
+            results.append({"f0": value.get("f0"), "voiced": int(value.get("voiced") or 0)})
+            weights.append(float(b) - float(a))
+        passed = [r for r in results if r["f0"] is not None and r["voiced"] >= pitch.MIN_VOICED]
+        voiced = sum(r["voiced"] for r in passed)
+        f0 = pitch.label_f0(results, weights) if voiced >= pitch.SAMPLE_MIN_VOICED else None
+        if f0 is None:
+            counts["skipped (too little voiced speech)"] += 1
             continue
-        fields = {"f0": round(float(np.median(values)), 2), "f0_source": tag, "f0_estimator": BENCH_ESTIMATOR,
-                  "f0_clips": [int(c["i"]) for c in matched], "f0_aggregation": "median of the clips' median F0",
+        fields = {"f0": round(f0, 2), "f0_voiced": voiced, "f0_source": tag, "f0_estimator": BENCH_ESTIMATOR,
+                  "f0_clips": [int(clip["i"]) for clip, _ in matched],
+                  "f0_aggregation": (f"duration-weighted median of clips with >= {pitch.MIN_VOICED} voiced frames "
+                                     f"(>= {pitch.SAMPLE_MIN_VOICED} per sample)"),
                   "f0_imported_at": now}  # fmt: skip
         with store.lock:
             added = store.add_sample_fields(data["person_id"], data["sample_id"], fields)
@@ -157,8 +176,10 @@ def import_bench(store, db, directory: Path, *, tag: str = BENCH_TAG, now: float
     return counts
 
 
-def _match(store, db, data: dict, entries: list[dict], bench: dict | None) -> tuple[str, list[dict]]:
-    """("", the bench clips in the sample's clip order) when the bench measured exactly this sample's audio."""
+def _match(store, db, data: dict, entries: list[dict], bench: dict | None) -> tuple[str, list]:
+    """("", [(bench clip, sample span)] in the sample's clip order) only when the bench positively measured exactly
+    this sample's audio: same conversation (start within 0.05 s), same voices generation (named on both sides), the
+    same audio, and every clip's start and end within 0.05 s, one to one. Anything unknown is a mismatch."""
     row = db.one("SELECT id, start, audio_sha FROM conversations WHERE id=?", (data["conversation_id"],))
     if row is None:
         return "conversation not indexed", []
@@ -170,20 +191,22 @@ def _match(store, db, data: dict, entries: list[dict], bench: dict | None) -> tu
     if found is None:
         return "no clip bounds", []
     spans, voices_file = found
-    if bench.get("voices_file") and voices_file and bench["voices_file"] != voices_file:
+    if not bench.get("voices_file") or not voices_file:
+        return "no voices generation to match", []
+    if bench["voices_file"] != voices_file:
         return "voices generation differs", []
-    bench_audio = audio16(bench.get("voices_file"))
-    if bench_audio and bench_audio != (data.get("audio_sha") or "")[:16] and bench_audio != audio16(voices_file):
+    bench_audio, sample_audio = audio16(bench["voices_file"]), (data.get("audio_sha") or "")[:16] or audio16(voices_file)
+    if not bench_audio or bench_audio != sample_audio:
         return "audio differs", []
     bounds = (bench.get("labels") or {}).get(data["label"], {}).get("clips") or []
-    located = [(bounds[c["j"]], c) for c in entries if 0 <= int(c["j"]) < len(bounds)]
-    if len(located) != len(spans):
+    if any(not 0 <= int(c["j"]) < len(bounds) for c in entries) or len(entries) != len(spans):
         return "clip bounds differ", []
-    matched = []
-    for (a, _b), (bench_span, clip) in zip(sorted(spans), sorted(located, key=lambda x: float(x[0][0])), strict=True):
-        if abs(float(a) - float(bench_span[0])) > START_TOLERANCE:
+    located = sorted(((bounds[int(c["j"])], c) for c in entries), key=lambda x: (float(x[0][0]), float(x[0][1])))
+    ordered = sorted(spans, key=lambda x: (float(x[0]), float(x[1])))
+    pairs = []
+    for (a, b), (bench_span, clip) in zip(ordered, located, strict=True):
+        if abs(float(a) - float(bench_span[0])) > START_TOLERANCE or abs(float(b) - float(bench_span[1])) > START_TOLERANCE:
             return "clip bounds differ", []
-        matched.append(clip)
-    order = {tuple(s): i for i, s in enumerate(spans)}
-    pairs = sorted(zip(sorted(spans), matched, strict=True), key=lambda p: order[tuple(p[0])])
-    return "", [clip for _, clip in pairs]
+        pairs.append((clip, (a, b)))
+    order = {(float(a), float(b)): i for i, (a, b) in enumerate(spans)}
+    return "", sorted(pairs, key=lambda p: order[(float(p[1][0]), float(p[1][1]))])
