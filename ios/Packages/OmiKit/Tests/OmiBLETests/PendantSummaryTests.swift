@@ -138,6 +138,10 @@ import Testing
         var q = streaming()
         q.outbox.quarantineCount = 2
         #expect(summary(q, reachable, nil).flow[1].level == .needsAction)
+        #expect(summary(q, reachable, nil).rows.contains { $0.title == "2 files couldn't upload" })
+        q.outbox.quarantineWatchCount = 2
+        #expect(!summary(q, reachable, nil).rows.contains { $0.title.contains("couldn't upload") }, "the Watch's files show on the Watch")
+        #expect(summary(q, reachable, nil).flow[1].level == .needsAction, "still kept on this phone")
         var full = streaming()
         full.storageTripped = true
         full.connection = .paused("phone storage low")

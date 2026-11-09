@@ -173,8 +173,9 @@ public struct PendantSummary: Equatable, Sendable {
         let n = s.outbox.pendingCount
         let files = "\(n) file\(n == 1 ? "" : "s")"
         if s.storageTripped { return row("iPhone storage is full", "Recording stopped · free up space", attention: true) }
-        if s.outbox.quarantineCount > 0 {
-            let q = s.outbox.quarantineCount
+        // the Watch's kept-aside files show on the Watch's card
+        if s.outbox.quarantineCount - s.outbox.quarantineWatchCount > 0 {
+            let q = s.outbox.quarantineCount - s.outbox.quarantineWatchCount
             return row("\(q) file\(q == 1 ? "" : "s") couldn't upload", "Kept on this iPhone", attention: true, fix: .openDiagnostics)
         }
         if let paused = s.upload.pausedReason { return row("Uploads paused", paused, attention: true, fix: .openServer) }

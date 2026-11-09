@@ -12,12 +12,27 @@ public struct WatchSummary: Equatable, Sendable {
     public var title: String
     public var detail: String?
     public var tone: Tone
+    /// A problem shown on the Watch's card (one short line), and what fixes it.
+    public var issue: String?
+    public var issueFix: SystemHealth.Fix?
 
     /// A report older than this says what the Watch was doing then, not now.
     public static let fresh: TimeInterval = 10 * 60
 
     /// - Parameter installed: the Watch app is installed on a paired Watch; nil while unknown.
-    public static func evaluate(installed: Bool?, report: WatchReport?, lastReceivedAt: Date?, now: Date) -> WatchSummary {
+    /// - Parameter quarantined: the Watch's files this iPhone kept aside because they couldn't upload.
+    public static func evaluate(installed: Bool?, report: WatchReport?, lastReceivedAt: Date?, now: Date,
+                                quarantined: Int = 0) -> WatchSummary {
+        var summary = state(installed: installed, report: report, lastReceivedAt: lastReceivedAt, now: now)
+        if quarantined > 0 {
+            summary.configured = true
+            summary.issue = "\(quarantined) file\(quarantined == 1 ? "" : "s") couldn't upload"
+            summary.issueFix = .openDiagnostics
+        }
+        return summary
+    }
+
+    static func state(installed: Bool?, report: WatchReport?, lastReceivedAt: Date?, now: Date) -> WatchSummary {
         let configured = installed == true || report != nil || lastReceivedAt != nil
         if let r = report {
             let age = now.timeIntervalSince(r.at)
