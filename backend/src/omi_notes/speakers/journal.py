@@ -87,8 +87,10 @@ def apply(store, op: dict) -> None:
         {"move": _move, "unmove": _unmove, "reject": _reject, "unreject": _unreject, "merge": _merge}[op["kind"]](store, op)
     finally:
         _busy.op = None
-    complete(store, op)
+    # the work it leaves is recorded before the operation is complete: voices changed, so assignments re-run
+    store.db.set_meta("relabel_pending", "1")
     store.samples_changed()
+    complete(store, op)
 
 
 # -- helpers ------------------------------------------------------------------------------------------
@@ -126,6 +128,8 @@ def _label_step(store, op: dict, request_id: str, change) -> None:
     states[label] = after
     store.write_labels(conv_id, states, request=(request_id, record | {
         "label": label, "before": store.persisted({label: before}).get(label), "after": store.persisted({label: after}).get(label)}))  # fmt: skip
+    # its note shows the label's name: re-render it (from cache), recorded before the operation completes
+    store.db.execute("UPDATE conversations SET needs_render=1, next_attempt_at=NULL WHERE id=? AND note_path IS NOT NULL", (conv_id,))
 
 
 # -- operations ------------------------------------------------------------------------------------
