@@ -293,7 +293,7 @@ public final class RingSyncEngine {
         if let lp = cursor.lastPersistedSeq, i.readSeq > lp &+ 1 {
             log(.warning, "ring", "gap: device read_seq \(i.readSeq) > last persisted \(lp) + 1 (\(i.readSeq - lp - 1) records never received)")
         }
-        if i.dropped > 0 { log(.warning, "ring", "device reports \(i.dropped) records overwritten before sync") }
+        if let dropped = cursor.droppedToReport(i.dropped) { log(.warning, "ring", "device reports \(dropped) records overwritten before sync") }
         do { try cursors.save(cursor, deviceId: ctx.meta.deviceId) } catch {
             fail("could not persist ring cursor: \(error)")
             return

@@ -76,6 +76,22 @@ import OmiProtocol
         #expect(!c.isDuplicate(10))
     }
 
+    /// The device's overwritten-record count is cumulative: build 43 warned "2344902 records overwritten
+    /// before sync" on every connection for an unchanged count. Only a new count is reported, across launches.
+    @Test func anUnchangedOverwrittenCountIsReportedOnce() throws {
+        var c = RingCursor()
+        #expect(c.droppedToReport(0) == nil)
+        #expect(c.droppedToReport(2_344_902) == 2_344_902)
+        #expect(c.droppedToReport(2_344_902) == nil, "the same count on the next connection")
+        let decoded = try JSONDecoder().decode(RingCursor.self, from: JSONEncoder().encode(c))
+        var reloaded = decoded
+        #expect(reloaded.droppedToReport(2_344_902) == nil, "nor after a relaunch")
+        #expect(reloaded.droppedToReport(2_345_000) == 2_345_000, "more records lost: reported")
+        #expect(reloaded.droppedToReport(10) == 10, "a reset device counter that is not zero: reported")
+        let old = try JSONDecoder().decode(RingCursor.self, from: Data(#"{"generation":1}"#.utf8))
+        #expect(old.lastDroppedReported == nil, "a cursor saved by an earlier build still loads")
+    }
+
     @Test func persistedNeverMovesBackwards() {
         var c = RingCursor()
         c.notePersisted(10)
