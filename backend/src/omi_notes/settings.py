@@ -103,6 +103,9 @@ class Settings(BaseSettings):
     provisional_wait_seconds: float = 1200.0
     soft_max_conversation_seconds: float = 10800.0
     hard_max_conversation_seconds: float = 11400.0
+    # Conversations with less detected speech than this are deferred: transcribed only when the queue is otherwise
+    # idle, or when the owner asks (`POST /v1/conversations/{id}/transcribe`). 0 turns deferral off.
+    defer_speech_seconds: float = 60.0
     # Raw audio is kept permanently (Alan's rule, 2026-11-08); nothing deletes it. RAW_RETENTION_DAYS from older
     # configurations is accepted and ignored (the worker logs a warning).
     raw_retention_days: float | None = None

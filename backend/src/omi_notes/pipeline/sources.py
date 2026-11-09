@@ -26,6 +26,7 @@ import sqlite3
 
 import numpy as np
 
+from .. import deferral
 from ..audio.timeline import SAMPLE_RATE
 from ..vault import Vault
 
@@ -66,11 +67,17 @@ def read(pipeline, conv_id: str) -> dict | None:
     return data if isinstance(data, dict) and data.get("format") == FORMAT else None
 
 
+def settled(row) -> bool:
+    """Finished, or deferred (a short session that may never be transcribed: its audio is final and comparable)."""
+    return row["status"] in ("done", "discarded", "failed") or deferral.waiting(row)
+
+
 def ready(pipeline, row, now: float) -> bool:
-    """Every overlapping conversation is finished (or it has waited long enough)."""
+    """Every overlapping conversation is settled (or it has waited long enough). A deferred sibling never makes
+    the Watch recording wait."""
     if now - row["end"] >= WAIT_LIMIT:
         return True
-    return all(r["status"] in ("done", "discarded", "failed") for r in overlapping(pipeline.db, row))
+    return all(settled(r) for r in overlapping(pipeline.db, row))
 
 
 def envelope(pipeline, rows, lo: float, hi: float) -> np.ndarray:
@@ -128,7 +135,8 @@ def decide(pipeline, row, now: float) -> dict:
     others = overlapping(pipeline.db, row)
     data = {"format": FORMAT, "decided_at": now, "decision": "distinct", "of": [], "correlation": None,
             "lag_seconds": None, "coverage": None}  # fmt: skip
-    finished = [r for r in others if r["status"] == "done"]
+    # notes, and deferred pendant sessions (their audio is final; the comparison needs no transcript)
+    finished = [r for r in others if r["status"] == "done" or deferral.waiting(r)]
     if finished:
         lo, hi = row["start"] - MAX_SKEW, row["end"] + MAX_SKEW
         r, lag, cover = compare(envelope(pipeline, [row], lo, hi), envelope(pipeline, finished, lo, hi))

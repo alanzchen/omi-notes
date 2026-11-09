@@ -29,6 +29,17 @@ it dismissed, so a repeat answers its original decision and never dismisses a ne
 after a rebuild. A request may name the failure it saw (`failure_id`, from the issues): another
 failure than the current one is refused (409 `failure_changed`). Requests that named their failure
 are the only ones ever forgotten (beyond 1000); past that many, a request must name its failure.
+
+A transcription request (`kind: "transcribe"`, `POST /v1/conversations/{id}/transcribe`) asks for a
+deferred short session now (`deferral.py`). The file is written (fsync'd) before the answer; the
+request is then noted in the index (`transcribe_op`) and committed into the conversation's
+`deferral.requested` under its claim, or later by the worker or the sweeper while the worker holds it
+(an idle-lane claim already running shares the work: it sees the request between transcription and
+summary). One request per conversation: a second tap, a repeat or a concurrent one answers with the
+operation already accepted. It never forces fresh inference: whatever the conversation already has
+(a transcript, a summary, a note) is used as it is. It closes `done` once the conversation has a
+note (or was set aside), `failed` if processing failed; a conversation already finished answers
+with a request closed at once (`outcome: "already"`).
 """
 
 from __future__ import annotations
@@ -48,7 +59,7 @@ from .views import LISTED
 log = logging.getLogger(__name__)
 
 FORMAT = 1
-KINDS = ("retry", "keep")
+KINDS = ("retry", "keep", "transcribe")
 KEPT = "kept_speaker_unknown"
 DISMISSED = "dismissed"
 # dismiss requests remembered per conversation, each with the failure it dismissed: every one that
@@ -327,6 +338,8 @@ def _repair(pipeline, op: dict) -> bool:
         return True
     if any(pipeline.db.meta(k) for k in ("read_only", "divergence", "fenced")):
         return False
+    if op.get("kind") == "transcribe":
+        return _repair_transcription(pipeline, op)
     vault, db = pipeline.vault, pipeline.db
     row = _row(db, op["conversation_id"])
     if row is None:
@@ -359,6 +372,113 @@ def _repair(pipeline, op: dict) -> bool:
         op.update(state="superseded", finished_at=time.time())
         _write(vault, op)
     return True
+
+
+# -- transcription requests (deferred short sessions) ---------------------------------------------------------------
+
+FINISHED = ("done", "discarded")
+
+
+def request_transcription(pipeline, conv_id: str, request_id: str, *, read_only: str | None) -> tuple[int, dict]:
+    """`POST /v1/conversations/{id}/transcribe`: 202 with the accepted operation; 200 with the operation already
+    there (a repeat, another tap on the same conversation, or a conversation already finished)."""
+    from . import deferral
+
+    if not isinstance(request_id, str) or not UUID_RE.match(request_id):
+        raise ApiError(422, "invalid_body", "request_id must be a lowercase UUID")
+    if read_only:
+        raise ApiError(503, "vault_read_only", read_only)
+    vault, db = pipeline.vault, pipeline.db
+    with lock(vault):
+        existing = read(vault, request_id)
+        if existing is not None:
+            if existing.get("kind") != "transcribe" or existing.get("conversation_id") != conv_id:
+                raise ApiError(409, "request_conflict", "this request id belongs to another operation")
+            _repair(pipeline, existing)  # best effort: a busy conversation is finished by the sweeper
+            return 200, view(pipeline, request_id)
+        row = _row(db, conv_id)
+        if row is None:
+            raise ApiError(404, "not_found", "unknown conversation")
+        if row["status"] == "open":
+            raise ApiError(409, "in_progress", "the conversation is still being recorded")
+        if row["status"] == "failed":
+            raise ApiError(409, "failed", "this conversation's processing failed; use Retry")
+        shared = deferral.requested_op(row) if not row["note_path"] else None
+        if shared:
+            try:
+                other = read(vault, shared)
+            except OperationCorrupt:
+                other = None
+            if other is not None:  # one request per conversation: every tap shares it
+                _repair(pipeline, other)
+                return 200, view(pipeline, shared)
+        now = time.time()
+        op = {"format": FORMAT, "id": request_id, "kind": "transcribe", "conversation_id": conv_id,
+              "stage": "transcribing", "failure_kind": None, "failure_id": None, "record_sha": row["record_sha"],
+              "requested_at": now, "state": "accepted"}  # fmt: skip
+        if row["status"] in FINISHED or row["note_path"]:
+            # nothing to do: it already has its result (the idle lane got there first)
+            op.update(state="done", outcome="already", finished_at=now)
+            _write(vault, op)
+            return 200, view(pipeline, request_id)
+        _write(vault, op)  # durable before anything else, and before the answer
+        db.execute("UPDATE conversations SET transcribe_op=? WHERE id=? AND transcribe_op IS NULL", (request_id, conv_id))
+        _repair_transcription(pipeline, op)
+    return 202, view(pipeline, request_id)
+
+
+def _repair_transcription(pipeline, op: dict) -> bool:
+    """Note the request in the index, commit it into the record under the claim, or close it once the conversation
+    is finished. False while the conversation is busy or missing (the sweeper tries again)."""
+    from . import deferral
+
+    db = pipeline.db
+    row = _row(db, op["conversation_id"])
+    if row is None:
+        return False
+    if row["status"] in FINISHED or (row["status"] == "failed" and row["retry_op"] is None):
+        _close_transcription(pipeline.vault, op, row)
+        return True
+    if row["status"] == "open":
+        return False
+    if deferral.requested_op(row) is None:  # after a rebuild: the index learns of the request again
+        db.execute("UPDATE conversations SET transcribe_op=? WHERE id=? AND transcribe_op IS NULL", (op["id"], row["id"]))
+    token = pipeline.claim(row["id"])
+    if token is None:
+        return False  # the worker has it; it commits the request itself (`commit_transcribe_request`)
+    try:
+        pipeline.commit_transcribe_request(_row(db, row["id"]))
+    finally:
+        pipeline.release(row["id"], token)
+    return True
+
+
+def _close_transcription(vault: Vault, op: dict, row) -> None:
+    if op.get("state") in TERMINAL:
+        return
+    status = "failed" if row["status"] == "failed" else "done"
+    op.update(state=status, outcome=row["status"], outcome_failure_kind=row["error_kind"] if status == "failed" else None,
+              finished_at=time.time())  # fmt: skip
+    _write(vault, op)
+
+
+def transcription_finished(pipeline, conv_id: str) -> None:
+    """Close the conversation's transcription request now that its outcome is committed. Best effort: the sweeper
+    closes it later if this fails."""
+    from . import deferral
+
+    try:
+        row = _row(pipeline.db, conv_id)
+        op_id = deferral.requested_op(row) if row is not None else None
+        if not op_id:
+            return
+        with lock(pipeline.vault):
+            op = read(pipeline.vault, op_id)
+            if op is not None and op.get("kind") == "transcribe":
+                _close_transcription(pipeline.vault, op, row)
+        pipeline.db.execute("UPDATE conversations SET transcribe_op=NULL WHERE id=?", (conv_id,))
+    except Exception:
+        log.exception("could not close the transcription request of %s", conv_id)
 
 
 class Sweeper:
@@ -406,7 +526,19 @@ def view(pipeline, op_id: str) -> dict:
     state = op.get("state", "accepted")
     finished_at = op.get("finished_at")
     row = _row(pipeline.db, op["conversation_id"]) if op.get("conversation_id") else None
-    if state not in TERMINAL and row is not None:
+    if state not in TERMINAL and row is not None and op.get("kind") == "transcribe":
+        now = time.time()
+        if row["status"] in FINISHED:
+            state = "done"
+        elif row["status"] == "failed":
+            state = "failed"
+        elif row["error"] and row["next_attempt_at"]:
+            state = "backing_off"
+        elif row["claim_token"] and (row["claim_expires"] or 0) > now:
+            state = "running"
+        else:
+            state = "queued"
+    elif state not in TERMINAL and row is not None:
         outcome = _outcome(row)
         if outcome and outcome.get("op") == op_id:
             state = _state(outcome)
@@ -431,7 +563,8 @@ def view(pipeline, op_id: str) -> dict:
         "state": state,
         "requested_at": iso_utc_epoch(op["requested_at"]) if op.get("requested_at") else None,
         "finished_at": iso_utc_epoch(finished_at) if finished_at else None,
-        "message": (_KEEP_MESSAGES.get(state) if op.get("kind") == "keep" else None) or _MESSAGES.get(state, state),
+        "message": ({"keep": _KEEP_MESSAGES, "transcribe": _TRANSCRIBE_MESSAGES}.get(op.get("kind") or "", {}).get(state)
+                    or _MESSAGES.get(state, state)),
     }
 
 
@@ -445,6 +578,14 @@ _MESSAGES = {
     "failed": "The retry failed again",
     "stopped": "Stopped: the note is frozen on the server",
     "superseded": "Replaced by later processing",
+}
+
+_TRANSCRIBE_MESSAGES = {
+    "accepted": "Transcription requested",
+    "queued": "Queued for transcription",
+    "running": "Transcribing now",
+    "done": "Transcribed",
+    "failed": "Transcription failed",
 }
 
 _KEEP_MESSAGES = {

@@ -64,6 +64,7 @@ from ..speakers.voices import cosine_distance, embed_voices, label_turns, select
 from ..vault import Vault
 from . import prompt
 from .relevance import deterministic_relevance
+from .. import deferral
 from .. import recording_class as rclass
 from .segmenter import RingCapture, ring_resolved_until
 from .speakers import SpeakerResult, has_speakers, resolve_speakers
@@ -107,6 +108,23 @@ LINKS_FORMAT = 1  # `links-v<n>-<stt file>`: the speaker-linked response (bump w
 BACKGROUND_MIN_VOICES = 200  # stored voices needed for a stable background (speaker linking)
 # why a kept `speakers_unknown` conversation has no summary (shown in its note)
 KEPT_REASON = "kept from the phone without speaker separation"
+
+# -- the one claim decision (`run`, `next_claim`, `_outranked`) ------------------------------------------------------
+# A runnable row (due now: not waiting for a backoff) and its lane. Lane 0: new work, renders, the owner's explicit
+# requests (an app retry, a class change, a deferred conversation the owner asked to transcribe). Lane 1: re-runs of
+# finished conversations (a reprocess, the ASR backfill). Lane 2: deferred short sessions nobody asked for, their
+# summaries included; claimed only when nothing in lanes 0 and 1 is runnable... except that every IDLE_FAIR_EVERY-th
+# idle claim with both waiting takes the oldest deferred one, so a long run of re-runs can't starve them.
+RUNNABLE_SQL = """((status IN ('closed','transcribing','summarizing') OR (needs_render=1 AND status IN ('done','discarded','failed')))
+                   AND (next_attempt_at IS NULL OR next_attempt_at <= :now))
+               OR (reprocess_request > reprocess_handled AND status <> 'open')"""
+LANE_SQL = f"""CASE WHEN {deferral.WAITING_SQL} AND reprocess_request <= reprocess_handled THEN 2
+                    WHEN retry_op IS NOT NULL THEN 0
+                    WHEN note_path IS NULL AND (transcribe_op IS NOT NULL OR json_extract(deferral, '$.requested') IS NOT NULL) THEN 0
+                    WHEN reprocess_request > reprocess_handled OR (status IN ('closed','transcribing') AND stt_ref IS NOT NULL) THEN 1
+                    ELSE 0 END"""
+LANE_NOW, LANE_RERUN, LANE_IDLE = 0, 1, 2
+IDLE_FAIR_EVERY = 4
 
 
 class CacheMiss(RuntimeError):
@@ -284,6 +302,7 @@ class ConversationPipeline:
         self._status_written: tuple[float, str] | None = None
         self._stub_written: dict[str, float] = {}
         self._class_rank: dict[str, int] = {}  # conversation → summarizing priority (recording class), this process
+        self._idle_claims = 0  # idle claims made with both re-runs and deferred sessions waiting (IDLE_FAIR_EVERY)
         self._engine_deaths: dict[tuple[str, str], tuple[int, int]] = {}  # (conversation, audio) -> (counted, successes then)
         self._local_successes = 0  # sidecar transcriptions that worked, in this process
         self._deaths_in_a_row = 0
@@ -334,23 +353,55 @@ class ConversationPipeline:
                  AND COALESCE(rendered_speakers_revision, 0) <> speakers_revision"""
         ).rowcount
 
-    def run(self, now: float, *, limit: int = 20) -> int:
-        self.mark_stale_renders()
+    def candidates(self, now: float, *, exclude: frozenset[str] | set[str] = frozenset(), conv_id: str | None = None):
+        """Runnable rows with their lane (`LANE_SQL`): the best of lanes 0 and 1, and the oldest few of lane 2."""
+        where = f"({RUNNABLE_SQL})" + (" AND id = :id" if conv_id else "")
         rows = self.db.query(
-            """SELECT id FROM conversations
-               WHERE ((status IN ('closed','transcribing','summarizing') OR (needs_render=1 AND status IN ('done','discarded','failed')))
-                      AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
-                  OR (reprocess_request > reprocess_handled AND status <> 'open')
-               -- new conversations before re-runs of finished ones (a reprocess or the ASR backfill): a long
-               -- re-transcription of an old recording must not hold back what was just recorded
-               ORDER BY (reprocess_request > reprocess_handled OR (status IN ('closed','transcribing') AND stt_ref IS NOT NULL)), start
-               LIMIT ?""",
-            (now, limit),
+            f"""SELECT id, status, start, finalized_at, lane FROM (
+                    SELECT id, status, start, finalized_at, {LANE_SQL} AS lane FROM conversations WHERE {where})
+                ORDER BY lane, start LIMIT 200""",
+            {"now": now, "id": conv_id},
         )
-        # summaries by recording class: monologue, then dialogue, then passive (anything else as a dialogue);
-        # a stable sort keeps the order above (new work before re-runs, oldest first) within each
-        rows = sorted(rows, key=lambda r: (self._class_rank.get(r["id"], 1) if self._row(r["id"])["status"] == "summarizing" else 1))
-        for row in rows:
+        return [r for r in rows if r["id"] not in exclude]
+
+    def lane(self, conv_id: str, now: float) -> int | None:
+        """The lane a conversation is runnable in now (`LANE_SQL`), or None when it isn't runnable."""
+        rows = self.candidates(now, conv_id=conv_id)
+        return rows[0]["lane"] if rows else None
+
+    def _key(self, row) -> tuple:
+        """Order within the lanes: summaries by recording class (monologue, dialogue, passive) inside lane 0 only, so
+        a class can never lift a re-run or a deferred session above new work; then oldest first."""
+        rank = self._class_rank.get(row["id"], 1) if row["lane"] == LANE_NOW and row["status"] == "summarizing" else 1
+        return (row["lane"], rank, row["start"], row["id"])
+
+    def next_claim(self, now: float, *, exclude: frozenset[str] | set[str] = frozenset(), idle: bool = True):
+        """The one claim decision, rechecked at every claim: the best runnable row, or None. `idle` is false while
+        other work (chunks to decode) is pending: deferred sessions then wait."""
+        rows = self.candidates(now, exclude=exclude)
+        if not rows:
+            return None
+        best = min(rows, key=self._key)
+        if best["lane"] == LANE_NOW:
+            return best
+        deferred = [r for r in rows if r["lane"] == LANE_IDLE] if idle else []
+        reruns = [r for r in rows if r["lane"] == LANE_RERUN]
+        if reruns and deferred:
+            self._idle_claims += 1
+            if self._idle_claims % IDLE_FAIR_EVERY == 0:  # the oldest deferred one: waiting since it was finalized
+                return min(deferred, key=lambda r: (r["finalized_at"] or r["start"], r["id"]))
+        if reruns:
+            return min(reruns, key=self._key)
+        return min(deferred, key=self._key) if deferred else None
+
+    def run(self, now: float, *, limit: int = 20, idle: bool = True) -> int:
+        self.mark_stale_renders()
+        done: set[str] = set()
+        while len(done) < limit:
+            row = self.next_claim(now, exclude=done, idle=idle)
+            if row is None:
+                break
+            done.add(row["id"])  # each row at most once per pass (one that waits stays runnable)
             try:
                 self.advance(row["id"], now)
             except Exception as exc:  # one bad row must never stall the others
@@ -358,7 +409,7 @@ class ConversationPipeline:
                 current = self._row(row["id"])
                 self._set(row["id"], attempts=current["attempts"] + 1, error=f"{type(exc).__name__}: {exc}"[:500],
                           next_attempt_at=now + backoff(current["attempts"] + 1))  # fmt: skip
-        return len(rows)
+        return len(done)
 
     def advance(self, conv_id: str, now: float) -> None:
         token = self.claim(conv_id)
@@ -371,6 +422,7 @@ class ConversationPipeline:
 
     def _advance(self, conv_id: str, now: float) -> None:
         row = self._row(conv_id)
+        row = self.commit_transcribe_request(row)
         if row["reprocess_request"] > row["reprocess_handled"] and row["status"] != "open":
             row = self._consume_reprocess(row)
         if row["status"] not in ("closed", "transcribing", "summarizing"):
@@ -417,6 +469,17 @@ class ConversationPipeline:
         except Exception as exc:  # a bug or unexpected I/O error must not stop the worker loop
             log.exception("conversation %s failed in %s", conv_id, stage)
             self._fail(conv_id, stage, ProviderError(f"{type(exc).__name__}: {exc}"), now, rewrite=rewrite)
+
+    def commit_transcribe_request(self, row: sqlite3.Row) -> sqlite3.Row:
+        """An accepted transcription request (`transcribe_op`, its operation file already written) recorded in the
+        conversation's `deferral` block, so a restart or rebuild still treats it as asked for. The caller holds the
+        claim. Nothing else changes: the stage it is at and any results already made are kept."""
+        block = deferral.block(row)
+        op = row["transcribe_op"]
+        if not op or block is None or row["note_path"] or (block.get("requested") or {}).get("op"):
+            return row
+        self._commit(row["id"], deferral=json.dumps(block | {"requested": {"op": op, "at": time.time()}}, sort_keys=True))
+        return self._row(row["id"])
 
     def _consume_reprocess(self, row: sqlite3.Row) -> sqlite3.Row:
         """Apply `reprocess` requests (a counter plus accumulated force flags, stored apart from the
@@ -485,6 +548,7 @@ class ConversationPipeline:
         self._commit(row["id"], status="discarded", relevance="too_short", error=None, error_kind=None, failed_stage=None,
                      attempts=0, next_attempt_at=None, done_at=row["done_at"] or now, updated_at=now,
                      index_json=json.dumps({"kind": "discarded", "discard_reason": TOO_SHORT_REASON}))  # fmt: skip
+        operations.transcription_finished(self, row["id"])
 
     def _fail(self, conv_id: str, stage: str, exc: ProviderError, now: float, *, rewrite: bool = False) -> None:
         row = self._row(conv_id)
@@ -510,6 +574,7 @@ class ConversationPipeline:
                          failure_id=sha256_hex(f"{conv_id}:{now!r}:{attempts}".encode())[:16],
                          **_outcome(row, "failed", exc.kind))  # fmt: skip
             operations.finished(self, row["retry_op"])
+            operations.transcription_finished(self, conv_id)
             if stage == "summarizing":
                 # The transcript is safe; publish it now rather than waiting for the LLM.
                 try:
@@ -859,14 +924,18 @@ class ConversationPipeline:
         return {label: (v["name"], v["me"]) for label, v in self.speakers.names(conv_id).items()}
 
     def _outranked(self, conv_id: str, now: float) -> bool:
-        """Whether another conversation waiting for its summary has a higher-priority class than this one."""
+        """Between transcription and summary: whether another runnable conversation now comes first by the one claim
+        decision (a deferred session yields to any other work; summaries go by class: monologue, dialogue, passive).
+        The provider call already made is never interrupted; this only decides whether the summary waits."""
         try:
-            mine = rclass.RANK.get(self.recording(conv_id, self.load_transcript(conv_id), self._row(conv_id)["transcript_sha"])["class"], 1)
+            self.recording(conv_id, self.load_transcript(conv_id), self._row(conv_id)["transcript_sha"])
         except Exception:  # the summary stage reports its own problems
+            pass
+        mine = self.candidates(now, conv_id=conv_id)
+        if not mine:
             return False
-        waiting = self.db.query("SELECT id FROM conversations WHERE status='summarizing' AND id<>? AND "
-                                "(next_attempt_at IS NULL OR next_attempt_at <= ?)", (conv_id, now))  # fmt: skip
-        return any(self._class_rank.get(r["id"], 1) < mine for r in waiting)
+        others = self.candidates(now, exclude={conv_id})
+        return any(self._key(r)[:2] < self._key(mine[0])[:2] for r in others)
 
     def reconcile_classes(self, now: float) -> int:
         """Apply owners' class choices newer than their notes (a new summary, never from a render): the choice's
@@ -1342,6 +1411,7 @@ class ConversationPipeline:
         )  # fmt: skip
         if not cache_only:
             operations.finished(self, row["retry_op"])
+            operations.transcription_finished(self, conv_id)
         if moved:
             self._remove_own(moved, conv_id)
             self._commit(conv_id, stale_note_path=None)
@@ -1524,7 +1594,8 @@ class ConversationPipeline:
                 and now - self._stub_written.get(relpath, float("-inf")) < STATUS_INTERVAL):  # fmt: skip
             return relpath
         content = render_stub(
-            conv_id=row["id"], status=row["status"], start=row["start"], end=row["end"], tz=self.tz,
+            conv_id=row["id"], status="deferred" if deferral.waiting(row) else row["status"], start=row["start"],
+            end=row["end"], tz=self.tz,
             speech_seconds=row["speech_seconds"], waiting_for=row["waiting_for"], error=row["error"],
         )  # fmt: skip
         if now is not None:
@@ -1553,7 +1624,7 @@ class ConversationPipeline:
                 if row["note_path"] and kind:
                     status = kind
                 else:
-                    status = "failed" if row["status"] == "failed" else "in_progress"
+                    status = "failed" if row["status"] == "failed" else ("deferred" if deferral.waiting(row) else "in_progress")
                 entries.append(
                     daily_mod.DailyEntry(
                         start=row["start"], end=row["end"], status=status, title=row["title"] or "Conversation",
@@ -1737,9 +1808,12 @@ def queue_counts(db: Database) -> dict:
     return {
         "chunks_pending": count("SELECT COUNT(*) AS n FROM chunks WHERE status='pending'"),
         "conversations_open": count("SELECT COUNT(*) AS n FROM conversations WHERE status='open'"),
+        # work the server will do on its own soon: deferred short sessions wait for an idle moment or the owner
         "conversations_pending": count(
-            "SELECT COUNT(*) AS n FROM conversations WHERE status IN ('closed','transcribing','summarizing')"
+            "SELECT COUNT(*) AS n FROM conversations WHERE status IN ('closed','transcribing','summarizing') "
+            f"AND NOT {deferral.WAITING_SQL}"
         ),
+        "conversations_deferred": count(f"SELECT COUNT(*) AS n FROM conversations WHERE {deferral.WAITING_SQL}"),
         "failed": conversations_failed + chunks_failed,  # older phones read only this sum
         "conversations_failed": conversations_failed,
         "chunks_failed": chunks_failed,

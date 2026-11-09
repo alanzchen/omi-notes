@@ -370,6 +370,8 @@ def render_stub(
     labels = {
         "open": "Recording — waiting for the conversation to end",
         "closed": "Queued for transcription",
+        "deferred": "Deferred — under a minute of speech; transcribed when the server is idle, or when you tap "
+                    "Transcribe in the app. The audio is kept.",
         "transcribing": "Transcribing",
         "summarizing": "Summarizing",
         "failed": "Processing failed — see _status.md (`omi-notes retry-failed`)",

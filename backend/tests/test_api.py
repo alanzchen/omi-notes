@@ -41,7 +41,7 @@ def test_status(client):
     assert body["stt"] == {"provider": "fake", "model": "fake-stt", "diarization": "auto", "ready": True}
     assert body["llm"] == {"provider": "fake", "model": "fake-llm", "ready": True}
     assert body["queue"] == {"chunks_pending": 0, "conversations_open": 0, "conversations_pending": 0, "failed": 0,
-                             "conversations_failed": 0, "chunks_failed": 0, "conversations_retrying": 0,
+                             "conversations_failed": 0, "chunks_failed": 0, "conversations_retrying": 0, "conversations_deferred": 0,
                              "notes_conflicted": 0}  # fmt: skip
     # the test client runs no worker: the phone must not be told processing is running
     assert body["worker"] == {"present": False} and body["last_note_at"] is None and body["read_only"] is None
@@ -172,7 +172,8 @@ def test_events_idempotent(client, new_id, settings):
 
 
 def test_recent_conversations_empty(client):
-    assert client.get("/v1/conversations/recent?limit=5", headers=AUTH).json() == {"conversations": [], "next_cursor": None}
+    assert client.get("/v1/conversations/recent?limit=5", headers=AUTH).json() == {"conversations": [], "next_cursor": None,
+                                                                                  "days": {}, "short_s": 60.0}
 
 
 def test_recent_conversations_only_offer_speakers_after_transcription(client, worker):

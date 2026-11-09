@@ -64,7 +64,7 @@ def render_daily(day: date, entries: list[DailyEntry], tz: ZoneInfo) -> str:
     kept = [e for e in shown if e.recording_class != "passive"]
     background = [e for e in shown if e.recording_class == "passive"]
     discarded = [e for e in entries if e.status == "discarded"]
-    pending = [e for e in entries if e.status in ("in_progress", "failed")]
+    pending = [e for e in entries if e.status in ("in_progress", "failed", "deferred")]
     speech = sum(e.speech_seconds for e in kept + background + discarded)
     stt_cost = sum(e.stt_seconds for e in entries) / 60 * STT_USD_PER_MINUTE
     llm_total = sum(llm_cost(e.llm_model, e.llm_usage) for e in entries)
@@ -112,7 +112,8 @@ def render_daily(day: date, entries: list[DailyEntry], tz: ZoneInfo) -> str:
         out += ["## In Progress", ""]
         for e in pending:
             local = datetime.fromtimestamp(e.start, tz)
-            out.append(f"- {local:%H:%M} · {'processing failed' if e.status == 'failed' else 'in progress'}")
+            label = {"failed": "processing failed", "deferred": "short, not transcribed yet"}.get(e.status, "in progress")
+            out.append(f"- {local:%H:%M} · {label}")
         out.append("")
     if discarded:
         out += ["## Discarded", ""]

@@ -21,7 +21,7 @@ import threading
 import time
 from collections import OrderedDict
 
-from .. import __version__, operations, priority, search
+from .. import __version__, deferral, operations, priority, search
 from ..audio.timeline import RING_RECORD_SECONDS, CaptureTimeline, ChunkDecode
 from ..audio.vad import MIN_SPEECH, VadChoice, VadStream, make_vad
 from ..db import Database
@@ -41,6 +41,7 @@ from .conversations import (
     BOOKMARK_REACH,
     PENDING,
     SOURCE_LABEL,
+    TOO_SHORT_S,
     ConversationPipeline,
     Providers,
     backoff,
@@ -144,7 +145,8 @@ class Worker:
                     self.pipeline.reconcile_classes(now)
                 except Exception:
                     log.exception("could not apply recording-class choices")
-            advanced = self.pipeline.run(now)
+            # chunks still waiting to be decoded are work too: deferred short sessions wait for them
+            advanced = self.pipeline.run(now, idle=not self._ready_chunks())
             try:
                 self.search.run(self.pipeline)
             except Exception:
@@ -774,6 +776,11 @@ class Worker:
                 sources, clock_suspect = self._sources(device, c.start, c.end)
                 fields |= {"status": "closed", "provisional": int(c.provisional), "finalized_at": now,
                            "sources_json": json.dumps(sources), "clock_suspect": int(clock_suspect), "waiting_for": None}  # fmt: skip
+                # a short session is deferred only now, after the usual coverage-aware closure (its length is never
+                # evidence that it ended); enrollment readings are never transcribed at all, so never deferred
+                block = None if verdict else deferral.decide(self.settings.defer_speech_seconds, c.speech_seconds, now,
+                                                             too_short_s=TOO_SHORT_S)  # fmt: skip
+                fields["deferral"] = json.dumps(block, sort_keys=True) if block else None
                 if verdict and verdict[0] == "inside":
                     # the wearer's enrollment reading: finalized as discarded, never transcribed
                     fields |= {"status": "discarded", "enrollment_id": verdict[1], "stub_path": None}

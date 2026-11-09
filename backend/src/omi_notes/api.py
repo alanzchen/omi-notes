@@ -210,7 +210,7 @@ def create_app(
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes
-            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star", "watch_performance", "phone_log", "dismiss", "same_audio_resend", "recording_class"] + (["watch_aac"] if aac.available() else []),
+            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star", "watch_performance", "phone_log", "dismiss", "same_audio_resend", "recording_class", "deferred_transcription"] + (["watch_aac"] if aac.available() else []),
             "vault_id": vault.vault_id,
         }
 
@@ -260,9 +260,18 @@ def create_app(
                 "latest_watch": watch_perf.latest(samples), "phone_relay": watch_perf.phone_relay(db)}  # fmt: skip
 
     @app.get("/v1/conversations/recent")
-    def recent(limit: int = 20, before: str | None = None, recording_class: str | None = Query(None, alias="class")) -> dict:
+    def recent(limit: int = 20, before: str | None = None, recording_class: str | None = Query(None, alias="class"),
+               day: str | None = None, short: bool | None = None) -> dict:  # fmt: skip
         limit = max(1, min(limit, 200))
         where, params = views.LISTED, []
+        pipeline = app.state.speakers.pipeline
+        if day is not None:  # one local day (the server's timezone), filtered before paging
+            lo, hi = _day(day, pipeline.tz), _day(day, pipeline.tz, next_day=True)
+            where += " AND start >= ? AND start < ?"
+            params += [lo, hi]
+        if short is not None:  # under (or at least) the short-session threshold of detected speech
+            where += " AND speech_seconds " + ("< ?" if short else ">= ?")
+            params.append(views.short_seconds(pipeline))
         if recording_class is not None:  # filtered before paging, so a page is full and the cursor stays valid
             if recording_class not in ("monologue", "dialogue", "passive"):
                 raise ApiError(422, "invalid_class", "class must be monologue, dialogue or passive")
@@ -276,10 +285,12 @@ def create_app(
             params += [cursor[0], cursor[0], cursor[1]]
         rows = db.query(f"SELECT * FROM conversations WHERE {where} ORDER BY start DESC, id DESC LIMIT ?", (*params, limit + 1))
         page = rows[:limit]
-        speakers_pipeline = app.state.speakers.pipeline
         return {
-            "conversations": [views.summary_row(speakers_pipeline, r) for r in page],
+            "conversations": [views.summary_row(pipeline, r) for r in page],
             "next_cursor": views.make_cursor(page[-1]) if len(rows) > limit else None,
+            # each listed day of this page in full, whatever the filter and paging: short sessions and what needs a look
+            "days": views.day_aggregates(pipeline, {views.local_day(pipeline, r) for r in page}),
+            "short_s": views.short_seconds(pipeline),
         }
 
     @app.get("/v1/conversations/search")
@@ -350,7 +361,14 @@ def create_app(
             row = db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
             applied = (json.loads(row["index_json"] or "{}").get("recording_class") or {}) if row else {}
             # stored in the vault only: the worker sees the newer choice and summarizes again (reconcile_classes)
-            return rclass.put(pipeline, conv_id, body, applied)
+            out = rclass.put(pipeline, conv_id, body, applied)
+            if row is not None and not row["note_path"]:
+                # no summary yet (deferred, or still queued): the choice only changes the provisional kind shown; the
+                # first summary reads it. Nothing is scheduled.
+                provisional = views.recording_view(pipeline, db.one("SELECT * FROM conversations WHERE id=?", (conv_id,)))
+                if provisional:
+                    return provisional | {"applied": out.get("applied")}
+            return out
 
         return await run_in_threadpool(apply)
 
@@ -363,6 +381,18 @@ def create_app(
         pipeline = app.state.speakers.pipeline
         status_code, op = await run_in_threadpool(
             operations.accept, pipeline, conv_id, body.get("request_id"), read_only=read_only_reason(db)
+        )
+        return JSONResponse({"operation": op}, status_code=status_code)
+
+    @app.post("/v1/conversations/{conv_id}/transcribe")
+    async def transcribe(conv_id: str, request: Request) -> JSONResponse:
+        """Transcribe a deferred short session now (a durable operation like a retry; docs/vault.md, "Operations")."""
+        body = await read_json(request)
+        if not isinstance(body, dict):
+            raise ApiError(422, "invalid_body", "expected a JSON object")
+        pipeline = app.state.speakers.pipeline
+        status_code, op = await run_in_threadpool(
+            operations.request_transcription, pipeline, conv_id, body.get("request_id"), read_only=read_only_reason(db)
         )
         return JSONResponse({"operation": op}, status_code=status_code)
 

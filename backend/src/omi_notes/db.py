@@ -22,7 +22,7 @@ from pathlib import Path
 
 from .spool import make_dirs_durable
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -235,6 +235,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     retry_outcome TEXT,
     resolution TEXT,
     failure_id TEXT,
+    deferral TEXT,
+    transcribe_op TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     finalized_at REAL,
@@ -460,6 +462,10 @@ COLUMN_SOURCES: dict[str, dict[str, str]] = {
         "retry_outcome": "conversation.json retry_outcome {op, status, failure_kind, finished_at}: the last finished app retry",
         "resolution": "conversation.json resolution {kind, op, resolved_at, failure}: kept from the phone with the speaker unknown",
         "speakers_revision": "<conversation dir>/speakers.json revision",
+        "deferral": "conversation.json deferral {policy, threshold_s, speech_s, decided_at, provisional, requested}: a "
+                    "short session transcribed only when idle or asked for",
+        "transcribe_op": "operational — an accepted transcription request not yet in conversation.json (the sweeper "
+                         "sets it again from _omi/operations/ after a rebuild)",
         "created_at": "operational",
         "updated_at": "operational",
     },

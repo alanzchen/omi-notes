@@ -146,8 +146,14 @@ def state(row: sqlite3.Row) -> dict:
     if status == "open":
         return {"code": "listening", "message": _waiting_message(row["waiting_for"])}
     if status in ("closed", "transcribing", "summarizing"):
+        from . import deferral
+
         if row["error"] and row["next_attempt_at"]:
             return {"code": "retrying", "message": failure_message(row["error_kind"], _stage(status)) + " Retrying."}
+        if status == "closed" and deferral.waiting(row):
+            return {"code": "deferred", "message": "Short recording: transcribed when the server is idle, or when you ask"}
+        if status == "closed" and deferral.block(row) and deferral.requested_op(row) and not row["note_path"]:
+            return {"code": "processing", "message": "Transcription requested"}
         return {"code": "processing", "message": "Writing the summary" if status == "summarizing" else "Transcribing"}
     if status == "discarded":
         return {"code": "discarded", "message": "Skipped: " + (_index(row).get("discard_reason") or "nothing worth keeping")}
@@ -330,6 +336,10 @@ def summary_row(pipeline, row: sqlite3.Row) -> dict:
         "started_at": iso_utc_epoch(row["start"]),
         "ended_at": iso_utc_epoch(row["end"]),
         "duration_s": duration(row),
+        # detected speech (duration_s is the elapsed span): what decides a short session
+        "speech_s": round(row["speech_seconds"], 3),
+        "day": local_day(pipeline, row),
+        "deferred": deferred_view(row),
         "title": row["title"] if row["note_path"] else None,
         "emoji": (_index(row).get("emoji") or None) if row["note_path"] else None,
         "preview": (overview[:PREVIEW_CHARS].rstrip() + ("…" if len(overview) > PREVIEW_CHARS else "")) or None,
@@ -349,12 +359,18 @@ def recording_view(pipeline, row: sqlite3.Row) -> dict | None:
     confidence; `updating` while an owner's newer choice waits for its new summary. None: not classified yet."""
     from . import recording_class as rclass
 
+    from . import deferral
+
     applied = _index(row).get("recording_class") if row["note_path"] else None
     unreadable = None
     try:
         choice = rclass.read(pipeline, row["id"])
     except rclass.UnreadableChoice as exc:  # shown, never taken as "no choice"; the last applied class stands
         choice, unreadable = None, str(exc)
+    if not row["note_path"] and row["status"] != "failed":
+        provisional = deferral.provisional_view(row, choice)  # no summary yet: the provisional kind
+        if provisional is not None:
+            return provisional | ({"choice_unreadable": unreadable} if unreadable else {})
     if not applied and not unreadable:
         return None
     failed = None
@@ -362,6 +378,62 @@ def recording_view(pipeline, row: sqlite3.Row) -> dict | None:
         failed = ("The note couldn't be rewritten for the new kind: " + failure_message(row["error_kind"], "summarizing")
                   + " It keeps its current kind and is tried again later.")  # fmt: skip
     return rclass.view(applied, choice, unreadable=unreadable, update_failed=failed)
+
+
+def short_seconds(pipeline) -> float:
+    """Detected speech below which a session is short: deferred on the server, folded on the phone."""
+    return float(pipeline.settings.defer_speech_seconds or 60.0)
+
+
+def local_day(pipeline, row) -> str:
+    from datetime import datetime
+
+    return datetime.fromtimestamp(row["start"], pipeline.tz).date().isoformat()
+
+
+def deferred_view(row: sqlite3.Row) -> dict | None:
+    """A deferred short session still without a result: `waiting` (for an idle moment or the owner), or `requested`
+    (the owner asked; processed with ordinary work). None otherwise."""
+    from . import deferral
+
+    block = deferral.block(row)
+    if block is None or row["note_path"] or row["status"] not in ("closed", "transcribing", "summarizing"):
+        return None
+    op = deferral.requested_op(row)
+    return {"state": "waiting" if deferral.waiting(row) else "requested", "operation_id": op,
+            "threshold_s": block.get("threshold_s"), "provisional_class": (block.get("provisional") or {}).get("class")}  # fmt: skip
+
+
+def day_aggregates(pipeline, days: set[str]) -> dict:
+    """Per local day, over every listed conversation of that day (not one page, not one filter): how many short
+    sessions there are, how many wait deferred, how many the owner asked to transcribe and aren't done, and how
+    many carry a failure or issue, so the phone's folded row shows them all."""
+    from datetime import date, datetime, timedelta
+
+    from . import deferral
+
+    out: dict = {}
+    threshold = short_seconds(pipeline)
+    for day in sorted(days):
+        d = date.fromisoformat(day)
+        lo = datetime(d.year, d.month, d.day, tzinfo=pipeline.tz)
+        rows = pipeline.db.query(f"SELECT * FROM conversations WHERE {LISTED} AND start >= ? AND start < ? AND status <> 'open' "
+                                 "AND speech_seconds < ?", (lo.timestamp(), (lo + timedelta(days=1)).timestamp(), threshold))  # fmt: skip
+        out[day] = {
+            "short": len(rows),
+            "deferred": sum(1 for r in rows if deferral.waiting(r)),
+            "requested": sum(1 for r in rows if (deferred_view(r) or {}).get("state") == "requested"),
+            "issues": sum(1 for r in rows if (r["status"] == "failed" and _not_dismissed(r)) or issues(r)),
+        }
+    return out
+
+
+def _not_dismissed(row) -> bool:
+    try:
+        res = json.loads(row["resolution"]) if row["resolution"] else {}
+    except json.JSONDecodeError:
+        return True
+    return not (isinstance(res, dict) and res.get("kind") == "dismissed" and (res.get("failure") or {}).get("id") == row["failure_id"])
 
 
 def parse_cursor(cursor: str) -> tuple[float, str] | None:

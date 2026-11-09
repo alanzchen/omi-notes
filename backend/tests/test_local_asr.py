@@ -440,10 +440,29 @@ def test_a_new_conversation_is_transcribed_before_an_old_ones_reprocess(client, 
     worker.tick(T0 + 400)
     (old,) = convs(worker)
     worker.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1, force_restt = 1 WHERE id=?", (old["id"],))
+    worker.settings.defer_speech_seconds = 0  # a new conversation that isn't a deferred short session
     replay(client, np.concatenate([np.zeros(SR, np.int16), voice(4, PRIYA, 9), np.zeros(2 * SR, np.int16)]), start=STARTED + timedelta(seconds=1000))
     order.clear()
     worker.tick(T0 + 1400)
     assert len(order) == 2 and order[0] < order[1], "the new (shorter) recording went first"
+
+
+def test_a_deferred_short_session_waits_behind_an_old_ones_reprocess(client, worker):
+    order = []
+
+    def recording(request, n):
+        order.append(seconds_of(request))
+        return moss_like(request, n)
+
+    worker.providers._local_stt, _ = sidecar(recording)
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (old,) = convs(worker)
+    worker.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1, force_restt = 1 WHERE id=?", (old["id"],))
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(4, PRIYA, 9), np.zeros(2 * SR, np.int16)]), start=STARTED + timedelta(seconds=1000))
+    order.clear()
+    worker.tick(T0 + 1400)
+    assert len(order) == 2 and order[0] > order[1], "the deferred short session is the lowest lane"
 
 
 def overlap_sidecar(voices_at, full_pcm, max_seconds, overlap):
