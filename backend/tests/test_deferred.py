@@ -450,3 +450,32 @@ def test_a_transcription_request_raises_the_vault_format_before_its_operation_fi
     client.app.state.speakers.pipeline.vault.info["format"] = 2
     assert transcribe(client, row["id"]).status_code in (200, 202)
     assert vault_format(settings) == 5
+
+
+def test_deferred_claims_stop_as_soon_as_chunks_arrive(client, worker):
+    for i in range(3):
+        insert(worker, f"d{i}", 100 + i, deferral=DEFERRED)
+    advanced = []
+    worker.pipeline.advance = lambda conv_id, now: advanced.append(conv_id)
+    ready = iter([True, False, False])
+    assert worker.pipeline.run(1000, idle=lambda: next(ready)) == 1 and advanced == ["d0"]
+
+
+def test_a_reprocess_keeps_its_lane_through_its_summary(client, worker):
+    insert(worker, "rerun", 100, "done", note_path="Conversations/x.md", reprocess_request=1)
+    worker.pipeline._consume_reprocess(worker.pipeline._row("rerun"))
+    worker.pipeline._set("rerun", status="summarizing")  # its transcription ran
+    worker.pipeline._class_rank["rerun"] = 0  # a monologue
+    insert(worker, "new", 300)
+    assert worker.pipeline.lane("rerun", 1000) == 1
+    assert worker.pipeline.next_claim(1000)["id"] == "new"
+
+
+def test_hundreds_of_reruns_never_hide_the_deferred_lane(client, worker):
+    for i in range(205):
+        insert(worker, f"r{i:03d}", 10 + i, stt_ref="stt-old.json")
+    insert(worker, "deferred", 5000, deferral=DEFERRED)
+    picks = [worker.pipeline.next_claim(10**6)["id"] for _ in range(IDLE_FAIR_EVERY)]
+    assert picks[-1] == "deferred", picks
+    excluded = {f"r{i:03d}" for i in range(205)}
+    assert worker.pipeline.next_claim(10**6, exclude=excluded)["id"] == "deferred"

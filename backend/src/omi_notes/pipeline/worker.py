@@ -146,7 +146,7 @@ class Worker:
                 except Exception:
                     log.exception("could not apply recording-class choices")
             # chunks still waiting to be decoded are work too: deferred short sessions wait for them
-            advanced = self.pipeline.run(now, idle=not self._ready_chunks())
+            advanced = self.pipeline.run(now, idle=lambda: not self._ready_chunks())
             try:
                 self.search.run(self.pipeline)
             except Exception:

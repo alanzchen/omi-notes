@@ -237,6 +237,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     failure_id TEXT,
     deferral TEXT,
     transcribe_op TEXT,
+    rerun INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     finalized_at REAL,
@@ -466,6 +467,7 @@ COLUMN_SOURCES: dict[str, dict[str, str]] = {
                     "short session transcribed only when idle or asked for",
         "transcribe_op": "operational — an accepted transcription request not yet in conversation.json (the sweeper "
                          "sets it again from _omi/operations/ after a rebuild)",
+        "rerun": "operational — a reprocess (lane 1) in progress, kept through its summary; reset by a rebuild",
         "created_at": "operational",
         "updated_at": "operational",
     },

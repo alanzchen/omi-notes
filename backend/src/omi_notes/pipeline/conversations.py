@@ -121,7 +121,8 @@ RUNNABLE_SQL = """((status IN ('closed','transcribing','summarizing') OR (needs_
 LANE_SQL = f"""CASE WHEN {deferral.WAITING_SQL} AND reprocess_request <= reprocess_handled THEN 2
                     WHEN retry_op IS NOT NULL THEN 0
                     WHEN note_path IS NULL AND (transcribe_op IS NOT NULL OR json_extract(deferral, '$.requested') IS NOT NULL) THEN 0
-                    WHEN reprocess_request > reprocess_handled OR (status IN ('closed','transcribing') AND stt_ref IS NOT NULL) THEN 1
+                    WHEN rerun = 1 OR reprocess_request > reprocess_handled
+                         OR (status IN ('closed','transcribing') AND stt_ref IS NOT NULL) THEN 1
                     ELSE 0 END"""
 LANE_NOW, LANE_RERUN, LANE_IDLE = 0, 1, 2
 IDLE_FAIR_EVERY = 4
@@ -353,16 +354,21 @@ class ConversationPipeline:
                  AND COALESCE(rendered_speakers_revision, 0) <> speakers_revision"""
         ).rowcount
 
-    def candidates(self, now: float, *, exclude: frozenset[str] | set[str] = frozenset(), conv_id: str | None = None):
-        """Runnable rows with their lane (`LANE_SQL`): the best of lanes 0 and 1, and the oldest few of lane 2."""
+    def candidates(self, now: float, *, exclude: frozenset[str] | set[str] = frozenset(), conv_id: str | None = None,
+                   per_lane: int = 200):
+        """Runnable rows with their lane (`LANE_SQL`): up to `per_lane` of each lane, oldest first, selected per lane
+        after the exclusions (a long run of re-runs never hides the deferred lane)."""
         where = f"({RUNNABLE_SQL})" + (" AND id = :id" if conv_id else "")
-        rows = self.db.query(
-            f"""SELECT id, status, start, finalized_at, lane FROM (
-                    SELECT id, status, start, finalized_at, {LANE_SQL} AS lane FROM conversations WHERE {where})
-                ORDER BY lane, start LIMIT 200""",
-            {"now": now, "id": conv_id},
-        )
-        return [r for r in rows if r["id"] not in exclude]
+        out = []
+        for lane in (LANE_NOW, LANE_RERUN, LANE_IDLE):
+            out += self.db.query(
+                f"""SELECT id, status, start, finalized_at, lane FROM (
+                        SELECT id, status, start, finalized_at, {LANE_SQL} AS lane FROM conversations WHERE {where})
+                    WHERE lane = :lane AND id NOT IN (SELECT value FROM json_each(:exclude))
+                    ORDER BY start LIMIT :limit""",
+                {"now": now, "id": conv_id, "lane": lane, "exclude": json.dumps(sorted(exclude)), "limit": per_lane},
+            )
+        return out
 
     def lane(self, conv_id: str, now: float) -> int | None:
         """The lane a conversation is runnable in now (`LANE_SQL`), or None when it isn't runnable."""
@@ -375,16 +381,19 @@ class ConversationPipeline:
         rank = self._class_rank.get(row["id"], 1) if row["lane"] == LANE_NOW and row["status"] == "summarizing" else 1
         return (row["lane"], rank, row["start"], row["id"])
 
-    def next_claim(self, now: float, *, exclude: frozenset[str] | set[str] = frozenset(), idle: bool = True):
-        """The one claim decision, rechecked at every claim: the best runnable row, or None. `idle` is false while
-        other work (chunks to decode) is pending: deferred sessions then wait."""
+    def next_claim(self, now: float, *, exclude: frozenset[str] | set[str] = frozenset(), idle=True):
+        """The one claim decision, rechecked at every claim: the best runnable row, or None. `idle` (a bool, or a
+        callable asked right before a deferred session would be claimed) is false while other work (chunks to
+        decode) is pending: deferred sessions then wait."""
         rows = self.candidates(now, exclude=exclude)
         if not rows:
             return None
         best = min(rows, key=self._key)
         if best["lane"] == LANE_NOW:
             return best
-        deferred = [r for r in rows if r["lane"] == LANE_IDLE] if idle else []
+        deferred = [r for r in rows if r["lane"] == LANE_IDLE]
+        if deferred and not (idle() if callable(idle) else idle):
+            deferred = []
         reruns = [r for r in rows if r["lane"] == LANE_RERUN]
         if reruns and deferred:
             self._idle_claims += 1
@@ -394,7 +403,7 @@ class ConversationPipeline:
             return min(reruns, key=self._key)
         return min(deferred, key=self._key) if deferred else None
 
-    def run(self, now: float, *, limit: int = 20, idle: bool = True) -> int:
+    def run(self, now: float, *, limit: int = 20, idle=True) -> int:
         self.mark_stale_renders()
         done: set[str] = set()
         while len(done) < limit:
@@ -508,9 +517,12 @@ class ConversationPipeline:
                 status = "closed"  # an app retry redoes the stage that failed, even with an older transcript
             cur = self.db.execute(
                 """UPDATE conversations SET reprocess_handled=?, force_restt=0, force_llm=0, skip_stt=?, skip_llm=?,
-                       status=?, attempts=0, error=NULL, error_kind=NULL, failed_stage=NULL, next_attempt_at=NULL, edited=0
+                       status=?, attempts=0, error=NULL, error_kind=NULL, failed_stage=NULL, next_attempt_at=NULL, edited=0,
+                       rerun=?
                    WHERE id=? AND reprocess_request=?""",
-                (row["reprocess_request"], skip_stt, skip_llm, status, row["id"], row["reprocess_request"]),
+                # a re-run (not an app retry) stays in lane 1 through its summary, until it finishes
+                (row["reprocess_request"], skip_stt, skip_llm, status, 0 if row["retry_op"] else 1, row["id"],
+                 row["reprocess_request"]),
             )
             row = self._row(row["id"])
             if cur.rowcount == 1:
@@ -549,6 +561,7 @@ class ConversationPipeline:
                      attempts=0, next_attempt_at=None, done_at=row["done_at"] or now, updated_at=now,
                      index_json=json.dumps({"kind": "discarded", "discard_reason": TOO_SHORT_REASON}))  # fmt: skip
         operations.transcription_finished(self, row["id"])
+        self._set(row["id"], rerun=0)
 
     def _fail(self, conv_id: str, stage: str, exc: ProviderError, now: float, *, rewrite: bool = False) -> None:
         row = self._row(conv_id)
@@ -575,6 +588,7 @@ class ConversationPipeline:
                          **_outcome(row, "failed", exc.kind))  # fmt: skip
             operations.finished(self, row["retry_op"])
             operations.transcription_finished(self, conv_id)
+            self._set(conv_id, rerun=0)
             if stage == "summarizing":
                 # The transcript is safe; publish it now rather than waiting for the LLM.
                 try:
@@ -961,7 +975,8 @@ class ConversationPipeline:
                 if rclass.pending(choice, applied):
                     log.info("conversation %s: the owner chose %s (revision %s): summarizing again", conv_id,
                              (choice or {}).get("class"), (choice or {}).get("revision"))  # fmt: skip
-                    self._set(conv_id, status="summarizing", attempts=0, next_attempt_at=None, updated_at=now)
+                    # the owner's explicit choice: lane 0, whatever re-run state a stopped one left behind
+                    self._set(conv_id, status="summarizing", attempts=0, next_attempt_at=None, updated_at=now, rerun=0)
                     queued += 1
             except Exception:
                 log.exception("conversation %s: its class choice could not be checked", conv_id)
@@ -1412,6 +1427,7 @@ class ConversationPipeline:
         if not cache_only:
             operations.finished(self, row["retry_op"])
             operations.transcription_finished(self, conv_id)
+            self._set(conv_id, rerun=0)
         if moved:
             self._remove_own(moved, conv_id)
             self._commit(conv_id, stale_note_path=None)
