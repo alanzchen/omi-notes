@@ -90,6 +90,12 @@ def decode_upload(filename: str, payload: bytes) -> np.ndarray:
     return np.clip(np.round(pcm), -32768, 32767).astype(np.int16)
 
 
+def authorized(consent: tuple | None) -> bool:
+    """The import's consent snapshot (`Importer._consent`) allows keeping this voice: the wearer, or attested after
+    the acknowledgment."""
+    return consent is not None and bool(consent[0] or (consent[1] and consent[2]))
+
+
 def import_id(person_id: str, sha: str, start: float, end: float) -> str:
     digest = hashlib.sha256(f"{person_id}:{sha}:{start:.3f}:{end:.3f}".encode()).digest()
     return str(uuid.UUID(bytes=digest[:16], version=4))
@@ -115,8 +121,10 @@ class Importer:
     def run(self, person_id: str, fields: dict, upload: tuple[str, bytes] | None) -> tuple[int, dict]:
         if not UUID_RE.match(person_id):
             raise ApiError(404, "not_found", "unknown person")
-        person = self.store.person(person_id)
-        if person is None:
+        with self.store.lock:  # the authorization is the snapshot it was made from, taken together
+            consent = self._consent(person_id)
+            person = self.store.person(person_id)
+        if consent is None or person is None:
             raise ApiError(404, "not_found", "unknown person")
         confirm = fields.get("confirm_person")
         if confirm not in (True, "true", "1"):
@@ -124,12 +132,11 @@ class Importer:
         name = fields.get("person_name")
         if not isinstance(name, str) or name.strip().casefold() != person["name"].strip().casefold():
             raise ApiError(422, "person_name_mismatch", f"person_name must be this person's name ({person['name']})")
-        if not person["me"] and not (self.store.settings()["acknowledged_at"] and self.store.attested(person_id)):
+        if not authorized(consent):
             raise ApiError(409, "consent_required", "this person's voice can't be kept without the acknowledgment and their attestation")
         embedder = self.pipeline.providers.embedder
         if embedder is None:
             raise ApiError(409, "no_speaker_model", "the speaker model isn't installed (`omi-notes fetch-models --speakers`)")
-        consent = self._consent(person_id)
         source, pcm, day, whole = self._source(fields, upload)
         return self._enroll(person_id, consent, source, pcm, day, embedder, whole)
 
@@ -248,7 +255,7 @@ class Importer:
             current = self._consent(person_id)
             if current is None or current[3] != consent[3]:
                 raise ApiError(404, "not_found", "the person's voice was forgotten while the import was judged")
-            if current != consent:
+            if current != consent or not authorized(current):
                 raise ApiError(409, "consent_required", "the person's consent changed while the import was judged; try again")
             if {e["import_id"] for e in self._imports(person_id, sha) if e["start"] < end and e["end"] > start} != {
                     e["import_id"] for e in overlapping}:  # fmt: skip

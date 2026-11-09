@@ -88,6 +88,32 @@ def test_restoring_any_import_that_overlaps_an_active_one_is_refused(env):
     assert undo["samples"]["undone"] == [] and sample_file(settings, me, c["sample_id"])["state"] == "removed"
 
 
+# -- 6: an import needs valid consent when it is authorized and again when it is written ------------------------------
+
+
+def test_consent_revoked_right_after_the_authorization_check_never_enrolls(env, monkeypatch):
+    from omi_notes.speakers.imports import Importer
+
+    settings, client, worker = env
+    priya = consented_priya(client)
+    row = monologue_row(client, worker)
+    store = worker.pipeline.speakers
+    real = Importer._consent
+    calls = []
+
+    def revoke_then_capture(self, person_id):
+        if not calls:  # consent withdrawn between the check and the snapshot
+            (store.person_dir(person_id) / "consent.json").unlink()
+            store.scan_people()
+        calls.append(person_id)
+        return real(self, person_id)
+
+    monkeypatch.setattr(Importer, "_consent", revoke_then_capture)
+    r = import_range(client, priya, row["id"], 0, 60, name="Priya")
+    assert r.status_code == 409 and r.json()["error"] == "consent_required", r.text
+    assert worker.db.one("SELECT COUNT(*) AS n FROM samples WHERE person_id=?", (priya,))["n"] == 0
+
+
 # -- 7: a moved label keeps only the new person's samples -----------------------------------------------------------
 
 
