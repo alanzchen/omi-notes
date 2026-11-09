@@ -114,6 +114,43 @@ def test_consent_revoked_right_after_the_authorization_check_never_enrolls(env, 
     assert worker.db.one("SELECT COUNT(*) AS n FROM samples WHERE person_id=?", (priya,))["n"] == 0
 
 
+# -- 4: a transitive forget resumes the purge set it decided on ---------------------------------------------------------
+
+
+def test_a_forget_interrupted_mid_lineage_resumes_the_same_purge_set(env, monkeypatch):
+    from omi_notes.speakers import store as store_module
+
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    priya = consented_priya(client)
+    ravi = new_person(client, "Ravi", attest_knows=True)
+    assert client.post(f"/v1/samples/{ids[0]}/move", json={"person_id": priya, "request_id": "f-1"}, headers=AUTH).status_code == 200
+    copy = sample_file(settings, me, ids[0])["moved_to"]["sample_id"]
+    assert client.post(f"/v1/samples/{copy}/move", json={"person_id": ravi, "request_id": "f-2"}, headers=AUTH).status_code == 200
+    vault = Vault.open(settings)
+    middle = vault.person_dir(priya) / "samples" / f"{copy}.json"
+    first = vault.person_dir(me) / "samples" / f"{ids[0]}.json"
+    real = store_module.remove
+
+    def crash_after_middle(path):  # B's record goes, A's doesn't, then the process dies
+        if path == first:
+            return False
+        done = real(path)
+        if path == middle:
+            raise OSError("power cut")
+        return done
+
+    monkeypatch.setattr(store_module, "remove", crash_after_middle)
+    with pytest.raises(OSError):
+        client.delete(f"/v1/people/{ravi}", headers=AUTH)
+    monkeypatch.setattr(store_module, "remove", real)
+    assert not middle.exists()
+    assert client.delete(f"/v1/people/{ravi}", headers=AUTH).status_code == 200
+    assert not first.exists(), "A's record (A→B→C) is purged by the resumed forget"
+    assert not (settings.vault_dir / "_omi" / "speakers" / "forgetting").exists() or not any(
+        (settings.vault_dir / "_omi" / "speakers" / "forgetting").iterdir())
+
+
 # -- 7: a moved label keeps only the new person's samples -----------------------------------------------------------
 
 

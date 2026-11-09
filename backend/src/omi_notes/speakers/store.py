@@ -371,6 +371,8 @@ class SpeakerStore:
         if delete_note and person is not None and person["note_path"]:
             remove(self.vault.root / person["note_path"])
         self.db.execute("DELETE FROM samples WHERE person_id=?", (person_id,))
+        if remove(self.forgetting_path(person_id)):  # complete
+            fsync_dir(self.forgetting_path(person_id).parent)
         self.scan_people()
 
     def _purge_lineage(self, person_id: str) -> None:
@@ -393,15 +395,29 @@ class SpeakerStore:
                 key = (target.get("person_id"), target.get("sample_id"))
             return False
 
+        purge: set[str] = set()
         for (owner, sample_id), (path, data) in records.items():
             if owner == person_id or not reaches((owner, sample_id)):
                 continue
+            purge.add(self.vault.relpath(path))
             if data.get("enrollment_id"):  # its audio and result are this person's voice too
                 for extra in (self.person_dir(owner) / "enrollment" / f"{data['enrollment_id']}.omiaudio",
                               self.person_dir(owner) / "enrollments" / f"{data['enrollment_id']}.json"):  # fmt: skip
-                    remove(extra)
+                    purge.add(self.vault.relpath(extra))
+        # the whole set is decided and recorded before anything goes: a crash after deleting the middle of a chain
+        # (A→B→this) leaves A's link unfollowable, so a retry resumes this set rather than recomputing it
+        plan = self.forgetting_path(person_id)
+        purge |= set((Vault.read_json(plan) or {}).get("paths") or [])
+        Vault.write_json(plan, {"person_id": person_id, "paths": sorted(purge)})
+        for rel in sorted(purge):
+            path = self.vault.root / rel
             remove(path)
-            self.db.execute("DELETE FROM samples WHERE id=?", (sample_id,))
+            if path.parent.name == "samples":
+                self.db.execute("DELETE FROM samples WHERE id=?", (path.stem,))
+
+    def forgetting_path(self, person_id: str) -> Path:
+        """A forget's recorded purge set (removed when the forget is complete)."""
+        return self.vault.speakers / "forgetting" / f"{person_id}.json"
 
     def _forget_calibration(self, person_id: str) -> None:
         """Calibration results about this person are removed too (the published one and every logged run)."""
