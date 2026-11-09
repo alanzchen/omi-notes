@@ -64,6 +64,30 @@ def test_a_journaled_label_change_queues_the_render_and_the_relabel(env):
     assert worker.db.meta("relabel_pending") == "1"
 
 
+# -- 5: a restore or undo never counts imported audio twice ------------------------------------------------------------
+
+
+def test_restoring_any_import_that_overlaps_an_active_one_is_refused(env):
+    settings, client, worker = env
+    me = new_person(client, "Alan", me=True)
+    row = monologue_row(client, worker)
+    a = import_range(client, me, row["id"], 0, 60).json()
+    b = import_range(client, me, row["id"], 0, 70).json()
+    c = import_range(client, me, row["id"], 0, 80).json()
+    assert b["merged"] == [a["import_id"]] and c["merged"] == [b["import_id"]]
+
+    def restore(sample_id, rid):
+        return client.post(f"/v1/samples/{sample_id}/restore", json={"request_id": rid}, headers=AUTH)
+
+    assert restore(a["sample_id"], "x-a").json().get("error") == "superseded", "C covers A's audio"
+    assert client.post(f"/v1/samples/{c['sample_id']}/remove", json={"request_id": "x-c"}, headers=AUTH).status_code == 200
+    assert restore(b["sample_id"], "x-b").status_code == 200  # nothing active overlaps it now
+    assert restore(c["sample_id"], "x-c2").json().get("error") == "superseded", "B is active again"
+    # an undo that would bring C back is refused the same way
+    undo = client.post("/v1/speakers/undo", json={"request_id": "x-c", "undo_request_id": "u-c"}, headers=AUTH).json()
+    assert undo["samples"]["undone"] == [] and sample_file(settings, me, c["sample_id"])["state"] == "removed"
+
+
 # -- 7: a moved label keeps only the new person's samples -----------------------------------------------------------
 
 

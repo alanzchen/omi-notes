@@ -349,16 +349,24 @@ class Review:
         if not person["me"] and not (self.store.settings()["acknowledged_at"] and self.store.attested(person_id)):
             raise ApiError(409, "consent_required", "this person's voice can't be kept without the acknowledgment and their attestation")
 
-    def _not_superseded(self, data: dict) -> None:
-        """A sample an import merge replaced comes back only once the union that replaced it is gone (else its
-        seconds would count twice)."""
-        merge = next((h for h in reversed(data.get("history") or []) if h.get("action") == "merge"), None)
-        if merge is None or data.get("source") != "enrollment":
-            return
-        for r in self.db.query("SELECT id, state FROM samples WHERE person_id=? AND source='enrollment'", (data["person_id"],)):
+    def _overlap_why(self, data: dict) -> str:
+        """Why this imported enrollment can't count again ("" when it can): another active enrollment of the same
+        person holds audio from the same source over an overlapping range (whatever merged into what)."""
+        source = data.get("import") or {}
+        if data.get("source") != "enrollment" or not source.get("sha256"):
+            return ""
+        for r in self.db.query("SELECT id FROM samples WHERE person_id=? AND source='enrollment' AND id<>?",
+                               (data["person_id"], data["sample_id"])):  # fmt: skip
             other = self.store.read_sample(data["person_id"], r["id"]) or {}
-            if other.get("enrollment_id") == merge.get("into") and sample_eligible(other):
-                raise ApiError(409, "superseded", "an import that covers this audio replaced it; remove that one first")
+            theirs = other.get("import") or {}
+            if (sample_eligible(other) and theirs.get("sha256") == source["sha256"]
+                    and float(theirs["start"]) < float(source["end"]) and float(theirs["end"]) > float(source["start"])):  # fmt: skip
+                return "superseded"
+        return ""
+
+    def _not_superseded(self, data: dict) -> None:
+        if self._overlap_why(data):
+            raise ApiError(409, "superseded", "an active import holds overlapping audio from the same source; remove it first")
 
     def _listing_label(self, data: dict) -> str | None:
         """The label in the sample's conversation whose state lists this sample under its person."""
@@ -434,14 +442,14 @@ class Review:
         record = {"undo_of": request_id}
         if action == "move":
             target = data.get("moved_to") or {}
-            why = self._copies_unchanged(target.get("person_id"), [[sid, target.get("sample_id")]]) or self._consent_why(pid)
+            why = self._copies_unchanged(target.get("person_id"), [[sid, target.get("sample_id")]]) or self._consent_why(pid) or self._overlap_why(data)
             if why:
                 return why
             journal.run(self.store, {"kind": "unmove", "request_id": undo_id, "undo_of": request_id, "from": pid,
                                      "to": target["person_id"], "pairs": [[sid, target["sample_id"]]], "label": None})  # fmt: skip
         elif action in ("reject", "remove", "restore"):
             back = entry.get("from") or ACTIVE
-            if back == ACTIVE and (why := self._consent_why(pid)):
+            if back == ACTIVE and (why := self._consent_why(pid) or self._overlap_why(data)):
                 return why
             self.store.update_sample(pid, sid, {"state": back}, action="undo", by="user", request_id=undo_id,
                                      record=record | {"from": data.get("state") or ACTIVE, "to": back})  # fmt: skip
@@ -489,6 +497,8 @@ class Review:
                 index = next((i for i, h in enumerate(history) if h.get("request_id") == key and h.get("action") == "move"), None)
                 if data.get("state") != MOVED or (data.get("moved_to") or {}).get("sample_id") != new or index is None or _later(history, index):
                     return "a moved sample changed since"
+                if self._overlap_why(data):
+                    return "an active import holds overlapping audio from the same source"
             why = self._copies_unchanged(b, pairs) or self._consent_why(a)
             if why:
                 return why
@@ -503,6 +513,8 @@ class Review:
             index = next((i for i, h in enumerate(history) if h.get("request_id") == key and h.get("action") == "reject"), None)
             if data.get("state") != REMOVED or index is None or _later(history, index):
                 return "a rejected sample changed since"
+            if self._overlap_why(data):
+                return "an active import holds overlapping audio from the same source"
         if why := self._consent_why(x):
             return why
         journal.run(self.store, {"kind": "unreject", "request_id": undo_id, "undo_of": key, "person": x, "samples": rejected["samples"],
