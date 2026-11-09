@@ -34,3 +34,18 @@ import Testing
         #expect(WatchBackgroundBudget.processCPUSeconds() > a && x > 0)
     }
 }
+
+/// Astra (P0 review): a spent budget never reset for the next background wake in the same process.
+@Suite struct WatchBackgroundBudgetWakeTests {
+    @Test func eachWakeGetsAFreshBudgetButTheFirstStillCountsTheLaunch() {
+        var b = WatchBackgroundBudget()
+        b.beginWake(cpu: 0.9)  // launched into the background by this wake: the launch counts
+        let first = b.mayWork(active: false, cpu: 1.2)
+        #expect(!first, "launch and cold load count against the first wake")
+        b.beginWake(cpu: 5.0)  // a later wake, never foregrounded in between
+        let second = b.mayWork(active: false, cpu: 5.5)
+        #expect(second, "a new wake starts a new budget")
+        let spent = b.mayWork(active: false, cpu: 6.1)
+        #expect(!spent)
+    }
+}

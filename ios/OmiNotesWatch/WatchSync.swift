@@ -195,8 +195,9 @@ final class WatchSync: NSObject, WCSessionDelegate {
     /// background it stops once this period's CPU budget is spent: the parts wait for the next wake or launch.
     func pump() {
         // recording keeps the app running in the background (an audio session, not a WatchConnectivity wake,
-        // so no 2 s watchdog): its parts keep moving as they are made
-        let active = WKApplication.shared().applicationState == .active || recorderState.state != .idle
+        // so no 2 s watchdog): its parts keep moving as they are made. Paused (an interruption ended the
+        // audio session) isn't recording: it obeys the budget
+        let active = WKApplication.shared().applicationState == .active || recorderState.state == .recording
         guard budget.mayWork(active: active, cpu: WatchBackgroundBudget.processCPUSeconds()) else {
             if !budgetSpentLogged { watchLog.info("background CPU budget spent: sending waits for the next wake") }
             budgetSpentLogged = true
@@ -308,6 +309,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
     private(set) var inBackgroundWake = false
     func backgroundWake() async {
         backgroundWakes += 1
+        budget.beginWake(cpu: WatchBackgroundBudget.processCPUSeconds())
         inBackgroundWake = true
         defer { inBackgroundWake = false }
         let session = WCSession.default
