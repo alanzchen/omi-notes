@@ -39,7 +39,9 @@ import Testing
         #expect(s.transcriptionLabel.health == .down && s.transcriptionLabel.text == "Local · not responding")
         s = try status(Self.local)
         s.localTranscription?.available = false
-        #expect(s.transcriptionLabel.health == .down, "the server's own check counts too")
+        let answered = try #require(ISO8601UTC.parse("2026-11-09T06:22:30.000Z"))
+        #expect(s.serviceLabels(answeredAt: answered, latestRequestFailed: false, now: answered).transcription.health == .down,
+                "the server's own recent check counts too")
         s = try status(Self.local)
         s.stt?.ready = false
         #expect(s.transcriptionLabel.health == .down, "a local engine that isn't ready isn't answering")
@@ -109,6 +111,37 @@ import Testing
         #expect(recent.serviceLabels(answeredAt: answered, latestRequestFailed: false, now: answered.addingTimeInterval(280)).transcription.health == .unknown)
         let recentDown = try at("2026-11-09T06:29:30.000Z", available: "false")
         #expect(recentDown.serviceLabels(answeredAt: answered, latestRequestFailed: false, now: answered).transcription.health == .down)
+    }
+
+    /// ASTRA-20261109-IT2-04: a worker check dated after the answer was clamped to age zero, and a
+    /// missing or malformed `checked_at` defaulted to fresh, so `available: true` showed green with no
+    /// proof it was current. The worker's word counts only with a valid, not-future, recent check; an
+    /// engine block that is itself healthy stays separate evidence.
+    @Test func aWorkerCheckWithoutAValidRecentDateIsUnknown() throws {
+        let answered = try #require(ISO8601UTC.parse("2026-11-09T06:30:00.000Z"))
+        func health(_ local: String, engine: String = "", serverTime: Bool = true) throws -> ServiceLabel.Health {
+            let time = serverTime ? #""server_time": "2026-11-09T06:30:00.000Z", "# : ""
+            let s = try status(#"{\#(time)"stt": {"provider": "local", "model": "Qwen", "ready": true\#(engine)}, "local_transcription": {\#(local)}}"#)
+            return s.serviceLabels(answeredAt: answered, latestRequestFailed: false, now: answered).transcription.health
+        }
+        #expect(try health(#""available": true, "checked_at": "2026-11-10T06:30:00.000Z""#) == .unknown, "a check a day ahead")
+        #expect(try health(#""available": true, "checked_at": "2026-11-09T06:30:01.000Z""#) == .unknown, "ahead of the server's own clock")
+        #expect(try health(#""available": true"#) == .unknown, "no check time")
+        #expect(try health(#""available": true, "checked_at": null"#) == .unknown)
+        #expect(try health(#""available": true, "checked_at": "not-a-date""#) == .unknown, "malformed check time")
+        #expect(try health(#""available": false, "checked_at": "not-a-date""#) == .unknown, "an undated \"down\" isn't current either")
+        // controls: a valid recent check is trusted, an old one isn't
+        #expect(try health(#""available": true, "checked_at": "2026-11-09T06:30:00.000Z""#) == .ok)
+        #expect(try health(#""available": true, "checked_at": "2026-11-09T06:29:30.000Z""#) == .ok)
+        #expect(try health(#""available": false, "checked_at": "2026-11-09T06:29:30.000Z""#) == .down)
+        #expect(try health(#""available": true, "checked_at": "2026-11-09T06:20:00.000Z""#) == .unknown)
+        // without the server's time the check is dated by this phone's clock (within its usual skew)
+        #expect(try health(#""available": true, "checked_at": "2026-11-09T06:29:30.000Z""#, serverTime: false) == .ok)
+        #expect(try health(#""available": true, "checked_at": "2026-11-09T06:30:30.000Z""#, serverTime: false) == .ok)
+        #expect(try health(#""available": true, "checked_at": "2026-11-09T06:35:00.000Z""#, serverTime: false) == .unknown)
+        // the engine's own current answer is separate evidence
+        #expect(try health(#""available": true, "checked_at": "2026-11-10T06:30:00.000Z""#, engine: #", "engine": {"healthy": true}"#) == .ok)
+        #expect(try health(#""available": true"#, engine: #", "engine": {"healthy": false}"#) == .down)
     }
 
     @Test func absentHealthFieldsStayUnknown() throws {
