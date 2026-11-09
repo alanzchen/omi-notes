@@ -313,20 +313,23 @@ struct ShortClipsGroup: View {
     let model: AppModel
     let day: String
     let rows: [ConversationSummary]
+    let totals: ShortDay
     @State private var open = false
 
     private var shown: [ConversationSummary] { model.shortDayRows[day] ?? rows }
-    private var totals: ShortDay { HomeDay.totals(shown, server: model.shortDays[day]) }
 
     var body: some View {
         DisclosureGroup(isExpanded: $open) {
             let groups = HomeDay.byKind(shown)
+            if groups.isEmpty {
+                ProgressView().frame(maxWidth: .infinity)  // the day's list is loading (none on this page yet)
+            }
             ForEach(groups, id: \.kind) { group in
                 if groups.count > 1 { ShortKindHeader(kind: group.kind, count: group.rows.count) }
                 ForEach(group.rows) { c in ShortClipRow(model: model, conversation: c) }
             }
         } label: {
-            ShortClipsLabel(totals: totals)
+            ShortClipsLabel(totals: HomeDay.totals(shown, server: model.shortDays[day] ?? totals))
         }
         .onChange(of: open) { _, isOpen in
             if isOpen { Task { await model.loadShortSessions(day: day) } }
@@ -376,47 +379,54 @@ struct ShortKindHeader: View {
     }
 }
 
-/// One short session: its time and seconds of speech, its title once it has a note, and 转写 while it waits.
+/// One short session: its time and seconds of speech, its title once it has a note, and 转写 while it waits (with
+/// the reason beside it when a request failed). Every row opens its detail (playback, the provisional kind).
 struct ShortClipRow: View {
     let model: AppModel
     let conversation: ConversationSummary
 
-    private var c: ConversationSummary { conversation }
-    private var asked: Bool {
-        c.deferred?.isRequested == true || (model.retries[c.id].map { $0.kind == "transcribe" && !$0.isFinished } ?? false)
-    }
+    private var c: ConversationSummary { model.row(of: conversation) }
 
     var body: some View {
-        if c.deferred == nil, model.serverStatus?.supportsConversationDetail == true || model.details[c.id] != nil {
-            NavigationLink { ConversationDetailView(model: model, summary: c) } label: { line }
+        if model.serverStatus?.supportsConversationDetail == true || model.details[c.id] != nil {
+            // a hidden link under the row keeps 转写 its own tap target
+            line.background(NavigationLink { ConversationDetailView(model: model, summary: c) } label: { EmptyView() }.opacity(0))
         } else {
             line
         }
     }
 
     private var line: some View {
-        HStack(spacing: 10) {
-            Text(Fmt.time(c.startedDate)).font(.subheadline.monospacedDigit())
-            Text(seconds).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-            if let title = c.title {
-                Text(title).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
-            }
-            Spacer(minLength: 4)
-            if c.displayState.code == "failed" || !(c.issues ?? []).isEmpty {
-                Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange).accessibilityLabel("需要查看")
-            }
-            if asked {
-                ProgressView().controlSize(.small).accessibilityLabel("转写中")
-            } else if c.deferred?.isWaiting == true, model.canTranscribeDeferred {
-                Button { Task { await model.transcribe(conversationId: c.id) } } label: {
-                    Text("转写").font(.caption.weight(.semibold)).padding(.horizontal, 10).padding(.vertical, 4)
-                        .background(Color.accentColor.opacity(0.14), in: .capsule)
+        let state = model.transcribeState(of: c)
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 10) {
+                Text(Fmt.time(c.startedDate)).font(.subheadline.monospacedDigit())
+                Text(seconds).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                if let title = c.title {
+                    Text(title).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
                 }
-                .buttonStyle(.borderless)
+                Spacer(minLength: 4)
+                if c.displayState.code == "failed" || !(c.issues ?? []).isEmpty {
+                    Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange).accessibilityLabel("需要查看")
+                }
+                switch state {
+                case .asked:
+                    ProgressView().controlSize(.small).accessibilityLabel("转写中")
+                case .offer:
+                    Button { Task { await model.transcribe(conversationId: c.id) } } label: {
+                        Text("转写").font(.caption.weight(.semibold)).padding(.horizontal, 10).padding(.vertical, 4)
+                            .background(Color.accentColor.opacity(0.14), in: .capsule)
+                    }
+                    .buttonStyle(.borderless)
+                case .none, .unavailable:
+                    EmptyView()
+                }
+            }
+            if case .offer(let message?) = state {
+                Text(message).font(.caption2).foregroundStyle(.orange).lineLimit(2)
             }
         }
         .padding(.vertical, 1)
-        .accessibilityElement(children: .combine)
     }
 
     private var seconds: String {

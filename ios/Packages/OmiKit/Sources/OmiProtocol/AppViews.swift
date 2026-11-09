@@ -270,6 +270,12 @@ public struct RetryOperation: Codable, Equatable, Sendable, Identifiable {
 
     public var isFinished: Bool { ["done", "failed", "superseded"].contains(state) }
 
+    public init(id: String, kind: String? = nil, conversationId: String? = nil, stage: String? = nil, state: String,
+                requestedAt: String? = nil, finishedAt: String? = nil, message: String? = nil) {
+        self.id = id; self.kind = kind; self.conversationId = conversationId; self.stage = stage; self.state = state
+        self.requestedAt = requestedAt; self.finishedAt = finishedAt; self.message = message
+    }
+
     /// Worded from the state (an older server said "Waiting for the server to start" for queued work).
     public var displayMessage: String {
         switch state {

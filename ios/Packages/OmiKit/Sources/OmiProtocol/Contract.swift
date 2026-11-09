@@ -507,10 +507,11 @@ public struct RecordingClassView: Codable, Equatable, Hashable, Sendable {
 
     public init(kind: String?, auto: String? = nil, confidence: String? = nil, overridden: Bool? = nil,
                 wearerShare: Double? = nil, updating: Bool? = nil, requested: String? = nil, choiceUnreadable: String? = nil,
-                updateFailed: String? = nil) {
+                updateFailed: String? = nil, provisional: Bool? = nil) {
         self.kind = kind; self.auto = auto; self.confidence = confidence
         self.overridden = overridden; self.wearerShare = wearerShare; self.updating = updating
         self.requested = requested; self.choiceUnreadable = choiceUnreadable; self.updateFailed = updateFailed
+        self.provisional = provisional
     }
 
     public var isUpdating: Bool { updating == true }

@@ -33,7 +33,7 @@ extension AppModel {
     /// The server's answer: still the applied class. The cached note takes it only when it describes the summary
     /// that note shows; otherwise (the server applied another choice meanwhile) the note is loaded again.
     func applyRecordingClass(_ view: RecordingClassView, to conversationId: String) {
-        if let i = recent.firstIndex(where: { $0.id == conversationId }) { recent[i].recordingClass = view }
+        updateRow(conversationId) { $0.recordingClass = view }
         guard let shown = details[conversationId]?.entry.recordingClass else { return }
         if shown.sameTreatment(as: view) {
             details[conversationId]?.entry.recordingClass = view

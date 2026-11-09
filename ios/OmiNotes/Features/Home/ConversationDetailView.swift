@@ -54,14 +54,20 @@ struct ConversationDetailView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
             }
-            if entry.deferred?.isWaiting == true, model.canTranscribeDeferred, model.retries[summary.id] == nil {
+            switch model.transcribeState(of: entry) {
+            case .offer(let message):
                 Section {
                     Button { Task { await model.transcribe(conversationId: summary.id) } } label: {
                         Label("转写", systemImage: "text.bubble")
                     }
+                    if let message { Text(message).font(.footnote).foregroundStyle(.orange) }
                 } footer: {
                     Text("不到一分钟的语音，空闲时才转写。")
                 }
+            case .asked:
+                Section { Label("转写中", systemImage: "clock").font(.footnote).foregroundStyle(.secondary) }
+            case .none, .unavailable:
+                EmptyView()
             }
             if let saved = model.detailSavedAt[summary.id] {
                 Section {

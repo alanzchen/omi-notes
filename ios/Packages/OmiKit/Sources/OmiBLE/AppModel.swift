@@ -291,6 +291,7 @@ public final class AppModel {
         switch page {
         case .success(let page):
             mergeFirstPage(page)
+            await reloadOpenedShortDays()  // an opened fold follows refreshes: no stale "waiting" or spinner
             await settlePriorities(api: api, data: data)
             guard isCurrent(config), data == dataEpoch else { return }
             recentError = nil
@@ -374,6 +375,7 @@ public final class AppModel {
         guard isCurrent(config), config == answeredFor, data == dataEpoch else { throw APIError.transport("The server changed; reload.") }
         if segmentsFrom == 0 {
             if let i = recent.firstIndex(where: { $0.id == id }) { recent[i] = detail.entry }
+            reconcileShortDays(with: [detail.entry])
             details[id] = detail
             detailSavedAt[id] = nil
             if epoch == cacheEpoch { saveForOffline(detail, config) }
