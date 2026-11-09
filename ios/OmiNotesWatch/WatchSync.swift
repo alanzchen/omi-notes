@@ -271,13 +271,13 @@ final class WatchSync: NSObject, WCSessionDelegate {
         guard !items.isEmpty else { return }
         lastSyncPing = now
         count("sync_pings")
-        session.sendMessage(WatchWire.syncPing(items: Array(items), binding: binding), replyHandler: { reply in
+        session.sendMessage(WatchWire.syncPing(items: Array(items), binding: binding), replyHandler: { @Sendable reply in
             let r = Received(reply)
             self.onMain {
                 self.count("sync_replies")
                 self.handle(r)
             }
-        }, errorHandler: { error in
+        }, errorHandler: { @Sendable error in
             let code = (error as NSError).code
             self.onMain {
                 self.count("sync_ping_errors")
@@ -340,7 +340,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
     private func askForBinding() {
         let session = WCSession.default
         guard session.activationState == .activated, session.isReachable else { return }
-        session.sendMessage(["hello": 1], replyHandler: { reply in
+        session.sendMessage(["hello": 1], replyHandler: { @Sendable reply in
             let r = Received(reply)
             // the iPhone can't read its identity yet (not unlocked since it restarted): asking again at
             // once would loop; it announces itself after unlocking, and the recheck asks again
