@@ -42,8 +42,9 @@ def sample_item_id(sample_id: str, revision: int) -> str:
     return f"s.{sample_id}.{revision}"
 
 
-def label_item_id(conv_id: str, label: str, revision: int) -> str:
-    return f"l.{conv_id}.{label}.{revision}"
+def label_item_id(conv_id: str, label: str, revision: int, person_id: str, evidence: str) -> str:
+    """Bound to the label's revision, the person it proposes and the evidence that proposed them (`_evidence`)."""
+    return f"l.{conv_id}.{label}.{revision}.{person_id}.{evidence}"
 
 
 def _request_id(body: dict) -> str:
@@ -220,7 +221,8 @@ class Review:
         spans = self.service._clips(row["id"], transcript).get(label) or []
         clips = self.service._clip_list(row["id"], transcript, label, spans)
         playable = bool(clips) and self.store.raw_available(row)
-        item = {"id": label_item_id(row["id"], label, row["speakers_revision"]), "kind": "label", "person_id": person_id,
+        item = {"id": label_item_id(row["id"], label, row["speakers_revision"], person_id, self._evidence()), "kind": "label",
+                "person_id": person_id,
                 "label": label, "reasons": reasons, "playable": playable,
                 "text": next((c["text"] for c in clips if c["text"]), ""),
                 "conversation": self.service._context(row["id"]), "device": row["device_id"]}  # fmt: skip
@@ -245,16 +247,28 @@ class Review:
                 raise ApiError(404, "not_found", "unknown review item")
             result = self.sample_decision(sample_id, decision, request_id, expected_revision=int(revision), person_id=person_id)
         elif kind == "l":
-            head, _, revision = rest.rpartition(".")
-            conv_id, _, label = head.partition(".")
-            if not revision.isdigit() or not UUID_RE.match(conv_id) or not label:
-                raise ApiError(404, "not_found", "unknown review item")
-            result = self.label_decision(conv_id, label, int(revision), decision, request_id, person_id)
+            parts = rest.split(".")
+            if len(parts) != 5 or not UUID_RE.match(parts[0]) or not parts[1] or not parts[2].isdigit():
+                raise ApiError(409, "stale_review", "this review item is from an older queue; fetch it again")
+            conv_id, label, revision, proposed, evidence = parts
+            result = self.label_decision(conv_id, label, int(revision), decision, request_id, person_id,
+                                         proposed=proposed, evidence=evidence)  # fmt: skip
         else:
             raise ApiError(404, "not_found", "unknown review item")
         return {"item_id": item_id, "decision": decision, "request_id": request_id, "undo_token": request_id} | result
 
-    def label_decision(self, conv_id: str, label: str, revision: int, decision: str, request_id: str, person_id: str | None) -> dict:
+    def _evidence(self) -> str:
+        """A digest of what proposes people for labels: the eligible samples and the consent behind them."""
+        import hashlib
+
+        prefs = self.store.settings()
+        rows = sorted((r["id"], r["state"], r["revision"]) for r in self.db.query("SELECT id, state, revision FROM samples"))
+        attested = sorted(r["id"] for r in self.store.people() if r["attested_at"])
+        basis = json.dumps([rows, attested, prefs["acknowledged_at"], prefs["unknown_voices_enabled"]], sort_keys=True)
+        return hashlib.sha256(basis.encode()).hexdigest()[:12]
+
+    def label_decision(self, conv_id: str, label: str, revision: int, decision: str, request_id: str, person_id: str | None,
+                       *, proposed: str, evidence: str) -> dict:  # fmt: skip
         with self.store.lock:
             self.store.sync_conversation(conv_id)
             if self.store.request_result(conv_id, request_id) is not None:  # a retry: the naming path answers it
@@ -269,6 +283,8 @@ class Review:
                 target = self._hint_people(row).get(label)
             if target is None:
                 raise ApiError(409, "stale_review", "this voice has no suggested person any more")
+            if target != proposed or evidence != self._evidence():
+                raise ApiError(409, "stale_review", "what proposed this person changed since the review item was made")
             body = {"expected_revision": revision, "request_id": request_id}
             if decision == "confirm":
                 body["person_id"] = target

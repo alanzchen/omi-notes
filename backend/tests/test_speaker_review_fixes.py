@@ -402,6 +402,34 @@ def test_forget_purges_the_whole_move_lineage_enrollment_audio_and_calibration_e
     assert priya not in log and ravi not in log
 
 
+def test_a_hint_confirmation_is_bound_to_the_person_and_evidence_it_showed(env, monkeypatch):
+    from omi_notes.pipeline import conversations
+
+    settings, client, worker = env
+    monkeypatch.setattr(conversations, "BACKGROUND_MIN_VOICES", 1)
+    client.put("/v1/speakers/settings", json={"acknowledged_at": "2026-09-27T10:00:00Z", "unknown_voices_enabled": True},
+               headers=AUTH)  # fmt: skip
+    priya = new_person(client, "Priya", attest_knows=True)
+    first = talk(client, worker, dialogue(ALAN, PRIYA, seed=3), day=3)
+    assert name_label(client, first["id"], "S2", priya).json()["sample"] == "created"
+    later = talk(client, worker, dialogue(RAVI, PRIYA, seed=9), day=1)
+    item = next(i for i in review(client) if i["kind"] == "label" and i["conversation"]["id"] == later["id"])
+    assert (item["label"], item["person_id"], item["reasons"]) == ("S2", priya, ["possible"])
+    head, _, _ = item["id"].rpartition(".")
+    tampered = head.rsplit(".", 1)[0] + "." + str(__import__("uuid").uuid4()) + "." + item["id"].rsplit(".", 1)[1]
+    assert decide(client, tampered, "confirm", "h-0").json()["error"] == "stale_review"
+    # the evidence behind the hint changes (a voiceprint added, no relabel yet) without the label changing
+    store = worker.pipeline.speakers
+    with store.lock:
+        store.add_sample(priya, vec(PRIYA, 4), model=MODEL[0], model_sha=MODEL[1], source="user", seconds=8.0, day=None, session="x")
+    assert worker.db.one("SELECT speakers_revision FROM conversations WHERE id=?", (later["id"],))[0] == int(item["id"].split(".")[3])
+    stale = decide(client, item["id"], "confirm", "h-1")
+    assert stale.status_code == 409 and stale.json()["error"] == "stale_review"
+    assert worker.pipeline.speakers.labels(later["id"]).get("S2", {}).get("person_id") is None
+    fresh = next(i for i in review(client) if i["kind"] == "label" and i["conversation"]["id"] == later["id"])
+    assert decide(client, fresh["id"], "confirm", "h-2").status_code == 200
+
+
 def test_a_reject_leaves_a_label_alone_that_no_longer_lists_the_sample(env):
     settings, client, worker = env
     me, rows, ids = me_with_samples(client, worker)
