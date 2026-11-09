@@ -506,6 +506,24 @@ def test_the_review_queue_puts_flagged_samples_first_with_playable_clips_and_cap
     assert "voice_review" in client.get("/v1/status", headers=AUTH).json()["features"]
 
 
+def test_the_review_queue_pages_past_items_skipped_on_the_phone(env):
+    # Astra: the phone could only ever see the first 50 items; skipping them left item 51 unreachable
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    whole = client.get("/v1/speakers/review?limit=50", headers=AUTH).json()
+    assert whole["total"] == len(whole["items"]) and whole["next_offset"] is None
+    first = client.get("/v1/speakers/review?limit=1", headers=AUTH).json()
+    assert len(first["items"]) == 1 and first["next_offset"] == 1 and first["total"] == whole["total"]
+    pages, offset = [], 0
+    while offset is not None:
+        page = client.get(f"/v1/speakers/review?limit=1&offset={offset}", headers=AUTH).json()
+        pages += page["items"]
+        offset = page["next_offset"]
+    assert [i["id"] for i in pages] == [i["id"] for i in whole["items"]], "the same order, page by page"
+    beyond = client.get(f"/v1/speakers/review?limit=10&offset={whole['total']}", headers=AUTH).json()
+    assert beyond["items"] == [] and beyond["next_offset"] is None
+
+
 def test_a_review_confirm_resolves_the_flag_once_stale_ids_are_refused_and_retries_answer_the_same(env):
     settings, client, worker = env
     me, rows, ids = me_with_samples(client, worker)

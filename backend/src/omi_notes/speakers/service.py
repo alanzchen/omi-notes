@@ -102,8 +102,8 @@ class SpeakerService:
 
     # -- review and samples (`speakers.review`) ---------------------------------------------------
 
-    def review_items(self, limit: int) -> list[dict]:
-        return self.review.items(limit)
+    def review_items(self, limit: int, offset: int = 0) -> dict:
+        return self.review.page(limit, offset)
 
     def review_decide(self, item_id: str, body: dict) -> dict:
         return self.review.decide(item_id, body)

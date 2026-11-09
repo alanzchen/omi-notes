@@ -519,8 +519,8 @@ def create_app(
         return speakers(request).calibration()
 
     @app.get("/v1/speakers/review")
-    def review_items(request: Request, limit: int = 10) -> dict:
-        return {"items": speakers(request).review_items(max(1, min(limit, 50)))}
+    def review_items(request: Request, limit: int = 10, offset: int = 0) -> dict:
+        return speakers(request).review_items(max(1, min(limit, 50)), max(0, offset))
 
     @app.post("/v1/speakers/review/{item_id}")
     async def review_decide(item_id: str, request: Request) -> dict:

@@ -158,6 +158,12 @@ class Review:
     # -- the queue -------------------------------------------------------------------------------
 
     def items(self, limit: int, now: float | None = None) -> list[dict]:
+        return self.page(limit, 0, now)["items"]
+
+    def page(self, limit: int, offset: int = 0, now: float | None = None) -> dict:
+        """`limit` items from `offset` in the queue's order (flagged samples, then recent automatic names and hints,
+        then unconfirmed samples), with the queue's `total` and the `next_offset` (None at the end), so a phone
+        that skips items can page past them. Only the page's items are built."""
         now = time.time() if now is None else now
         self.store.sync_samples()
         flagged, rest = [], []
@@ -171,14 +177,14 @@ class Review:
                 flagged.append((-len(data["flag"].get("reasons") or []), -(data.get("created_at") or 0), data))
             elif not any(h.get("action") == "confirm" for h in data.get("history") or []):
                 rest.append(data)
-        out = [self._sample_item(d) for *_, d in sorted(flagged, key=lambda x: (x[0], x[1]))][:limit]
-        if len(out) < limit:
-            out += self.label_items(limit - len(out), now)
-        for data in rest:
-            if len(out) >= limit:
-                break
-            out.append(self._sample_item(data))
-        return out
+        entries = [("sample", d) for *_, d in sorted(flagged, key=lambda x: (x[0], x[1]))]
+        entries += [("label", item) for item in self.label_items(len(entries) + len(rest) + offset + limit, now)]
+        entries += [("sample", d) for d in rest]
+        offset = max(0, offset)
+        chosen = entries[offset:offset + limit]
+        out = [self._sample_item(v) if kind == "sample" else v for kind, v in chosen]
+        end = offset + len(chosen)
+        return {"items": out, "total": len(entries), "next_offset": end if end < len(entries) else None}
 
     def label_items(self, limit: int, now: float) -> list[dict]:
         """Recent automatic names and "possibly X" hints, newest conversation first."""
