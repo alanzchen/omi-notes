@@ -161,6 +161,13 @@ deletes a voiceprint except forgetting a person; everything else is a state chan
   `pending_op` and is ineligible until its operation completes; an undo makes the copy pending again
   before restoring the original), and completed by deleting the intent. Incomplete operations roll
   forward before every model build, sample decision, undo, import and forget, and at worker startup.
+  Each records the forget generation of everyone involved: a replay after one of them was forgotten,
+  or after the person it gives a voice to lost consent, is cancelled (its applied part rolled back,
+  pending copies removed, the intent deleted) instead of applied. While an operation can't be
+  finished, decisions, imports and undo touching its people or samples are `409 recovery_pending`.
+  A forget starts durably (forget count, purge plan in `_omi/speakers/forgetting/`) and cancels every
+  operation touching the person before anything else, or stops. A moved or rejected label keeps
+  only the new person's samples; the old person's other ids are detached and restored by undo.
 - **Calibration** (`speakers/calibration.py`, informational, never changes activation): per person,
   consistency with the robust centroid, and the matcher's actual decision evaluated with each
   conversation left out (models and the rm space rebuilt without it, user-named labels as truth):

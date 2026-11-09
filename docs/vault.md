@@ -40,6 +40,7 @@ operational index. Copy the folder anywhere, point a backend at it, and it rebui
     speakers/calibration.json                      the last published (informational) speaker calibration + its input fingerprint
     speakers/calibration-log.jsonl                 one line per published calibration — append-only (rewritten only to forget a person)
     speakers/journal/<op_id>.json                  an unfinished multi-file sample operation (move, reject, merge, undo) — removed on completion
+    speakers/forgetting/<person_id>.json           a forget in progress: its recorded purge set (paths only) — removed on completion
     displaced/<sha>.md                             user-edited note versions set aside by an explicit "overwrite"
     operations/<request_id>.json                   app retries: accepted → done | failed | superseded (see "Operations")
 ```
