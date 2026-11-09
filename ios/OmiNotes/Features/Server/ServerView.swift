@@ -157,19 +157,26 @@ struct ServerView: View {
     }
 
     private func configurationSection(_ st: ServerStatus) -> some View {
-        Section {
-            LabeledContent("Transcription", value: providerLabel(st.stt))
-            if let d = st.stt?.diarization { LabeledContent("Speaker separation", value: diarizationLabel(d)) }
-            LabeledContent("Summaries", value: st.llm?.provider == "none" ? "Turned off" : providerLabel(st.llm))
-            if let dir = st.notesDir { LabeledContent("Notes folder", value: dir).font(.footnote) }
+        let stt = st.transcriptionLabel, llm = st.summariesLabel
+        return Section {
+            ServiceRow(title: "Transcription", label: stt)
+            ServiceRow(title: "Summaries", label: llm)
+            if let dir = st.notesDir { LabeledContent("Notes folder", value: dir).font(.footnote).lineLimit(1).truncationMode(.head) }
             LabeledContent("Server version", value: st.serverVersion ?? "—")
             if let started = st.serverStartedAt.flatMap(ISO8601UTC.parse) {
                 LabeledContent("Running since", value: started.formatted(date: .abbreviated, time: .shortened))
             }
+            if !stt.details.isEmpty || !llm.details.isEmpty {
+                DisclosureGroup("Details") {
+                    ServiceDetails(title: "Transcription", details: stt.details)
+                    ServiceDetails(title: "Summaries", details: llm.details)
+                }
+                .font(.subheadline)
+            }
         } header: {
             Text("Configuration")
         } footer: {
-            Text("Set on the server. Your server decides which services receive your audio and transcripts. “Ready” means configured; it isn't a test that the service works.")
+            Text("Set on the server, which decides where your audio and transcripts go. A green dot means configured or answering, not that a transcript worked.")
         }
     }
 
@@ -182,19 +189,57 @@ struct ServerView: View {
         }
     }
 
-    private func providerLabel(_ p: ServerStatus.Provider?) -> String {
-        guard let p else { return "—" }
-        let name = [p.provider, p.model].compactMap { $0 }.joined(separator: " · ")
-        let ready = p.ready == false ? " (not set up)" : ""
-        return (name.isEmpty ? "—" : name) + ready
+}
+
+/// One configured service on one line: a health dot and its short name (full names in the details).
+struct ServiceRow: View {
+    let title: String
+    let label: ServiceLabel
+
+    var body: some View {
+        LabeledContent(title) {
+            HStack(spacing: 6) {
+                if let color { Circle().fill(color).frame(width: 7, height: 7).accessibilityHidden(true) }
+                Text(label.text).lineLimit(1).truncationMode(.middle)
+            }
+        }
+        .accessibilityValue([label.text, healthWords].compactMap { $0 }.joined(separator: ", "))
     }
 
-    private func diarizationLabel(_ mode: String) -> String {
-        switch mode {
-        case "local": return "On the server"
-        case "provider": return "By the transcription service"
-        case "off": return "Off"
-        default: return "Automatic"
+    private var color: Color? {
+        switch label.health {
+        case .ok: return .green
+        case .down: return .red
+        case .notSetUp: return .orange
+        case .unknown: return nil
+        }
+    }
+
+    private var healthWords: String? {
+        switch label.health {
+        case .ok: return "configured"
+        case .down, .notSetUp, .unknown: return nil  // already in the text, or nothing known
+        }
+    }
+}
+
+/// A service's full model names and settings, title above value (long names wrap left-aligned).
+struct ServiceDetails: View {
+    let title: String
+    let details: [ServiceLabel.Detail]
+
+    var body: some View {
+        if !details.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title).font(.footnote.weight(.semibold))
+                ForEach(details, id: \.self) { d in
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(d.title).font(.caption).foregroundStyle(.secondary)
+                        Text(d.value).font(.footnote).textSelection(.enabled)
+                    }
+                }
+            }
+            .padding(.vertical, 2)
         }
     }
 }

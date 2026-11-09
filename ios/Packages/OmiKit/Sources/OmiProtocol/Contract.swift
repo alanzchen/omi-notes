@@ -327,6 +327,31 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
         public var diarization: String?
         /// Configured, not proven to work: the status call never runs inference.
         public var ready: Bool?
+        /// STT only, with the local transcription sidecar: its health and models (newer servers).
+        public var engine: Engine?
+    }
+    public struct Engine: Decodable, Equatable, Sendable {
+        public var name: String?
+        /// Its health check answered on the server's last check (cached 30 s).
+        public var healthy: Bool?
+        public var selfTest: String?
+        /// Role (`diarization`, `text`, `aligner`) → model id.
+        public var models: [String: String]?
+        enum CodingKeys: String, CodingKey {
+            case name, healthy, models
+            case selfTest = "self_test"
+        }
+    }
+    /// The local transcription sidecar as the server last checked it (newer servers, sidecar configured).
+    public struct LocalTranscription: Decodable, Equatable, Sendable {
+        public var available: Bool?
+        public var checkedAt: String?
+        public var downSince: String?
+        enum CodingKeys: String, CodingKey {
+            case available
+            case checkedAt = "checked_at"
+            case downSince = "down_since"
+        }
     }
     public struct Queue: Decodable, Equatable, Sendable {
         public var chunksPending: Int?
@@ -411,8 +436,10 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
     public var readOnly: String?
     /// Optional capabilities, e.g. `voice_enrollment` (older servers send none).
     public var features: [String]?
+    public var localTranscription: LocalTranscription?
 
     enum CodingKeys: String, CodingKey {
+        case localTranscription = "local_transcription"
         case ok
         case serverVersion = "server_version"
         case protocolVersion = "protocol_version"
