@@ -81,7 +81,17 @@ class SpeakerService:
 
     def calibration_people(self) -> dict:
         """The last published calibration (`speakers.calibration`), {} before the first."""
-        return {}
+        return Vault.read_json(self.vault.speakers / "calibration.json") or {}
+
+    def calibration(self) -> dict:
+        """`GET /v1/speakers/calibration`: the last published calibration and whether its inputs changed since."""
+        from .calibration import Calibrator
+
+        calibrator = Calibrator(self.pipeline)
+        current = calibrator.current()
+        return {"calibration": current,
+                "stale": current is None or current.get("fingerprint") != calibrator.fingerprint(),
+                "pending": self.db.meta("calibrate_pending") is not None}  # fmt: skip
 
     # -- review and samples (`speakers.review`) ---------------------------------------------------
 
@@ -124,6 +134,7 @@ class SpeakerService:
         with self.store.lock:
             created = self.store.put_person(person_id, name.strip(), me=me, attest=attest)
             self.db.set_meta("relabel_pending", "1")  # names/me shape rendering and prompts
+            self.store.samples_changed()  # consent or the wearer may have changed: recalibrate
         person = next(p for p in self.people() if p["id"] == person_id)
         return (201 if created else 200), person
 
@@ -152,6 +163,7 @@ class SpeakerService:
             self.store.remove_obsolete_voices_everywhere()
             self.store.reconcile_vectors()
             self.store.forget_voice(person_id, delete_note=delete_note)
+            self.store.samples_changed()
             self.db.set_meta("relabel_pending", "1")
         return affected
 
@@ -627,6 +639,7 @@ class SpeakerService:
             before = self.store.settings()
             self.store.update_settings(**changes)
             self.store.reconcile_vectors()  # e.g. unknown voices off or the acknowledgment withdrawn
+            self.store.samples_changed()
             if "auto_assign" in changes and changes["auto_assign"] != before["auto_assign"]:
                 self.db.set_meta("relabel_pending", "1")
         return self.get_settings()

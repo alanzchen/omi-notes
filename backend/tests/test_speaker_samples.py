@@ -594,3 +594,137 @@ def test_a_review_item_without_raw_audio_keeps_its_caption_and_is_not_playable(e
     (item,) = [i for i in review(client) if i.get("sample_id") == ids[0]]
     assert item["playable"] is False and "clip" not in item and item["text"]
     assert client.get(f"/v1/clips/sample.{ids[0]}.0", headers=AUTH).status_code == 410
+
+
+# -- M6: calibration (informational) ---------------------------------------------------------------------
+
+from omi_notes.speakers import calibration as cal  # noqa: E402
+
+
+def test_clopper_pearson_one_sided_upper_bounds():
+    assert cal.cp_upper(0, 0) is None
+    assert cal.cp_upper(0, 29) == pytest.approx(1 - 0.05 ** (1 / 29), abs=1e-4) and cal.cp_upper(0, 29) < 0.10
+    assert cal.cp_upper(0, 59) < 0.05 < cal.cp_upper(0, 58)
+    assert cal.cp_upper(1, 10) == pytest.approx(0.3942, abs=1e-3)
+    assert cal.cp_upper(5, 5) == 1.0
+
+
+def two_people(client, worker, days=(6, 5, 4, 3)) -> tuple[str, str, list[dict]]:
+    client.put("/v1/speakers/settings", json={"acknowledged_at": "2026-09-27T10:00:00Z"}, headers=AUTH)
+    me = new_person(client, "Alan", me=True)
+    priya = new_person(client, "Priya", attest_knows=True)
+    rows = []
+    for day in days:
+        row = talk(client, worker, dialogue(ALAN, PRIYA, seed=day), day=day)
+        name_label(client, row["id"], "S1", me)
+        name_label(client, row["id"], "S2", priya)
+        rows.append(row)
+    return me, priya, rows
+
+
+def calibration_file(settings) -> dict | None:
+    return Vault.read_json(settings.vault_dir / "_omi" / "speakers" / "calibration.json")
+
+
+def test_calibration_measures_held_out_conversations_and_never_changes_activation(env):
+    settings, client, worker = env
+    me, priya, rows = two_people(client, worker)
+    before = {p["name"]: p["auto_active"] for p in client.get("/v1/people", headers=AUTH).json()["people"]}
+    assert worker.calibrator.run(T0 + 10_000, force=True)
+    data = calibration_file(settings)
+    assert data["version"] == cal.VERSION and data["fingerprint"] and data["computed_at"]
+    alan = data["people"][me]
+    held = alan["held_out"]
+    assert held["positives"]["conversations"] == 4 and held["named_other"]["conversations"] == 0
+    assert held["target_absent"] == {"conversations": 0, "errors": 0, "upper": None}
+    assert held["positives"]["upper"] == cal.cp_upper(held["positives"]["errors"], 4)
+    assert data["people"][priya]["held_out"]["positives"]["conversations"] == 4
+    assert alan["consistency"]["samples"] == 4 and "median" in alan["consistency"]
+    assert {p["name"]: p["auto_active"] for p in client.get("/v1/people", headers=AUTH).json()["people"]} == before
+    people = {p["name"]: p for p in client.get("/v1/people", headers=AUTH).json()["people"]}
+    assert people["Alan"]["calibrated_at"] == data["computed_at"]
+    assert people["Alan"]["measured"]["conversations"] == 4 and "wrong_at_most" in people["Alan"]["measured"]
+    api = client.get("/v1/speakers/calibration", headers=AUTH).json()
+    assert api["calibration"]["fingerprint"] == data["fingerprint"] and api["stale"] is False
+    log = Vault.read_jsonl(settings.vault_dir / "_omi" / "speakers" / "calibration-log.jsonl")
+    assert log[-1]["fingerprint"] == data["fingerprint"] and log[-1]["computed_at"] == data["computed_at"]
+    assert "voice_calibration" in client.get("/v1/status", headers=AUTH).json()["features"]
+
+
+def test_calibration_is_unmeasured_without_held_out_counts(env):
+    settings, client, worker = env
+    me = new_person(client, "Alan", me=True)
+    with worker.pipeline.speakers.lock:
+        add_samples(worker.pipeline.speakers, me, [None, None, None])  # voiceprints from no conversation
+    assert worker.calibrator.run(T0, force=True)
+    alan = people(client)["Alan"]
+    assert alan["measured"] is None and alan["calibrated_at"] is not None
+    assert calibration_file(settings)["people"][me]["held_out"]["positives"] == {"conversations": 0, "errors": 0, "upper": None}
+
+
+def test_calibration_runs_debounced_after_a_change_and_nightly(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker, days=(6, 5))
+    calibrator = worker.calibrator
+    assert calibrator.run(T0 + 5000, force=True)
+    first = calibration_file(settings)["computed_at"]
+    changed = T0 + 6000
+    with worker.pipeline.speakers.lock:
+        worker.pipeline.speakers.set_sample_state(me, ids[0], "removed", action="remove", by="user", request_id="r", now=changed)
+    assert not calibrator.run(changed + 10), "debounced"
+    assert calibrator.run(changed + cal.DEBOUNCE_SECONDS)
+    assert calibration_file(settings)["computed_at"] > first
+    assert not calibrator.run(changed + cal.DEBOUNCE_SECONDS + 1), "nothing pending"
+    # nightly at 03:10 local, once a day
+    from datetime import datetime
+
+    night = datetime(2026, 9, 28, 3, 15, tzinfo=worker.pipeline.tz).timestamp()
+    assert calibrator.run(night) and not calibrator.run(night + 60)
+    assert not calibrator.run(datetime(2026, 9, 29, 2, 0, tzinfo=worker.pipeline.tz).timestamp())
+    assert calibrator.run(datetime(2026, 9, 29, 3, 11, tzinfo=worker.pipeline.tz).timestamp())
+
+
+def test_calibration_publishes_only_if_its_inputs_did_not_change_meanwhile(env, monkeypatch):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker, days=(6, 5))
+    real = cal.evaluate
+
+    def racing(*args, **kwargs):
+        with worker.pipeline.speakers.lock:  # a remove from the app while the calibration computes
+            worker.pipeline.speakers.set_sample_state(me, ids[0], "removed", action="remove", by="user", request_id="r")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cal, "evaluate", racing)
+    before = calibration_file(settings)  # (the worker's ticks may have calibrated already)
+    assert not worker.calibrator.run(T0, force=True)
+    assert calibration_file(settings) == before, "computed from inputs that changed meanwhile: never published"
+    monkeypatch.setattr(cal, "evaluate", real)
+    assert worker.calibrator.run(T0 + 100, force=True)
+    assert calibration_file(settings)["fingerprint"] == worker.calibrator.fingerprint()
+
+
+def test_consent_and_forget_ask_for_a_recalibration(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker, days=(6,))
+    for change in (
+        lambda: client.put("/v1/speakers/settings", json={"acknowledged_at": "2026-09-27T10:00:00Z"}, headers=AUTH),
+        lambda: new_person(client, "Priya", attest_knows=True),
+        lambda: client.delete(f"/v1/people/{me}", headers=AUTH),
+    ):
+        worker.db.set_meta("calibrate_pending", None)
+        change()
+        assert worker.db.meta("calibrate_pending") is not None
+
+
+def test_startup_reconciles_a_stale_or_missing_calibration(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker, days=(6, 5))
+    assert worker.calibrator.run(T0, force=True)
+    worker.db.set_meta("calibrate_pending", None)
+    path = settings.vault_dir / "_omi" / "speakers" / "calibration.json"
+    Vault.write_json(path, json.loads(path.read_text()) | {"fingerprint": "other"})
+    assert client.get("/v1/speakers/calibration", headers=AUTH).json()["stale"] is True
+    worker.calibrator.reconcile()
+    assert worker.db.meta("calibrate_pending") is not None
+    assert worker.calibrator.run(T0 + 1)
+    assert client.get("/v1/speakers/calibration", headers=AUTH).json()["stale"] is False
