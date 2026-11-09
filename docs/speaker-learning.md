@@ -164,7 +164,12 @@ deletes a voiceprint except forgetting a person; everything else is a state chan
   Each records the forget generation of everyone involved: a replay after one of them was forgotten,
   or after the person it gives a voice to lost consent, is cancelled (its applied part rolled back,
   pending copies removed, the intent deleted) instead of applied. While an operation can't be
-  finished, decisions, imports and undo touching its people or samples are `409 recovery_pending`.
+  finished, decisions, label assignments, imports and undo touching its people, samples or label are
+  `409 recovery_pending` (checked before a retry is answered). A replay restores a label only while
+  its decision is still what the operation left; an undo of a move past its commit point (the
+  originals count again) always rolls forward. While a forget is unfinished, nothing new is kept for
+  that person (`409 forget_in_progress`). A moved enrollment that would duplicate the destination's
+  audio is `409 superseded`.
   A forget starts durably (forget count, purge plan in `_omi/speakers/forgetting/`) and cancels every
   operation touching the person before anything else, or stops. A moved or rejected label keeps
   only the new person's samples; the old person's other ids are detached and restored by undo.
