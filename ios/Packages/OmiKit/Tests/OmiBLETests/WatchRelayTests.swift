@@ -160,6 +160,14 @@ import OmiCapture
         #expect(again.segments().map(\.segment.id) == [mb.id, mc.id] && again.manifestReads == 2, "kept current without rereading")
         _ = again.retire(receipts: [.init(id: mb.id, sha256: mb.sha256)])
         #expect(again.segments().map(\.segment.id) == [mc.id] && WatchOutbox(root: root.appendingPathComponent("outbox")).segments().map(\.segment.id) == [mc.id])
+        // build 38/42 Watch apps were killed by the 2 s background CPU watchdog inside segments(): with 628 parts
+        // waiting, every call sorted them and built their URLs again, several times per send loop
+        let builds = again.segmentListBuilds
+        for _ in 0..<20 { _ = again.segments() }
+        #expect(again.segmentListBuilds == builds, "the sorted list is kept between changes")
+        let d = try Self.segmentFile(seconds: 1, in: root, name: "d")
+        try again.add(segmentFile: d, segment: manifest(d, recording: "r", index: 3, binding: "p", start: 3_000_000))
+        #expect(again.segments().count == 2 && again.segmentListBuilds == builds + 1, "and built again after a change")
     }
 }
 

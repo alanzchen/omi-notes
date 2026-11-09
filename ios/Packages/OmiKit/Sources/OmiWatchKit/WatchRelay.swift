@@ -233,7 +233,12 @@ public final class WatchOutbox: @unchecked Sendable {
     /// sync loop asks for the queue after every part, and reading every manifest each time grew
     /// with the backlog (a day away from the iPhone is over a thousand files). The files stay the
     /// truth; only this process changes them.
-    private var segmentIndex: [String: WatchSegment]?
+    private var segmentIndex: [String: WatchSegment]? { didSet { segmentList = nil } }
+    /// `segments()`'s answer, kept until the index changes: with hundreds of parts waiting, sorting them and
+    /// building their URLs on every call (several per send loop) used up the 2 s background CPU allowance.
+    private var segmentList: [(segment: WatchSegment, file: URL)]?
+    /// Times that list was built (for tests).
+    public private(set) var segmentListBuilds = 0
     private var endIndex: [String: WatchRecordingEnd]?
     /// Audio under segments/ with no manifest that matches it (an older build ended between moving a
     /// part in and publishing its manifest, or the metadata is damaged): id → bytes. Kept, never sent
@@ -283,10 +288,11 @@ public final class WatchOutbox: @unchecked Sendable {
     private func loadSegments() {
         guard segmentIndex == nil else { return }
         var index: [String: WatchSegment] = [:]
+        let audio = Set(Files.names(segmentsDir, suffix: ".m4a"))  // one listing, not a lookup per part
         for name in Files.names(segmentsDir, suffix: ".json") {
             manifestReads += 1
             guard let s = WatchWire.decode(WatchSegment.self, try? Data(contentsOf: segmentsDir.appendingPathComponent(name))),
-                  FileManager.default.fileExists(atPath: segmentsDir.appendingPathComponent("\(s.id).m4a").path) else { continue }
+                  audio.contains("\(s.id).m4a") else { continue }
             index[s.id] = s
         }
         reconcile(&index)
@@ -333,9 +339,13 @@ public final class WatchOutbox: @unchecked Sendable {
     public func segments() -> [(segment: WatchSegment, file: URL)] {
         lock.lock(); defer { lock.unlock() }
         loadSegments()
-        return (segmentIndex ?? [:]).values
+        if let segmentList { return segmentList }
+        let list = (segmentIndex ?? [:]).values
             .sorted { ($0.recordingStartedAt, $0.index) < ($1.recordingStartedAt, $1.index) }
             .map { ($0, segmentsDir.appendingPathComponent("\($0.id).m4a")) }
+        segmentList = list
+        segmentListBuilds += 1
+        return list
     }
 
     public func ends() -> [WatchRecordingEnd] {

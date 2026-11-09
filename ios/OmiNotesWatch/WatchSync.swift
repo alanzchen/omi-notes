@@ -187,8 +187,22 @@ final class WatchSync: NSObject, WCSessionDelegate {
     /// Delivered parts asked about per inventory question (oldest first).
     static let inventoryBatch = 300
 
-    /// Hands what is waiting (for this iPhone) to WatchConnectivity, skipping what is in flight.
+    /// CPU allowed per background period (WatchConnectivity kills the app at 2 s; builds 38 and 42 were, here).
+    private var budget = WatchBackgroundBudget()
+    private var budgetSpentLogged = false
+
+    /// Hands what is waiting (for this iPhone) to WatchConnectivity, skipping what is in flight. In the
+    /// background it stops once this period's CPU budget is spent: the parts wait for the next wake or launch.
     func pump() {
+        // recording keeps the app running in the background (an audio session, not a WatchConnectivity wake,
+        // so no 2 s watchdog): its parts keep moving as they are made
+        let active = WKApplication.shared().applicationState == .active || recorderState.state != .idle
+        guard budget.mayWork(active: active, cpu: WatchBackgroundBudget.processCPUSeconds()) else {
+            if !budgetSpentLogged { watchLog.info("background CPU budget spent: sending waits for the next wake") }
+            budgetSpentLogged = true
+            return
+        }
+        budgetSpentLogged = false
         refreshCounts()
         guard activated else { return }
         guard let binding else { askForBinding(); return }
@@ -287,16 +301,17 @@ final class WatchSync: NSObject, WCSessionDelegate {
     }
 
     /// A WatchConnectivity background wake (`.backgroundTask(.watchConnectivity)`): stay until the session is
-    /// active, everything pending has been received (`hasContentPending`) and handled on the main actor
-    /// (`callbackWork`), and the send loop ran after it, so one wake moves the acknowledgements and the next
-    /// parts instead of a single part. Returns at once when the task is cancelled (its time expired).
+    /// active and everything pending has been received (`hasContentPending`) and handled on the main actor
+    /// (`callbackWork`), run the send loop once (within the CPU budget, `pump`), and wait for its own
+    /// callbacks. It never loops the send loop: build 44 did, every 500 ms, and a wake must stay well under
+    /// WatchConnectivity's 2 s CPU allowance. Returns at once when the task is cancelled (its time expired).
     private(set) var inBackgroundWake = false
     func backgroundWake() async {
         backgroundWakes += 1
         inBackgroundWake = true
         defer { inBackgroundWake = false }
         let session = WCSession.default
-        let deadline = Date().addingTimeInterval(25)
+        let deadline = Date().addingTimeInterval(15)
         var settled: Bool { activated && !session.hasContentPending && callbackWork.isIdle }
         while !settled && Date() < deadline {
             // delegate callbacks run on the main actor meanwhile; a cancelled sleep throws: stop now
@@ -304,16 +319,10 @@ final class WatchSync: NSObject, WCSessionDelegate {
         }
         guard !Task.isCancelled else { return }
         pump()
-        // give the receipts for what this pump handed over a moment to come back, then send again
-        while Date() < deadline, transferCounts.moving > 0 || !settled {
-            guard (try? await Task.sleep(for: .milliseconds(500))) != nil else { return }
-            pump()
-        }
-        // the last pump's own callbacks (replies to what it sent) before the wake ends
+        // the pump's own callbacks (replies to what it sent) before the wake ends
         while !callbackWork.isIdle && Date() < deadline {
             guard (try? await Task.sleep(for: .milliseconds(100))) != nil else { return }
         }
-        sendReport()
         watchLog.info("background wake: \(self.backgroundWakeParts) part(s) handed over in \(self.backgroundWakes) wake(s) so far")
     }
 
