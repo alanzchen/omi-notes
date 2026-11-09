@@ -116,3 +116,75 @@ def test_different_audio_under_a_stored_identity_is_still_a_conflict_but_its_byt
     path = worker.db.one("SELECT path FROM chunks WHERE capture_id=? AND chunk_sequence=0", (capture,))["path"]
     kept = list(((worker.pipeline.settings.vault_dir / path).parent / "alternates").glob("0-*.omnc"))
     assert len(kept) == 1 and kept[0].read_bytes() == other[0]
+
+
+def test_a_copy_whose_last_seconds_differ_is_not_the_same_audio():
+    # Astra's probe: a 60 s chunk with its last two seconds replaced correlated 0.97 as a whole
+    from omi_notes.ingest import same_audio
+
+    capture = str(uuid.uuid4())
+    pcm = talk(60, 3)
+    changed = pcm.copy()
+    changed[-2 * 16000 :] = talk(2, 11)
+    a = parse_envelope(pcm_envelopes(pcm, capture_id=capture, device_id=WATCH, started_at=STARTED, source="watch_mic")[0])
+    b = parse_envelope(aac_envelopes(changed, capture_id=capture, device_id=WATCH, started_at=STARTED)[0])
+    same = parse_envelope(aac_envelopes(pcm, capture_id=capture, device_id=WATCH, started_at=STARTED)[0])
+    assert same_audio(a, same) is True
+    assert same_audio(a, b) is False
+
+
+def test_a_damaged_alternate_copy_is_rewritten_before_the_resend_is_acknowledged(client, worker):
+    capture = str(uuid.uuid4())
+    pcm = np.concatenate([talk(20, 3), silence(10)])
+    as_pcm = pcm_envelopes(pcm, capture_id=capture, device_id=WATCH, started_at=STARTED, source="watch_mic")
+    as_aac = aac_envelopes(pcm, capture_id=capture, device_id=WATCH, started_at=STARTED)
+    assert put_chunk(client, capture, 0, as_pcm[0]).status_code == 201
+    assert put_chunk(client, capture, 0, as_aac[0]).status_code == 200
+    path = worker.db.one("SELECT path FROM chunks WHERE capture_id=? AND chunk_sequence=0", (capture,))["path"]
+    (alternate,) = ((worker.pipeline.settings.vault_dir / path).parent / "alternates").glob("0-*.omnc")
+    alternate.write_bytes(as_aac[0][:100])  # truncated on disk
+    assert put_chunk(client, capture, 0, as_aac[0]).status_code == 200
+    assert alternate.read_bytes() == as_aac[0], "the sent bytes are durably there again before the 200"
+
+
+def test_a_different_last_half_second_is_not_the_same_audio():
+    # Astra's probe: 30.5 s with the final 0.5 s replaced slipped past the whole-second windows
+    from omi_notes.ingest import same_audio
+
+    capture = str(uuid.uuid4())
+    pcm = talk(30.5, 3)
+    changed = pcm.copy()
+    t = np.arange(8000) / 16000  # other speech: a different voice (talk() shares one carrier across seeds)
+    changed[-8000:] = (8000 * np.sin(2 * np.pi * 237 * t) * np.sin(2 * np.pi * 3 * t)).astype(np.int16)
+    a = parse_envelope(pcm_envelopes(pcm, capture_id=capture, device_id=WATCH, started_at=STARTED, source="watch_mic")[0])
+    b = parse_envelope(aac_envelopes(changed, capture_id=capture, device_id=WATCH, started_at=STARTED)[0])
+    assert same_audio(a, b) is False
+    assert same_audio(a, parse_envelope(aac_envelopes(pcm, capture_id=capture, device_id=WATCH, started_at=STARTED)[0])) is True
+
+
+def test_a_copy_with_extra_sound_past_the_shorter_end_is_not_the_same_audio():
+    # Astra's probe: the identical 30 s plus 80 ms of loud audio passed, since both were cut to the shorter
+    # length before any check; the same holds when everything before it is silent
+    from omi_notes.ingest import same_audio
+
+    capture = str(uuid.uuid4())
+    t = np.arange(1280) / 16000
+    loud = (8000 * np.sin(2 * np.pi * 237 * t)).astype(np.int16)
+    for pcm in (talk(30, 3), silence(30)):
+        a, b = (
+            parse_envelope(pcm_envelopes(p, capture_id=capture, device_id=WATCH, started_at=STARTED, source="watch_mic")[0])
+            for p in (pcm, np.concatenate([pcm, loud]))
+        )
+        assert same_audio(a, b) is False
+        assert same_audio(b, a) is False
+    pcm = talk(30, 3)
+    padded = np.concatenate([pcm, np.zeros(1280, dtype=np.int16)])
+    a, b = (
+        parse_envelope(pcm_envelopes(p, capture_id=capture, device_id=WATCH, started_at=STARTED, source="watch_mic")[0])
+        for p in (pcm, padded)
+    )
+    assert same_audio(a, b) is True, "quiet padding past the end is still the same recording"
+
+
+def test_the_server_advertises_that_it_takes_the_same_audio_sent_again(client):
+    assert "same_audio_resend" in client.get("/v1/status", headers=AUTH).json()["features"]

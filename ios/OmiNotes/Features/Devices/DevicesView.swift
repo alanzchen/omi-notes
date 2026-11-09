@@ -54,7 +54,7 @@ struct DevicesView: View {
                     ForEach(layout.cards, id: \.self) { device in
                         switch device {
                         case .pendant: PendantCardView(summary: pendant.summary, onFix: onFix) { page = .pendant }
-                        case .watch: WatchCardView(summary: watch.summary) { page = .watch }
+                        case .watch: WatchCardView(summary: watch.summary, onFix: onFix) { page = .watch }
                         }
                     }
                     if layout.cards.isEmpty {
@@ -119,7 +119,8 @@ struct DevicesView: View {
            let fixture = WatchSummary.debugFixture(name, now: now) { return (fixture.summary, fixture.report, true) }
         #endif
         let s = model.snapshot
-        return (WatchSummary.evaluate(installed: watchAppInstalled, report: s.watchReport, lastReceivedAt: s.watchLastReceivedAt, now: now),
+        return (WatchSummary.evaluate(installed: watchAppInstalled, report: s.watchReport, lastReceivedAt: s.watchLastReceivedAt, now: now,
+                                      quarantined: s.outbox.quarantineWatchCount),
                 s.watchReport, false)
     }
 
@@ -205,23 +206,7 @@ private struct PendantCardView: View {
                             art: { MiniPendant(on: summary.connected) }, action: open)
             // a problem shows here, on its device; everything else is on the pendant's page
             if let issue = summary.rows.first(where: \.attention) {
-                Divider().padding(.leading, 86)
-                HStack(spacing: 10) {
-                    Image(systemName: "exclamationmark").font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(Pendant.warnForeground).frame(width: 22, height: 22)
-                        .background(Pendant.warnBackground, in: .rect(cornerRadius: 7))
-                    Text(issue.title).font(.footnote.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 0)
-                    if let fix = issue.fix {
-                        Button { onFix(fix) } label: {
-                            Text(fix == .retryUploads ? "Retry" : fix.title).font(.footnote.weight(.semibold))
-                                .padding(.horizontal, 12).padding(.vertical, 6)
-                                .foregroundStyle(Pendant.actionText).background(Pendant.actionFill, in: .capsule)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(.leading, 86).padding(.trailing, 16).padding(.vertical, 10)
+                DeviceIssueRow(title: issue.title, fix: issue.fix, onFix: onFix)
             }
         }
     }
@@ -246,14 +231,44 @@ private struct PendantCardView: View {
     }
 }
 
+/// A device's problem under its card: one short line; the whole row is the fix (no separate button).
+private struct DeviceIssueRow: View {
+    let title: String
+    let fix: SystemHealth.Fix?
+    var onFix: (SystemHealth.Fix) -> Void
+
+    var body: some View {
+        Divider().padding(.leading, 86)
+        Button { if let fix { onFix(fix) } } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "exclamationmark").font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(Pendant.warnForeground).frame(width: 22, height: 22)
+                    .background(Pendant.warnBackground, in: .rect(cornerRadius: 7))
+                Text(title).font(.footnote.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.85)
+                Spacer(minLength: 4)
+                if fix != nil {
+                    Image(systemName: "chevron.right").font(.caption2.weight(.semibold)).foregroundStyle(Pendant.chevron)
+                }
+            }
+            .padding(.leading, 86).padding(.trailing, 16).padding(.vertical, 9)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(fix == nil)
+        .accessibilityHint(fix.map { $0 == .retryUploads ? "Retry" : $0.title } ?? "")
+    }
+}
+
 private struct WatchCardView: View {
     let summary: WatchSummary
+    var onFix: (SystemHealth.Fix) -> Void
     var open: () -> Void
 
     var body: some View {
         Card {
             DeviceCardShell(name: "Apple Watch", state: summary.title, stateColor: dot, detail: summary.detail,
                             art: { MiniWatch(recording: summary.tone == .recording) }, action: open)
+            if let issue = summary.issue { DeviceIssueRow(title: issue, fix: summary.issueFix, onFix: onFix) }
         }
     }
 

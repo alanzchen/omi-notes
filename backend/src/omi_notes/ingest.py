@@ -460,6 +460,10 @@ class Ingest:
             return False
         stored_path = self.vault.root / row["path"]
         alternate = stored_path.parent / "alternates" / f"{seq}-{digest[:16]}.omnc"
+        if alternate.exists() and sha256_hex(alternate.read_bytes()) != digest:  # damaged: these bytes again, durably
+            log.warning("chunk %s/%d: alternate copy %s was damaged; writing it again", capture_id, seq, alternate.name)
+            self._writable()
+            atomic_write_bytes(alternate, body)
         if not alternate.exists():
             self._writable()
             self._ensure_space()
@@ -616,6 +620,8 @@ def seal_end_epoch(capture) -> float | None:
 
 SAME_AUDIO_CORRELATION = 0.9  # decoded copies of one recording (lossless vs 32 kbit/s AAC) correlate well above this
 SAME_AUDIO_MAX_LAG = 2400  # samples (0.15 s): codec priming and padding
+SAME_AUDIO_WINDOW = 16000  # every aligned second with sound must match on its own...
+SAME_AUDIO_WINDOW_CORRELATION = 0.8  # ... at least this well (32 kbit/s AAC of the same second is far above)
 
 
 def _samples(env) -> np.ndarray:
@@ -639,8 +645,13 @@ def same_audio(a, b) -> bool:
     if abs(len(x) - len(y)) > 1600:
         return False
     n = min(len(x), len(y))
+    longer = x if len(x) > n else y
     x, y = x[:n] - x[:n].mean(), y[:n] - y[:n].mean()
     ex, ey = float(np.sqrt((x**2).mean())), float(np.sqrt((y**2).mean()))
+    # what the longer copy has past the shorter one's end is cut off below: it may only be quiet padding
+    tail = longer[n:] - longer[:n].mean()
+    if len(tail) and float(np.sqrt((tail**2).mean())) >= max(1.0, 0.05 * max(ex, ey)):
+        return False
     if ex < 1.0 and ey < 1.0:
         return True
     if ex < 1.0 or ey < 1.0:
@@ -648,4 +659,27 @@ def same_audio(a, b) -> bool:
     size = 1 << (2 * n - 1).bit_length()
     corr = np.fft.irfft(np.fft.rfft(x, size) * np.conj(np.fft.rfft(y, size)), size)
     lags = np.concatenate([corr[: SAME_AUDIO_MAX_LAG + 1], corr[-SAME_AUDIO_MAX_LAG:]])
-    return float(lags.max()) / (n * ex * ey) >= SAME_AUDIO_CORRELATION
+    if float(lags.max()) / (n * ex * ey) < SAME_AUDIO_CORRELATION:
+        return False
+    # the whole can match while a part differs (two replaced seconds of sixty still correlate 0.97 overall):
+    # aligned, every second where either copy has sound must match too
+    best = int(np.argmax(lags))
+    lag = best if best <= SAME_AUDIO_MAX_LAG else best - len(lags)
+    xa, ya = (x[lag:], y[: n - lag]) if lag >= 0 else (x[: n + lag], y[-lag:])
+    floor = 0.05 * max(ex, ey)
+    # what the alignment trims off either copy's edges may only be codec padding: quiet
+    edges = (x[:lag], y[n - lag :]) if lag > 0 else (y[:-lag], x[n + lag :]) if lag < 0 else ()
+    if any(len(e) and float(np.sqrt((e**2).mean())) >= floor for e in edges):
+        return False
+    # every aligned window, the last partial one too (a tail under 0.1 s joins the window before it)
+    bounds = list(range(0, len(xa), SAME_AUDIO_WINDOW)) + [len(xa)]
+    if len(bounds) > 2 and bounds[-1] - bounds[-2] < SAME_AUDIO_WINDOW // 10:
+        bounds.pop(-2)
+    for a, b in zip(bounds, bounds[1:], strict=False):
+        wx, wy = xa[a:b], ya[a:b]
+        rx, ry = float(np.sqrt((wx**2).mean())), float(np.sqrt((wy**2).mean()))
+        if rx < floor and ry < floor:
+            continue
+        if min(rx, ry) < 0.5 * max(rx, ry) or float(wx @ wy) / (len(wx) * rx * ry) < SAME_AUDIO_WINDOW_CORRELATION:
+            return False
+    return True

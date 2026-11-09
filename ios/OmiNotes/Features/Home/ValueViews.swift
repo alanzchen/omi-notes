@@ -290,6 +290,22 @@ struct LessUsefulGroup: View {
     }
 }
 
+/// A day's short (under 30 s) and skipped recordings, folded into one row; they open to the same rows.
+struct ShortClipsGroup: View {
+    let model: AppModel
+    let rows: [ConversationSummary]
+    @State private var open = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $open) {
+            ForEach(rows) { c in ConversationLink(model: model, conversation: c) }
+        } label: {
+            Label("Short clips (\(rows.count))", systemImage: "waveform.path")
+                .font(.subheadline).foregroundStyle(.secondary)
+        }
+    }
+}
+
 /// The detail's "Worth revisiting": the kind of recording, why, and the parts to revisit.
 struct ValueDetailSection: View {
     let detail: ConversationDetail

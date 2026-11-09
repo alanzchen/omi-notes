@@ -136,12 +136,11 @@ struct HomeView: View {
             }
             ForEach(days, id: \.day) { group in
                 Section(group.day) {
-                    // only the owner's explicit "less useful" moves a row (into a collapsed group)
-                    let demoted = group.rows.filter { model.priorityState(of: $0).state == "less_useful" }
-                    ForEach(group.rows.filter { model.priorityState(of: $0).state != "less_useful" }) { c in
-                        ConversationLink(model: model, conversation: c)
-                    }
-                    if !demoted.isEmpty { LessUsefulGroup(model: model, rows: demoted) }
+                    // short or skipped clips and the owner's "less useful" fold into collapsed groups
+                    let day = HomeDay(group.rows) { model.priorityState(of: $0).state }
+                    ForEach(day.rows) { c in ConversationLink(model: model, conversation: c) }
+                    if !day.shortClips.isEmpty { ShortClipsGroup(model: model, rows: day.shortClips) }
+                    if !day.lessUseful.isEmpty { LessUsefulGroup(model: model, rows: day.lessUseful) }
                 }
             }
             Section {

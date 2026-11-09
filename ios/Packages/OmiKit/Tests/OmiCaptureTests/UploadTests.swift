@@ -284,6 +284,18 @@ final class UploaderHarness: @unchecked Sendable {
         #expect(h.uploader.status.attention.count == 3)
     }
 
+    @Test func aFileThatCantBeQuarantinedIsHeldNotSentAgainAtOnce() throws {
+        let h = UploaderHarness()
+        let a = try h.writeChunk(seq: 0)
+        try FileIO.atomicWrite(Data("{not json".utf8), to: h.t.outbox.requeuedLedger)
+        h.reconcile()
+        h.complete(a.name, status: 409)
+        #expect(h.t.outbox.pending().map(\.name) == [a.name], "kept in place")
+        #expect(h.task(for: a.name)?.earliest == h.now.addingTimeInterval(3600), "not uploaded again straight away")
+        #expect(h.uploader.state.record(a.name).nextAttemptAt == h.now.addingTimeInterval(3600))
+        #expect(h.uploader.status.attention.contains { $0.contains(a.name) })
+    }
+
     @Test func unauthorizedPausesEverything() throws {
         let h = UploaderHarness()
         let a = try h.writeChunk(seq: 0)

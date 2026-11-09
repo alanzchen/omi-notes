@@ -202,8 +202,10 @@ struct TransferDetailView: View {
             line = "Checking for Apple Watch"
         } else if w.keptOnWatch > 0, w.reportAt != nil {
             line = "\(TransferText.plural(w.keptOnWatch, "part", "parts")) kept on the Watch, can't be sent"
-        } else if let parts = w.waitingParts, w.reportAt != nil, w.reportFresh {
-            line = parts == 0 ? "Nothing left on the Watch" : "\(TransferText.plural(parts, "part", "parts")) left on the Watch"
+        } else if let parts = w.newParts, w.reportAt != nil, w.reportFresh {
+            let recheck = w.recheckParts > 0 ? "re-checking \(TransferText.plural(w.recheckParts, "older part", "older parts"))" : nil
+            line = parts == 0 ? (recheck.map { "R" + $0.dropFirst() } ?? "Nothing left on the Watch")
+                : "\(TransferText.plural(parts, "part", "parts")) left on the Watch" + (recheck.map { " · \($0)" } ?? "")
         } else if let at = w.reportAt, at <= now {
             line = "Last Watch report \(Fmt.relative(at))"  // not current: no claim about now
         } else if w.reportAt != nil {
@@ -295,6 +297,7 @@ struct TransferDetailView: View {
                 VStack(spacing: 0) {
                     row("Watch report", w.reportAt.map { (w.reportFresh ? "" : "Old · ") + Fmt.relative($0) })
                     if let seconds = w.waitingSeconds, w.reportAt != nil { row("Audio on the Watch", TransferText.duration(Double(seconds))) }
+                    if w.recheckParts > 0, w.reportAt != nil { row("Of it, re-checking", TransferText.plural(w.recheckParts, "older part", "older parts")) }
                     row("Received from Watch", TransferText.plural(w.receivedOnPhone, "part", "parts"))
                     row("Last received", w.lastReceivedAt.map { Fmt.relative($0) } ?? "Not since launch")
                     if w.converting > 0 { row("Preparing", TransferText.plural(w.converting, "part", "parts")) }

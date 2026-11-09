@@ -534,9 +534,15 @@ public final class Uploader: @unchecked Sendable {
             addAttention("Kept but not uploaded: \(name) (\(reason))")
             log(.error, "upload", "quarantined \(name): \(reason)")
         } catch {
-            log(.error, "upload", "quarantine of \(name) failed: \(error)")
+            // kept pending but not sent again for an hour: each try would be refused the same way, and the file
+            // can't move until its re-queue record is durable (`Outbox.quarantine`)
+            state.update(name) { $0.nextAttemptAt = now().addingTimeInterval(Self.heldAfterFailedQuarantine) }
+            addAttention("Held, not uploaded: \(name) couldn't be set aside (\(error))")
+            log(.error, "upload", "quarantine of \(name) failed: \(error); held for an hour")
         }
     }
+
+    static let heldAfterFailedQuarantine: TimeInterval = 3600
 
     private func addAttention(_ message: String) {
         if !status.attention.contains(message) { status.attention.append(message) }

@@ -268,6 +268,7 @@ public final class AppModel {
         serverStatus = status
         serverStatusAt = Date()
         engine.noteServerWatchAAC(status.features?.contains("watch_aac") == true, generation: config.generation)
+        engine.noteServerSameAudioResend(status.features?.contains("same_audio_resend") == true)
         rememberValueNotesScope(config)
         if status.supportsPhoneLog { uploadPhoneLogIfDue(api: api) }
         let epoch = cacheEpoch

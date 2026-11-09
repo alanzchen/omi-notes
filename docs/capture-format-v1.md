@@ -302,6 +302,13 @@ Body: one envelope. Headers:
 | `400` | `X-Content-SHA256` mismatch / HTTP body length mismatch | re-verify the local file's SHA-256; retry up to 5 times, then quarantine |
 | `401` | Bad token | stop, show "needs attention" |
 | `409` | Different content already stored under this identity | stop retrying this chunk, keep it, show "needs attention" |
+
+**Same audio sent again (`same_audio_resend` in `features`).** Other bytes under a stored chunk's identity
+are always kept by the server (beside the stored chunk, never overwriting it). When they are the same
+recording encoded another way (same device, start and timing, decoded audio matching; e.g. a Watch
+part stored as PCM by an older phone build and relayed again as AAC), the answer is `200` duplicate,
+not `409`. A phone that sees this feature moves chunks it quarantined for a `409` back to its upload
+queue once (never deleting them); a real conflict comes back as `409` and stays quarantined.
 | `413` | Too large | keep (quarantine), show "needs attention" |
 | `422` | Envelope invalid (bad magic, header, header/payload length mismatch, record CRC, unsupported codec) | keep (quarantine), show "needs attention" |
 | `5xx` | Transient (incl. `507` disk full) | retry with exponential backoff + jitter |
