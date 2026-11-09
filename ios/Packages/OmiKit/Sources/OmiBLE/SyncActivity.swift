@@ -25,7 +25,7 @@ extension SyncActivityState {
         let queuedAudio: Double?
         if p.queuedAudioFiles == 0 { queuedAudio = stage == .queueUnreadable ? nil : 0 }
         else { queuedAudio = knownAudio > 0 ? p.queuedAudioSeconds : nil }
-        let watchWaiting = t.watch.inUse == true ? t.watch.waitingSeconds : nil
+        let watchWaiting = t.watch.inUse == true ? t.watch.newSeconds : nil  // re-checks of older parts aren't "on the Watch"
         var detail: String?
         switch p.state {
         case .offline(let why), .paused(let why): detail = why

@@ -2,6 +2,7 @@ import Foundation
 import OmiBLE
 import OmiCapture
 import OmiWatchKit
+import UIKit
 import WatchConnectivity
 
 /// The iPhone end of the Apple Watch relay. A segment is acknowledged to the Watch only after it is
@@ -18,6 +19,9 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
         self.engine = engine
         self.onWatchState = onWatchState
         super.init()
+        for (name, active) in [(UIApplication.didBecomeActiveNotification, true), (UIApplication.didEnterBackgroundNotification, false)] {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in self?.setForeground(active) }
+        }
         guard WCSession.isSupported() else {
             onWatchState(false)  // no Watch can pair with this device
             return
@@ -84,14 +88,39 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
         engine.acceptWatchReport(context[WatchWire.report] as? Data)
     }
 
-    /// The Watch asks who its iPhone is (it has no binding yet).
+    /// Whether the app is in the foreground, for the relay's log lines (memo checks D1/D2).
+    private let stateLock = NSLock()
+    private var foreground = false
+    private func setForeground(_ value: Bool) { stateLock.withLock { foreground = value } }
+    private var appState: String { stateLock.withLock { foreground ? "fg" : "bg" } }
+
+    /// A message with a reply: the Watch's sync ping while it records (receipts for the parts it asks about),
+    /// or its question who its iPhone is (it has no binding yet).
     func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
-        replyHandler(engine.settings.phoneInstallId.map { [WatchWire.binding: $0] } ?? [:])
+        guard let phone = engine.settings.phoneInstallId else { return replyHandler([:]) }
+        if message[WatchWire.kind] as? String == WatchWire.sync {
+            let items = WatchWire.inventoryItems(from: message[WatchWire.inventoryItems])
+            do {
+                let held = Set(try engine.answerWatchInventory(items, binding: message[WatchWire.binding] as? String).acks)
+                let receipts = items.filter { held.contains($0.id) }
+                OmiLog.shared.log(.info, "watch", "sync ping: \(items.count) asked, \(receipts.count) held app=\(appState)")
+                // receipts only: no question id, so nothing here makes the Watch send anything again
+                replyHandler([WatchWire.binding: phone, WatchWire.inventoryAcks: WatchWire.inventoryItems(receipts)])
+            } catch {
+                OmiLog.shared.log(.warning, "watch", "sync ping not answered: \(error.localizedDescription)")
+                replyHandler([WatchWire.binding: phone])
+            }
+            return
+        }
+        replyHandler([WatchWire.binding: phone])
         announce(session)
     }
 
     func session(_ session: WCSession, didReceive file: WCSessionFile) {
-        OmiLog.shared.log(.info, "watch", "received a file from the Watch (\(file.metadata?[WatchWire.kind] as? String ?? "?"))")
+        let segment = WatchWire.decode(WatchSegment.self, file.metadata?[WatchWire.manifest] as? Data)
+        // how long after its recording the part arrived (Watch clock), and whether this app was in front
+        let age = segment.map { " \($0.id) age=\(Int(Date().timeIntervalSince($0.recordingStartedAt) - Double($0.endOffsetUs) / 1_000_000))s" } ?? ""
+        OmiLog.shared.log(.info, "watch", "received a file from the Watch (\(file.metadata?[WatchWire.kind] as? String ?? "?"))\(age) app=\(appState)")
         guard file.metadata?[WatchWire.kind] as? String == WatchWire.segment else { return }
         do {
             let receipt = try engine.acceptWatchSegmentReceipt(file: file.fileURL, manifest: file.metadata?[WatchWire.manifest] as? Data)

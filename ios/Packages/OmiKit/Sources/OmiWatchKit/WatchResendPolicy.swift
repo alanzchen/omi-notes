@@ -51,6 +51,10 @@ public struct WatchResendPolicy: Codable, Equatable, Sendable {
     public private(set) var pendingInventory: PendingInventory?
     /// The next attempt number (only ever grows, saved).
     public private(set) var nextAttempt: Int?
+    /// Parts an inventory answer called missing: re-checks of audio an older iPhone build already converted
+    /// (it kept no checksum receipt), almost always on the server already. They go after new audio
+    /// (`sendOrder`) and are reported apart (absent in older saved state).
+    public private(set) var recheck: Set<String>?
 
     public init() {}
 
@@ -83,11 +87,23 @@ public struct WatchResendPolicy: Codable, Equatable, Sendable {
 
     public mutating func acknowledged(_ ids: [String]) {
         for id in ids { entries[id] = nil }
+        if recheck != nil { recheck?.subtract(ids) }
     }
 
     /// Drops entries for items no longer waiting (acknowledged before this state was saved).
     public mutating func keep(only ids: Set<String>) {
         entries = entries.filter { ids.contains($0.key) }
+        if recheck != nil { recheck?.formIntersection(ids) }
+    }
+
+    /// Whether `id` is a re-check (see `recheck`).
+    public func isRecheck(_ id: String) -> Bool { recheck?.contains(id) ?? false }
+
+    public var recheckCount: Int { recheck?.count ?? 0 }
+
+    /// New audio first (never handed over, or resent after a failure), re-checks after it; stable within each.
+    public func sendOrder<T>(_ items: [T], id: (T) -> String) -> [T] {
+        items.filter { !isRecheck(id($0)) } + items.filter { isRecheck(id($0)) }
     }
 
     public var awaitingAck: Int { entries.values.filter(\.delivered).count }
@@ -128,6 +144,7 @@ public struct WatchResendPolicy: Codable, Equatable, Sendable {
             entries[item] = nil
             due.append(item)
         }
+        if !due.isEmpty { recheck = (recheck ?? []).union(due) }
         return due
     }
 }

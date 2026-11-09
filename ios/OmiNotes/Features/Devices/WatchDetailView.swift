@@ -158,13 +158,16 @@ struct WatchDetailView: View {
 
     @ViewBuilder private func places(_ f: Flow, _ now: Date) -> some View {
         place("applewatch", "On the Watch", f.report.map { r in
-            // the recorded length (from the Watch's own parts), never a count of parts
+            // the recorded length (from the Watch's own parts), never a count of parts; re-checks of parts
+            // an older iPhone build converted are not "not on this iPhone"
+            let waiting = max(0, r.waitingParts - r.recheckParts), seconds = r.waitingSeconds.map { max(0, $0 - r.recheckSeconds) }
             let parts = r.keptParts > 0 ? "\(r.keptParts) part\(r.keptParts == 1 ? "" : "s") kept on the Watch, can't be sent"
-                : r.waitingParts == 0 ? "Everything sent to this iPhone"
-                : (r.waitingSeconds ?? 0) > 0 ? "\(WaitingAudio.text(r.waitingSeconds!).capitalizedFirst) of audio not on this iPhone yet"
+                : waiting == 0 && r.recheckParts > 0 ? "Everything sent; re-checking \(r.recheckParts) older part\(r.recheckParts == 1 ? "" : "s")"
+                : waiting == 0 ? "Everything sent to this iPhone"
+                : (seconds ?? 0) > 0 ? "\(WaitingAudio.text(seconds!).capitalizedFirst) of audio not on this iPhone yet"
                 : "Some audio not on this iPhone yet"
             // waiting, and nothing has arrived for a while: what helps
-            let stuck = r.waitingParts > 0 && (f.lastReceivedAt.map { now.timeIntervalSince($0) > 15 * 60 } ?? true)
+            let stuck = waiting > 0 && (f.lastReceivedAt.map { now.timeIntervalSince($0) > 15 * 60 } ?? true)
             return "\(parts) · reported \(SystemHealth.relative(r.at, now))" + (stuck ? ". They move when both are nearby with Omi Notes open." : "")
         } ?? "Unknown until the Watch app reports")
         Divider().padding(.leading, 50)

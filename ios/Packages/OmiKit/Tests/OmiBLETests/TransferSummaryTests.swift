@@ -64,6 +64,18 @@ import OmiWatchKit
         #expect(!w.reportFresh, "a report from the future isn't current either")
     }
 
+    @Test func reCheckedPartsAreNotCountedAsOnTheWatch() {
+        var snap = snapshot()
+        snap.watchReport = WatchReport(state: .recording, since: nil, waitingParts: 10, waitingSeconds: 600, at: now.addingTimeInterval(-60),
+                                       stats: ["recheck_parts": 7, "recheck_s": 420])
+        let w = TransferSummary.evaluate(snapshot: snap, server: reachable(), status: nil, statusAt: nil, watchInstalled: true, nowMono: s, now: now).watch
+        #expect(w.recheckParts == 7 && w.recheckSeconds == 420)
+        #expect(w.newParts == 3 && w.newSeconds == 180)
+        snap.watchReport = WatchReport(state: .idle, since: nil, waitingParts: 2, waitingSeconds: 60, at: now)
+        let old = TransferSummary.evaluate(snapshot: snap, server: reachable(), status: nil, statusAt: nil, watchInstalled: true, nowMono: s, now: now).watch
+        #expect(old.recheckParts == 0 && old.newParts == 2, "an older Watch app reports no re-checks")
+    }
+
     // UX-LT-ASTRA-05/07 (astra-review/EngineHarness.swift)
 
     @Test func retainedWorkIsNeverAllSent() {

@@ -62,6 +62,10 @@ struct OmiNotesWatchApp: App {
                 recorder.noteOpened()
             }
         }
+        // a system wake for WatchConnectivity: receive everything pending and send before it ends
+        .backgroundTask(.watchConnectivity) {
+            await sync.backgroundWake()
+        }
     }
 }
 
