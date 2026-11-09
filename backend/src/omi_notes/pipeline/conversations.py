@@ -756,6 +756,8 @@ class ConversationPipeline:
         transcript and its voices stage) are moved before anything uses their names."""
         segments = transcript.get("segments") or []
         sha = sha256_hex(canonical_json(segments).encode())
+        if self.speakers.current_transcript_sha(conv_id) != sha:
+            return  # a superseded copy (transcript.json is published outside the speaker lock): never moved back to it
         if self.speakers.labels_to_move(conv_id, transcript):
             self.identify(conv_id, None, transcript.get("audio_sha"), {}, sha, {s["speaker"] for s in segments},
                           consistent=transcript.get("speaker_labels_consistent", True),

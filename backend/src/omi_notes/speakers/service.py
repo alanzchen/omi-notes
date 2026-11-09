@@ -149,11 +149,14 @@ class SpeakerService:
         self._conversation(conv_id)
         transcript = self._transcript(conv_id)
         # the recovery a change runs first, when there is any (checked without waiting for the lock), so the
-        # revision shown is the one a change will meet
+        # revision shown is the one a change will meet; decided again under the lock on the transcript then
+        # current (a reprocess may have published a newer one meanwhile), never on the copy read before
         if self.store.labels_to_move(conv_id, transcript):
             with self.store.lock:
-                self.store.sync_conversation(conv_id)
-                self.pipeline.move_labels(conv_id, transcript)
+                transcript = self._transcript(conv_id)
+                if self.store.labels_to_move(conv_id, transcript):
+                    self.store.sync_conversation(conv_id)
+                    self.pipeline.move_labels(conv_id, transcript)
         row = self._conversation(conv_id)
         return {
             "revision": row["speakers_revision"],

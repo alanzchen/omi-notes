@@ -957,3 +957,27 @@ def test_a_stored_voice_that_skipped_a_too_short_fragment_still_describes_its_tr
 
     assert same_clips([[760.95, 770.95], [751.34, 758.95]], [[760.95, 770.95], [784.12, 784.25], [751.34, 758.95]])
     assert not same_clips([[0.25, 9.75]], [[0.25, 5.75]])
+
+
+def test_moving_labels_with_a_superseded_transcript_changes_nothing(client, worker):
+    # Astra IT4-01: GET read transcript T1, waited for the lock, and repaired with T1 after T2 was published
+    # and named: speakers.json went back to T1's hash, the name was lost and T2's voices file was deleted
+    from .test_speaker_learning import FakeEmbedder, name_label, new_person
+
+    worker.providers._local_stt, _ = sidecar(all_unknown)
+    worker.providers._diarizer = TurnsDiarizer([(0.0, 9.0, 0)])
+    worker.providers._embedder = FakeEmbedder()
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    person = new_person(client, "Wearer", me=True)
+    assert name_label(client, row["id"], "S1", person).status_code == 200
+    directory = worker.pipeline.conv_dir(row["id"])
+    current = json.loads((directory / "transcript.json").read_text())
+    store = worker.pipeline.speakers
+    before = (store.labels_transcript(row["id"]), store.voices_file(row["id"]), (directory / "speakers.json").read_bytes())
+    stale = dict(current, segments=[dict(s, text=s["text"] + " (earlier)") for s in current["segments"]])
+    with store.lock:
+        worker.pipeline.move_labels(row["id"], stale)
+    assert (store.labels_transcript(row["id"]), store.voices_file(row["id"]), (directory / "speakers.json").read_bytes()) == before
+    assert store.labels(row["id"])["S1"]["person_id"] == person
