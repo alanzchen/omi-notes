@@ -141,6 +141,18 @@ public final class AppModel {
                               watchAppInstalled: watchAppInstalled)
     }
 
+    /// The Server page's service rows as of now: the last answer's names, with a health only while that
+    /// answer is current (a failed latest request or an old answer makes it last-known). nil before any answer.
+    public func serviceLabels(now: Date = Date()) -> (transcription: ServiceLabel, summaries: ServiceLabel)? {
+        guard let serverStatus else { return nil }
+        let failed: Bool
+        switch server {
+        case .unreachable, .unauthorized, .notConfigured: failed = true
+        case .unknown, .checking, .reachable: failed = false
+        }
+        return serverStatus.serviceLabels(answeredAt: serverStatusAt, latestRequestFailed: failed, now: now)
+    }
+
     // MARK: Server
 
     /// Forgets everything a previous server said (another server, or none), people included.

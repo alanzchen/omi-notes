@@ -159,8 +159,13 @@ struct ServerView: View {
     private func configurationSection(_ st: ServerStatus) -> some View {
         let stt = st.transcriptionLabel, llm = st.summariesLabel
         return Section {
-            ServiceRow(title: "Transcription", label: stt)
-            ServiceRow(title: "Summaries", label: llm)
+            // the dots are only as current as the last answer: re-evaluated as it ages, without a new one
+            TimelineView(.periodic(from: .now, by: 30)) { context in
+                ServiceRow(title: "Transcription", label: model.serviceLabels(now: context.date)?.transcription ?? stt)
+            }
+            TimelineView(.periodic(from: .now, by: 30)) { context in
+                ServiceRow(title: "Summaries", label: model.serviceLabels(now: context.date)?.summaries ?? llm)
+            }
             if let dir = st.notesDir { LabeledContent("Notes folder", value: dir).font(.footnote).lineLimit(1).truncationMode(.head) }
             LabeledContent("Server version", value: st.serverVersion ?? "—")
             if let started = st.serverStartedAt.flatMap(ISO8601UTC.parse) {
@@ -176,7 +181,7 @@ struct ServerView: View {
         } header: {
             Text("Configuration")
         } footer: {
-            Text("Set on the server, which decides where your audio and transcripts go. A green dot means configured or answering, not that a transcript worked.")
+            Text("Set on the server, which decides where your audio and transcripts go. A green dot means configured or answering, not that a transcript worked; grey means the server hasn't answered recently.")
         }
     }
 
