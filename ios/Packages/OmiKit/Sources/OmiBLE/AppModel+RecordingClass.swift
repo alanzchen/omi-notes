@@ -15,13 +15,6 @@ extension AppModel {
         recent.first { $0.id == c.id }?.recordingClass ?? details[c.id]?.entry.recordingClass ?? c.recordingClass
     }
 
-    /// Whether the cached note was made for a different treatment than the server now reports (a rewrite for
-    /// the owner's choice finished): its summary is stale and must be loaded again.
-    public func detailNeedsReload(_ id: String) -> Bool {
-        guard let shown = details[id]?.entry.recordingClass, let row = recent.first(where: { $0.id == id }) else { return false }
-        return !shown.sameTreatment(as: row.recordingClass)
-    }
-
     public func setRecordingClass(_ conversationId: String, _ kind: String) async {
         let config = engine.settings.serverConfig()
         guard let endpoint = config.endpoint, supportsRecordingClass else { return }

@@ -56,7 +56,13 @@ extension AppModel {
         await request(conversationId: conversationId, kind: "keep")
     }
 
-    private func request(conversationId: String, kind: String?) async {
+    /// Transcribe a deferred short session now. Durable and idempotent like a retry: the request id is saved before
+    /// sending, and the server shares one request per conversation (another tap, or the idle lane already on it).
+    public func transcribe(conversationId: String) async {
+        await request(conversationId: conversationId, kind: "transcribe")
+    }
+
+    func request(conversationId: String, kind: String?) async {
         let config = engine.settings.serverConfig()
         guard let endpoint = config.endpoint, config == answeredForConfig, let key = retryServerKey else { return }
         let entry: RetryStore.Entry
@@ -97,9 +103,11 @@ extension AppModel {
         func current() -> Bool { isCurrent(config) && data == dataEpoch }
         guard current() else { return }  // never send a retry meant for a previous server or vault
         do {
-            let op = entry.kind == "keep"
-                ? try await api.keep(conversationId: entry.conversationId, requestId: entry.requestId)
-                : try await api.retry(conversationId: entry.conversationId, requestId: entry.requestId)
+            let op = switch entry.kind {
+            case "keep": try await api.keep(conversationId: entry.conversationId, requestId: entry.requestId)
+            case "transcribe": try await api.transcribe(conversationId: entry.conversationId, requestId: entry.requestId)
+            default: try await api.retry(conversationId: entry.conversationId, requestId: entry.requestId)
+            }
             guard current() else { return }
             retryStore.record(op, for: entry.requestId)
             retries[entry.conversationId] = op
@@ -115,7 +123,7 @@ extension AppModel {
         } catch {
             // No answer, or the server failed: keep the id and ask again on the next refresh.
             guard current() else { return }
-            let what = entry.kind == "keep" ? "request" : "retry"
+            let what = entry.kind == nil ? "retry" : "request"
             retryMessages[entry.conversationId] = "Couldn't confirm the \(what) yet (\(Self.describe(error))). The app asks again automatically."
         }
     }
@@ -167,6 +175,8 @@ extension AppModel {
         case "note_conflict": return "The note was edited outside My Notes. Resolve that on the server first."
         case "busy": return "The server is working on this conversation right now. Try again in a moment."
         case "not_keepable": return "This one can't be kept as it is; it needs a fix on the server."
+        case "failed": return "Processing failed; retry it instead."
+        case "in_progress": return "It's still being recorded."
         default: return "The server refused the retry (\(detail))."
         }
     }

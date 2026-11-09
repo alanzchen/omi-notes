@@ -54,6 +54,15 @@ struct ConversationDetailView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
             }
+            if entry.deferred?.isWaiting == true, model.canTranscribeDeferred, model.retries[summary.id] == nil {
+                Section {
+                    Button { Task { await model.transcribe(conversationId: summary.id) } } label: {
+                        Label("转写", systemImage: "text.bubble")
+                    }
+                } footer: {
+                    Text("不到一分钟的语音，空闲时才转写。")
+                }
+            }
             if let saved = model.detailSavedAt[summary.id] {
                 Section {
                     Label("Saved copy from \(Fmt.relative(saved)). The server can't be reached right now.", systemImage: "tray.full")
@@ -128,8 +137,9 @@ struct ConversationDetailView: View {
         }
         .refreshable { await load() }
         // a retry or keep that finished changed the note: show the new state, not "Failed"
-        // a list refresh learned that the server rewrote this note for the owner's choice: load the new summary
-        .onChange(of: model.recordingClass(of: entry)) { _, _ in
+        // a list refresh learned that the server wrote a new version of this note (another revision, a deferred
+        // session transcribed, a rewrite for the owner's kind): load it, even when its kind didn't change
+        .onChange(of: model.artifactKey(summary.id)) { _, _ in
             if model.detailNeedsReload(summary.id) { Task { await load() } }
         }
         .onChange(of: model.retries[summary.id]?.state) { _, state in

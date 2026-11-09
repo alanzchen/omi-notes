@@ -149,7 +149,18 @@ enum RecordingClassStyle {
         case "dialogue": "Conversation"
         case "passive": "Background"
         case "auto": "Automatic"
+        case "undetermined": "未确定"
         default: "Not known yet"
+        }
+    }
+
+    /// The short-session fold's group names.
+    static func shortName(_ kind: String?) -> String {
+        switch kind {
+        case "monologue": "我"
+        case "dialogue": "对话"
+        case "passive": "背景"
+        default: "未确定"
         }
     }
 
@@ -157,6 +168,7 @@ enum RecordingClassStyle {
         switch kind {
         case "monologue": "person.wave.2"
         case "passive": "speaker.wave.2"
+        case "undetermined": "questionmark"
         default: "person.2"
         }
     }
@@ -170,7 +182,11 @@ struct RecordingClassBadge: View {
     var body: some View {
         if let view {
             HStack(spacing: 6) {
-                if view.kind == "monologue" || view.kind == "passive" {
+                if view.isUndetermined {
+                    Text("未确定").font(.caption2.weight(.medium)).foregroundStyle(.secondary)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color(.tertiarySystemFill), in: .capsule)
+                } else if view.kind == "monologue" || view.kind == "passive" {
                     Label(RecordingClassView.title(view.kind) ?? "", systemImage: RecordingClassStyle.icon(view.kind))
                         .font(.caption2.weight(.medium)).foregroundStyle(.secondary)
                         .padding(.horizontal, 6).padding(.vertical, 2)
@@ -290,19 +306,122 @@ struct LessUsefulGroup: View {
     }
 }
 
-/// A day's short (under 30 s) and skipped recordings, folded into one row; they open to the same rows.
+/// A day's short sessions (under a minute of speech), folded into one "短片段" row whatever the filter. Its counts are
+/// the server's for the whole day, so a short failure or a requested transcription shows even before its page is
+/// loaded. Opened, it lists the day's short sessions by kind; a deferred one offers 转写.
 struct ShortClipsGroup: View {
     let model: AppModel
+    let day: String
     let rows: [ConversationSummary]
     @State private var open = false
 
+    private var shown: [ConversationSummary] { model.shortDayRows[day] ?? rows }
+    private var totals: ShortDay { HomeDay.totals(shown, server: model.shortDays[day]) }
+
     var body: some View {
         DisclosureGroup(isExpanded: $open) {
-            ForEach(rows) { c in ConversationLink(model: model, conversation: c) }
+            let groups = HomeDay.byKind(shown)
+            ForEach(groups, id: \.kind) { group in
+                if groups.count > 1 { ShortKindHeader(kind: group.kind, count: group.rows.count) }
+                ForEach(group.rows) { c in ShortClipRow(model: model, conversation: c) }
+            }
         } label: {
-            Label("Short clips (\(rows.count))", systemImage: "waveform.path")
-                .font(.subheadline).foregroundStyle(.secondary)
+            ShortClipsLabel(totals: totals)
         }
+        .onChange(of: open) { _, isOpen in
+            if isOpen { Task { await model.loadShortSessions(day: day) } }
+        }
+    }
+}
+
+/// "短片段  12" with two quiet markers: transcriptions asked for and still running, and anything that needs a look.
+struct ShortClipsLabel: View {
+    let totals: ShortDay
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "waveform").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+                .frame(width: 28, height: 28).background(Color(.tertiarySystemFill), in: .circle)
+            Text("短片段").font(.subheadline.weight(.medium))
+            Text("\(totals.short)").font(.subheadline.monospacedDigit()).foregroundStyle(.secondary)
+            Spacer(minLength: 4)
+            if totals.requested > 0 {
+                Label("\(totals.requested)", systemImage: "clock").labelStyle(.titleAndIcon)
+                    .font(.caption.monospacedDigit()).foregroundStyle(.blue)
+                    .accessibilityLabel("\(totals.requested) 转写中")
+            }
+            if totals.issues > 0 {
+                Label("\(totals.issues)", systemImage: "exclamationmark.circle.fill").labelStyle(.titleAndIcon)
+                    .font(.caption.monospacedDigit()).foregroundStyle(.orange)
+                    .accessibilityLabel("\(totals.issues) 需要查看")
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+struct ShortKindHeader: View {
+    let kind: String
+    let count: Int
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: RecordingClassStyle.icon(kind)).font(.caption2)
+            Text(RecordingClassStyle.shortName(kind)).font(.caption.weight(.semibold))
+            Text("\(count)").font(.caption.monospacedDigit())
+        }
+        .foregroundStyle(.secondary)
+        .padding(.top, 4)
+        .accessibilityAddTraits(.isHeader)
+    }
+}
+
+/// One short session: its time and seconds of speech, its title once it has a note, and 转写 while it waits.
+struct ShortClipRow: View {
+    let model: AppModel
+    let conversation: ConversationSummary
+
+    private var c: ConversationSummary { conversation }
+    private var asked: Bool {
+        c.deferred?.isRequested == true || (model.retries[c.id].map { $0.kind == "transcribe" && !$0.isFinished } ?? false)
+    }
+
+    var body: some View {
+        if c.deferred == nil, model.serverStatus?.supportsConversationDetail == true || model.details[c.id] != nil {
+            NavigationLink { ConversationDetailView(model: model, summary: c) } label: { line }
+        } else {
+            line
+        }
+    }
+
+    private var line: some View {
+        HStack(spacing: 10) {
+            Text(Fmt.time(c.startedDate)).font(.subheadline.monospacedDigit())
+            Text(seconds).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            if let title = c.title {
+                Text(title).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            if c.displayState.code == "failed" || !(c.issues ?? []).isEmpty {
+                Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange).accessibilityLabel("需要查看")
+            }
+            if asked {
+                ProgressView().controlSize(.small).accessibilityLabel("转写中")
+            } else if c.deferred?.isWaiting == true, model.canTranscribeDeferred {
+                Button { Task { await model.transcribe(conversationId: c.id) } } label: {
+                    Text("转写").font(.caption.weight(.semibold)).padding(.horizontal, 10).padding(.vertical, 4)
+                        .background(Color.accentColor.opacity(0.14), in: .capsule)
+                }
+                .buttonStyle(.borderless)
+            }
+        }
+        .padding(.vertical, 1)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var seconds: String {
+        guard let s = c.speechS ?? c.durationS else { return "" }
+        return "\(Int(s.rounded())) s"
     }
 }
 

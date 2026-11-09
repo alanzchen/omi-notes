@@ -812,9 +812,13 @@ public struct APIClient: Sendable {
     public func status() async throws -> ServerStatus { try await get("/v1/status") }
 
     /// One page, newest first; pass the returned cursor as `before` for the next one.
-    public func recentConversations(limit: Int = 20, before: String? = nil) async throws -> RecentConversationsResponse {
+    /// `day` (the server's YYYY-MM-DD) and `short` (under the short-session threshold, or at least it) filter before paging.
+    public func recentConversations(limit: Int = 20, before: String? = nil, day: String? = nil,
+                                    short: Bool? = nil) async throws -> RecentConversationsResponse {
         var query = "limit=\(limit)"
         if let before { query += "&before=\(Self.queryValue(before))" }
+        if let day { query += "&day=\(Self.queryValue(day))" }
+        if let short { query += "&short=\(short)" }
         return try await get("/v1/conversations/recent", query: query)
     }
 
@@ -838,6 +842,13 @@ public struct APIClient: Sendable {
     public func keep(conversationId: String, requestId: String) async throws -> RetryOperation {
         let body = try JSONSerialization.data(withJSONObject: ["request_id": requestId])
         let r: RetryOperationResponse = try await send("POST", "/v1/conversations/\(Self.queryValue(conversationId))/keep", body: body)
+        return r.operation
+    }
+
+    /// Transcribe a deferred short session now; answered like `retry` (a second tap shares the first request).
+    public func transcribe(conversationId: String, requestId: String) async throws -> RetryOperation {
+        let body = try JSONSerialization.data(withJSONObject: ["request_id": requestId])
+        let r: RetryOperationResponse = try await send("POST", "/v1/conversations/\(Self.queryValue(conversationId))/transcribe", body: body)
         return r.operation
     }
 

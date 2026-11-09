@@ -13,8 +13,8 @@ struct HomeView: View {
     @State private var debugOpened: ConversationSummary?
     @State private var query = HomeView.debugSearch
     @State private var naming: ConversationSpeakersView.NamingRun?
-    /// The recording kind the list shows (nil: all), over the rows already loaded.
-    @State private var kindFilter: String?
+    /// The kind the main list shows: conversations by default (with anything not yet known).
+    @State private var kindFilter: HomeFilter = .talk
 
     /// Simulator automation only (debug builds): `-OmiNotesDebugOpenConversation YES` opens the
     /// newest conversation once it has loaded (a headless simulator can't tap).
@@ -101,11 +101,18 @@ struct HomeView: View {
 
     private var days: [(day: String, rows: [ConversationSummary])] {
         var out: [(String, [ConversationSummary])] = []
-        for c in model.recent where kindFilter == nil || c.recordingClass?.kind == kindFilter {
+        for c in model.recent {
             let day = c.startedDate.map(Fmt.day) ?? "Earlier"
             if out.last?.0 == day { out[out.count - 1].1.append(c) } else { out.append((day, [c])) }
         }
         return out
+    }
+
+    /// One day as Home shows it: the filter applies to the main list only (on servers with recording classes).
+    private func homeDay(_ rows: [ConversationSummary]) -> HomeDay {
+        HomeDay(rows, filter: model.supportsRecordingClass ? kindFilter : nil, shortSeconds: model.shortSeconds) {
+            model.priorityState(of: $0).state
+        }
     }
 
     @ViewBuilder private var conversationSections: some View {
@@ -127,20 +134,20 @@ struct HomeView: View {
         } else {
             if model.supportsRecordingClass {
                 Section {
-                    RecordingClassChips(selection: $kindFilter)
-                } footer: {
-                    if kindFilter != nil, days.isEmpty {
-                        Text("None of the loaded conversations is of this kind. Show older conversations to look further back.")
-                    }
+                    HomeFilterPicker(selection: $kindFilter)
                 }
             }
             ForEach(days, id: \.day) { group in
-                Section(group.day) {
-                    // short or skipped clips and the owner's "less useful" fold into collapsed groups
-                    let day = HomeDay(group.rows) { model.priorityState(of: $0).state }
-                    ForEach(day.rows) { c in ConversationLink(model: model, conversation: c) }
-                    if !day.shortClips.isEmpty { ShortClipsGroup(model: model, rows: day.shortClips) }
-                    if !day.lessUseful.isEmpty { LessUsefulGroup(model: model, rows: day.lessUseful) }
+                let day = homeDay(group.rows)
+                if !day.rows.isEmpty || !day.shortClips.isEmpty || !day.lessUseful.isEmpty {
+                    Section(group.day) {
+                        ForEach(day.rows) { c in ConversationLink(model: model, conversation: c) }
+                        // short sessions (under a minute of speech) and the owner's "less useful" fold into rows
+                        if !day.shortClips.isEmpty {
+                            ShortClipsGroup(model: model, day: model.day(of: day.shortClips[0]), rows: day.shortClips)
+                        }
+                        if !day.lessUseful.isEmpty { LessUsefulGroup(model: model, rows: day.lessUseful) }
+                    }
                 }
             }
             Section {
@@ -169,30 +176,20 @@ struct HomeView: View {
     }
 }
 
-/// All / Talks / Me / Background: filters the loaded rows by the kind their notes were made for.
-struct RecordingClassChips: View {
-    @Binding var selection: String?
-
-    private static let options: [(title: String, kind: String?)] =
-        [("All", nil), ("Talks", "dialogue"), ("Me", "monologue"), ("Background", "passive")]
+/// 对话 / 我 / 背景: the main list's kind. 对话 also holds anything not yet known (未确定, or a kind this app doesn't
+/// know), so nothing falls out of the default view.
+struct HomeFilterPicker: View {
+    @Binding var selection: HomeFilter
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(Self.options, id: \.title) { option in
-                    let on = selection == option.kind
-                    Button { selection = option.kind } label: {
-                        Text(option.title).font(.subheadline.weight(on ? .semibold : .regular))
-                            .padding(.horizontal, 12).padding(.vertical, 6)
-                            .foregroundStyle(on ? Color.white : Color.primary)
-                            .background(on ? Color.accentColor : Color(.tertiarySystemFill), in: .capsule)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityAddTraits(on ? .isSelected : [])
-                }
-            }
+        Picker("Kind", selection: $selection) {
+            Text("对话").tag(HomeFilter.talk).accessibilityLabel("对话（含未确定）")
+            Text("我").tag(HomeFilter.me).accessibilityLabel("我（独白·听写）")
+            Text("背景").tag(HomeFilter.background)
         }
-        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+        .pickerStyle(.segmented)
+        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+        .listRowBackground(Color.clear)
     }
 }
 

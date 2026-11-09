@@ -345,6 +345,8 @@ def summary_row(pipeline, row: sqlite3.Row) -> dict:
         "preview": (overview[:PREVIEW_CHARS].rstrip() + ("…" if len(overview) > PREVIEW_CHARS else "")) or None,
         "speaker_names": sorted(set(names.values())),
         "note_path": row["note_path"],
+        # the note's revision (bumped whenever its content changes): the phone reloads a cached detail when it moves
+        "revision": row["revision"] if row["note_path"] else None,
         "late_audio": bool(row["late_audio"]),
         "provisional": bool(row["provisional"]),
         # nothing to review when no speaker was separated

@@ -124,6 +124,8 @@ def test_the_idle_lane_transcribes_a_deferred_session_when_nothing_else_is_runna
     assert record(worker, row["id"])["deferral"]["policy"] == "short_speech", "kept as history"
     assert not list((settings.vault_dir / "_in-progress").glob("*.md"))
     assert listed(client)[0]["deferred"] is None and listed(client)[0]["state"]["code"] == "ready"
+    detail = client.get(f"/v1/conversations/{row['id']}", headers=AUTH).json()
+    assert listed(client)[0]["revision"] == detail["revision"] == row["revision"] >= 1
 
 
 def test_long_sessions_enrollment_and_too_short_ones_are_never_deferred(client, worker, monkeypatch):

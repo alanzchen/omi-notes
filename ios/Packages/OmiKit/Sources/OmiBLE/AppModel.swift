@@ -43,6 +43,12 @@ public final class AppModel {
     public private(set) var recentLoadedAt: Date?
     /// Cursor for the next older page; nil when everything is loaded.
     public internal(set) var recentCursor: String?
+    /// Each loaded day's short sessions, counted by the server over the whole day (whatever is loaded or filtered).
+    public internal(set) var shortDays: [String: ShortDay] = [:]
+    /// Detected speech below which a session is short (the server's, else 60 s).
+    public internal(set) var shortSeconds: Double = 60
+    /// A day's short sessions as the server lists them (loaded when the folded row opens), by day.
+    public internal(set) var shortDayRows: [String: [ConversationSummary]] = [:]
     public private(set) var loadingMore = false
     /// Conversations opened this session, shown (marked stale) when the server can't be reached.
     public internal(set) var details: [String: ConversationDetail] = [:]
@@ -169,6 +175,8 @@ public final class AppModel {
         issues = []
         recent = []
         recentCursor = nil
+        shortDays = [:]
+        shortDayRows = [:]
         recentError = nil
         recentLoadedAt = nil
         details = [:]
@@ -298,6 +306,7 @@ public final class AppModel {
     /// Refreshing page one keeps older pages already loaded: rows newer than the page's last one
     /// come from the page; older rows stay (with their cursor) unless the page is the whole list.
     func mergeFirstPage(_ page: RecentConversationsResponse) {
+        noteShortDays(page)
         guard page.nextCursor != nil, let last = page.conversations.last, recent.count > page.conversations.count else {
             recent = page.conversations
             recentCursor = page.nextCursor
@@ -323,6 +332,7 @@ public final class AppModel {
             let ids = Set(recent.map(\.id))
             recent += page.conversations.filter { !ids.contains($0.id) }
             recentCursor = page.nextCursor
+            noteShortDays(page)
             recentError = nil
         } catch {
             if isCurrent(config) { recentError = Self.describe(error) }

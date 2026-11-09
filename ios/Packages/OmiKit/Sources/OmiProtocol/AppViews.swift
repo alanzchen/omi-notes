@@ -274,7 +274,7 @@ public struct RetryOperation: Codable, Equatable, Sendable, Identifiable {
     public var displayMessage: String {
         switch state {
         case "accepted", "queued": return "Queued on the server"
-        case "running": return kind == "keep" ? "Keeping it now" : "Retrying now"
+        case "running": return kind == "keep" ? "Keeping it now" : kind == "transcribe" ? "Transcribing now" : "Retrying now"
         default: return message ?? state
         }
     }

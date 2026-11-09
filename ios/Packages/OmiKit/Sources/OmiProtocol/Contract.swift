@@ -443,6 +443,8 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
     /// Value assessments, highlights and the owner's priority choice.
     public var supportsValueNotes: Bool { features?.contains("value_notes") == true }
     public var supportsRecordingClass: Bool { features?.contains("recording_class") == true }
+    /// Short sessions are deferred and `POST /v1/conversations/{id}/transcribe` asks for one now.
+    public var supportsDeferredTranscription: Bool { features?.contains("deferred_transcription") == true }
     public var supportsSearch: Bool { features?.contains("search") == true }
     /// Accepts the phone's diagnostic log tail (`PUT /v1/diagnostics/phone-log`).
     public var supportsPhoneLog: Bool { features?.contains("phone_log") == true }
@@ -492,12 +494,15 @@ public struct RecordingClassView: Codable, Equatable, Hashable, Sendable {
     public var choiceUnreadable: String?
     /// The new summary for `requested` couldn't be written; the note stays as it was and the server tries again later.
     public var updateFailed: String?
+    /// No summary yet: a deferred session's provisional kind (`undetermined` without evidence, or the owner's choice).
+    public var provisional: Bool?
 
     enum CodingKeys: String, CodingKey {
         case kind = "class", auto, confidence, overridden, updating, requested
         case wearerShare = "wearer_share"
         case choiceUnreadable = "choice_unreadable"
         case updateFailed = "update_failed"
+        case provisional
     }
 
     public init(kind: String?, auto: String? = nil, confidence: String? = nil, overridden: Bool? = nil,
@@ -509,6 +514,8 @@ public struct RecordingClassView: Codable, Equatable, Hashable, Sendable {
     }
 
     public var isUpdating: Bool { updating == true }
+    /// Nobody can tell yet (a deferred short session without a classifier's verdict).
+    public var isUndetermined: Bool { kind == "undetermined" }
 
     /// Whether a note made for `self` still shows what `newer` describes: the same kind, and no rewrite finished
     /// in between (a pending choice that is no longer pending means the server wrote a new summary).
@@ -547,8 +554,17 @@ public struct ConversationSummary: Codable, Equatable, Hashable, Sendable, Ident
     public var speakersReady: Bool?
     /// What the summary says it's worth, and the owner's own choice (servers with `value_notes`).
     public var value: ConversationValue?
-    /// What kind of recording it is (servers with `recording_class`); nil until summarized.
+    /// What kind of recording it is (servers with `recording_class`); nil until summarized, or provisional
+    /// (`undetermined` until a transcription-free classifier exists) for a deferred short session.
     public var recordingClass: RecordingClassView?
+    /// Detected speech in seconds (`duration_s` is the elapsed span); what makes a session short.
+    public var speechS: Double?
+    /// The server's local day (YYYY-MM-DD) the conversation started on: the key of `RecentConversationsResponse.days`.
+    public var day: String?
+    /// A deferred short session still without a result (servers with `deferred_transcription`).
+    public var deferred: DeferredTranscription?
+    /// The note's revision, bumped whenever its content changes; a cached detail with another one is stale.
+    public var revision: Int?
 
     /// A placeholder until the server's answer arrives (e.g. opened from an issue).
     public init(id: String, status: String, startedAt: String? = nil, title: String? = nil) {
@@ -599,6 +615,56 @@ public struct ConversationSummary: Codable, Equatable, Hashable, Sendable, Ident
         case speakersReady = "speakers_ready"
         case value
         case recordingClass = "recording_class"
+        case speechS = "speech_s"
+        case day, deferred, revision
+    }
+
+    /// A short session (under `threshold` seconds of detected speech). Older servers don't report speech: there a
+    /// finished note under 30 s, or a skipped recording, counts (the earlier fold). Never a recording still open
+    /// (it may grow; a short one is never a sign that it ended).
+    public func isShort(threshold: Double) -> Bool {
+        if status == "open" { return false }
+        if let speechS { return speechS < threshold }
+        switch (status, displayState.code) {
+        case ("discarded", "discarded"): return true
+        case ("done", "ready"): return (durationS ?? .infinity) < 30
+        default: return false
+        }
+    }
+}
+
+/// A deferred short session: `waiting` (for an idle moment on the server, or the owner's tap) or `requested`.
+public struct DeferredTranscription: Codable, Equatable, Hashable, Sendable {
+    public var state: String
+    public var operationId: String?
+    public var thresholdS: Double?
+    public var provisionalClass: String?
+
+    public init(state: String, operationId: String? = nil, thresholdS: Double? = nil, provisionalClass: String? = nil) {
+        self.state = state; self.operationId = operationId; self.thresholdS = thresholdS; self.provisionalClass = provisionalClass
+    }
+
+    public var isWaiting: Bool { state == "waiting" }
+    public var isRequested: Bool { state == "requested" }
+
+    enum CodingKeys: String, CodingKey {
+        case state
+        case operationId = "operation_id"
+        case thresholdS = "threshold_s"
+        case provisionalClass = "provisional_class"
+    }
+}
+
+/// One day's short sessions over the whole day (not one page, not one filter): how many, how many wait deferred,
+/// how many the owner asked to transcribe, and how many need a look.
+public struct ShortDay: Codable, Equatable, Hashable, Sendable {
+    public var short: Int
+    public var deferred: Int
+    public var requested: Int
+    public var issues: Int
+
+    public init(short: Int = 0, deferred: Int = 0, requested: Int = 0, issues: Int = 0) {
+        self.short = short; self.deferred = deferred; self.requested = requested; self.issues = issues
     }
 }
 
@@ -674,10 +740,21 @@ public struct RecentConversationsResponse: Decodable, Equatable, Sendable {
     public var conversations: [ConversationSummary]
     /// nil on the last page (and from older servers, which don't paginate).
     public var nextCursor: String?
+    /// Per local day of this page's rows, that whole day's short sessions (servers with `deferred_transcription`).
+    public var days: [String: ShortDay]?
+    /// Detected speech below which a session is short (seconds).
+    public var shortS: Double?
+
+    public init(conversations: [ConversationSummary], nextCursor: String? = nil, days: [String: ShortDay]? = nil,
+                shortS: Double? = nil) {
+        self.conversations = conversations; self.nextCursor = nextCursor; self.days = days; self.shortS = shortS
+    }
 
     enum CodingKeys: String, CodingKey {
         case conversations
         case nextCursor = "next_cursor"
+        case days
+        case shortS = "short_s"
     }
 }
 
