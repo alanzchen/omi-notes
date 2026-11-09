@@ -76,8 +76,10 @@ def evaluate(samples: list[FlagInput], enrollment_centroids: dict[str, np.ndarra
     for s in samples:
         by_person.setdefault(s.person_id, []).append(s)
     for pid, items in by_person.items():
+        enrolled = (enrollment_centroids or {}).get(pid)
         if len(items) >= MIN_SAMPLES:
-            centre = robust_centroid([s.vector for s in items], [s.weight for s in items])
+            # an enrollment-only model is the reference once there is one: the rest are re-scored against it
+            centre = _unit(enrolled) if enrolled is not None else robust_centroid([s.vector for s in items], [s.weight for s in items])
             scores = [float(_unit(s.vector) @ centre) for s in items]
             med, spread = mad(scores)
             spread = max(spread, SCORE_MIN_SPREAD)
@@ -91,7 +93,6 @@ def evaluate(samples: list[FlagInput], enrollment_centroids: dict[str, np.ndarra
                 for s in known:
                     if abs(s.f0 - med) > half:
                         out[s.id].append("pitch")
-        enrolled = (enrollment_centroids or {}).get(pid)
         if enrolled is not None:
             for s in items:
                 if cosine_distance(s.vector, enrolled) >= THRESHOLD:

@@ -37,6 +37,7 @@ WEARER_CONTINUOUS_SECONDS = 10.0
 WEARER_CONTINUOUS_DISTANCE = 0.25
 WEARER_CLIP_SECONDS = 3.0
 SAMPLE_CAP = 20
+ENROLLMENT_ONLY_SECONDS = 60.0  # of enrollment speech: the centroid comes from enrollment alone
 ACTIVE_SAMPLES = 3
 ACTIVE_DAYS = 2
 CONFIRMED = ("enrollment", "user")
@@ -108,9 +109,23 @@ def confirmed(samples: list[Sample]) -> list[Sample]:
     return sorted(keep, key=lambda s: (s.created_at, s.id))[-SAMPLE_CAP:]
 
 
+def enrollment_only(samples: list[Sample]) -> list[Sample] | None:
+    """A person's enrollment samples (newest SAMPLE_CAP) once they hold ≥ 60 s of enrollment speech (pendant or
+    imported): their voice is then modelled from that clean audio alone. None below that."""
+    enrolled = [s for s in samples if s.source == "enrollment"]
+    if sum(s.seconds or 0.0 for s in enrolled) < ENROLLMENT_ONLY_SECONDS:
+        return None
+    return sorted(enrolled, key=lambda s: (s.created_at, s.id))[-SAMPLE_CAP:]
+
+
 def centroid_basis(samples: list[Sample]) -> list[Sample]:
-    """The samples people's voices are compared with in the recording-mean space: every confirmed one."""
-    return [s for s in samples if s.source in CONFIRMED]
+    """The samples people's voices are compared with in the recording-mean space: every confirmed one, or a
+    person's enrollment alone once it reaches 60 s."""
+    by_person: dict[str, list[Sample]] = {}
+    for s in samples:
+        if s.source in CONFIRMED:
+            by_person.setdefault(s.person_id, []).append(s)
+    return [s for items in by_person.values() for s in (enrollment_only(items) or items)]
 
 
 def build_models(samples: list[Sample], op: Operating = Operating(), *, wearer_id: str | None = None) -> dict[str, PersonModel]:
@@ -119,10 +134,12 @@ def build_models(samples: list[Sample], op: Operating = Operating(), *, wearer_i
         by_person.setdefault(s.person_id, []).append(s)
     models = {}
     for pid, items in by_person.items():
-        chosen = confirmed(items)
-        models[pid] = PersonModel(pid, centroid([s.vector for s in chosen]) if chosen else None, chosen,
+        chosen = confirmed(items)  # what activation judges, unchanged
+        enrolled = enrollment_only(items)
+        basis = enrolled or chosen
+        models[pid] = PersonModel(pid, centroid([s.vector for s in basis]) if basis else None, chosen,
                                   enrolled_wearer=pid == wearer_id and any(s.source == "enrollment" for s in items),
-                                  wearer=pid == wearer_id)  # fmt: skip
+                                  wearer=pid == wearer_id, enrollment_only=enrolled is not None)  # fmt: skip
     for model in models.values():
         model.active, model.why_inactive = activation(model, models, op)
     return models

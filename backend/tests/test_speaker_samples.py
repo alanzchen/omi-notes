@@ -716,6 +716,15 @@ def test_consent_and_forget_ask_for_a_recalibration(env):
         assert worker.db.meta("calibrate_pending") is not None
 
 
+def test_startup_reconciles_a_stale_or_missing_calibration_first(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker, days=(6,))
+    (settings.vault_dir / "_omi" / "speakers" / "calibration.json").unlink(missing_ok=True)
+    worker.db.set_meta("calibrate_pending", None)
+    worker.calibrator.reconcile()
+    assert worker.db.meta("calibrate_pending") == "0"
+
+
 def test_startup_reconciles_a_stale_or_missing_calibration(env):
     settings, client, worker = env
     me, rows, ids = me_with_samples(client, worker, days=(6, 5))
@@ -728,3 +737,102 @@ def test_startup_reconciles_a_stale_or_missing_calibration(env):
     assert worker.db.meta("calibrate_pending") is not None
     assert worker.calibrator.run(T0 + 1)
     assert client.get("/v1/speakers/calibration", headers=AUTH).json()["stale"] is False
+
+
+# -- M7: enrollment import ---------------------------------------------------------------------------------
+
+import io  # noqa: E402
+
+import soundfile as sf  # noqa: E402
+
+
+def monologue(f0: float = ALAN, turns: int = 8, seed: int = 0) -> np.ndarray:
+    return dialogue(f0, f0, turns=turns, seconds=4.0, seed=seed)
+
+
+def import_range(client, person_id: str, conv_id: str, start: float, end: float, name: str = "Alan", **extra):
+    body = {"conversation_id": conv_id, "start": start, "end": end, "confirm_person": True, "person_name": name} | extra
+    return client.post(f"/v1/people/{person_id}/enrollments/import", json=body, headers=AUTH)
+
+
+def enrollment_seconds(worker, person_id: str) -> float:
+    return sum(s.seconds for s in worker.pipeline.speakers.samples(*MODEL) if s.person_id == person_id and s.source == "enrollment")
+
+
+def test_importing_a_recording_range_enrolls_once_and_overlaps_never_add_seconds(env):
+    settings, client, worker = env
+    me = new_person(client, "Alan", me=True)
+    row = talk(client, worker, monologue(), day=3)
+    first = import_range(client, me, row["id"], 0.0, 60.0)
+    assert first.status_code == 201, first.text
+    result = first.json()
+    assert result["state"] == "accepted" and result["speech_s"] >= 20 and result["sample_id"]
+    data = sample_file(settings, me, result["sample_id"])
+    assert data["source"] == "enrollment" and data["conversation_id"] == row["id"] and data["session"] == row["id"]
+    assert data["import"]["kind"] == "conversation" and data["import"]["sha256"] == row["audio_sha"]
+    assert (Vault.open(settings).person_dir(me) / "enrollment" / f"{result['import_id']}.omiaudio").exists()
+    again = import_range(client, me, row["id"], 0.0, 60.0)
+    assert again.status_code == 200 and again.json()["import_id"] == result["import_id"]
+    inside = import_range(client, me, row["id"], 5.0, 50.0)
+    assert inside.status_code == 200 and inside.json()["import_id"] == result["import_id"], "already covered"
+    seconds = enrollment_seconds(worker, me)
+    wider = import_range(client, me, row["id"], 0.0, 70.0)
+    assert wider.status_code == 201 and wider.json()["merged"] == [result["import_id"]]
+    assert sample_file(settings, me, result["sample_id"])["state"] == "removed"
+    assert enrollment_seconds(worker, me) == pytest.approx(wider.json()["speech_s"]) and enrollment_seconds(worker, me) >= seconds
+    assert "enrollment_import" in client.get("/v1/status", headers=AUTH).json()["features"]
+
+
+def test_an_import_needs_the_persons_name_consent_and_enough_speech(env):
+    settings, client, worker = env
+    me = new_person(client, "Alan", me=True)
+    priya = new_person(client, "Priya")
+    row = talk(client, worker, monologue(), day=3)
+    assert import_range(client, me, row["id"], 0, 60, name="Bob").status_code == 422
+    assert import_range(client, me, row["id"], 0, 60, confirm_person=False).status_code == 422
+    refused = import_range(client, priya, row["id"], 0, 60, name="Priya")
+    assert refused.status_code == 409 and refused.json()["error"] == "consent_required"
+    short = import_range(client, me, row["id"], 0, 8)
+    assert short.status_code == 422 and short.json()["error"] == "not_enough_speech"
+    assert enrollment_seconds(worker, me) == 0
+
+
+def wav_bytes(pcm: np.ndarray, rate: int = 16000) -> bytes:
+    buf = io.BytesIO()
+    sf.write(buf, pcm, rate, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+def test_an_uploaded_wav_enrolls_and_forget_deletes_its_audio(env):
+    settings, client, worker = env
+    me = new_person(client, "Alan", me=True)
+    files = {"file": ("reading.wav", wav_bytes(monologue()), "audio/wav")}
+    r = client.post(f"/v1/people/{me}/enrollments/import", data={"confirm_person": "true", "person_name": "Alan"},
+                    files=files, headers=AUTH)  # fmt: skip
+    assert r.status_code == 201, r.text
+    data = sample_file(settings, me, r.json()["sample_id"])
+    assert data["import"]["kind"] == "upload" and data["import"]["filename"] == "reading.wav" and data["conversation_id"] is None
+    again = client.post(f"/v1/people/{me}/enrollments/import", data={"confirm_person": "true", "person_name": "Alan"},
+                        files=files, headers=AUTH)  # fmt: skip
+    assert again.status_code == 200 and again.json()["import_id"] == r.json()["import_id"]
+    too_long = {"file": ("long.wav", wav_bytes(np.zeros(16000 * 60 * 21, np.int16)), "audio/wav")}
+    long = client.post(f"/v1/people/{me}/enrollments/import", data={"confirm_person": "true", "person_name": "Alan"},
+                       files=too_long, headers=AUTH)  # fmt: skip
+    assert long.status_code in (413, 422)
+    client.delete(f"/v1/people/{me}", headers=AUTH)
+    assert not Vault.open(settings).person_dir(me).exists()
+
+
+def test_sixty_seconds_of_enrollment_make_the_centroid_enrollment_only_and_the_gate_still_applies():
+    enrolled = [sm.Sample(f"e{i}", "alan", vec(ALAN, i), "enrollment", "2026-09-20", f"imp{i}", float(i), seconds=35.0) for i in (0, 1)]
+    stray = [sm.Sample(f"u{i}", "alan", vec(RAVI, i), "user", "2026-09-21", f"c{i}", 10.0 + i, seconds=8.0) for i in (1, 2, 3)]
+    models = sm.build_models(enrolled + stray)
+    model = models["alan"]
+    assert model.enrollment_only
+    assert np.allclose(model.centroid, sm.centroid([s.vector for s in enrolled]), atol=1e-6)
+    assert not model.active and "days" in model.why_inactive, "the existing gate still applies"
+    short = sm.build_models([enrolled[0]] + stray)["alan"]
+    assert not short.enrollment_only
+    found = fl.evaluate([fl.FlagInput(s.id, s.person_id, s.vector) for s in enrolled + stray], {"alan": model.centroid})
+    assert all("enrollment" in found[s.id] for s in stray) and not found["e0"]
+

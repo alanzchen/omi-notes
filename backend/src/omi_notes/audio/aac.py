@@ -34,8 +34,9 @@ def available() -> bool:
     return ffmpeg() is not None
 
 
-def decode(payload: bytes, expected_samples: int) -> np.ndarray:
-    """16 kHz mono int16 samples, exactly `expected_samples` long."""
+def decode(payload: bytes, expected_samples: int | None, *, max_samples: int | None = None) -> np.ndarray:
+    """16 kHz mono int16 samples, exactly `expected_samples` long; with None (an uploaded file, whose
+    length nothing vouches for), whatever it holds up to `max_samples`."""
     exe = ffmpeg()
     if exe is None:
         raise AacError("ffmpeg is not installed: this server can't decode AAC")
@@ -46,7 +47,7 @@ def decode(payload: bytes, expected_samples: int) -> np.ndarray:
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(payload)
-        limit = (expected_samples + 2 * SAMPLE_RATE) * 2
+        limit = ((expected_samples if expected_samples is not None else max_samples or 0) + 2 * SAMPLE_RATE) * 2
         try:
             run = subprocess.run(
                 [exe, "-nostdin", "-v", "error", "-c:a", "aac", "-i", path, "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE), "pipe:1"],
@@ -61,6 +62,8 @@ def decode(payload: bytes, expected_samples: int) -> np.ndarray:
     finally:
         os.unlink(path)
     pcm = np.frombuffer(run.stdout[: len(run.stdout) // 2 * 2], dtype="<i2").astype(np.int16)
+    if expected_samples is None:
+        return pcm
     if abs(len(pcm) - expected_samples) > TOLERANCE:
         raise AacError(f"AAC decodes to {len(pcm)} samples, header says {expected_samples}")
     if len(pcm) < expected_samples:

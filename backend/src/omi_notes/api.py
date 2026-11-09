@@ -210,7 +210,7 @@ def create_app(
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes
-            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star", "watch_performance", "phone_log", "dismiss", "same_audio_resend", "voice_review", "voice_calibration"] + (["watch_aac"] if aac.available() else []),
+            "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star", "watch_performance", "phone_log", "dismiss", "same_audio_resend", "voice_review", "voice_calibration", "enrollment_import"] + (["watch_aac"] if aac.available() else []),
             "vault_id": vault.vault_id,
         }
 
@@ -496,6 +496,23 @@ def create_app(
         if result is None:
             raise ApiError(404, "unknown_enrollment", "no voice enrollment with this id")
         return result
+
+    @app.post("/v1/people/{person_id}/enrollments/import")
+    async def import_enrollment(person_id: str, request: Request) -> JSONResponse:
+        from .speakers.imports import MAX_UPLOAD_BYTES, parse_multipart
+
+        content_type = request.headers.get("content-type", "")
+        if content_type.startswith("multipart/form-data"):
+            fields, upload = parse_multipart(content_type, await read_body(request, MAX_UPLOAD_BYTES))
+            if upload is None:
+                raise ApiError(422, "invalid_body", "a multipart import needs a `file` part")
+        else:
+            fields, upload = await read_json(request), None
+            if not isinstance(fields, dict):
+                raise ApiError(422, "invalid_body", "expected a JSON object")
+        writable()
+        status_code, result = await run_in_threadpool(speakers(request).import_enrollment, person_id, fields, upload)
+        return JSONResponse(result, status_code=status_code)
 
     @app.get("/v1/speakers/calibration")
     def speaker_calibration(request: Request) -> dict:

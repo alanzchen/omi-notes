@@ -79,6 +79,12 @@ class SpeakerService:
             })  # fmt: skip
         return out
 
+    def import_enrollment(self, person_id: str, fields: dict, upload) -> tuple[int, dict]:
+        """`POST /v1/people/{id}/enrollments/import` (`speakers.imports`)."""
+        from .imports import Importer
+
+        return Importer(self).run(person_id, fields, upload)
+
     def calibration_people(self) -> dict:
         """The last published calibration (`speakers.calibration`), {} before the first."""
         return Vault.read_json(self.vault.speakers / "calibration.json") or {}
