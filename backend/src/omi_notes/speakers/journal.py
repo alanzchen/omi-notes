@@ -187,15 +187,15 @@ def _set_pending(store, person_id: str, sample_id: str, op_id: str | None) -> No
     store._publish_sample(person_id, sample_id, data)
 
 
-def _moved_import(store, data: dict, b: str, new: str) -> str:
-    """A moved imported enrollment becomes an import of the person it moved to: its own import id (from the same
-    source and range, so dedupe and merges see it), its own copy of the speech audio and its own result, in that
-    person's folder (forgetting either person then removes exactly their own audio)."""
+def _moved_import(store, op: dict, data: dict, b: str, new: str) -> str:
+    """A moved imported enrollment becomes an import of the person it moved to: a fresh import id chosen with the
+    operation, its own copy of the speech audio and its own result in that person's folder, at the paths the intent
+    recorded before anything was written (so a cancel removes them even if the copy never got published). Forgetting
+    either person then removes exactly their own audio."""
     from ..spool import atomic_write_bytes
-    from .imports import import_id
 
-    source = data["import"]
-    iid = import_id(b, source["sha256"], float(source["start"]), float(source["end"]))
+    entry = (op.get("files") or {}).get(new) or {}
+    iid = entry.get("import_id") or str(uuid.uuid5(uuid.NAMESPACE_URL, f"{op['id']}:{new}"))
     audio = store.person_dir(data["person_id"]) / "enrollment" / f"{data.get('enrollment_id')}.omiaudio"
     target = store.person_dir(b) / "enrollment" / f"{iid}.omiaudio"
     if not target.exists() and audio.exists():
@@ -209,13 +209,17 @@ def _moved_import(store, data: dict, b: str, new: str) -> str:
     return iid
 
 
-def drop_copy(store, person_id: str, sample_id: str) -> None:
-    """Remove a copy a move made, with the import files a moved enrollment got (`_moved_import`)."""
-    data = store.read_sample(person_id, sample_id)
-    if data and data.get("moved_from") and data.get("import") and data.get("enrollment_id"):
-        for extra in (store.person_dir(person_id) / "enrollments" / f"{data['enrollment_id']}.json",
-                      store.person_dir(person_id) / "enrollment" / f"{data['enrollment_id']}.omiaudio"):  # fmt: skip
-            remove(extra)
+def _own_files(store, op: dict, new: str) -> list[str]:
+    entry = (op.get("files") or {}).get(new) or {}
+    return list(entry.get("paths") or [])
+
+
+def drop_copy(store, person_id: str, sample_id: str, files: list[str] | None = None) -> None:
+    """Remove a copy a move made, with the files that move recorded as its own (`files`, else the copy's `own_files`);
+    never anything else, whatever ids it shares."""
+    data = store.read_sample(person_id, sample_id) or {}
+    for rel in sorted(set(files or []) | set(data.get("own_files") or [])):
+        remove(store.vault.root / rel)
     store.remove_sample_ids(person_id, [sample_id])
 
 
@@ -282,7 +286,9 @@ def _move(store, op: dict) -> None:
         extra = {k: data[k] for k in PROVENANCE if data.get(k) is not None}
         extra |= {"pending_op": op["id"], "moved_from": {"person_id": a, "sample_id": src}}
         person = store.person(b)
-        iid = _moved_import(store, data, b, new) if data.get("import") else None
+        iid = _moved_import(store, op, data, b, new) if data.get("import") else None
+        if iid is not None:
+            extra["own_files"] = _own_files(store, op, new)
         store.add_sample(b, decode_vector(data["vector_b64"]), model=data["model"], model_sha=data["model_sha"], source=data["source"],
                          seconds=data.get("seconds") or 0.0, day=data.get("day"), session=data.get("session"),
                          conversation_id=data.get("conversation_id"), label=data.get("label"), request_id=f"{rid}:move:{src}",
@@ -388,7 +394,7 @@ def cancel(store, op: dict, forgotten: set = frozenset()) -> None:
         if kind == "move":
             a, b = op["from"], op["to"]
             for src, new in op["pairs"]:
-                drop_copy(store, b, new)
+                drop_copy(store, b, new, _own_files(store, op, new))  # also when the copy was never published
                 data = store.read_sample(a, src)
                 if a not in forgotten and data and data.get("state") == "moved" and (data.get("moved_to") or {}).get("sample_id") == new:
                     store.update_sample(a, src, {"state": "active", "moved_to": None}, action="rollback", by="recovery",

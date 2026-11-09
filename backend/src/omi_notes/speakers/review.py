@@ -409,8 +409,18 @@ class Review:
         for src, _ in pairs:  # the same audio must not count twice for the person it moves to
             if self._overlap_why(self.store.read_sample(data["person_id"], src) or {}, person_id):
                 raise ApiError(409, "superseded", "that person already has an active enrollment of the same audio")
+        # a moved import gets a fresh import identity (never one the destination may have used before), and every
+        # file it will write is recorded in the intent before it is written
+        files = {}
+        for src, new in pairs:
+            if (self.store.read_sample(data["person_id"], src) or {}).get("import"):
+                iid = str(uuid.uuid4())
+                folder = self.store.person_dir(person_id)
+                files[new] = {"import_id": iid, "paths": [self.store.vault.relpath(folder / "enrollment" / f"{iid}.omiaudio"),
+                                                          self.store.vault.relpath(folder / "enrollments" / f"{iid}.json")]}  # fmt: skip
         journal.run(self.store, {"kind": "move", "request_id": request_id, "by": "user", "from": data["person_id"], "to": person_id,
-                                 "pairs": pairs, "label": {"conversation_id": data["conversation_id"], "label": label} if label else None})  # fmt: skip
+                                 "pairs": pairs, "files": files,
+                                 "label": {"conversation_id": data["conversation_id"], "label": label} if label else None})  # fmt: skip
         return self.store.read_sample(data["person_id"], data["sample_id"])
 
     def _reject(self, data: dict, request_id: str) -> dict:
