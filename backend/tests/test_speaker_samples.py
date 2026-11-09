@@ -58,7 +58,6 @@ def test_a_removed_sample_stops_feeding_the_model_and_a_restore_brings_it_back(e
     settings, client, worker = env
     me, _, ids = me_with_samples(client, worker)
     store = worker.pipeline.speakers
-    assert Vault.open(settings).format < 6
     assert people(client)["Alan"]["auto_active"] is True
     with store.lock:
         store.set_sample_state(me, ids[0], "removed", action="remove", by="user", request_id="r-remove", now=T0 + 10)
@@ -79,8 +78,11 @@ def test_a_removed_sample_stops_feeding_the_model_and_a_restore_brings_it_back(e
 
 def test_the_vault_format_is_raised_before_the_first_state_is_written(env, monkeypatch):
     settings, client, worker = env
-    me, _, ids = me_with_samples(client, worker, days=(6,))
+    me = new_person(client, "Alan", me=True)
     store = worker.pipeline.speakers
+    with store.lock:  # a voiceprint from before F0 (nothing has raised the format yet)
+        ids = [store.add_sample(me, vec(ALAN), model=MODEL[0], model_sha=MODEL[1], source="user", seconds=8.0, day=None, session="s")]
+    assert Vault.open(settings).format < 6
     real = Vault.write_json
 
     def failing(path, value, **kw):

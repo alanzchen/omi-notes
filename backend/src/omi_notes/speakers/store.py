@@ -629,6 +629,9 @@ class SpeakerStore:
 
     def write_voices(self, conv_id: str, name: str, model: str, model_sha: str, voices: dict[str, LabelVoice],
                      keep_vectors: set[str]) -> None:  # fmt: skip
+        if any(getattr(v, "f0", None) is not None and label in keep_vectors for label, v in voices.items()):
+            # an older backend prunes vector_b64 but would keep f0 next to it: it must refuse this vault first
+            self.vault.raise_format(SAMPLE_FORMAT)
         labels = {}
         for label, voice in voices.items():
             entry = {"seconds": voice.seconds, "turns": voice.turns, "spread": voice.spread, "rms_db": voice.rms_db,

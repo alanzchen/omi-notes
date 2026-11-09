@@ -212,17 +212,19 @@ class Vault:
         an older backend refuses it instead of silently dropping what it doesn't understand."""
         if self.format >= fmt:
             return
+        self._update_info({"format": fmt})
+
+    def _update_info(self, changes: dict) -> None:
+        """Write these VAULT.json keys. The API and a worker process may both write it: the file is re-read under the
+        per-vault meta lock and changes merge into it, and `format` only ever goes up."""
         from .lock import SpeakerLock  # (lock imports this module)
 
-        # the API and a worker process may raise it at once: re-read under the per-vault meta lock, never lower it
         with SpeakerLock(self, "vault-meta.lock"):
-            on_disk = self.read_json(self.vault_json) or {}
-            current = max(int(on_disk.get("format", 1)), self.format)
-            if current >= fmt:
-                self.info = dict(self.info) | {"format": current}
-                return
-            info = dict(on_disk or self.info) | {"format": fmt}
-            self.write_json(self.vault_json, info)
+            on_disk = self.read_json(self.vault_json) or dict(self.info)
+            fmt = max(int(on_disk.get("format", 1)), int(self.info.get("format", 1)), int(changes.get("format", 1)))
+            info = on_disk | changes | {"format": fmt}
+            if info != on_disk:
+                self.write_json(self.vault_json, info)
             self.info = info
 
     def sync_render_settings(self, settings: Settings) -> None:
@@ -231,8 +233,7 @@ class Vault:
         changed = {key: getattr(settings, key) for key in ("timezone", "owner_name")
                    if key in settings.model_fields_set and self.info.get(key) != getattr(settings, key)}  # fmt: skip
         if changed:
-            self.info |= changed
-            self.write_json(self.vault_json, self.info)
+            self._update_info(changed)
 
     # -- files -----------------------------------------------------------------------------------
 
