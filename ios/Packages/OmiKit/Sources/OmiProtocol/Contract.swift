@@ -475,6 +475,9 @@ public struct ConversationFlag: Codable, Equatable, Sendable, Hashable {
 /// The owner talking alone (`monologue`), a conversation (`dialogue`) or background (`passive`), as the
 /// note was made (capture-format-v1.md, "Recording class").
 public struct RecordingClassView: Codable, Equatable, Hashable, Sendable {
+    public static let kinds = ["monologue", "dialogue", "passive"]
+
+    /// The kind the current note was made for; never a requested one before the server applies it.
     public var kind: String?
     public var auto: String?
     /// `high`, `medium`, `low`, or `owner` (the owner chose it).
@@ -483,13 +486,35 @@ public struct RecordingClassView: Codable, Equatable, Hashable, Sendable {
     public var wearerShare: Double?
     /// The owner's newer choice is waiting for its new summary.
     public var updating: Bool?
+    /// That newer choice (`auto` for going back to the automatic kind), while `updating`.
+    public var requested: String?
+    /// The stored choice can't be read on the server; the note keeps `kind`.
+    public var choiceUnreadable: String?
 
-    enum CodingKeys: String, CodingKey { case kind = "class", auto, confidence, overridden, wearerShare, updating }
+    enum CodingKeys: String, CodingKey {
+        case kind = "class", auto, confidence, overridden, updating, requested
+        case wearerShare = "wearer_share"
+        case choiceUnreadable = "choice_unreadable"
+    }
 
     public init(kind: String?, auto: String? = nil, confidence: String? = nil, overridden: Bool? = nil,
-                wearerShare: Double? = nil, updating: Bool? = nil) {
+                wearerShare: Double? = nil, updating: Bool? = nil, requested: String? = nil, choiceUnreadable: String? = nil) {
         self.kind = kind; self.auto = auto; self.confidence = confidence
         self.overridden = overridden; self.wearerShare = wearerShare; self.updating = updating
+        self.requested = requested; self.choiceUnreadable = choiceUnreadable
+    }
+
+    public var isUpdating: Bool { updating == true }
+
+    /// The short name a row shows.
+    public static func title(_ kind: String?) -> String? {
+        switch kind {
+        case "monologue": "Me"
+        case "dialogue": "Talk"
+        case "passive": "Background"
+        case "auto": "Automatic"
+        default: nil
+        }
     }
 }
 
@@ -562,6 +587,7 @@ public struct ConversationSummary: Codable, Equatable, Hashable, Sendable, Ident
         case provisional
         case speakersReady = "speakers_ready"
         case value
+        case recordingClass = "recording_class"
     }
 }
 

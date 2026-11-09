@@ -55,24 +55,29 @@ struct PriorityActions: ViewModifier {
     let conversation: ConversationSummary
 
     func body(content: Content) -> some View {
-        if model.supportsValueNotes, conversation.status != "open" {
+        let values = model.supportsValueNotes
+        let kinds = RecordingClassMenu.offered(model: model, conversation: conversation)
+        if values || kinds, conversation.status != "open" {
             let state = model.priority(of: conversation).state
             content
                 .swipeActions(edge: .leading) {
-                    if state == "important" {
+                    if values, state == "important" {
                         Button { set("auto") } label: { Label("Not Important", systemImage: "star.slash") }.tint(.gray)
-                    } else {
+                    } else if values {
                         Button { set("important") } label: { Label("Important", systemImage: "star.fill") }.tint(.yellow)
                     }
                 }
                 .swipeActions(edge: .trailing) {
-                    if state == "less_useful" {
+                    if values, state == "less_useful" {
                         Button { set("auto") } label: { Label("Restore", systemImage: "arrow.uturn.backward") }.tint(.blue)
-                    } else {
+                    } else if values {
                         Button { set("less_useful") } label: { Label("Less Useful", systemImage: "arrow.down.to.line") }.tint(.gray)
                     }
                 }
-                .contextMenu { PriorityMenuItems(model: model, conversation: conversation) }
+                .contextMenu {
+                    if values { PriorityMenuItems(model: model, conversation: conversation) }
+                    if kinds { RecordingClassMenu(model: model, conversation: conversation) }
+                }
         } else {
             content
         }
@@ -100,6 +105,83 @@ struct PriorityMenuItems: View {
     }
 
     private func set(_ state: String) { Task { await model.setPriority(conversation.id, state) } }
+}
+
+/// "Recording Kind ▸ Me talking / Conversation / Background / Automatic": the owner's correction. The current
+/// kind is the one the note was made for; a requested one shows as "Changing to …" until the server applies it.
+struct RecordingClassMenu: View {
+    let model: AppModel
+    let conversation: ConversationSummary
+
+    /// Only for summarized notes on servers with recording classes.
+    static func offered(model: AppModel, conversation: ConversationSummary) -> Bool {
+        model.supportsRecordingClass && conversation.status != "open" && model.recordingClass(of: conversation)?.kind != nil
+    }
+
+    var body: some View {
+        let view = model.recordingClass(of: conversation)
+        Menu {
+            ForEach(RecordingClassView.kinds, id: \.self) { kind in
+                Button { set(kind) } label: {
+                    Label(RecordingClassStyle.name(kind), systemImage: view?.kind == kind ? "checkmark" : RecordingClassStyle.icon(kind))
+                }
+                .disabled(view?.kind == kind && view?.isUpdating != true)
+            }
+            if view?.overridden == true || view?.isUpdating == true {
+                Button { set("auto") } label: {
+                    Label("Automatic (\(RecordingClassStyle.name(view?.auto)))", systemImage: "arrow.uturn.backward")
+                }
+            }
+        } label: {
+            Label("Recording Kind", systemImage: "waveform")
+        }
+    }
+
+    private func set(_ kind: String) { Task { await model.setRecordingClass(conversation.id, kind) } }
+}
+
+enum RecordingClassStyle {
+    static func name(_ kind: String?) -> String {
+        switch kind {
+        case "monologue": "Me talking"
+        case "dialogue": "Conversation"
+        case "passive": "Background"
+        case "auto": "Automatic"
+        default: "Not known yet"
+        }
+    }
+
+    static func icon(_ kind: String?) -> String {
+        switch kind {
+        case "monologue": "person.wave.2"
+        case "passive": "speaker.wave.2"
+        default: "person.2"
+        }
+    }
+}
+
+/// "Me" / "Background" on a row (a conversation is the default and has no badge), and "Changing to …" while
+/// the owner's choice waits for its new summary.
+struct RecordingClassBadge: View {
+    let view: RecordingClassView?
+
+    var body: some View {
+        if let view {
+            HStack(spacing: 6) {
+                if view.kind == "monologue" || view.kind == "passive" {
+                    Label(RecordingClassView.title(view.kind) ?? "", systemImage: RecordingClassStyle.icon(view.kind))
+                        .font(.caption2.weight(.medium)).foregroundStyle(.secondary)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color(.tertiarySystemFill), in: .capsule)
+                }
+                if view.isUpdating {
+                    Label(view.requested == "auto" ? "Going back to automatic…"
+                          : "Changing to \(RecordingClassStyle.name(view.requested).lowercased())…", systemImage: "clock.arrow.circlepath")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
 }
 
 /// Home's top: up to four conversations worth revisiting (marked important, then recommended).

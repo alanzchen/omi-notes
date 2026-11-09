@@ -13,6 +13,8 @@ struct HomeView: View {
     @State private var debugOpened: ConversationSummary?
     @State private var query = HomeView.debugSearch
     @State private var naming: ConversationSpeakersView.NamingRun?
+    /// The recording kind the list shows (nil: all), over the rows already loaded.
+    @State private var kindFilter: String?
 
     /// Simulator automation only (debug builds): `-OmiNotesDebugOpenConversation YES` opens the
     /// newest conversation once it has loaded (a headless simulator can't tap).
@@ -99,7 +101,7 @@ struct HomeView: View {
 
     private var days: [(day: String, rows: [ConversationSummary])] {
         var out: [(String, [ConversationSummary])] = []
-        for c in model.recent {
+        for c in model.recent where kindFilter == nil || c.recordingClass?.kind == kindFilter {
             let day = c.startedDate.map(Fmt.day) ?? "Earlier"
             if out.last?.0 == day { out[out.count - 1].1.append(c) } else { out.append((day, [c])) }
         }
@@ -123,6 +125,15 @@ struct HomeView: View {
                 }
             }
         } else {
+            if model.supportsRecordingClass {
+                Section {
+                    RecordingClassChips(selection: $kindFilter)
+                } footer: {
+                    if kindFilter != nil, days.isEmpty {
+                        Text("None of the loaded conversations is of this kind. Show older conversations to look further back.")
+                    }
+                }
+            }
             ForEach(days, id: \.day) { group in
                 Section(group.day) {
                     // only the owner's explicit "less useful" moves a row (into a collapsed group)
@@ -159,6 +170,33 @@ struct HomeView: View {
     }
 }
 
+/// All / Talks / Me / Background: filters the loaded rows by the kind their notes were made for.
+struct RecordingClassChips: View {
+    @Binding var selection: String?
+
+    private static let options: [(title: String, kind: String?)] =
+        [("All", nil), ("Talks", "dialogue"), ("Me", "monologue"), ("Background", "passive")]
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(Self.options, id: \.title) { option in
+                    let on = selection == option.kind
+                    Button { selection = option.kind } label: {
+                        Text(option.title).font(.subheadline.weight(on ? .semibold : .regular))
+                            .padding(.horizontal, 12).padding(.vertical, 6)
+                            .foregroundStyle(on ? Color.white : Color.primary)
+                            .background(on ? Color.accentColor : Color(.tertiarySystemFill), in: .capsule)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(on ? .isSelected : [])
+                }
+            }
+        }
+        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+    }
+}
+
 /// A conversation row that opens its note (or, on an older server, its speakers).
 struct ConversationLink: View {
     let model: AppModel
@@ -168,7 +206,7 @@ struct ConversationLink: View {
 
     private var row: ConversationRow {
         ConversationRow(conversation: conversation, priority: model.priorityState(of: conversation), showsDay: showsDay,
-                        priorityMessage: model.priorityMessages[conversation.id])
+                        priorityMessage: model.priorityMessages[conversation.id] ?? model.classMessages[conversation.id])
     }
 
     var body: some View {
@@ -217,6 +255,7 @@ struct ConversationRow: View {
                 if c.displayState.code != "ready" { StateChip(state: c.displayState) }
             }
             Text(meta).font(.caption).foregroundStyle(.secondary)
+            RecordingClassBadge(view: c.recordingClass)
             if c.isRecommended, priority.state != "less_useful" { WorthRevisitingLine(highlight: c.value?.highlight) }
             if let preview = c.preview {
                 Text(preview).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)

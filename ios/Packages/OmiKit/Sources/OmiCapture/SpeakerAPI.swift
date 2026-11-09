@@ -70,13 +70,19 @@ extension APIClient {
     }
 
     /// The owner's recording class (monologue, dialogue, passive or auto); the later choice wins on the server.
+    /// The answer is still the applied class, with `updating`/`requested` until the server's new summary.
     public func putRecordingClass(_ conversationId: String, kind: String, requestId: String, setAt: Date) async throws -> RecordingClassView {
         struct Body: Encodable {
             var kind: String; var requestId: String; var setAt: String
             enum CodingKeys: String, CodingKey { case kind = "class", requestId, setAt }
         }
-        return try await json("PUT", "/v1/conversations/\(conversationId)/class",
-                              body: Body(kind: kind, requestId: requestId, setAt: ISO8601UTC.format(setAt)))
+        let body: Data
+        do { body = try Self.snakeEncoder.encode(Body(kind: kind, requestId: requestId, setAt: ISO8601UTC.format(setAt))) } catch {
+            throw APIError.decoding("encoding request: \(error)")
+        }
+        let data = try await raw("PUT", "/v1/conversations/\(conversationId)/class", body: body)
+        // the view's keys are spelled out (it is also part of ConversationSummary), so no key conversion here
+        do { return try JSONDecoder().decode(RecordingClassView.self, from: data) } catch { throw APIError.decoding("\(error)") }
     }
 
     public func speakerSettings() async throws -> SpeakerSettings { try await json("GET", "/v1/speakers/settings") }

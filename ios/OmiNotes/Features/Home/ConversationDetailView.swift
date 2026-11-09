@@ -40,8 +40,17 @@ struct ConversationDetailView: View {
         ScrollViewReader { proxy in
         List {
             header
-            if let message = model.priorityMessages[summary.id] {
+            if let message = model.priorityMessages[summary.id] ?? model.classMessages[summary.id] {
                 Section { Label(message, systemImage: "exclamationmark.circle").font(.footnote).foregroundStyle(.orange) }
+            }
+            if let kind = model.recordingClass(of: entry), kind.isUpdating {
+                Section {
+                    Label("This note was written as \(RecordingClassStyle.name(kind.kind).lowercased()). The server is rewriting it as "
+                          + (kind.requested == "auto" ? "the automatic kind" : RecordingClassStyle.name(kind.requested).lowercased())
+                          + "; pull to refresh in a minute.",
+                          systemImage: "clock.arrow.circlepath")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
             }
             if let saved = model.detailSavedAt[summary.id] {
                 Section {
@@ -95,6 +104,18 @@ struct ConversationDetailView: View {
                     .accessibilityLabel("Importance")
                     .accessibilityValue(model.priority(of: entry).state == "important" ? "Important"
                                         : model.priority(of: entry).state == "less_useful" ? "Less useful" : "Automatic")
+                }
+            }
+            if RecordingClassMenu.offered(model: model, conversation: entry) {
+                ToolbarItem(placement: .topBarTrailing) {
+                    let kind = model.recordingClass(of: entry)?.kind
+                    Menu {
+                        RecordingClassMenu(model: model, conversation: entry)
+                    } label: {
+                        Image(systemName: RecordingClassStyle.icon(kind))
+                    }
+                    .accessibilityLabel("Recording kind")
+                    .accessibilityValue(RecordingClassStyle.name(kind))
                 }
             }
         }
