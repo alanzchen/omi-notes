@@ -78,10 +78,12 @@ def decode_upload(filename: str, payload: bytes) -> np.ndarray:
         data, rate = sf.read(io.BytesIO(payload), dtype="int16", always_2d=True)
     except Exception as exc:  # soundfile raises its own error types
         raise ApiError(422, "undecodable_audio", "expected an m4a or wav file") from exc
+    if rate != SR:  # a band-limited resampler (ffmpeg's), never interpolation that aliases
+        try:
+            return aac.resample(payload, ".wav", MAX_SECONDS * SR)
+        except aac.AacError as exc:
+            raise ApiError(422, "undecodable_audio", str(exc)) from exc
     pcm = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0].astype(np.float64)
-    if rate != SR and len(pcm):
-        n = int(round(len(pcm) * SR / rate))
-        pcm = np.interp(np.arange(n) * (rate / SR), np.arange(len(pcm)), pcm)
     return np.clip(np.round(pcm), -32768, 32767).astype(np.int16)
 
 

@@ -69,3 +69,27 @@ def decode(payload: bytes, expected_samples: int | None, *, max_samples: int | N
     if len(pcm) < expected_samples:
         pcm = np.concatenate([pcm, np.zeros(expected_samples - len(pcm), np.int16)])
     return pcm[:expected_samples]
+
+
+def resample(payload: bytes, suffix: str, max_samples: int) -> np.ndarray:
+    """16 kHz mono int16 of any audio file ffmpeg reads (an upload at another sample rate or channel count),
+    through ffmpeg's band-limited resampler: nothing above 8 kHz folds into the speech band."""
+    exe = ffmpeg()
+    if exe is None:
+        raise AacError("ffmpeg is not installed: this server can only read 16 kHz WAV uploads")
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+        try:
+            run = subprocess.run([exe, "-nostdin", "-v", "error", "-i", path, "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE), "pipe:1"],
+                                 capture_output=True, timeout=TIMEOUT_S * 4, check=False)  # fmt: skip
+        except subprocess.TimeoutExpired as exc:
+            raise AacError("decoding the upload took too long") from exc
+        if run.returncode != 0:
+            raise AacError(f"decode failed: {run.stderr.decode(errors='replace').strip()[:300]}")
+        if len(run.stdout) > (max_samples + 2 * SAMPLE_RATE) * 2:
+            raise AacError("the recording is too long")
+    finally:
+        os.unlink(path)
+    return np.frombuffer(run.stdout[: len(run.stdout) // 2 * 2], dtype="<i2").astype(np.int16)

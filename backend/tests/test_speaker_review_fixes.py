@@ -124,3 +124,31 @@ def test_the_calibration_fingerprint_covers_ga_unknown_storage_and_operating_poi
     worker.db.execute("UPDATE voices SET vector=? WHERE conversation_id=? AND label='S1'",
                       (np.asarray(vec(RAVI), dtype="<f4").tobytes(), rows[1]["id"]))  # fmt: skip
     assert calibrator.fingerprint() != third, "the GA cohort is part of the input"
+
+
+# -- 15: uploads at other sample rates are resampled without aliasing -------------------------------------------
+
+
+def test_an_uploaded_wav_at_another_rate_is_resampled_without_aliasing():
+    import io
+
+    import soundfile as sf
+
+    from omi_notes.audio import aac
+    from omi_notes.speakers.imports import decode_upload
+
+    if not aac.available():
+        pytest.skip("ffmpeg is not installed")
+    rate = 44100
+    t = np.arange(rate * 2) / rate
+    high = (np.sin(2 * np.pi * 12000 * t) * 12000).astype(np.int16)  # above the 8 kHz Nyquist of 16 kHz audio
+    low = (np.sin(2 * np.pi * 300 * t) * 12000).astype(np.int16)
+    buf = io.BytesIO()
+    sf.write(buf, np.stack([high, high], axis=1), rate, format="WAV", subtype="PCM_16")
+    out = decode_upload("stereo.wav", buf.getvalue()).astype(np.float64)
+    assert abs(len(out) - 32000) <= 32
+    assert np.sqrt(np.mean(out**2)) < 0.02 * 12000 / np.sqrt(2), "a 12 kHz tone must not fold into the speech band"
+    buf = io.BytesIO()
+    sf.write(buf, low, rate, format="WAV", subtype="PCM_16")
+    kept = decode_upload("tone.wav", buf.getvalue()).astype(np.float64)
+    assert np.sqrt(np.mean(kept**2)) == pytest.approx(12000 / np.sqrt(2), rel=0.05)
