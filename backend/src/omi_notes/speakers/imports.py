@@ -39,8 +39,11 @@ from ..audio.vad import make_vad, speech_intervals
 from ..ingest import ApiError
 from ..util import UUID_RE
 from . import enroll
+from ..spool import atomic_write_bytes
 from ..vault import Vault
-from .store import ACTIVE, REMOVED
+from . import journal
+from .store import ACTIVE
+from .voices import encode_vector
 
 SR = 16000
 MAX_SECONDS = 20 * 60
@@ -126,8 +129,17 @@ class Importer:
         embedder = self.pipeline.providers.embedder
         if embedder is None:
             raise ApiError(409, "no_speaker_model", "the speaker model isn't installed (`omi-notes fetch-models --speakers`)")
-        source, pcm, day = self._source(fields, upload)
-        return self._enroll(person_id, bool(person["me"]), source, pcm, day, embedder)
+        consent = self._consent(person_id)
+        source, pcm, day, whole = self._source(fields, upload)
+        return self._enroll(person_id, consent, source, pcm, day, embedder, whole)
+
+    def _consent(self, person_id: str) -> tuple | None:
+        """What the import was allowed by (None: the person is gone): rechecked before anything is written."""
+        self.store.scan_people()
+        person = self.store.person(person_id)
+        if person is None:
+            return None
+        return (bool(person["me"]), person["attested_at"], self.store.settings()["acknowledged_at"], self.store.forget_count(person_id))
 
     def _range(self, fields: dict, total: float | None) -> tuple[float, float]:
         try:
@@ -139,8 +151,8 @@ class Importer:
             raise ApiError(422, "invalid_range", f"start < end, at most {MAX_SECONDS // 60} minutes apart")
         return round(start, 3), round(end, 3)
 
-    def _source(self, fields: dict, upload) -> tuple[dict, np.ndarray, str]:
-        """(provenance, the range's PCM, the local day of the audio)."""
+    def _source(self, fields: dict, upload) -> tuple[dict, np.ndarray, str, np.ndarray | None]:
+        """(provenance, the range's PCM, the local day of the audio, an upload's whole PCM)."""
         if upload is not None:
             filename, payload = upload
             if len(payload) > MAX_UPLOAD_BYTES:
@@ -151,7 +163,7 @@ class Importer:
             start, end = self._range(fields, len(pcm) / SR)
             source = {"kind": "upload", "filename": filename[:120], "sha256": hashlib.sha256(payload).hexdigest(),
                       "start": start, "end": end}  # fmt: skip
-            return source, pcm[int(start * SR) : int(end * SR)], datetime.now(self.pipeline.tz).date().isoformat()
+            return source, pcm[int(start * SR) : int(end * SR)], datetime.now(self.pipeline.tz).date().isoformat(), pcm
         conv_id = fields.get("conversation_id")
         if not isinstance(conv_id, str) or not UUID_RE.match(conv_id):
             raise ApiError(422, "invalid_body", "conversation_id (or a multipart file) is required")
@@ -171,7 +183,7 @@ class Importer:
                 parts.append(audio.pcm[i0 : i0 + int(round((b - a) * SR))])
         pcm = np.concatenate(parts).astype(np.int16) if parts else np.zeros(0, np.int16)
         source = {"kind": "conversation", "conversation_id": conv_id, "sha256": row["audio_sha"], "start": start, "end": end}
-        return source, pcm, datetime.fromtimestamp(row["start"], self.pipeline.tz).date().isoformat()
+        return source, pcm, datetime.fromtimestamp(row["start"], self.pipeline.tz).date().isoformat(), None
 
     def _speech(self, pcm: np.ndarray) -> np.ndarray:
         spans = speech_intervals(self.vad, pcm, 0.0) if len(pcm) else []
@@ -196,11 +208,12 @@ class Importer:
             return None
         return {k: result.get(k) for k in ("import_id", "state", "speech_s", "sample_id", "person_id", "merged", "source")}
 
-    def _enroll(self, person_id: str, me: bool, source: dict, pcm: np.ndarray, day: str, embedder) -> tuple[int, dict]:
+    def _enroll(self, person_id: str, consent: tuple | None, source: dict, pcm: np.ndarray, day: str, embedder,
+                whole: np.ndarray | None) -> tuple[int, dict]:  # fmt: skip
         sha, start, end = source["sha256"], source["start"], source["end"]
         iid = import_id(person_id, sha, start, end)
         with self.store.lock:
-            self.store.sync_samples()
+            self.store.reconcile()  # an interrupted import finishes before it is answered
             done = self._answer(person_id, iid)
             if done is not None:
                 return 200, done
@@ -212,9 +225,12 @@ class Importer:
         if overlapping:
             # one enrollment from the union: repeated audio never counts twice
             start, end = min([start] + [e["start"] for e in overlapping]), max([end] + [e["end"] for e in overlapping])
-            source = source | {"start": start, "end": end}
             if source["kind"] == "conversation":
-                source, pcm, day = self._source({"conversation_id": source["conversation_id"], "start": start, "end": end}, None)
+                source, pcm, day, _ = self._source({"conversation_id": source["conversation_id"], "start": start, "end": end}, None)
+            else:  # the same file (same sha256): the union is cut from the whole upload
+                if whole is None or end * SR > len(whole) + SR:
+                    raise ApiError(409, "import_conflict", "the earlier import of this file covers audio this upload doesn't have")
+                source, pcm = source | {"start": start, "end": end}, whole[int(start * SR) : int(end * SR)]
             iid = import_id(person_id, sha, start, end)
         verdict = enroll.evaluate(self._speech(pcm), embedder)  # outside the lock: the slow part
         if verdict["state"] != "accepted":
@@ -223,29 +239,40 @@ class Importer:
         vector, enroll_pcm = verdict.pop("vector"), verdict.pop("enroll_pcm")
         now = time.time()
         with self.store.lock:
-            self.store.sync_samples()
+            self.store.reconcile()
             done = self._answer(person_id, iid)
             if done is not None:
                 return 200, done
+            # what was judged must still hold: the person and their consent (a forget meanwhile is final), and the
+            # imports the union replaces
+            current = self._consent(person_id)
+            if current is None or current[3] != consent[3]:
+                raise ApiError(404, "not_found", "the person's voice was forgotten while the import was judged")
+            if current != consent:
+                raise ApiError(409, "consent_required", "the person's consent changed while the import was judged; try again")
+            if {e["import_id"] for e in self._imports(person_id, sha) if e["start"] < end and e["end"] > start} != {
+                    e["import_id"] for e in overlapping}:  # fmt: skip
+                raise ApiError(409, "import_conflict", "another import of this audio finished meanwhile; try again")
             request = f"import:{iid}"
-            sample = self.store.sample_for_request(request)  # a crash before the result: reuse the sample
-            if sample is None:
-                sample_id = self.store.add_sample(
-                    person_id, vector, model=embedder.model, model_sha=embedder.model_sha, source="enrollment",
-                    seconds=verdict["speech_s"], day=day, session=source.get("conversation_id") or f"import:{iid}",
-                    conversation_id=source.get("conversation_id"), request_id=request, enrollment_id=iid, now=now,
-                    extra={"import": source, "imported_at": now}, attested=me or self.store.attested(person_id))  # fmt: skip
-            else:
-                sample_id = sample["id"]
-            merged = sorted({e["import_id"] for e in overlapping if e["import_id"] != iid})
+            sample_id = str(uuid.uuid5(uuid.NAMESPACE_URL, request))
+            person = self.store.person(person_id)
+            sample = {
+                "sample_id": sample_id, "person_id": person_id, "person_name": person["name"], "model": embedder.model,
+                "model_sha": embedder.model_sha, "dim": int(len(vector)), "vector_b64": encode_vector(vector),
+                "source": "enrollment", "seconds": round(float(verdict["speech_s"]), 3), "created_at": now, "day": day,
+                "session": source.get("conversation_id") or f"import:{iid}", "conversation_id": source.get("conversation_id"),
+                "label": None, "request_id": request, "enrollment_id": iid, "attested": bool(consent[0] or consent[1]),
+                "import": source, "imported_at": now,
+            }  # fmt: skip
+            replaced = sorted(e["sample"]["sample_id"] for e in overlapping if e["import_id"] != iid)
             result = verdict | {"import_id": iid, "enrollment_id": iid, "person_id": person_id, "sample_id": sample_id,
                                 "model": embedder.model, "model_sha": embedder.model_sha, "source": source,
-                                "merged": merged, "decided_at": now}  # fmt: skip
-            self.store.save_enrollment(person_id, iid, enroll.flac_bytes(enroll_pcm), result)
-            for e in overlapping:  # replaced by the union (soft: restorable, never deleted)
-                if e["import_id"] != iid and (e["sample"].get("state") or ACTIVE) == ACTIVE:
-                    self.store.set_sample_state(person_id, e["sample"]["sample_id"], REMOVED, action="merge", by="import",
-                                                request_id=request, now=now, record={"into": iid})  # fmt: skip
+                                "merged": sorted({e["import_id"] for e in overlapping if e["import_id"] != iid}),
+                                "decided_at": now}  # fmt: skip
+            # the audio first (unreferenced until the operation completes), then one journaled operation
+            atomic_write_bytes(self.store.person_dir(person_id) / "enrollment" / f"{iid}.omiaudio", enroll.flac_bytes(enroll_pcm))
+            journal.run(self.store, {"kind": "merge", "person": person_id, "import_id": iid, "request_id": request,
+                                     "sample": sample, "replaced": replaced, "result": result})  # fmt: skip
             self.db.set_meta("relabel_pending", "1")
         self.service._relabel()
         return 201, self._answer(person_id, iid)

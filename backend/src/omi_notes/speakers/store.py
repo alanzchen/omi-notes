@@ -364,6 +364,12 @@ class SpeakerStore:
             if data.get("state") == MOVED and (data.get("moved_to") or {}).get("person_id") == person_id:
                 remove(path)
                 self.db.execute("DELETE FROM samples WHERE id=?", (path.stem,))
+        # a durable mark that this voice was forgotten (first), so work begun before it (an import being judged)
+        # can tell and never writes the voice back
+        current = Vault.read_json(self.settings_path) or {}
+        forgotten = dict(current.get("forgotten_voices") or {})
+        forgotten[person_id] = int(forgotten.get(person_id) or 0) + 1
+        self.update_settings(forgotten_voices=forgotten)
         folder = self.person_dir(person_id)
         if folder.exists():
             shutil.rmtree(folder)
@@ -373,6 +379,10 @@ class SpeakerStore:
             remove(self.vault.root / person["note_path"])
         self.db.execute("DELETE FROM samples WHERE person_id=?", (person_id,))
         self.scan_people()
+
+    def forget_count(self, person_id: str) -> int:
+        """How many times this person's voice was forgotten (`forget_voice`)."""
+        return int(((Vault.read_json(self.settings_path) or {}).get("forgotten_voices") or {}).get(person_id) or 0)
 
     def attested(self, person_id: str) -> bool:
         row = self.person(person_id)

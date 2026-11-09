@@ -291,6 +291,86 @@ def test_undoing_a_reject_needs_the_persons_current_consent(env):
     assert restore.status_code == 409 and restore.json()["error"] == "consent_required"
 
 
+def monologue_row(client, worker):
+    from .test_speaker_samples import monologue
+
+    return talk(client, worker, monologue(), day=3)
+
+
+def import_range(client, person_id, conv_id, start, end, name="Alan"):
+    body = {"conversation_id": conv_id, "start": start, "end": end, "confirm_person": True, "person_name": name}
+    return client.post(f"/v1/people/{person_id}/enrollments/import", json=body, headers=AUTH)
+
+
+def enrollment_seconds(worker, person_id) -> float:
+    return sum(s.seconds for s in worker.pipeline.speakers.samples(*MODEL) if s.person_id == person_id and s.source == "enrollment")
+
+
+def test_an_interrupted_merge_never_counts_twice_and_is_finished_before_it_answers(env, monkeypatch):
+    settings, client, worker = env
+    me = new_person(client, "Alan", me=True)
+    row = monologue_row(client, worker)
+    first = import_range(client, me, row["id"], 0, 60).json()
+    store = worker.pipeline.speakers
+    real = store.set_sample_state
+    monkeypatch.setattr(store, "set_sample_state", lambda *a, **k: (_ for _ in ()).throw(OSError("power cut"))
+                        if k.get("action") == "merge" else real(*a, **k))  # fmt: skip
+    with pytest.raises(OSError):
+        import_range(client, me, row["id"], 0, 70)
+    monkeypatch.setattr(store, "set_sample_state", real)
+    union = [p for p in journal_files(settings)]
+    assert len(union) == 1, "the merge is journaled"
+    # before it finishes, the union's sample doesn't count: only the first import's seconds
+    pending = [s for s in worker.db.query("SELECT id, state FROM samples WHERE person_id=?", (me,)) if s["state"] == "pending"]
+    assert len(pending) == 1
+    counted = sum(r["seconds"] for r in worker.db.query("SELECT seconds, state FROM samples WHERE person_id=? AND state='active'", (me,)))
+    assert counted == pytest.approx(first["speech_s"])
+    retry = import_range(client, me, row["id"], 0, 70)
+    assert retry.status_code == 200 and retry.json()["merged"] == [first["import_id"]]
+    assert journal_files(settings) == []
+    assert enrollment_seconds(worker, me) == pytest.approx(retry.json()["speech_s"])
+    restore = client.post(f"/v1/samples/{first['sample_id']}/restore", json={"request_id": "rs-8"}, headers=AUTH)
+    assert restore.status_code == 409 and restore.json()["error"] == "superseded", "its seconds are in the union"
+
+
+def test_a_merged_upload_range_is_cut_from_the_whole_upload(env):
+    from .test_speaker_samples import monologue, wav_bytes
+
+    settings, client, worker = env
+    me = new_person(client, "Alan", me=True)
+    audio = wav_bytes(monologue(turns=14))
+
+    def upload(start, end):
+        return client.post(f"/v1/people/{me}/enrollments/import", files={"file": ("long.wav", audio, "audio/wav")},
+                           data={"confirm_person": "true", "person_name": "Alan", "start": str(start), "end": str(end)},
+                           headers=AUTH)  # fmt: skip
+
+    first = upload(0, 60).json()
+    union = upload(50, 120)
+    assert union.status_code == 201, union.text
+    assert union.json()["source"]["start"] == 0 and union.json()["source"]["end"] == 120
+    assert union.json()["speech_s"] > first["speech_s"] + 20, "the union's audio, not only the second range's"
+
+
+def test_an_import_never_recreates_a_voice_forgotten_while_it_was_judged(env, monkeypatch):
+    from omi_notes.speakers import enroll
+
+    settings, client, worker = env
+    me = new_person(client, "Alan", me=True)
+    row = monologue_row(client, worker)
+    real = enroll.evaluate
+
+    def forget_meanwhile(*args, **kwargs):
+        assert client.delete(f"/v1/people/{me}", headers=AUTH).status_code == 200
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(enroll, "evaluate", forget_meanwhile)
+    r = import_range(client, me, row["id"], 0, 60)
+    assert r.status_code in (404, 409)
+    assert not Vault.open(settings).person_dir(me).exists()
+    assert worker.db.one("SELECT COUNT(*) AS n FROM samples")["n"] == 0
+
+
 def test_a_reject_leaves_a_label_alone_that_no_longer_lists_the_sample(env):
     settings, client, worker = env
     me, rows, ids = me_with_samples(client, worker)
