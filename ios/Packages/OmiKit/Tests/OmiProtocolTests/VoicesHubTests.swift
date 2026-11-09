@@ -121,9 +121,26 @@ import Testing
     }
 
     @Test func measuredIsHiddenWithoutTheCalibrationFeature() throws {
-        let p = try decode(Person.self, Self.alanJSON)
+        var p = try decode(Person.self, Self.alanJSON)
+        p.autoActive = true
         #expect(VoicesHub.measuredLine(p, calibrationSupported: false) == nil)
         #expect(VoicesHub.measuredLine(p, calibrationSupported: true) != nil)
+    }
+
+    /// Live calibration 2026-11-09: an inactive person's measurement is of the gated decision, so it
+    /// found nobody ("认出 ≥ 0%" would read as a broken model). Only an active person's line shows.
+    @Test func measuredIsShownOnlyForAnActivePerson() throws {
+        let inactive = try decode(Person.self, #"""
+        {"id":"p-alan","name":"Alan","me":true,"auto_active":false,
+         "measured":{"conversations":213,"found_at_least":0.0,"negative_conversations":30,"wrong_at_most":0.133}}
+        """#)
+        #expect(VoicesHub.measuredLine(inactive, calibrationSupported: true) == nil)
+        var unknown = inactive
+        unknown.autoActive = nil  // an answer without auto_active isn't active either
+        #expect(VoicesHub.measuredLine(unknown, calibrationSupported: true) == nil)
+        var active = inactive
+        active.autoActive = true
+        #expect(VoicesHub.measuredLine(active, calibrationSupported: true) == "243 段 · 认出 ≥ 0% · 误认 ≤ 14%")
     }
 
     // MARK: Hub

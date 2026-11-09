@@ -189,9 +189,11 @@ public enum VoicesHub {
         people.reduce(0) { $0 + ($1.reviewCount ?? 0) }
     }
 
-    /// Held-out counts and bounds, only from a server that calibrates and only when it counted any.
+    /// Held-out counts and bounds, only from a server that calibrates, only when it counted any, and only
+    /// for an active person: an inactive one's measurement is of the gated decision, which names nobody
+    /// ("认出 ≥ 0%" would read as a broken model).
     public static func measuredLine(_ person: Person, calibrationSupported: Bool) -> String? {
-        calibrationSupported ? person.measured?.compactLine : nil
+        calibrationSupported && person.autoActive == true ? person.measured?.compactLine : nil
     }
 
     /// "今天 03:10", "昨天 03:10", "11-02", or "2025-11-02" in the phone's time zone.
