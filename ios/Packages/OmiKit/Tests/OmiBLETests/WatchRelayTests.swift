@@ -293,6 +293,21 @@ import OmiCapture
         #expect(WatchWire.inventory == "inventory" && WatchWire.missing == "missing", "wire keys both builds read")
     }
 
+    @Test func syncPingReceiptsAreVerifiedPairsAndAConflictingDuplicateGetsNone() throws {
+        let (inbox, relay, _, root) = try inbox()
+        let rec = UUID().uuidString.lowercased()
+        let (m0, f0) = try part(inbox, root, index: 0, recording: rec)
+        let (m1, f1) = try part(inbox, root, index: 1, recording: rec)
+        try inbox.accept(file: f0, segment: m0)
+        try inbox.accept(file: f1, segment: m1)
+        _ = relay.process()
+        let other = String(repeating: "b", count: 64)
+        let receipts = try inbox.receipts(items: [.init(id: m0.id, sha256: m0.sha256), .init(id: m0.id, sha256: m0.sha256),
+                                                  .init(id: m1.id, sha256: m1.sha256), .init(id: m1.id, sha256: other)], binding: "phone-A")
+        #expect(receipts == [WatchInventoryItem(id: m0.id, sha256: m0.sha256)], "one id with two checksums: no receipt for either")
+        #expect(throws: WatchRelayError.wrongPhone) { try inbox.receipts(items: [.init(id: m0.id, sha256: m0.sha256)], binding: "phone-B") }
+    }
+
     /// ASTRA-IT2-01 (blocker): a filename was taken as proof of audio, and the Watch deleted its only
     /// copy. Unreadable, absent, quarantined-without-audio and legacy receipts are "missing" now.
     @Test func noAcknowledgementWithoutMatchingAudio() throws {

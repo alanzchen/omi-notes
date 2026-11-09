@@ -81,6 +81,10 @@ public struct WatchReport: Codable, Equatable, Sendable {
     public var stats: [String: Int]?
     /// Audio parts kept on the Watch that it can't send (no manifest matches them; `orphan_parts`).
     public var keptParts: Int { stats?["orphan_parts"] ?? 0 }
+    /// Of the waiting parts, those being re-checked: audio an older iPhone build already converted, which
+    /// the Watch sends again after any new audio (`recheck_parts`, `recheck_s`; absent from older Watch apps).
+    public var recheckParts: Int { stats?["recheck_parts"] ?? 0 }
+    public var recheckSeconds: Int { stats?["recheck_s"] ?? 0 }
 
     public init(state: State, since: Date?, waitingParts: Int, waitingSeconds: Int? = nil, at: Date, deviceId: String? = nil,
                 stats: [String: Int]? = nil) {
@@ -117,6 +121,14 @@ public enum WatchWire {
     /// iPhone → Watch, in an inventory answer: the parts it holds, as `[{id, sha256}]` (the only thing
     /// in an answer that lets the Watch delete anything).
     public static let inventoryAcks = "inventory_acks"
+    /// Watch → iPhone while recording (kind `sync`, a `sendMessage` with a reply): `inventory_items` of parts
+    /// waiting for a receipt. The reply carries `inventory_acks` for those the iPhone holds; it names no
+    /// question, so nothing in it makes the Watch resend anything.
+    public static let sync = "sync"
+
+    public static func syncPing(items: [WatchInventoryItem], binding: String) -> [String: Any] {
+        [kind: sync, inventoryItems: inventoryItems(items), self.binding: binding]
+    }
 
     /// The Watch's question: checksummed items only (no id-only list an older phone might answer by filename).
     public static func inventoryQuestion(id: String, items: [WatchInventoryItem], binding: String) -> [String: Any] {
@@ -474,6 +486,18 @@ public final class PhoneWatchInbox: @unchecked Sendable {
             if holds(item.id, sha256: item.sha256, binding: binding) { acks.append(item.id) } else { missing.append(item.id) }
         }
         return (acks, missing)
+    }
+
+    /// Receipts for a sync ping: only the (id, sha256) pairs this phone holds with that checksum. An id asked
+    /// with two different checksums gets no receipt at all (the Watch can't have both), and each pair is
+    /// returned once.
+    public func receipts(items: [WatchInventoryItem], binding asked: String?) throws -> [WatchInventoryItem] {
+        var hashes: [String: Set<String>] = [:]
+        for item in items { hashes[item.id, default: []].insert(item.sha256) }
+        let unique = hashes.compactMap { id, set in set.count == 1 ? WatchInventoryItem(id: id, sha256: set.first!) : nil }
+            .sorted { $0.id < $1.id }
+        let held = Set(try answer(items: unique, binding: asked).acks)
+        return unique.filter { held.contains($0.id) }
     }
 
     public func accept(end: WatchRecordingEnd) throws {

@@ -91,6 +91,9 @@ public struct OutboxStats: Sendable, Equatable {
     public var sentCount = 0
     public var sentBytes: Int64 = 0
     public var quarantineCount = 0
+    /// Of those, the Apple Watch's (chunks and seals with source `watch_mic`): the Devices screen shows
+    /// each problem on the device it concerns.
+    public var quarantineWatchCount = 0
     /// The waiting and kept-aside folders could be listed (false: counts are unknown, not zero).
     public var inventoryReadable = true
     public init() {}
@@ -123,6 +126,8 @@ public final class Outbox: @unchecked Sendable {
     /// Injectable for tests: system uptime in seconds.
     var uptime: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     private var listings: [URL: Listing] = [:]
+    /// Whether each quarantined file is the Watch's, read once from its header (the folder is small).
+    private var quarantineFromWatch: [String: Bool] = [:]
 
     public init(dirs: CaptureDirectories) { self.dirs = dirs }
 
@@ -199,7 +204,8 @@ public final class Outbox: @unchecked Sendable {
         }
     }
 
-    /// pending → quarantine with a `.reason` sidecar.
+    /// pending → quarantine with a `.reason` sidecar. Throws, leaving the file pending, when it may be a
+    /// re-queued file whose record can't be read or completed (the move would let it be re-queued twice).
     public func quarantine(_ name: String, reason: String) throws {
         lock.lock(); defer { lock.unlock() }
         let src = dirs.outboxPending.appendingPathComponent(name)
@@ -207,6 +213,7 @@ public final class Outbox: @unchecked Sendable {
         guard FileIO.exists(src) else { return }
         let freshPending = isFreshLocked(dirs.outboxPending), freshQuarantine = isFreshLocked(dirs.outboxQuarantine)
         if FileIO.exists(dst) { try? FileManager.default.removeItem(at: dst) }
+        try noteQuarantinedAgainLocked(name, reason: reason)  // before the move: a crash between them can't requeue it twice
         try FileManager.default.moveItem(at: src, to: dst)
         try? Data(reason.utf8).write(to: dst.appendingPathExtension("reason"))
         updateLocked(dirs.outboxPending, wasFresh: freshPending) { $0[name] = nil }
@@ -218,6 +225,123 @@ public final class Outbox: @unchecked Sendable {
     public func quarantineReason(_ name: String) -> String? {
         let url = dirs.outboxQuarantine.appendingPathComponent(name).appendingPathExtension("reason")
         return (try? Data(contentsOf: url)).flatMap { String(data: $0, encoding: .utf8) }
+    }
+
+    /// Where `requeueConflicts` remembers what it moves back (and each one's quarantine reason).
+    var requeuedLedger: URL { dirs.outboxQuarantine.deletingLastPathComponent().appendingPathComponent("requeued-conflicts.json") }
+
+    /// One file `requeueConflicts` moves back: the intent is recorded before the move and completed after
+    /// it, so a crash in between is redone (or completed) next time, never left excluded.
+    struct RequeueEntry: Codable, Equatable {
+        enum State: String, Codable { case intent, done }
+        var state: State
+        var reason: String
+    }
+
+    public enum RequeueError: Error, CustomStringConvertible {
+        /// The ledger exists but can't be read: nothing is moved (its entries might say a file was moved once already).
+        case unreadableLedger(String)
+        public var description: String {
+            switch self { case .unreadableLedger(let why): return "the re-queue ledger can't be read (\(why)); nothing re-queued" }
+        }
+    }
+
+    /// The ledger; empty only when there is none. An unreadable one throws rather than being taken as empty.
+    func readRequeueLedger() throws -> [String: RequeueEntry] {
+        guard FileIO.exists(requeuedLedger) else { return [:] }
+        do {
+            return try JSONDecoder().decode([String: RequeueEntry].self, from: Data(contentsOf: requeuedLedger))
+        } catch {
+            log(.error, "outbox", "re-queue ledger unreadable: \(error)")
+            throw RequeueError.unreadableLedger("\(error)")
+        }
+    }
+
+    /// Moves files quarantined for a 409 (`reason` starting "409") back to pending, each at most once ever:
+    /// for a server that takes the same audio sent again (`same_audio_resend`), where a re-encoded copy is
+    /// answered 200. A real conflict comes back as 409 and stays quarantined after that. Nothing is deleted:
+    /// the reason moves into the ledger. Each move is intent (fsync'd) → move (directories fsync'd) → done,
+    /// all under the lock. An intent left by a crash is never redone here, where uploads run (its file may
+    /// have been moved, uploaded and quarantined again): `recoverRequeueIntents` handles it at startup.
+    /// Throws when the quarantine folder can't be listed. Returns the names moved.
+    @discardableResult
+    public func requeueConflicts() throws -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        var ledger = try readRequeueLedger()
+        let names = try FileManager.default.contentsOfDirectory(atPath: dirs.outboxQuarantine.path)
+        var moved: [String] = []
+        for name in names.sorted() where OutboxKind.parse(name) != nil && ledger[name] == nil {
+            let src = dirs.outboxQuarantine.appendingPathComponent(name)
+            let dst = dirs.outboxPending.appendingPathComponent(name)
+            let reasonURL = src.appendingPathExtension("reason")
+            guard !FileIO.exists(dst), let reason = (try? Data(contentsOf: reasonURL)).flatMap({ String(data: $0, encoding: .utf8) }),
+                  reason.hasPrefix("409") else { continue }
+            ledger[name] = RequeueEntry(state: .intent, reason: reason)
+            try saveRequeueLedger(ledger)
+            try moveBackLocked(name)
+            ledger[name]?.state = .done
+            try saveRequeueLedger(ledger)
+            try? FileManager.default.removeItem(at: reasonURL)  // its text is in the ledger
+            moved.append(name)
+        }
+        return moved
+    }
+
+    /// At startup, before any upload can run: finishes re-queue moves a crash interrupted. An intent whose
+    /// file is pending (or already sent) was moved: it is marked done. One whose file is still quarantined
+    /// wasn't (no upload has run since the crash to quarantine it again): it is moved now. One with no file
+    /// in either place stays an intent (no evidence either way). Throws when a folder can't be listed.
+    @discardableResult
+    public func recoverRequeueIntents() throws -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        var ledger = try readRequeueLedger()
+        let intents = ledger.filter { $0.value.state == .intent }.keys.sorted()
+        guard !intents.isEmpty else { return [] }
+        let quarantined = Set(try FileManager.default.contentsOfDirectory(atPath: dirs.outboxQuarantine.path))
+        let pending = Set(try FileManager.default.contentsOfDirectory(atPath: dirs.outboxPending.path))
+        let sent = Set(try FileManager.default.contentsOfDirectory(atPath: dirs.outboxSent.path))
+        var moved: [String] = []
+        for name in intents {
+            if pending.contains(name) || sent.contains(name) {
+                // moved before the crash
+            } else if quarantined.contains(name) {
+                try moveBackLocked(name)
+                moved.append(name)
+            } else {
+                log(.warning, "outbox", "re-queue of \(name) unfinished and its file is in neither folder; left as an intent")
+                continue
+            }
+            ledger[name]?.state = .done
+            try saveRequeueLedger(ledger)
+            try? FileManager.default.removeItem(at: dirs.outboxQuarantine.appendingPathComponent(name).appendingPathExtension("reason"))
+        }
+        return moved
+    }
+
+    private func saveRequeueLedger(_ ledger: [String: RequeueEntry]) throws {
+        try FileIO.atomicWrite(try JSONEncoder().encode(ledger), to: requeuedLedger)
+    }
+
+    /// quarantine → pending, both directories fsync'd. Caller holds the lock.
+    private func moveBackLocked(_ name: String) throws {
+        try FileManager.default.moveItem(at: dirs.outboxQuarantine.appendingPathComponent(name), to: dirs.outboxPending.appendingPathComponent(name))
+        FileIO.fsyncDirectory(dirs.outboxPending)
+        FileIO.fsyncDirectory(dirs.outboxQuarantine)
+        listings[dirs.outboxPending] = nil
+        listings[dirs.outboxQuarantine] = nil
+    }
+
+    /// A file quarantined again after a re-queue whose "done" a crash lost: recorded as done (with the new
+    /// reason), so it is never moved back a second time. Throws when the ledger can't be read or saved:
+    /// the caller then leaves the file where it is. Caller holds the lock.
+    private func noteQuarantinedAgainLocked(_ name: String, reason: String) throws {
+        var ledger = try readRequeueLedger()
+        guard ledger[name]?.state == .intent else { return }
+        ledger[name] = RequeueEntry(state: .done, reason: (ledger[name]?.reason ?? "") + "\nquarantined again: " + reason)
+        do { try saveRequeueLedger(ledger) } catch {
+            log(.error, "outbox", "couldn't record \(name) quarantined again: \(error)")
+            throw error
+        }
     }
 
     /// Debug: move a quarantined file back to pending for another attempt.
@@ -258,8 +382,24 @@ public final class Outbox: @unchecked Sendable {
             s.sentBytes += item.size
         }
         s.quarantineCount = quarantineList?.count ?? 0
+        s.quarantineWatchCount = (quarantineList ?? []).filter { isFromWatch($0.name) }.count
         s.inventoryReadable = pendingList != nil && quarantineList != nil  // the inventory these counts came from
         return s
+    }
+
+    private func isFromWatch(_ name: String) -> Bool {
+        if let known = lock.withLock({ quarantineFromWatch[name] }) { return known }
+        struct Source: Decodable { var source: CaptureSource }
+        let data = try? Data(contentsOf: dirs.outboxQuarantine.appendingPathComponent(name))
+        let source: CaptureSource?
+        switch OutboxKind.parse(name) {
+        case .chunk: source = data.flatMap { try? Envelope.parse($0).header.source }
+        case .seal: source = data.flatMap { try? JSONDecoder().decode(Source.self, from: $0).source }
+        case .event, nil: source = nil
+        }
+        let watch = source == .watchMic
+        if data != nil { lock.withLock { quarantineFromWatch[name] = watch } }  // unreadable: asked again next time
+        return watch
     }
 
     /// nil: the folder couldn't be read (nothing cached; the next call reads it again).

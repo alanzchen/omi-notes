@@ -223,6 +223,13 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         let dirs = config.dirs
         do { try dirs.create() } catch { log(.error, "engine", "cannot create data directories: \(error)") }
         outbox = Outbox(dirs: dirs)
+        // before any upload can run: a re-queue a crash interrupted is told apart from a second 409
+        do {
+            let moved = try outbox.recoverRequeueIntents()
+            if !moved.isEmpty { log(.info, "upload", "finished re-queueing \(moved.count) chunk(s) a restart interrupted") }
+        } catch {
+            log(.error, "upload", "couldn't recover interrupted re-queues: \(error)")
+        }
         env = CaptureEnvironment(dirs: dirs, outbox: outbox, clock: config.clock, appVersion: config.appVersion, timezone: config.timezone)
         deviceMemory = DeviceMemory(stateDir: dirs.state)
         cursors = RingCursorStore(stateDir: dirs.state)
@@ -543,6 +550,23 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         if supported { UserDefaults.standard.set(generation, forKey: Self.watchAACKey) } else { UserDefaults.standard.removeObject(forKey: Self.watchAACKey) }
     }
 
+    /// The server answers the same audio sent again (another encoding of a stored chunk) with 200
+    /// (`same_audio_resend`): chunks quarantined for a 409 go back to the upload queue, each once ever.
+    public func noteServerSameAudioResend(_ supported: Bool) {
+        guard supported else { return }
+        queue.async {
+            do {
+                let moved = try self.outbox.requeueConflicts()
+                guard !moved.isEmpty else { return }
+                log(.info, "upload", "re-queued \(moved.count) chunk(s) quarantined for a 409: the server now takes the same audio sent again")
+                self.refreshOutboxStats()
+                self.uploader.reconcile()
+            } catch {
+                log(.error, "upload", "couldn't re-queue quarantined chunks: \(error)")
+            }
+        }
+    }
+
     var serverTakesWatchAAC: Bool {
         (UserDefaults.standard.object(forKey: Self.watchAACKey) as? Int) == settings.serverConfig().generation
     }
@@ -576,6 +600,11 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         let answer = try watchInbox.answer(items: items, binding: binding)
         log(.info, "watch", "Watch asked about \(items.count) waiting part(s): \(answer.acks.count) already here, \(answer.missing.count) missing")
         return answer
+    }
+
+    /// The Watch's sync ping: verified (id, sha256) receipts only.
+    public func watchReceipts(_ items: [WatchInventoryItem], binding: String?) throws -> [WatchInventoryItem] {
+        try watchInbox.receipts(items: items, binding: binding)
     }
 
     public func acceptWatchEnd(_ data: Data?) throws -> String {

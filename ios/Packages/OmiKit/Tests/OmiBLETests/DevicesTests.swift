@@ -23,6 +23,14 @@ import OmiWatchKit
         #expect(!unknown.configured && unknown.title == "Set up Apple Watch", "unknown installation: a setup row, not a fake device")
     }
 
+    @Test func theWatchsFilesThatCouldntUploadShowOnItsCard() {
+        let quiet = WatchSummary.evaluate(installed: true, report: nil, lastReceivedAt: nil, now: now)
+        #expect(quiet.issue == nil)
+        let kept = WatchSummary.evaluate(installed: nil, report: nil, lastReceivedAt: nil, now: now, quarantined: 3)
+        #expect(kept.issue == "3 files couldn't upload" && kept.issueFix == .openDiagnostics)
+        #expect(kept.configured, "a card, so the problem has somewhere to show")
+    }
+
     @Test func onlyAFreshReportSaysWhatTheWatchIsDoing() {
         let rec = WatchReport(state: .recording, since: now.addingTimeInterval(-3600), waitingParts: 1, at: now.addingTimeInterval(-120))
         let fresh = WatchSummary.evaluate(installed: true, report: rec, lastReceivedAt: nil, now: now)

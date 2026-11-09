@@ -27,6 +27,14 @@ public struct TransferSummary: Equatable, Sendable {
         public var waitingForServer: Int
         /// Audio parts the Watch keeps but can't send (from its report): never "all sent" while > 0.
         public var keptOnWatch: Int = 0
+        /// Of the waiting parts, re-checks: parts the iPhone had no checksum receipt for (mostly converted by
+        /// an older build), sent after new audio. Still unacknowledged: they stay in every total and nothing
+        /// says "all sent" while any remain; they are only named apart.
+        public var recheckParts: Int = 0
+        public var recheckSeconds: Int = 0
+
+        /// Waiting parts that aren't re-checks.
+        public var newParts: Int? { waitingParts.map { max(0, $0 - recheckParts) } }
     }
 
     // MARK: iPhone → server
@@ -93,7 +101,8 @@ public struct TransferSummary: Equatable, Sendable {
             reportFresh: report.map { now.timeIntervalSince($0.at) <= WatchSummary.fresh && $0.at <= now.addingTimeInterval(60) } ?? false,
             waitingParts: report?.waitingParts, waitingSeconds: report?.waitingSeconds,
             receivedOnPhone: s.watchReceived, lastReceivedAt: s.watchLastReceiptAt,
-            converting: s.watchPending, waitingForServer: s.watchWaitingUpload, keptOnWatch: report?.keptParts ?? 0)
+            converting: s.watchPending, waitingForServer: s.watchWaitingUpload, keptOnWatch: report?.keptParts ?? 0,
+            recheckParts: report?.recheckParts ?? 0, recheckSeconds: report?.recheckSeconds ?? 0)
 
         let m = s.transfer.meter
         let rate = m.rate(atMono: nowMono)

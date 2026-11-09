@@ -1,6 +1,7 @@
 import Foundation
 import OmiWatchKit
 import WatchConnectivity
+import WatchKit
 
 /// Sends the Watch's segments to the paired iPhone and removes them only when the iPhone says it
 /// has them (stored and checked). Segments made for another iPhone install are held, never sent.
@@ -32,6 +33,61 @@ final class WatchSync: NSObject, WCSessionDelegate {
     /// Audio kept without a usable manifest (`WatchOutbox.orphans`): never sent or deleted, reported so
     /// it can be recovered by hand.
     private(set) var orphans = 0
+    /// Of the waiting parts, re-checks of audio an older iPhone build already converted (sent after new audio).
+    private(set) var recheckParts = 0
+    private(set) var recheckSeconds = 0
+
+    /// When each waiting part was last handed over (this launch), for the receipt latency.
+    private var handedAt: [String: Date] = [:]
+    private var ackLatency = WatchAckLatency()
+    private var lastSyncPing: Date?
+    /// WatchConnectivity background wakes this launch, and audio parts handed over during them.
+    private var backgroundWakes = 0
+    private var backgroundWakeParts = 0
+    /// Which outstanding transfers are moving, stalled (no progress for minutes) or queued.
+    private var stalls = WatchTransferStalls()
+    private var transferCounts = WatchTransferStalls.Counts()
+    /// Delegate callbacks whose main-actor work hasn't run yet (a background wake waits for them).
+    nonisolated private let callbackWork = WatchCallbackWork()
+
+    /// Runs a delegate callback's work on the main actor, counted until it finishes.
+    nonisolated private func onMain(_ work: @escaping @MainActor @Sendable () -> Void) {
+        callbackWork.begin()
+        Task { @MainActor in
+            work()
+            self.callbackWork.end()
+        }
+    }
+
+    /// The link and app state for the status report and performance samples (memo checks D1/D3).
+    private var linkStats: [String: Int] {
+        var s: [String: Int] = ["recheck_parts": recheckParts, "recheck_s": recheckSeconds,
+                                "bg_wakes": backgroundWakes, "bg_wake_parts": backgroundWakeParts]
+        guard activated else { return s }
+        let session = WCSession.default
+        let transfers = session.outstandingFileTransfers
+        let now = Date()
+        let ages = transfers.compactMap { ($0.file.metadata?["id"] as? String).flatMap { handedAt[$0] } }.map { Int(now.timeIntervalSince($0)) }
+        s["reachable"] = session.isReachable ? 1 : 0
+        s["app_state"] = Self.appState
+        // as of the last pump: moving (progress within `stallAfter`), stalled (transferring, no progress), queued
+        s["outstanding_active"] = transferCounts.moving
+        s["outstanding_stalled"] = transferCounts.stalled
+        s["outstanding_queued"] = transferCounts.queued
+        if let oldest = ages.max() { s["outstanding_oldest_s"] = oldest }
+        if let p50 = ackLatency.quantile(0.5) { s["ack_latency_p50_s"] = p50 }
+        if let p90 = ackLatency.quantile(0.9) { s["ack_latency_p90_s"] = p90 }
+        return s
+    }
+
+    /// 0 foreground, 1 inactive, 2 background (`WKApplication.applicationState`).
+    private static var appState: Int {
+        switch WKApplication.shared().applicationState {
+        case .active: return 0
+        case .inactive: return 1
+        default: return 2
+        }
+    }
 
     func refreshCounts() {
         let segments = outbox.segments(), ends = outbox.ends()
@@ -42,6 +98,9 @@ final class WatchSync: NSObject, WCSessionDelegate {
         held = segments.filter { $0.segment.binding != binding }.count
         pending = segments.count - held + (segments.isEmpty ? ends.filter { $0.binding == binding }.count : 0)
         pendingSeconds = WaitingAudio.seconds(segments.filter { $0.segment.binding == binding }.map(\.segment))
+        let rechecks = segments.filter { $0.segment.binding == binding && resend.isRecheck($0.segment.id) }.map(\.segment)
+        recheckParts = rechecks.count
+        recheckSeconds = WaitingAudio.seconds(rechecks)
         sendReport()
         complication.update(recorder: complicationRecorder, waitingParts: pending, waitingSeconds: pendingSeconds, bound: binding != nil)
     }
@@ -70,8 +129,10 @@ final class WatchSync: NSObject, WCSessionDelegate {
         let r = WatchReport(state: recorderState.state, since: recorderState.since, waitingParts: pending, waitingSeconds: pendingSeconds, at: now,
                             deviceId: WatchRecorder.deviceId,
                             stats: counters.merging(captureStats) { a, _ in a }.merging(["awaiting_ack": resend.awaitingAck]) { a, _ in a }
-                                .merging(orphans > 0 ? ["orphan_parts": orphans] : [:]) { a, _ in a })
-        if let l = lastReport, l.state == r.state, l.since == r.since, l.waitingParts == r.waitingParts, now.timeIntervalSince(l.at) < 300 { return }
+                                .merging(orphans > 0 ? ["orphan_parts": orphans] : [:]) { a, _ in a }
+                                .merging(linkStats) { a, _ in a })
+        if let l = lastReport, l.state == r.state, l.since == r.since, l.waitingParts == r.waitingParts, l.recheckParts == r.recheckParts,
+           now.timeIntervalSince(l.at) < 300 { return }
         do {
             try WCSession.default.updateApplicationContext([WatchWire.report: WatchWire.encode(r)])
             lastReport = r
@@ -109,12 +170,15 @@ final class WatchSync: NSObject, WCSessionDelegate {
     var relayGauges: [String: Int] {
         let oldest = outbox.segments().first.map { Int(Date().timeIntervalSince($0.segment.recordingStartedAt)) } ?? 0
         return ["outbox_parts": pending, "waiting_s": pendingSeconds, "awaiting_ack": awaitingAck, "outstanding_files": activated ? WCSession.default.outstandingFileTransfers.count : -1,
-                "last_transfer_error": lastTransferError, "oldest_waiting_s": oldest]
+                "last_transfer_error": lastTransferError, "oldest_waiting_s": oldest].merging(linkStats) { a, _ in a }
     }
 
     private func markSent(_ id: String, now: Date) {
         count(resend.entries[id] == nil ? "transfers" : "resends")
+        if resend.isRecheck(id) { count("recheck_sent") }
         resend.handedOver(id, now: now)
+        handedAt[id] = now
+        if inBackgroundWake { backgroundWakeParts += 1 }
     }
 
     /// Files handed to WatchConnectivity at once, at most: after a day away from the iPhone, the
@@ -143,8 +207,17 @@ final class WatchSync: NSObject, WCSessionDelegate {
         let inFlight = Set(session.outstandingFileTransfers.compactMap { $0.file.metadata?["id"] as? String })
             .union(session.outstandingUserInfoTransfers.compactMap { $0.userInfo["id"] as? String })
         let now = Date()
-        var room = Self.maxInFlight - session.outstandingFileTransfers.count
-        for (segment, file) in outbox.segments() where segment.binding == binding && !inFlight.contains(segment.id) && resend.due(segment.id, now: now) {
+        // only moving transfers hold a slot: queued ones waiting for app runtime, or "transferring" ones with no
+        // progress for minutes, pinned the window at 4; never cancelled (their parts stay until a receipt)
+        let outstanding = session.outstandingFileTransfers
+        transferCounts = stalls.observe(outstanding.map { t in
+            WatchTransferStalls.Observation(id: t.file.metadata?["id"] as? String ?? t.file.fileURL.lastPathComponent,
+                                            transferring: t.isTransferring, completedBytes: t.progress.completedUnitCount)
+        }, now: now)
+        var room = WatchTransferWindow.room(maxInFlight: Self.maxInFlight, transferring: transferCounts.moving, outstanding: outstanding.count)
+        // new audio first; re-checks of parts an older iPhone build already converted after it
+        let waiting = resend.sendOrder(outbox.segments(), now: now) { $0.segment.id }
+        for (segment, file) in waiting where segment.binding == binding && !inFlight.contains(segment.id) && resend.due(segment.id, now: now) {
             guard room > 0 else { break }
             room -= 1
             watchLog.info("sending segment \(segment.id)")
@@ -183,7 +256,65 @@ final class WatchSync: NSObject, WCSessionDelegate {
             count("perf_batches_sent")
             session.transferUserInfo([WatchWire.kind: WatchWire.perf, "id": batch.id, WatchWire.manifest: WatchWire.encode(batch)])
         }
+        syncPing(now: now)
         scheduleRecheck()
+    }
+
+    /// While parts wait: asks the iPhone (a message with a reply, which wakes its app) for receipts about the
+    /// oldest waiting parts, delivered or not, at most once per `WatchSyncPing.interval`; the iPhone answers
+    /// only with receipts it can verify. Unreachable: nothing (the usual transfers and inventory still run).
+    private func syncPing(now: Date) {
+        let session = WCSession.default
+        guard let binding, WatchSyncPing.due(now: now, last: lastSyncPing, reachable: session.isReachable, waitingParts: pending) else { return }
+        let items = outbox.segments().filter { $0.segment.binding == binding }.prefix(WatchSyncPing.batch)
+            .map { WatchInventoryItem(id: $0.segment.id, sha256: $0.segment.sha256) }
+        guard !items.isEmpty else { return }
+        lastSyncPing = now
+        count("sync_pings")
+        session.sendMessage(WatchWire.syncPing(items: Array(items), binding: binding), replyHandler: { reply in
+            let r = Received(reply)
+            self.onMain {
+                self.count("sync_replies")
+                self.handle(r)
+            }
+        }, errorHandler: { error in
+            let code = (error as NSError).code
+            self.onMain {
+                self.count("sync_ping_errors")
+                self.lastTransferError = code
+            }
+        })
+    }
+
+    /// A WatchConnectivity background wake (`.backgroundTask(.watchConnectivity)`): stay until the session is
+    /// active, everything pending has been received (`hasContentPending`) and handled on the main actor
+    /// (`callbackWork`), and the send loop ran after it, so one wake moves the acknowledgements and the next
+    /// parts instead of a single part. Returns at once when the task is cancelled (its time expired).
+    private(set) var inBackgroundWake = false
+    func backgroundWake() async {
+        backgroundWakes += 1
+        inBackgroundWake = true
+        defer { inBackgroundWake = false }
+        let session = WCSession.default
+        let deadline = Date().addingTimeInterval(25)
+        var settled: Bool { activated && !session.hasContentPending && callbackWork.isIdle }
+        while !settled && Date() < deadline {
+            // delegate callbacks run on the main actor meanwhile; a cancelled sleep throws: stop now
+            guard (try? await Task.sleep(for: .milliseconds(200))) != nil else { return }
+        }
+        guard !Task.isCancelled else { return }
+        pump()
+        // give the receipts for what this pump handed over a moment to come back, then send again
+        while Date() < deadline, transferCounts.moving > 0 || !settled {
+            guard (try? await Task.sleep(for: .milliseconds(500))) != nil else { return }
+            pump()
+        }
+        // the last pump's own callbacks (replies to what it sent) before the wake ends
+        while !callbackWork.isIdle && Date() < deadline {
+            guard (try? await Task.sleep(for: .milliseconds(100))) != nil else { return }
+        }
+        sendReport()
+        watchLog.info("background wake: \(self.backgroundWakeParts) part(s) handed over in \(self.backgroundWakes) wake(s) so far")
     }
 
     /// What the iPhone told the Watch (a plain value, safe to pass to the main actor).
@@ -214,7 +345,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
             // the iPhone can't read its identity yet (not unlocked since it restarted): asking again at
             // once would loop; it announces itself after unlocking, and the recheck asks again
             guard r.binding != nil || !r.acks.isEmpty || r.inventoryId != nil else { return }  // (hello reply)
-            Task { @MainActor in self.handle(r) }
+            self.onMain { self.handle(r) }
         }, errorHandler: nil)
     }
 
@@ -238,6 +369,10 @@ final class WatchSync: NSObject, WCSessionDelegate {
         // audio goes only on a receipt matching the part's own manifest (the storage layer checks it);
         // plain acks reach recording ends and telemetry only, never anything under segments/
         let retired = outbox.retire(receipts: r.receipts)
+        let now = Date()
+        for id in retired {
+            if let at = handedAt.removeValue(forKey: id) { ackLatency.add(now.timeIntervalSince(at)) }
+        }
         let ends = outbox.acknowledgeEnds(r.acks)
         perf.acknowledge(r.acks)
         // done: what was removed, and plain acks for anything that holds no audio (telemetry batches);
@@ -266,7 +401,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
     nonisolated func session(_ session: WCSession, activationDidCompleteWith state: WCSessionActivationState, error: Error?) {
         let r = Received(session.receivedApplicationContext)
         let ok = state == .activated
-        Task { @MainActor in
+        onMain {
             self.activated = ok
             self.handle(r)
         }
@@ -274,17 +409,17 @@ final class WatchSync: NSObject, WCSessionDelegate {
 
     nonisolated func session(_ session: WCSession, didReceiveApplicationContext context: [String: Any]) {
         let r = Received(context)
-        Task { @MainActor in self.handle(r) }
+        onMain { self.handle(r) }
     }
 
     nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
         let r = Received(userInfo)
-        Task { @MainActor in self.handle(r) }
+        onMain { self.handle(r) }
     }
 
     nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
         let r = Received(message)
-        Task { @MainActor in self.handle(r) }
+        onMain { self.handle(r) }
     }
 
     nonisolated func session(_ session: WCSession, didFinish fileTransfer: WCSessionFileTransfer, error: Error?) {
@@ -292,7 +427,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
         let failed = error.map { "\($0.localizedDescription) (\(($0 as NSError).code))" }
         let failedCode = error.map { ($0 as NSError).code } ?? 0
         let transferId = fileTransfer.file.metadata?["id"] as? String
-        Task { @MainActor in
+        onMain {
             if let failed {
                 self.failures += 1
                 self.retryAt = Date().addingTimeInterval(min(300, 5 * pow(2, Double(min(self.failures - 1, 6)))))
@@ -315,13 +450,13 @@ final class WatchSync: NSObject, WCSessionDelegate {
     nonisolated func session(_ session: WCSession, didFinish userInfoTransfer: WCSessionUserInfoTransfer, error: Error?) {
         let id = userInfoTransfer.userInfo["id"] as? String
         let failed = error != nil
-        Task { @MainActor in
+        onMain {
             guard let id else { return }
             if failed { self.resend.failed(id); self.count("transfer_failures") } else { self.resend.delivered(id, now: Date()) }
         }
     }
 
     nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
-        Task { @MainActor in self.pump() }
+        onMain { self.pump() }
     }
 }

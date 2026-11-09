@@ -184,3 +184,7 @@ def test_a_copy_with_extra_sound_past_the_shorter_end_is_not_the_same_audio():
         for p in (pcm, padded)
     )
     assert same_audio(a, b) is True, "quiet padding past the end is still the same recording"
+
+
+def test_the_server_advertises_that_it_takes_the_same_audio_sent_again(client):
+    assert "same_audio_resend" in client.get("/v1/status", headers=AUTH).json()["features"]
