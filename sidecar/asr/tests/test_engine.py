@@ -207,3 +207,13 @@ def test_a_failed_tail_just_after_a_line_is_not_covered_by_timing_slack():
     with pytest.raises(IncompleteTranscription):
         _check_fallback(pcm, [(180.0, 180.8)], lines)
     _check_fallback(pcm, [(100.0, 180.0)], lines)  # a span MOSS words lie over is fine
+
+
+def test_a_half_that_still_hits_the_cap_is_halved_once_more_before_mosss_gaps_make_it_incomplete():
+    # 01a13ccd (2026-11-08 19:27): a 92 s chunk capped, its 46 s half capped again, and MOSS had no words
+    # for 14 s there: refused, though Qwen manages the same speech in shorter pieces
+    e = Engine()
+    e.models = (FakeMoss(lines_every(10, 40)), CappingQwen(limit=35), FakeAligner())  # the cuts fall at pauses: 61 + 31, then 34 + 27
+    out = e.transcribe(speech(92), [])
+    assert out["omi_asr"]["qwen_capped"] == 0 and out["omi_asr"]["qwen_split"] == 2
+    assert "moss" not in out["text"]

@@ -45,6 +45,9 @@ def _uncovered_speech(pcm: np.ndarray, a: float, b: float, covered: list[tuple[f
     return float((loud & ~hit).sum()) * frame / plan.SR, float(loud.sum()) * frame / plan.SR
 
 
+QWEN_SPLITS = 2  # a capped chunk is halved, a capped half halved again (pieces of 20 s or less are not)
+
+
 class IncompleteTranscription(RuntimeError):
     """Qwen failed on some audio and MOSS has no words there either: rather an error than silence."""
 
@@ -179,9 +182,10 @@ class Engine:
         return [(moss_lines(r.segments, offset=a), a, b, False)]
 
     def _qwen(self, qwen, aligner, pcm: np.ndarray, a: float, b: float, context: list[str], stats: dict,
-              languages: list[str], capped: list[tuple[float, float]], split: bool = True) -> list:  # fmt: skip
-        """Aligned units for [a, b] (absolute s). A chunk where Qwen runs into its cap (a repetition loop) is
-        tried once more as two halves; a half that still hits it goes into `capped` (MOSS's text there)."""
+              languages: list[str], capped: list[tuple[float, float]], splits: int = QWEN_SPLITS) -> list:  # fmt: skip
+        """Aligned units for [a, b] (absolute s). A chunk where Qwen runs into its cap (a repetition loop,
+        which depends on where the audio is cut) is tried again as two halves, and a half that still hits it
+        as two quarters; a piece that still hits it goes into `capped` (MOSS's text there)."""
         import mlx.core as mx
 
         chunk = pcm[round(a * plan.SR) : round(b * plan.SR)]
@@ -192,12 +196,12 @@ class Engine:
         r = qwen.generate(mx.array(padded), hotwords=context or None, max_tokens=cap)
         stats["qwen_chunks"] += 1
         if int(getattr(r, "generation_tokens", 0) or 0) >= cap:
-            if split and b - a > 20:
+            if splits > 0 and b - a > 20:
                 stats["qwen_split"] += 1
                 mid = a + plan.middle_cut(chunk, 0.0, b - a)
                 log.warning("Qwen hit its cap on a %.0f s chunk: trying its halves", b - a)
-                return (self._qwen(qwen, aligner, pcm, a, mid, context, stats, languages, capped, split=False)
-                        + self._qwen(qwen, aligner, pcm, mid, b, context, stats, languages, capped, split=False))  # fmt: skip
+                return (self._qwen(qwen, aligner, pcm, a, mid, context, stats, languages, capped, splits - 1)
+                        + self._qwen(qwen, aligner, pcm, mid, b, context, stats, languages, capped, splits - 1))  # fmt: skip
             stats["qwen_capped"] += 1
             capped.append((a, b))
             log.warning("Qwen hit its cap on a %.0f s chunk: keeping MOSS text there", b - a)
