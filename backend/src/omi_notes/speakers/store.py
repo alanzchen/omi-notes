@@ -61,6 +61,11 @@ def sample_eligible(sample) -> bool:
     return (state or ACTIVE) == ACTIVE
 
 
+def consent_ok(person, prefs: dict) -> bool:
+    """The one consent rule for keeping someone's voice: the wearer, or a person attested after the acknowledgment."""
+    return person is not None and bool(person["me"] or (prefs["acknowledged_at"] and person["attested_at"]))
+
+
 def flag_open(flag: dict | None) -> bool:
     """A review flag the owner hasn't resolved for this evidence."""
     if not flag or not flag.get("reasons"):
@@ -237,29 +242,39 @@ class SpeakerStore:
         return build_models(self.samples(model, model_sha), op, wearer_id=me["id"] if me else None)
 
     def rm_space(self, model: str, model_sha: str):
-        """GA and people's GA-centred centroids (`speakers.space`), in memory only: GA over the stored label
-        vectors `vector_labels` allows now (named for me or a consented person; others only with unknown-voice
-        storage on; never a forgotten label) plus every eligible sample. None without any vector."""
+        """GA and people's GA-centred centroids (`speakers.space`), in memory only. GA is the mean of the label
+        population `vector_labels` allows now (the one consent rule: named for me or a consented person; any
+        other label only with unknown-voice storage on and its raw audio still there; never a forgotten one),
+        plus the eligible samples of consented people that aren't one of those voices already (a named label's
+        sample is its voice: counted once). None without any vector."""
         from .space import build_space
 
-        prefs = self.settings()
-        people = {r["id"]: r for r in self.people()}
-        vectors = []
-        for r in self.db.query(
-            """SELECT v.vector, l.person_id, COALESCE(l.forgotten, 0) AS forgotten FROM voices v
-               LEFT JOIN speaker_labels l ON l.conversation_id = v.conversation_id AND l.label = v.label
-               WHERE v.vector IS NOT NULL AND v.model=? AND v.model_sha=?""",
-            (model, model_sha),
-        ):
-            person = people.get(r["person_id"])
-            consented = person is not None and (person["me"] or (prefs["acknowledged_at"] and person["attested_at"]))
-            if not r["forgotten"] and (consented or prefs["unknown_voices_enabled"]):
-                vectors.append(np.frombuffer(r["vector"], dtype="<f4").astype(np.float32))
+        prefs, people = self.settings(), {r["id"]: r for r in self.people()}
+        by_conv: dict[str, dict[str, bytes]] = {}
+        for r in self.db.query("SELECT conversation_id, label, vector FROM voices WHERE vector IS NOT NULL AND model=? AND model_sha=?",
+                               (model, model_sha)):  # fmt: skip
+            by_conv.setdefault(r["conversation_id"], {})[r["label"]] = r["vector"]
+        population: list[bytes] = []
+        kept: dict[str, set[bytes]] = {}  # conversation → its allowed voices (a sample from one of them is that voice)
+        for conv_id, stored in by_conv.items():
+            states = self.labels(conv_id)
+            keep = self.vector_labels(states, set(stored), raw=False, prefs=prefs, people=people)
+            if set(stored) - keep and prefs["unknown_voices_enabled"]:
+                row = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
+                if row is not None and self.raw_available(row):
+                    keep = self.vector_labels(states, set(stored), raw=True, prefs=prefs, people=people)
+            kept[conv_id] = {stored[label] for label in keep}
+            population += [stored[label] for label in sorted(keep)]
         samples = self.samples(model, model_sha)
+        for s in samples:
+            raw = np.asarray(s.vector, dtype="<f4").tobytes()
+            if consent_ok(people.get(s.person_id), prefs) and raw not in kept.get(s.session or "", set()):
+                population.append(raw)
         by_person: dict[str, list] = {}
         for s in centroid_basis(samples):
             by_person.setdefault(s.person_id, []).append(s.vector)
-        return build_space(vectors + [s.vector for s in samples], by_person)
+        vectors = [np.frombuffer(v, dtype="<f4").astype(np.float32) for v in population]
+        return build_space(vectors, by_person)
 
     def put_person(self, person_id: str, name: str, *, me: bool | None = None, attest: bool = False,
                    now: float | None = None) -> bool:  # fmt: skip
@@ -689,19 +704,20 @@ class SpeakerStore:
             self.index_voices(conv_id, row["file"])
         return changed
 
-    def vector_labels(self, states: dict[str, dict], labels: set[str], *, raw: bool) -> set[str]:
+    def vector_labels(self, states: dict[str, dict], labels: set[str], *, raw: bool, prefs: dict | None = None,
+                      people: dict | None = None) -> set[str]:  # fmt: skip
         """Labels whose voice vector may be stored (docs/speaker-learning.md, "Privacy"): named for
         me, or for someone with consent (acknowledged and attested); any other label only while
         unknown voices are on and its raw audio exists. A forgotten label never."""
-        prefs = self.settings()
-        people = {r["id"]: r for r in self.people()}
+        prefs = self.settings() if prefs is None else prefs
+        people = {r["id"]: r for r in self.people()} if people is None else people
         keep = set()
         for label in labels:
             state = states.get(label) or {}
             if state.get("forgotten"):
                 continue
             person = people.get(state.get("person_id"))
-            if person is not None and (person["me"] or (prefs["acknowledged_at"] and person["attested_at"])):
+            if consent_ok(person, prefs):
                 keep.add(label)
             elif raw and prefs["unknown_voices_enabled"]:
                 keep.add(label)

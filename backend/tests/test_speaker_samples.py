@@ -246,7 +246,7 @@ def test_ga_and_centroids_use_only_eligible_samples_and_consented_vectors(env):
     store = worker.pipeline.speakers
     space = store.rm_space(*MODEL)
     stored = worker.db.query("SELECT COUNT(*) AS n FROM voices WHERE vector IS NOT NULL")[0]["n"]
-    assert space.count == stored + 3 and set(space.centroids) == {me}
+    assert space.count == stored and set(space.centroids) == {me}  # each named voice is also its sample: once
     with store.lock:
         for sid in ids:
             store.set_sample_state(me, sid, "removed", action="remove", by="user", request_id=f"r-{sid}")

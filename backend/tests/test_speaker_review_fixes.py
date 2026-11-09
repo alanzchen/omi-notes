@@ -59,3 +59,29 @@ def test_a_voices_file_with_f0_raises_the_format_first(env):
     assert "f0" in json.loads(voices.read_text())["labels"]["S1"]
     # an older backend prunes vector_b64 but not f0: it must refuse this vault
     assert json.loads((settings.vault_dir / "_omi" / "VAULT.json").read_text())["format"] == 6
+
+
+# -- 12: GA is the consent-eligible label population, counted once ----------------------------------------------
+
+
+def test_ga_counts_each_voice_once_and_only_what_vector_labels_allows(env):
+    settings, client, worker = env
+    client.put("/v1/speakers/settings", json={"acknowledged_at": "2026-09-27T10:00:00Z", "unknown_voices_enabled": True},
+               headers=AUTH)  # fmt: skip
+    me, rows, ids = me_with_samples(client, worker, days=(6, 5))
+    store = worker.pipeline.speakers
+    stored = worker.db.query("SELECT conversation_id, label FROM voices WHERE vector IS NOT NULL")
+    assert {r["label"] for r in stored} == {"S1", "S2"}  # Alan named; Priya kept as an unknown voice
+    # each named label's voice is also its sample: one voice, counted once
+    assert store.rm_space(*MODEL).count == len(stored)
+    # an unknown voice whose raw audio is gone is no longer allowed (even before a reconcile prunes it)
+    worker.db.execute("UPDATE chunks SET raw_deleted=1")
+    named = [r for r in stored if r["label"] == "S1"]
+    assert store.rm_space(*MODEL).count == len(named)
+    # a person's samples feed GA only with their consent
+    priya = new_person(client, "Priya", attest_knows=True)
+    with store.lock:
+        store.add_sample(priya, vec(PRIYA), model=MODEL[0], model_sha=MODEL[1], source="user", seconds=8.0, day=None, session="x")
+    assert store.rm_space(*MODEL).count == len(named) + 1
+    client.put("/v1/speakers/settings", json={"acknowledged_at": None}, headers=AUTH)
+    assert store.rm_space(*MODEL).count == len(named)
