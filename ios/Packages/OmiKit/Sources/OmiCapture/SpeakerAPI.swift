@@ -61,9 +61,10 @@ extension APIClient {
     // MARK: 声纹 hub (servers with `voice_review`)
 
     /// The next questions, suspicious first (the server's order).
-    public func reviewItems(limit: Int) async throws -> [ReviewItem] {
-        let r: ReviewItemsResponse = try await json("GET", "/v1/speakers/review", query: "limit=\(limit)")
-        return r.items
+    /// One page from `offset` (an index into the server's order; an older server ignores it).
+    public func reviewItems(limit: Int, offset: Int? = nil) async throws -> ReviewItemsResponse {
+        let query = "limit=\(limit)" + (offset.map { $0 > 0 ? "&offset=\($0)" : "" } ?? "")
+        return try await json("GET", "/v1/speakers/review", query: query)
     }
 
     /// `confirm`, `reject` or `move` (with `personId`). A changed item → `APIError.http(409, "stale_review: …")`.

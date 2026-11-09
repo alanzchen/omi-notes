@@ -156,7 +156,22 @@ public struct ReviewItem: Decodable, Identifiable, Equatable, Hashable, Sendable
     public var isSuspicious: Bool { (reasons ?? []).contains { !VoicesHub.namingReasons.contains($0) } }
 }
 
-public struct ReviewItemsResponse: Decodable, Sendable { public var items: [ReviewItem] }
+/// One page of the review queue. A server with paging (`offset`) adds where the next page starts
+/// (`next_offset`, null at the end) and the queue's size (`total`); an older one sends items only.
+public struct ReviewItemsResponse: Decodable, Sendable {
+    public var items: [ReviewItem]
+    public var nextOffset: Int?
+    public var total: Int?
+
+    public init(items: [ReviewItem], nextOffset: Int? = nil, total: Int? = nil) {
+        self.items = items
+        self.nextOffset = nextOffset
+        self.total = total
+    }
+
+    /// The server pages (so a null `next_offset` means the end, not "unknown").
+    public var paginated: Bool { total != nil || nextOffset != nil }
+}
 
 /// `POST /v1/speakers/review/{id}`.
 public struct ReviewDecisionAnswer: Decodable, Equatable, Sendable {
@@ -209,9 +224,11 @@ public enum VoicesHub {
         return "\(c.year ?? 0)-\(two(c.month))-\(two(c.day))"
     }
 
-    /// The review card's count: the backend gives no queue total, only flagged samples per person.
-    public static func reviewBadge(_ flagged: Int) -> String? {
-        flagged > 0 ? "可疑 \(flagged)" : nil
+    /// The review card's count: the server's queue total (under the card's 待确认) when it sends one;
+    /// otherwise only flagged samples are known, and the badge says so (可疑).
+    public static func reviewBadge(total: Int?, flagged: Int) -> String? {
+        if let total { return total > 0 ? "\(total)" : nil }
+        return flagged > 0 ? "可疑 \(flagged)" : nil
     }
 
     /// A flag or review reason in a word or two.

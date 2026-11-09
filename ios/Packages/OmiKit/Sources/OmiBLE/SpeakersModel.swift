@@ -66,6 +66,8 @@ public final class SpeakersModel {
     public private(set) var serverSupportsVoiceReview = false
     /// People carry their last calibration and held-out counts.
     public private(set) var serverSupportsVoiceCalibration = false
+    /// The review queue's size, from a server that pages it (nil: unknown, count flagged samples).
+    public private(set) var reviewTotal: Int?
     public var enrollment: Enrollment = .idle
 
     private let engine: OmiEngine
@@ -124,6 +126,7 @@ public final class SpeakersModel {
         serverSupportsNameVoice = false
         serverSupportsVoiceReview = false
         serverSupportsVoiceCalibration = false
+        reviewTotal = nil
         switch enrollment {
         case .idle: break
         case .checking, .reading: cancelEnrollment()
@@ -161,7 +164,10 @@ public final class SpeakersModel {
             async let s = api.speakerSettings()
             let (newPeople, newSettings) = try await (p, s)
             let newSuggestions = newSettings.unknownVoicesEnabled == true ? (try await api.speakerSuggestions()) : []
+            // the queue's size, for the hub (one item is enough to learn it); unknown is not an error
+            let total = serverSupportsVoiceReview ? (try? await api.reviewItems(limit: 1))?.total : nil
             guard current() else { return }  // answered for a server (or vault) no longer shown
+            reviewTotal = total
             people = newPeople
             settings = newSettings
             suggestions = newSuggestions
@@ -317,7 +323,9 @@ public final class SpeakersModel {
 
     // MARK: 声纹 hub (errors are thrown to the screen's model)
 
-    public func reviewItems(limit: Int) async throws -> [ReviewItem] { try await api().reviewItems(limit: limit) }
+    public func reviewItems(limit: Int, offset: Int? = nil) async throws -> ReviewItemsResponse {
+        try await api().reviewItems(limit: limit, offset: offset)
+    }
 
     public func decideReview(_ itemId: String, decision: String, personId: String?, requestId: String) async throws -> ReviewDecisionAnswer {
         try await api().decideReview(itemId, decision: decision, personId: personId, requestId: requestId)

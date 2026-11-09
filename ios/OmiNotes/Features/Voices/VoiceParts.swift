@@ -118,6 +118,8 @@ struct PersonConsentFlow: ViewModifier {
     @Bindable var model: AppModel
     let personId: String?
     let done: () -> Void
+    /// The attestation the server didn't take, and why: shown until read (not lost with the alert).
+    @State private var failed: String?
 
     private var person: Person? { personId.flatMap { id in model.speakers.people.first { $0.id == id } } }
     private var acknowledged: Bool { model.speakers.settings?.acknowledged == true }
@@ -127,9 +129,20 @@ struct PersonConsentFlow: ViewModifier {
             .alert("\(person?.name ?? "TA") 知道吗？", isPresented: .init(get: { person != nil && acknowledged }, set: { if !$0 { done() } }),
                    presenting: person) { p in
                 Button("取消", role: .cancel) {}
-                Button("TA 知道") { Task { await model.speakers.attest(p) } }
+                Button("TA 知道") {
+                    Task {
+                        if await !model.speakers.attest(p) {
+                            failed = model.speakers.error ?? "请稍后再试"
+                        }
+                    }
+                }
             } message: { p in
                 Text("确认 \(p.name) 知道 Omi Notes 会识别 TA 的声音，然后再试一次。")
+            }
+            .alert("没能保存", isPresented: .init(get: { failed != nil }, set: { if !$0 { failed = nil } }), presenting: failed) { _ in
+                Button("好") {}
+            } message: { why in
+                Text(why)
             }
             .sheet(isPresented: .init(get: { person != nil && !acknowledged }, set: { if !$0 { done() } })) {
                 RecognitionConsentView(model: model)

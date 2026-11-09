@@ -26,7 +26,10 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
         }
         let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
         Self.requests.append((request.httpMethod ?? "GET", path, request.url?.query, body))
-        let key = "\(request.httpMethod ?? "GET") \(path)"
+        // a route with its query ("GET /v1/speakers/review?limit=50&offset=50") wins over the bare path
+        let bare = "\(request.httpMethod ?? "GET") \(path)"
+        let withQuery = request.url?.query.map { "\(bare)?\($0)" }
+        let key = withQuery.flatMap { Self.routes[$0] != nil ? $0 : nil } ?? bare
         var queue = Self.routes[key] ?? [(404, #"{"error":"not_found","detail":"no route"}"#)]
         let (status, text) = queue.count > 1 ? queue.removeFirst() : queue[0]
         Self.routes[key] = queue
@@ -274,6 +277,51 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
         VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, #"{"items":[]}"#)]
         await queue.load()
         #expect(queue.phase == .empty)
+    }
+
+    /// Server paging (`offset`, `next_offset`, `total`): a page of only skipped items is passed over to
+    /// the next one, and "剩下的都跳过了" waits for `next_offset: null`.
+    @Test func skippingPastTheFirstPageFetchesTheNext() async throws {
+        let queue = VoiceReviewQueue(speakers: try speakers())
+        let first = (1...50).map { Self.item("s.p\($0).1", sample: "p\($0)") }.joined(separator: ",")
+        let second = (51...60).map { Self.item("s.p\($0).1", sample: "p\($0)") }.joined(separator: ",")
+        VoicesHubStub.routes["GET /v1/speakers/review?limit=50"] = [(200, #"{"items":[\#(first)],"next_offset":50,"total":60}"#)]
+        VoicesHubStub.routes["GET /v1/speakers/review?limit=50&offset=50"] = [(200, #"{"items":[\#(second)],"next_offset":null,"total":60}"#)]
+        await queue.load()
+        #expect(queue.total == 60)
+        for round in 0..<5 {
+            #expect(queue.items.first?.id == "s.p\(round * 10 + 1).1")
+            for _ in 0..<10 { queue.skip() }
+            #expect(queue.phase == .batchDone)
+            await queue.load()
+        }
+        // the first page is all skipped: the next page is asked for, not "剩下的都跳过了"
+        #expect(queue.items.map(\.id) == (51...60).map { "s.p\($0).1" })
+        #expect(sent("GET", "/v1/speakers/review").last?.query == "limit=50&offset=50")
+        for _ in 0..<10 { queue.skip() }
+        #expect(queue.phase == .onlySkipped)  // next_offset null: nothing more on the server
+        await queue.load()
+        #expect(queue.phase == .onlySkipped && queue.items.isEmpty)
+    }
+
+    @Test func aPagedServerWithAnEmptyQueueIsEmpty() async throws {
+        let queue = VoiceReviewQueue(speakers: try speakers())
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, #"{"items":[],"next_offset":null,"total":0}"#)]
+        await queue.load()
+        #expect(queue.phase == .empty && queue.total == 0)
+    }
+
+    @Test func refreshReadsTheQueueTotalForTheHub() async throws {
+        let speakers = try speakers()
+        VoicesHubStub.routes["GET /v1/status"] = [(200, #"{"features":["voice_review"]}"#)]
+        VoicesHubStub.routes["GET /v1/people"] = [(200, #"{"people":[]}"#)]
+        VoicesHubStub.routes["GET /v1/speakers/settings"] = [(200, #"{"unknown_voices_enabled":false,"auto_assign":true}"#)]
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, #"{"items":[{"id":"s.a.1"}],"next_offset":1,"total":163}"#)]
+        await speakers.refresh()
+        #expect(speakers.reviewTotal == 163 && sent("GET", "/v1/speakers/review").first?.query == "limit=1")
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, #"{"items":[]}"#)]  // an older server: no total
+        await speakers.refresh()
+        #expect(speakers.reviewTotal == nil)
     }
 
     @Test func answeringAFullWindowLeavesMoreToFetch() async throws {

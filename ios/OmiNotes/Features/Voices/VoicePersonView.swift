@@ -54,7 +54,7 @@ struct VoicePersonView: View {
                         if samples.tab == .removed { Text("移除的样本可以恢复。") }
                     }
                 }
-                if let error = samples.error ?? player.unavailable {
+                if let error = samples.error ?? speakers.error ?? player.unavailable {
                     Section { Text(error).font(.footnote).foregroundStyle(.secondary) }
                 }
             }

@@ -8,9 +8,10 @@ import OmiProtocol
 /// undo token; "Skip" only moves on in this session. A changed item (`409 stale_review`) is never
 /// answered: the queue is fetched again.
 ///
-/// The backend has no offset or cursor, so each fetch asks for its whole window (`ReviewBatch.window`)
-/// and the phone pages it, leaving out what was skipped: skipping a batch shows the next one, and
-/// "nothing left" is said only when the server's answer has nothing else.
+/// Each fetch reads the server's order from the start, a window (`ReviewBatch.window`) at a time, and
+/// leaves out what was skipped: skipping a batch shows the next one. A server that pages (`offset`,
+/// `next_offset`) is read on past pages of skipped items, and "only skipped left" waits for its last
+/// page; an older one answers a single window, which is paged here.
 @MainActor
 @Observable
 public final class VoiceReviewQueue {
@@ -67,10 +68,14 @@ public final class VoiceReviewQueue {
     private let speakers: SpeakersModel
     /// Skipped this session: not asked again until the screen opens anew.
     private var skipped: Set<String> = []
+    /// The queue's size, from a server that pages it.
+    public private(set) var total: Int?
     /// What the last fetch had beyond this batch (not skipped).
     private var remaining = 0
-    /// The last fetch filled the server's window, so there may be more behind it.
-    private var windowFull = false
+    /// The server may have more behind what was fetched (another page, or a full window of an older server).
+    private var moreOnServer = false
+    /// Pages read in one fetch at most (a server that never ends its pages can't keep it busy).
+    static let maxPages = 40
     private var undoTimer: Task<Void, Never>?
 
     public init(speakers: SpeakersModel) {
@@ -88,13 +93,32 @@ public final class VoiceReviewQueue {
         phase = .loading
         generation += 1
         do {
-            let fresh = try await speakers.reviewItems(limit: ReviewBatch.window)
-            let open = ReviewBatch.make(fresh, excluding: skipped, limit: fresh.count)
+            var fetched: [ReviewItem] = []
+            var open: [ReviewItem] = []
+            var offset = 0
+            var pages = 0
+            var more = false
+            repeat {
+                let page = try await speakers.reviewItems(limit: ReviewBatch.window, offset: offset)
+                pages += 1
+                fetched += page.items
+                open = ReviewBatch.make(fetched, excluding: skipped, limit: fetched.count)
+                total = page.total
+                if page.paginated {
+                    // only forward: a next page that doesn't move on ends the reading
+                    guard let next = page.nextOffset, next > offset else { more = false; break }
+                    more = true
+                    offset = next
+                } else {
+                    more = page.items.count >= ReviewBatch.window
+                    break
+                }
+            } while open.count < ReviewBatch.size && pages < Self.maxPages
             items = Array(open.prefix(ReviewBatch.size))
             remaining = open.count - items.count
-            windowFull = fresh.count >= ReviewBatch.window
+            moreOnServer = more
             index = 0
-            phase = items.isEmpty ? (fresh.isEmpty ? .empty : .onlySkipped) : .ready
+            phase = items.isEmpty ? (fetched.isEmpty ? .empty : .onlySkipped) : .ready
         } catch {
             phase = .failed(SpeakersModel.describe(error))
         }
@@ -145,7 +169,7 @@ public final class VoiceReviewQueue {
     private func advance() {
         index += 1
         guard index >= items.count else { return }
-        if remaining > 0 || windowFull {
+        if remaining > 0 || moreOnServer {
             phase = .batchDone
         } else {
             phase = skipped.isEmpty ? .empty : .onlySkipped

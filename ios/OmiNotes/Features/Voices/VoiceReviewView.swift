@@ -107,9 +107,7 @@ struct VoiceReviewView: View {
                         if g.translation.width > 110 { answer(.confirm) } else if g.translation.width < -110 { answer(.reject) }
                         withAnimation(.snappy) { drag = .zero }
                     })
-            if let error = queue.error {
-                Text(error).font(.footnote).foregroundStyle(.orange).multilineTextAlignment(.center)
-            }
+            errorLine
             Spacer(minLength: 0)
             answers(item)
             bottomLine.frame(height: 50).padding(.bottom, 8)
@@ -258,10 +256,17 @@ struct VoiceReviewView: View {
         let (symbol, tint, text): (String, Color, String) = switch n {
         case .refreshed: ("arrow.clockwise.circle.fill", .blue, "刚刚有变化，已重新载入")
         case .undone: ("arrow.uturn.backward.circle.fill", .green, "已撤销")
-        case .undoFailed: ("exclamationmark.circle.fill", .orange, "之后又改过，没能撤销")
+        case .undoFailed: ("exclamationmark.circle.fill", .orange, "没能撤销")
         }
         return VoiceToast(symbol: symbol, tint: tint, text: text)
             .task { try? await Task.sleep(for: .seconds(3)); queue.clearNotice() }
+    }
+
+    /// The queue's own error (with an undo's reasons), or the speakers model's (a failed attestation).
+    @ViewBuilder private var errorLine: some View {
+        if let error = queue.error ?? speakers.error {
+            Text(error).font(.footnote).foregroundStyle(.orange).multilineTextAlignment(.center)
+        }
     }
 
     // MARK: Done
@@ -279,6 +284,8 @@ struct VoiceReviewView: View {
             Spacer()
             Image(systemName: "checkmark.seal.fill").font(.system(size: 56)).foregroundStyle(.green)
             Text(doneTitle).font(.title.bold())
+            // an undo of the last answer that failed says why here too
+            errorLine
             Spacer()
             if queue.phase == .batchDone {
                 Button { Task { await queue.load() } } label: {

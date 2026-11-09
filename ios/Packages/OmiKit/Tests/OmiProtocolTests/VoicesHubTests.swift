@@ -240,8 +240,22 @@ import Testing
     }
 
     /// The backend returns no queue total; the badge counts flagged samples and says so.
+    /// Without a queue total (older server) the badge counts flagged samples and says so (可疑); with
+    /// the server's `total` it is the real queue, under the card's own 待确认.
     @Test func theReviewBadgeSaysWhatItCounts() {
-        #expect(VoicesHub.reviewBadge(148) == "可疑 148")
-        #expect(VoicesHub.reviewBadge(0) == nil)
+        #expect(VoicesHub.reviewBadge(total: nil, flagged: 148) == "可疑 148")
+        #expect(VoicesHub.reviewBadge(total: nil, flagged: 0) == nil)
+        #expect(VoicesHub.reviewBadge(total: 163, flagged: 148) == "163")
+        #expect(VoicesHub.reviewBadge(total: 0, flagged: 148) == nil)
+    }
+
+    /// `GET /v1/speakers/review?limit&offset` pages: `next_offset` (null at the end) and `total`.
+    @Test func aReviewPageDecodesItsPaging() throws {
+        let page = try decode(ReviewItemsResponse.self, #"{"items":[{"id":"s.a.1"}],"next_offset":50,"total":163}"#)
+        #expect(page.nextOffset == 50 && page.total == 163 && page.paginated)
+        let last = try decode(ReviewItemsResponse.self, #"{"items":[],"next_offset":null,"total":163}"#)
+        #expect(last.nextOffset == nil && last.paginated)
+        let old = try decode(ReviewItemsResponse.self, #"{"items":[]}"#)
+        #expect(old.nextOffset == nil && old.total == nil && !old.paginated)
     }
 }
