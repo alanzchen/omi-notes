@@ -165,13 +165,16 @@ public final class SpeakersModel {
         // the people list empty, and a failed people call keeps the last good list.
         async let peopleAnswer = Self.attempt { try await api.people() }
         async let settingsAnswer = Self.attempt { try await api.speakerSettings() }
-        let (p, s) = await (peopleAnswer, settingsAnswer)
+        // people are shown as soon as their own answer arrives, while settings may still be on their way
+        let p = await peopleAnswer
         guard current() else { return }  // answered for a server (or vault) no longer shown
         var problems: [Error] = []
         switch p {
         case .success(let newPeople): people = newPeople
         case .failure(let e): problems.append(e)
         }
+        let s = await settingsAnswer
+        guard current() else { return }
         switch s {
         case .success(let newSettings):
             settings = newSettings

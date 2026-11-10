@@ -275,6 +275,19 @@ import Testing
         #expect(VoicesHub.reviewQuestion(blank, people: []) == .whoIsThis)
     }
 
+    /// The speakers revision a label item was made against: the server's field when it sends one,
+    /// else the documented id `l.<conversation>.<label>.<speakers revision>.<person>.<evidence>`.
+    @Test func aLabelItemKnowsTheRevisionItWasReviewedAgainst() throws {
+        let fromId = try decode(ReviewItem.self, #"{"id":"l.c9.S1.4.p-gigi.7f3a","kind":"label","label":"S1"}"#)
+        #expect(fromId.reviewedRevision == 4)
+        let noPerson = try decode(ReviewItem.self, #"{"id":"l.20261109T1200-ab.S2.12..7f3a","kind":"label","label":"S2"}"#)
+        #expect(noPerson.reviewedRevision == 12)
+        let field = try decode(ReviewItem.self, #"{"id":"l.c9.S1.4.p-gigi.7f3a","kind":"label","speakers_revision":7,"transcript_sha":"ab"}"#)
+        #expect(field.reviewedRevision == 7 && field.transcriptSha == "ab")
+        #expect(try decode(ReviewItem.self, #"{"id":"s.smp1.3","kind":"sample"}"#).reviewedRevision == nil)
+        #expect(try decode(ReviewItem.self, #"{"id":"l.c9.S1.x.p.e","kind":"label"}"#).reviewedRevision == nil)
+    }
+
     /// `GET /v1/speakers/review?limit&offset` pages: `next_offset` (null at the end) and `total`.
     @Test func aReviewPageDecodesItsPaging() throws {
         let page = try decode(ReviewItemsResponse.self, #"{"items":[{"id":"s.a.1"}],"next_offset":50,"total":163}"#)

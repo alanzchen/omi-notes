@@ -160,12 +160,18 @@ struct VoiceReviewView: View {
         .disabled(queue.busy)
     }
 
-    /// A conversation's speaker, for the naming flow (it adds a person and asks consent).
+    /// A conversation's speaker, for the naming flow (it adds a person and asks consent). It carries
+    /// the revision the item was reviewed against, so a reprocessed S1 is never named from the old
+    /// audition; without one there is nothing to protect it with, so no 新的人.
     static func namingItem(_ item: ReviewItem) -> VoiceItem? {
-        guard item.kind == "label", let label = item.label, let conv = item.conversation else { return nil }
+        guard item.kind == "label", let label = item.label, let conv = item.conversation,
+              let reviewed = item.reviewedRevision else { return nil }
         let clip = item.clip.map { SpeakerClip(id: $0.id, seconds: $0.seconds, startedAt: $0.startedAt, text: item.text, conversationId: conv.id) }
-        return VoiceItem(target: .label(conversationId: conv.id, label: label), question: .whoIsThis, context: conv,
-                         clips: clip.map { [$0] } ?? [], scope: [conv])
+        var naming = VoiceItem(target: .label(conversationId: conv.id, label: label), question: .whoIsThis, context: conv,
+                               clips: clip.map { [$0] } ?? [], scope: [conv])
+        naming.reviewedRevision = reviewed
+        naming.reviewedTranscript = item.transcriptSha
+        return naming
     }
 
     private func listenCard(_ item: ReviewItem) -> some View {

@@ -8,6 +8,8 @@ import Testing
 final class VoicesHubStub: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var routes: [String: [(Int, String)]] = [:]
     nonisolated(unsafe) static var requests: [(method: String, path: String, query: String?, body: [String: Any])] = []
+    /// Seconds a route ("GET /v1/speakers/settings") takes to answer.
+    nonisolated(unsafe) static var delays: [String: Double] = [:]
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -39,9 +41,16 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
             return
         }
         let resp = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
-        client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data(text.utf8))
-        client?.urlProtocolDidFinishLoading(self)
+        let answer = { [self] in
+            client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: Data(text.utf8))
+            client?.urlProtocolDidFinishLoading(self)
+        }
+        if let delay = Self.delays[bare] {
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) { answer() }
+        } else {
+            answer()
+        }
     }
     override func stopLoading() {}
 }
@@ -62,6 +71,7 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
     func speakers() throws -> SpeakersModel {
         VoicesHubStub.routes = [:]
         VoicesHubStub.requests = []
+        VoicesHubStub.delays = [:]
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let settings = SettingsStore(defaults: UserDefaults(suiteName: "omi-voices-\(UUID().uuidString)")!, tokens: InMemoryTokenStore())
         try settings.setServer(url: URL(string: "https://mac.ts.net")!, token: "tok")
@@ -507,6 +517,49 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
         #expect(await queue.choose("p-gigi"))
         let body = try #require(sent("POST", "/review/s.b.1").first?.body)
         #expect(body["decision"] as? String == "move" && body["person_id"] as? String == "p-gigi")
+    }
+
+    // MARK: Astra quick review of 02a9306
+
+    /// People are published as soon as their own answer arrives, not after settings (up to 40 s with a retry).
+    @Test func peopleShowWhileSettingsAreStillLoading() async throws {
+        let speakers = try speakers()
+        VoicesHubStub.routes["GET /v1/people"] = [(200, Self.peopleJSON)]
+        VoicesHubStub.routes["GET /v1/speakers/settings"] = [(200, Self.settingsJSON)]
+        VoicesHubStub.routes["GET /v1/speakers/suggestions"] = [(200, #"{"suggestions":[]}"#)]
+        VoicesHubStub.delays["GET /v1/speakers/settings"] = 1.5
+        let refresh = Task { await speakers.refresh() }
+        let deadline = Date().addingTimeInterval(1.0)
+        while speakers.people.isEmpty, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        #expect(speakers.people.map(\.name) == ["Alan"] && speakers.settings == nil)  // settings still on their way
+        await refresh.value
+        #expect(speakers.settings != nil)
+    }
+
+    /// "新的人" from a review item names the speaker it was reviewed against: if the conversation was
+    /// reprocessed meanwhile (another revision), nothing is saved and the owner is asked to listen again.
+    @Test func namingFromReviewRefusesAChangedSpeaker() async throws {
+        let speakers = try speakers()
+        VoicesHubStub.routes["GET /v1/conversations/c9/speakers"] = [(200, #"{"revision":6,"labels":[{"label":"S1"}]}"#)]
+        var item = VoiceItem(label: SpeakerLabel(label: "S1"), in: ConversationContext(id: "c9"))
+        item.reviewedRevision = 4
+        let flow = NameVoiceFlow(speakers: speakers, items: [item])
+        #expect(await flow.name(Person(id: "p-gigi", name: "Gigi")) == false)
+        #expect(flow.error == NameVoiceFlow.changedSinceReview && sent("PUT", "/speakers/S1").isEmpty)
+        #expect(flow.current?.id == item.id)
+    }
+
+    @Test func namingFromReviewSendsTheReviewedRevision() async throws {
+        let speakers = try speakers()
+        let labels = #"{"revision":4,"labels":[{"label":"S1"}]}"#
+        VoicesHubStub.routes["GET /v1/conversations/c9/speakers"] = [(200, labels)]
+        VoicesHubStub.routes["PUT /v1/conversations/c9/speakers/S1"] = [(200, labels)]
+        var item = VoiceItem(label: SpeakerLabel(label: "S1"), in: ConversationContext(id: "c9"))
+        item.reviewedRevision = 4
+        let flow = NameVoiceFlow(speakers: speakers, items: [item])
+        #expect(await flow.name(Person(id: "p-gigi", name: "Gigi")))
+        #expect(sent("PUT", "/speakers/S1").first?.body["expected_revision"] as? Int == 4)
+        #expect(sent("GET", "/c9/speakers").count == 1)  // checked fresh, not from a remembered revision
     }
 
     // MARK: Capabilities

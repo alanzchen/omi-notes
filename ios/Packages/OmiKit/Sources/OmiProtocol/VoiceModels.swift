@@ -137,6 +137,19 @@ public struct ReviewItem: Decodable, Identifiable, Equatable, Hashable, Sendable
     public var conversation: ConversationContext?
     public var device: String?
     public var source: String?
+    /// The conversation's speakers revision and transcript a label item was made against, when the
+    /// server sends them (otherwise the revision is read from the id, `reviewedRevision`).
+    public var speakersRevision: Int?
+    public var transcriptSha: String?
+
+    /// The speakers revision this label item was reviewed against: the server's field, else the
+    /// documented id `l.<conversation>.<label>.<speakers revision>.<person>.<evidence>`.
+    public var reviewedRevision: Int? {
+        if let speakersRevision { return speakersRevision }
+        let parts = id.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.first == "l", parts.count >= 6 else { return nil }
+        return Int(parts[parts.count - 3])
+    }
 
     public init(id: String, kind: String? = nil, personId: String? = nil, sampleId: String? = nil, label: String? = nil,
                 reasons: [String]? = nil, playable: Bool? = nil, clip: SpeakerClip? = nil, text: String? = nil,
