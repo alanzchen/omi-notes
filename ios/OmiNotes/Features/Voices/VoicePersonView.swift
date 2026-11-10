@@ -135,8 +135,14 @@ struct VoicePersonView: View {
             HStack(spacing: 14) {
                 Avatar(name: p.name, size: 56)
                 VStack(alignment: .leading, spacing: 4) {
-                    Label(p.statusLine ?? VoiceHealth.fallbackLine(p), systemImage: health.symbol)
-                        .font(.headline).foregroundStyle(health == .active ? Color.primary : health.color)
+                    // the symbol in the hub's color (green when active), the words in the text color
+                    HStack(spacing: 6) {
+                        Image(systemName: health.symbol).foregroundStyle(health.color)
+                        Text(p.statusLine ?? VoiceHealth.fallbackLine(p))
+                            .foregroundStyle(health == .active ? Color.primary : health.color)
+                    }
+                    .font(.headline)
+                    .accessibilityElement(children: .combine)
                     HStack(spacing: 12) {
                         Label("\(p.samples ?? 0)", systemImage: "waveform")
                         if let calibrated { Label(calibrated, systemImage: "clock") }
