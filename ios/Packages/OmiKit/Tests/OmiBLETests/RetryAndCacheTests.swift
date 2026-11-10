@@ -325,6 +325,51 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         #expect(RetryStore(url: root.appendingPathComponent("app-retries.json")).entries(server: "https://mac.ts.net|vault-a").isEmpty)
     }
 
+    /// Alan (build 50): opening a deferred short session transcribes it at once; no separate button. One request
+    /// per opening of a waiting session; after a refusal the row offers 转写 as a retry and opening again
+    /// sends nothing on its own.
+    @Test func openingADeferredSessionAsksForItsTranscriptionOnce() async throws {
+        let (m, _) = try model()
+        AppServerStub.routes["/v1/status"] = [(200, Self.status.replacingOccurrences(
+            of: #""retry","#, with: #""retry","deferred_transcription","recording_class","#))]
+        await m.refreshServer()
+        m.retryFollowUpInterval = .milliseconds(1)
+        var waiting = ConversationSummary(id: "conv-1", status: "closed", startedAt: "2026-11-08T15:00:00.000Z")
+        waiting.deferred = DeferredTranscription(state: "waiting")
+        waiting.speechS = 12
+        m.recent = [waiting]
+        AppServerStub.routes["/v1/conversations/conv-1/transcribe"] = [
+            (202, #"{"operation":{"id":"op-1","kind":"transcribe","conversation_id":"conv-1","stage":"transcribing","state":"queued"}}"#)]
+        AppServerStub.routes["/v1/operations/op-1"] = [
+            (200, #"{"operation":{"id":"op-1","kind":"transcribe","conversation_id":"conv-1","stage":"transcribing","state":"queued"}}"#)]
+        func sent() -> Int { AppServerStub.requests.filter { $0.path.hasSuffix("/transcribe") }.count }
+        await m.transcribeOnOpen(waiting)
+        #expect(sent() == 1 && m.transcribeState(of: waiting) == .asked)
+        await m.transcribeOnOpen(waiting)  // opened again while asked: nothing new
+        #expect(sent() == 1)
+
+        // a refused request: 转写 stays as a retry, and opening doesn't repeat it on its own
+        var other = waiting
+        other.id = "conv-2"
+        m.recent.append(other)
+        AppServerStub.routes["/v1/conversations/conv-2/transcribe"] = [(409, #"{"error":"failed","detail":"failed"}"#)]
+        await m.transcribeOnOpen(other)
+        guard case .offer(let message?) = m.transcribeState(of: other) else {
+            Issue.record("a refusal is offered again with its reason")
+            return
+        }
+        #expect(!message.isEmpty)
+        await m.transcribeOnOpen(other)
+        #expect(AppServerStub.requests.filter { $0.path.hasSuffix("conv-2/transcribe") }.count == 1)
+
+        // a session with its note, or a server without deferral, is never asked
+        var done = waiting
+        done.id = "conv-3"
+        done.deferred = nil
+        await m.transcribeOnOpen(done)
+        #expect(AppServerStub.requests.filter { $0.path.hasSuffix("conv-3/transcribe") }.isEmpty)
+    }
+
     @Test func anOlderServerOffersNoKeep() async throws {
         let (m, _) = try model()
         await m.refreshServer()

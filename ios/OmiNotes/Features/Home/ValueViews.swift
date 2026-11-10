@@ -379,8 +379,9 @@ struct ShortKindHeader: View {
     }
 }
 
-/// One short session: its time and seconds of speech, its title once it has a note, and 转写 while it waits (with
-/// the reason beside it when a request failed). Every row opens its detail (playback, the provisional kind).
+/// One short session: its time and seconds of speech, its title once it has a note, a spinner while it is being
+/// transcribed, and 转写 only as the retry after a refused or failed request (with the reason beside it). Every row
+/// opens its detail, which asks for the transcription of a waiting session by itself.
 struct ShortClipRow: View {
     let model: AppModel
     let conversation: ConversationSummary
@@ -412,14 +413,14 @@ struct ShortClipRow: View {
                 switch state {
                 case .asked:
                     ProgressView().controlSize(.small).accessibilityLabel("转写中")
-                case .offer:
+                case .offer(_?):
                     Button { Task { await model.transcribe(conversationId: c.id) } } label: {
                         Text("转写").font(.caption.weight(.semibold)).padding(.horizontal, 10).padding(.vertical, 4)
                             .background(Color.accentColor.opacity(0.14), in: .capsule)
                     }
                     .buttonStyle(.borderless)
-                case .none, .unavailable:
-                    EmptyView()
+                case .offer(nil), .none, .unavailable:
+                    EmptyView()  // waiting: opening it transcribes it
                 }
             }
             if case .offer(let message?) = state {

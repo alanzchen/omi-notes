@@ -116,6 +116,14 @@ extension AppModel {
         return canTranscribeDeferred ? .offer(nil) : .unavailable
     }
 
+    /// Alan's rule (build 50): opening a deferred short session transcribes it now. Sends the durable request once
+    /// when the session is waiting and nothing was asked or refused; 转写 stays only as the retry after a refusal.
+    public func transcribeOnOpen(_ c: ConversationSummary) async {
+        guard case .offer(nil) = transcribeState(of: c), !transcribedOnOpen.contains(c.id) else { return }
+        transcribedOnOpen.insert(c.id)
+        await transcribe(conversationId: c.id)
+    }
+
     /// What a list refresh says about a conversation's artifacts (note revision, deferral, state, applied kind): an
     /// open detail checks `detailNeedsReload` whenever this changes.
     public func artifactKey(_ id: String) -> String? {

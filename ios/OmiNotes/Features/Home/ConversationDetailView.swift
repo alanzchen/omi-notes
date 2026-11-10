@@ -54,17 +54,17 @@ struct ConversationDetailView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
             }
+            // a deferred short session is transcribed as soon as it is opened (`transcribeOnOpen`); 转写 is only
+            // the retry after the request was refused or failed
             switch model.transcribeState(of: entry) {
-            case .offer(let message):
+            case .offer(let message?):
                 Section {
                     Button { Task { await model.transcribe(conversationId: summary.id) } } label: {
-                        Label("转写", systemImage: "text.bubble")
+                        Label("重新转写", systemImage: "arrow.clockwise")
                     }
-                    if let message { Text(message).font(.footnote).foregroundStyle(.orange) }
-                } footer: {
-                    Text("不到一分钟的语音，空闲时才转写。")
+                    Text(message).font(.footnote).foregroundStyle(.orange)
                 }
-            case .asked:
+            case .offer(nil), .asked:
                 Section { Label("转写中", systemImage: "clock").font(.footnote).foregroundStyle(.secondary) }
             case .none, .unavailable:
                 EmptyView()
@@ -138,6 +138,7 @@ struct ConversationDetailView: View {
         }
         // Also after coming back from the speakers screen: names may have changed.
         .onAppear { Task { await load() } }
+        .task { await model.transcribeOnOpen(entry) }
         .fullScreenCover(item: $naming, onDismiss: { Task { await load() } }) { run in
             NameVoiceView(model: model, items: run.items)
         }
