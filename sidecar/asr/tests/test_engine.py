@@ -207,3 +207,117 @@ def test_a_failed_tail_just_after_a_line_is_not_covered_by_timing_slack():
     with pytest.raises(IncompleteTranscription):
         _check_fallback(pcm, [(180.0, 180.8)], lines)
     _check_fallback(pcm, [(100.0, 180.0)], lines)  # a span MOSS words lie over is fine
+
+
+def test_a_half_that_still_hits_the_cap_is_halved_once_more_before_mosss_gaps_make_it_incomplete():
+    # 01a13ccd (2026-11-08 19:27): a 92 s chunk capped, its 46 s half capped again, and MOSS had no words
+    # for 14 s there: refused, though Qwen manages the same speech in shorter pieces
+    e = Engine()
+    e.models = (FakeMoss(lines_every(10, 40)), CappingQwen(limit=35), FakeAligner())  # the cuts fall at pauses: 61 + 31, then 34 + 27
+    out = e.transcribe(speech(92), [])
+    assert out["omi_asr"]["qwen_capped"] == 0 and out["omi_asr"]["qwen_split"] == 2
+    assert "moss" not in out["text"]
+
+
+def test_a_quarter_that_still_hits_the_cap_is_halved_again_down_to_twenty_seconds():
+    # 01a13ccd again (2026-11-09 00:25): the 46 s span's 29 s quarter still looped; MOSS lacked 8 s there
+    e = Engine()
+    e.models = (FakeMoss(lines_every(10, 40)), CappingQwen(limit=20), FakeAligner())
+    out = e.transcribe(speech(92), [])
+    assert out["omi_asr"]["qwen_capped"] == 0
+    assert "moss" not in out["text"]
+
+
+def test_the_smallest_piece_is_tried_once_without_the_context_before_mosss_text():
+    class LoopsWithContext(FakeQwen):  # a hotword prompt can set off the repetition loop
+        def generate(self, audio, hotwords=None, max_tokens=0, **_):
+            r = super().generate(audio, hotwords, max_tokens)
+            if hotwords:
+                r.generation_tokens = max_tokens
+            return r
+
+    e = Engine()
+    e.models = (FakeMoss([]), LoopsWithContext(), FakeAligner())
+    out = e.transcribe(speech(15), ["Freedom"])
+    assert out["omi_asr"]["qwen_capped"] == 0 and out["omi_asr"]["qwen_without_context"] == 1
+
+
+def test_an_empty_answer_from_the_context_free_retry_is_still_incomplete_not_silence():
+    # Astra IT1-01: the retry came back short of the cap but with no words; with no MOSS words there, the
+    # span's speech vanished as an empty success instead of IncompleteTranscription
+    from omi_asr.engine import IncompleteTranscription
+
+    class EmptyWithoutContext(FakeQwen):
+        def generate(self, audio, hotwords=None, max_tokens=0, **_):
+            r = super().generate(audio, hotwords, max_tokens)
+            if hotwords:
+                r.generation_tokens = max_tokens
+            else:
+                r.text, r.generation_tokens = "  ", 1
+            return r
+
+    e = Engine()
+    e.models = (FakeMoss([]), EmptyWithoutContext(), FakeAligner())
+    with pytest.raises(IncompleteTranscription):
+        e.transcribe(speech(15), ["Freedom"])
+
+
+def test_an_empty_context_free_retry_under_moss_words_keeps_mosss_text():
+    class EmptyWithoutContext(FakeQwen):
+        def generate(self, audio, hotwords=None, max_tokens=0, **_):
+            r = super().generate(audio, hotwords, max_tokens)
+            if hotwords:
+                r.generation_tokens = max_tokens
+            else:
+                r.text, r.generation_tokens = "", 0
+            return r
+
+    e = Engine()
+    e.models = (FakeMoss(lines_every(5, 15)), EmptyWithoutContext(), FakeAligner())
+    out = e.transcribe(speech(15), ["Freedom"])
+    assert out["omi_asr"]["qwen_capped"] == 1 and [s["text"] for s in out["segments"]] == ["moss0", "moss5", "moss10"]
+
+
+class NoAlignment(FakeAligner):
+    """Aligns nothing (mlx-audio 0.6.3 gives no items for a punctuation-only text such as "…?!")."""
+
+    def generate(self, chunk, text, language):
+        return SimpleNamespace(items=[])
+
+
+class PunctuationWithoutContext(FakeQwen):
+    def generate(self, audio, hotwords=None, max_tokens=0, **_):
+        r = super().generate(audio, hotwords, max_tokens)
+        if hotwords:
+            r.generation_tokens = max_tokens
+        else:
+            r.text, r.generation_tokens = "…?!", 3
+        return r
+
+
+@pytest.mark.parametrize("moss", [[], [{"start": 0.0, "end": 3.0, "speaker_id": "S01", "text": "[0][S01] first three seconds"}]],
+                         ids=["no-moss", "moss-0-3s"])
+def test_a_retry_that_aligns_to_nothing_is_still_a_failed_piece(moss):
+    # Astra IT2-01: a nonempty retry counted as recovered before alignment; with no items the 15 s span vanished
+    from omi_asr.engine import IncompleteTranscription
+
+    e = Engine()
+    e.models = (FakeMoss(moss), PunctuationWithoutContext(), NoAlignment())
+    with pytest.raises(IncompleteTranscription):
+        e.transcribe(speech(15), ["Freedom"])
+
+
+def test_a_retry_that_aligns_to_nothing_under_full_moss_words_keeps_mosss_text():
+    e = Engine()
+    e.models = (FakeMoss(lines_every(5, 15)), PunctuationWithoutContext(), NoAlignment())
+    out = e.transcribe(speech(15), ["Freedom"])
+    assert out["omi_asr"]["qwen_unaligned"] == 1 and [s["text"] for s in out["segments"]] == ["moss0", "moss5", "moss10"]
+
+
+def test_a_first_answer_that_aligns_to_nothing_is_a_failed_piece_too():
+    from omi_asr.engine import IncompleteTranscription
+
+    e = Engine()
+    e.models = (FakeMoss([]), FakeQwen(), NoAlignment())
+    with pytest.raises(IncompleteTranscription):
+        e.transcribe(speech(15), [])

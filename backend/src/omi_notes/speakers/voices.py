@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ..audio.diarize import Turn
+from ..audio.pitch import voice_f0
 from ..pipeline.segmenter import Interval, intersect, subtract, union
 
 SAMPLE_RATE = 16000
@@ -49,6 +50,8 @@ class LabelVoice:
     spread: float = 0.0
     rms_db: float | None = None
     clip_vectors: list[np.ndarray] = field(default_factory=list, repr=False)
+    f0: float | None = None  # median F0 of the clips (`audio.pitch`), None when unknown
+    f0_voiced: int = 0
 
     @property
     def seconds(self) -> float:
@@ -154,6 +157,9 @@ def embed_voices(clips: dict[str, list[Clip]], pcm: np.ndarray, embedder) -> dic
                                      default=0.0), 4)  # fmt: skip
             mean_energy = sum(e * w for e, w in zip(energy, weights, strict=True)) / sum(weights)
             voice.rms_db = round(10 * math.log10(mean_energy / 32768.0**2), 2) if mean_energy > 0 else -120.0
+            # review evidence only, measured while the PCM is in hand (kept only where the vector is kept)
+            measured = voice_f0(pcm, [(c.start, c.end) for c in kept])
+            voice.f0, voice.f0_voiced = measured["f0"], measured["voiced"]
         voices[label] = voice
     return voices
 

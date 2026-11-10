@@ -196,24 +196,7 @@ struct TransferDetailView: View {
     }
 
     private func watchHop(_ t: TransferSummary, now: Date) -> some View {
-        let w = t.watch
-        let line: String
-        if w.inUse == nil {
-            line = "Checking for Apple Watch"
-        } else if w.keptOnWatch > 0, w.reportAt != nil {
-            line = "\(TransferText.plural(w.keptOnWatch, "part", "parts")) kept on the Watch, can't be sent"
-        } else if let parts = w.newParts, w.reportAt != nil, w.reportFresh {
-            let recheck = w.recheckParts > 0 ? "re-checking \(TransferText.plural(w.recheckParts, "older part", "older parts"))" : nil
-            line = parts == 0 ? (recheck.map { "R" + $0.dropFirst() } ?? "Nothing left on the Watch")
-                : "\(TransferText.plural(parts, "part", "parts")) left on the Watch" + (recheck.map { " · \($0)" } ?? "")
-        } else if let at = w.reportAt, at <= now {
-            line = "Last Watch report \(Fmt.relative(at))"  // not current: no claim about now
-        } else if w.reportAt != nil {
-            line = "Watch report time is ahead of this iPhone"
-        } else {
-            line = "No report from the Watch yet"
-        }
-        return hop("Watch → iPhone", symbol: "applewatch", fraction: t.watchFraction, line: line)
+        hop("Watch → iPhone", symbol: "applewatch", fraction: t.watchFraction, line: t.watchLine(now: now))
     }
 
     private func phoneHop(_ t: TransferSummary) -> some View {

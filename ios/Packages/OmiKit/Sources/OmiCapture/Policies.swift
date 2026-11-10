@@ -94,7 +94,15 @@ public struct RingCursor: Codable, Equatable, Sendable {
     public var generation: Int = 1
     public var lastPersistedSeq: UInt64?
     public var lastWriteSeq: UInt64?
+    /// The device's (cumulative) overwritten-record count last reported, so an unchanged one isn't warned again.
+    public var lastDroppedReported: UInt64?
     public init() {}
+
+    /// The overwritten-record count to report for this INFO, or nil when it is zero or unchanged.
+    public mutating func droppedToReport(_ dropped: UInt64) -> UInt64? {
+        defer { lastDroppedReported = dropped }
+        return dropped > 0 && dropped != lastDroppedReported ? dropped : nil
+    }
 
     /// Applies an INFO snapshot. Returns true if a new generation started.
     @discardableResult

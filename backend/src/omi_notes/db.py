@@ -22,7 +22,7 @@ from pathlib import Path
 
 from .spool import make_dirs_durable
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -286,7 +286,11 @@ CREATE TABLE IF NOT EXISTS samples (
     conversation_id TEXT,
     label TEXT,
     request_id TEXT,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    state TEXT NOT NULL DEFAULT 'active',
+    revision INTEGER NOT NULL DEFAULT 0,
+    flag_json TEXT,
+    f0 REAL
 );
 CREATE INDEX IF NOT EXISTS samples_person ON samples(person_id);
 CREATE INDEX IF NOT EXISTS samples_request ON samples(request_id);
@@ -302,6 +306,8 @@ CREATE TABLE IF NOT EXISTS voices (
     spread REAL NOT NULL DEFAULT 0,
     rms_db REAL,
     clips_json TEXT NOT NULL,
+    f0 REAL,
+    f0_voiced INTEGER,
     PRIMARY KEY (conversation_id, label)
 );
 CREATE TABLE IF NOT EXISTS speaker_labels (
@@ -315,6 +321,7 @@ CREATE TABLE IF NOT EXISTS speaker_labels (
     not_json TEXT NOT NULL DEFAULT '[]',
     forgotten INTEGER NOT NULL DEFAULT 0,
     samples_json TEXT NOT NULL DEFAULT '[]',
+    rm_basis TEXT,
     PRIMARY KEY (conversation_id, label)
 );
 CREATE INDEX IF NOT EXISTS speaker_labels_person ON speaker_labels(person_id);
@@ -487,17 +494,17 @@ COLUMN_SOURCES: dict[str, dict[str, str]] = {
     "samples": {
         c: "_omi/people/<person_id>/samples/<sample_id>.json"
         for c in ("id", "person_id", "model", "model_sha", "vector", "source", "seconds", "day", "session",
-                  "conversation_id", "label", "request_id", "created_at")
+                  "conversation_id", "label", "request_id", "created_at", "state", "revision", "flag_json", "f0")
     },
     "voices": {
         c: "<conversation dir>/voices-<model>-<audio_sha16>.json" for c in (
             "conversation_id", "label", "file", "model", "model_sha", "vector", "seconds", "turns", "spread", "rms_db",
-            "clips_json")
+            "clips_json", "f0", "f0_voiced")
     },  # fmt: skip
     "speaker_labels": {
         c: "<conversation dir>/speakers.json labels"
         for c in ("conversation_id", "label", "person_id", "source", "distance", "margin", "evidence_s", "not_json",
-                  "forgotten", "samples_json")
+                  "forgotten", "samples_json", "rm_basis")
     },
     "known_through": {
         "conversation_id": "conversation.json id",

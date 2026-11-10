@@ -40,7 +40,11 @@ log = logging.getLogger(__name__)
 # 3: conversation records may carry `resolution` (kept from the phone with the speaker unknown).
 # 4: speakers.json label states may be `source: "unknown"` (the owner kept a voice unknown); an older
 # backend would recompute them away.
-FORMAT = 5  # 5: conversation.json `deferral` and `transcribe` operations (deferred short sessions)
+# 6: voice samples may carry a `state` (removed | moved), `history` and a review `flag`; an older backend
+# would train on a removed or moved voiceprint again. (5 is left unused: no vault was ever written with it.)
+# 7: conversation.json `deferral` and `transcribe` operations (deferred short sessions). The Voices release
+# (`4573e20`) also wrote format 6, so deferral state needs its own number for that release to refuse it.
+FORMAT = 7
 OMI = "_omi"
 LEASE_RENEW_SECONDS = 5 * 60
 LEASE_STALE_SECONDS = 15 * 60
@@ -213,41 +217,36 @@ class Vault:
         """Serializes every read-modify-write of VAULT.json: one lock per vault path, shared by every handle in this
         process (a process-wide RLock) and by other processes on this host (a `flock` under LOCK_DIR, outside the
         synced vault). The API, the worker and CLI commands each open their own handles; without it, one raising
-        to 4 from a stale read could write over another's 5."""
+        to 4 from a stale read could write over another's 6."""
         from .lock import SpeakerLock
 
         return SpeakerLock(self, name="vault-meta.lock")
 
-    def _reload_info(self) -> None:
-        on_disk = self.read_json(self.vault_json) or {}
-        if isinstance(on_disk, dict) and on_disk:
-            self.info = on_disk  # another handle may have changed it: never write from a stale copy
-
     def raise_format(self, fmt: int) -> None:
         """Mark the vault as using a newer format's data (durably, before that data is written), so
-        an older backend refuses it instead of silently dropping what it doesn't understand. The read,
-        check and write happen under `meta_lock`, so concurrent raises never lower the format."""
+        an older backend refuses it instead of silently dropping what it doesn't understand. Never lowers it."""
+        if self.format >= fmt:
+            return
+        self._update_info({"format": fmt})
+
+    def _update_info(self, changes: dict) -> None:
+        """Write these VAULT.json keys. The API and a worker process may both write it: the file is re-read under the
+        per-vault meta lock and changes merge into it, and `format` only ever goes up."""
         with self.meta_lock():
-            self._reload_info()
-            if self.format >= fmt:
-                return
-            info = dict(self.info) | {"format": fmt}
-            self.write_json(self.vault_json, info)
+            on_disk = self.read_json(self.vault_json) or dict(self.info)
+            fmt = max(int(on_disk.get("format", 1)), int(self.info.get("format", 1)), int(changes.get("format", 1)))
+            info = on_disk | changes | {"format": fmt}
+            if info != on_disk:
+                self.write_json(self.vault_json, info)
             self.info = info
 
     def sync_render_settings(self, settings: Settings) -> None:
         """Record explicitly configured render-affecting settings (TIMEZONE, OWNER_NAME) in
         VAULT.json, so another machine pointed at this vault renders the same notes."""
-        if not any(key in settings.model_fields_set and self.info.get(key) != getattr(settings, key)
-                   for key in ("timezone", "owner_name")):  # fmt: skip
-            return
-        with self.meta_lock():
-            self._reload_info()
-            changed = {key: getattr(settings, key) for key in ("timezone", "owner_name")
-                       if key in settings.model_fields_set and self.info.get(key) != getattr(settings, key)}  # fmt: skip
-            if changed:
-                self.info = dict(self.info) | changed
-                self.write_json(self.vault_json, self.info)
+        changed = {key: getattr(settings, key) for key in ("timezone", "owner_name")
+                   if key in settings.model_fields_set and self.info.get(key) != getattr(settings, key)}  # fmt: skip
+        if changed:
+            self._update_info(changed)
 
     # -- files -----------------------------------------------------------------------------------
 

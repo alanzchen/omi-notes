@@ -11,6 +11,8 @@
   with confirmations from ≥ 3 distinct recordings on one day. Enrollment alone never activates.
 - An active enrolled wearer may match one continuous turn with ≥ 10 s, two disjoint ≥ 3 s clips,
   and distance < 0.25; margin and mixed-voice checks still apply.
+- The wearer is additionally restricted by `OwnerRule`: only the top raw-ranked label of a
+  multi-label conversation at raw cosine ≥ 0.88, or a single label at ≥ 0.80.
 - `source: user` assignments and `source: unknown` ("keep unknown") are sticky; `not` blocks a person for that label. Several labels may
   map to one person (diarization over-splits), but only when they are about as close: within one
   conversation the closest label is the runner-up for the others (margin 0.10).
@@ -35,9 +37,27 @@ WEARER_CONTINUOUS_SECONDS = 10.0
 WEARER_CONTINUOUS_DISTANCE = 0.25
 WEARER_CLIP_SECONDS = 3.0
 SAMPLE_CAP = 20
+ENROLLMENT_ONLY_SECONDS = 60.0  # of enrollment speech: the centroid comes from enrollment alone
 ACTIVE_SAMPLES = 3
 ACTIVE_DAYS = 2
 CONFIRMED = ("enrollment", "user")
+
+
+@dataclass(frozen=True)
+class OwnerRule:
+    """A pure restriction on automatically naming the wearer ("me"), on top of everything else here
+    (spk/a0-20261109/REPORT.md, recommendations 3 and 4; voices-hub plan, Revision 4). Diarization
+    over-splits the wearer, who is closest to the microphone, so within a conversation only the label
+    with the highest raw cosine to the wearer's centroid may be named, at raw ≥ 0.88; a conversation
+    with a single label has nothing to rank against and needs raw ≥ 0.80. A second over-split wearer
+    label stays unnamed, which is the safe side. `version` goes into the calibration fingerprint."""
+
+    version: int = 1
+    multi_min_cosine: float = 0.88
+    single_min_cosine: float = 0.80
+
+
+OWNER_RULE = OwnerRule()
 
 
 @dataclass(frozen=True)
@@ -57,6 +77,9 @@ class Sample:
     day: str | None = None  # local date of the audio
     session: str | None = None  # conversation or enrollment id
     created_at: float = 0.0
+    seconds: float = 0.0
+    state: str = "active"  # only eligible samples are ever passed in (`store.sample_eligible`)
+    f0: float | None = None
 
 
 @dataclass
@@ -67,6 +90,8 @@ class PersonModel:
     active: bool = False
     why_inactive: str = ""
     enrolled_wearer: bool = False
+    wearer: bool = False  # this is "me" (`OwnerRule`)
+    enrollment_only: bool = False  # the centroid comes from enrollment audio alone
 
 
 @dataclass(frozen=True)
@@ -84,15 +109,37 @@ def confirmed(samples: list[Sample]) -> list[Sample]:
     return sorted(keep, key=lambda s: (s.created_at, s.id))[-SAMPLE_CAP:]
 
 
+def enrollment_only(samples: list[Sample]) -> list[Sample] | None:
+    """A person's enrollment samples (newest SAMPLE_CAP) once they hold ≥ 60 s of enrollment speech (pendant or
+    imported): their voice is then modelled from that clean audio alone. None below that."""
+    enrolled = [s for s in samples if s.source == "enrollment"]
+    if sum(s.seconds or 0.0 for s in enrolled) < ENROLLMENT_ONLY_SECONDS:
+        return None
+    return sorted(enrolled, key=lambda s: (s.created_at, s.id))[-SAMPLE_CAP:]
+
+
+def centroid_basis(samples: list[Sample]) -> list[Sample]:
+    """The samples people's voices are compared with in the recording-mean space: every confirmed one, or a
+    person's enrollment alone once it reaches 60 s."""
+    by_person: dict[str, list[Sample]] = {}
+    for s in samples:
+        if s.source in CONFIRMED:
+            by_person.setdefault(s.person_id, []).append(s)
+    return [s for items in by_person.values() for s in (enrollment_only(items) or items)]
+
+
 def build_models(samples: list[Sample], op: Operating = Operating(), *, wearer_id: str | None = None) -> dict[str, PersonModel]:
     by_person: dict[str, list[Sample]] = {}
     for s in samples:
         by_person.setdefault(s.person_id, []).append(s)
     models = {}
     for pid, items in by_person.items():
-        chosen = confirmed(items)
-        models[pid] = PersonModel(pid, centroid([s.vector for s in chosen]) if chosen else None, chosen,
-                                  enrolled_wearer=pid == wearer_id and any(s.source == "enrollment" for s in items))
+        chosen = confirmed(items)  # what activation judges, unchanged
+        enrolled = enrollment_only(items)
+        basis = enrolled or chosen
+        models[pid] = PersonModel(pid, centroid([s.vector for s in basis]) if basis else None, chosen,
+                                  enrolled_wearer=pid == wearer_id and any(s.source == "enrollment" for s in items),
+                                  wearer=pid == wearer_id, enrollment_only=enrolled is not None)  # fmt: skip
     for model in models.values():
         model.active, model.why_inactive = activation(model, models, op)
     return models
@@ -120,6 +167,13 @@ def activation(model: PersonModel, models: dict[str, PersonModel], op: Operating
         best_other = min((cosine_distance(sample.vector, m.centroid) for m in others), default=None)
         if own >= op.threshold or (best_other is not None and best_other - own < op.margin):
             return False, "leave-one-out check failed: a sample does not match the others"
+    if model.enrollment_only and model.centroid is not None:
+        # names come from the enrollment-only centroid: every confirmation must match that model too
+        for sample in beyond:
+            own = cosine_distance(sample.vector, model.centroid)
+            best_other = min((cosine_distance(sample.vector, m.centroid) for m in others), default=None)
+            if own >= op.threshold or (best_other is not None and best_other - own < op.margin):
+                return False, "confirmations don't match the enrollment-only model"
     return True, ""
 
 
@@ -167,10 +221,40 @@ def _independent_clips(voice) -> int:
     return count
 
 
+def raw_cosine(a: np.ndarray, b: np.ndarray) -> float:
+    return 1.0 - cosine_distance(a, b)
+
+
+def owner_refusal(label: str, voices: dict[str, object], model: PersonModel, rule: OwnerRule = OWNER_RULE) -> str:
+    """Why `OwnerRule` keeps this label from being named the wearer ("" when it may be). A label counts
+    towards a multi-label conversation when it had a voice (a stored one whose vector wasn't kept too);
+    the ranking is over the vectors at hand."""
+    present = [lab for lab, v in voices.items() if v is not None
+               and (getattr(v, "vector", None) is not None or (getattr(v, "seconds", 0) or 0) > 0)]  # fmt: skip
+    scored = {lab: raw_cosine(voices[lab].vector, model.centroid) for lab in present if getattr(voices[lab], "vector", None) is not None}
+    mine = scored.get(label)
+    if mine is None:
+        return "no voice"
+    if len(present) >= 2:
+        top = min(scored, key=lambda lab: (-scored[lab], _label_key(lab)))
+        if top != label:
+            return f"another label ({top}) is closer to the wearer"
+        if mine < rule.multi_min_cosine:
+            return f"raw cosine {mine:.2f} < {rule.multi_min_cosine} for the wearer"
+        return ""
+    return f"raw cosine {mine:.2f} < {rule.single_min_cosine} for the wearer" if mine < rule.single_min_cosine else ""
+
+
 def assign(voices: dict[str, object], current: dict[str, dict], models: dict[str, PersonModel], *, auto_assign: bool,
-           op: Operating = Operating()) -> dict[str, dict]:  # fmt: skip
+           op: Operating = Operating(), owner: OwnerRule = OWNER_RULE, space=None, full_rm: bool = False) -> dict[str, dict]:  # fmt: skip
     """Label states after (re)assignment. User assignments and `not` lists are kept; automatic
-    ones are recomputed from the stored voices (only for active people, when auto naming is on)."""
+    ones are recomputed from the stored voices (only for active people, when auto naming is on;
+    the wearer only within `OwnerRule`). With `space` (`speakers.space.RmSpace`) anyone else is
+    named only when the recording-mean scores rank that person first too (`rm_basis` records how
+    the label was centred; `full_rm`: `voices` hold every label vector of the conversation)."""
+    from .space import ranking
+
+    label_vectors = [v.vector for v in voices.values() if v is not None and getattr(v, "vector", None) is not None]
     out: dict[str, dict] = {}
     for label in sorted(set(voices) | set(current), key=_label_key):
         state = dict(current.get(label) or {})
@@ -183,7 +267,12 @@ def assign(voices: dict[str, object], current: dict[str, dict], models: dict[str
                  "evidence_s": getattr(voices.get(label), "seconds", None), "not": sorted(blocked),
                  "forgotten": bool(state.get("forgotten")), "samples": list(state.get("samples") or [])}  # fmt: skip
         model = models.get(found.person_id) if found.person_id else None
-        if auto_assign and found.accepted and model is not None and model.active:
+        agrees = True
+        if space is not None and model is not None and not model.wearer:
+            scored, fresh["rm_basis"] = ranking(voices[label].vector, label_vectors, space, full=full_rm)
+            agrees = bool(scored) and scored[0][1] == found.person_id
+        if auto_assign and found.accepted and model is not None and model.active and agrees and not (
+                model.wearer and owner_refusal(label, voices, model, owner)):  # fmt: skip
             fresh |= {"person_id": found.person_id, "source": "auto"}
         out[label] = fresh
     # The diarizer already heard these labels as different voices, so the closest label to a person

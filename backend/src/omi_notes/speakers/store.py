@@ -4,10 +4,11 @@ Vault files (the index tables `people`, `samples`, `voices`, `speaker_labels` ar
 - `People/<Name>.md`: frontmatter `omi_person_id`, `name`, `aliases`, `omi_me`; created once by
   the server, then the user's (rename freely: identity is the id, the file name is the link).
 - `_omi/people/<id>/samples/<sample_id>.json`: a confirmed voiceprint {model, model_sha, dim,
-  vector_b64, source, seconds, created_at, ...}; `consent.json`: the person-level attestation;
+  vector_b64, source, seconds, created_at, ...}, from vault format 6 also `state` (active | removed |
+  moved), `revision`, `history` and a review `flag`; `consent.json`: the person-level attestation;
   `enrollment/<id>.omiaudio` + `enrollments/<id>.json`: the wearer's enrollment.
 - `_omi/speakers/settings.json`: acknowledgment, unknown-voice opt-in, auto naming, dismissals.
-- per conversation: `voices-<model>-<audio_sha16>.json` (clips, and vectors of assigned labels —
+- per conversation: `voices-<model>-<model_sha8>-<audio_sha16>-c<clip bounds8>-<transcript_sha8>.json` (clips, and vectors of assigned labels —
   of every label only with unknown-voice storage) and `speakers.json` (assignments + evidence).
 """
 
@@ -19,8 +20,11 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
+import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,14 +37,46 @@ from ..notes.writer import remove, sanitize_title, write_if_changed
 from ..spool import atomic_write_bytes, fsync_dir, make_dirs_durable
 from ..util import canonical_json, sha256_hex
 from ..vault import Vault
-from .match import Operating, Sample, build_models
+from .match import Operating, Sample, build_models, centroid_basis
 from .voices import LabelVoice, decode_vector, encode_vector
 
 log = logging.getLogger(__name__)
 
 PEOPLE_DIR = "People"
 REQUEST_MEMORY = 200
+ACTIVE, REMOVED, MOVED = "active", "removed", "moved"
+PENDING = "pending"  # index-only: a copy an unfinished journaled operation wrote (`speakers.journal`)
+SAMPLE_STATES = (ACTIVE, REMOVED, MOVED)
+SAMPLE_FORMAT = 6  # vault format whose samples may carry a state, history and flag
 _FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
+
+
+def sample_eligible(sample) -> bool:
+    """The one rule for which voiceprints teach anything (matching, activation, hints, suggestions and
+    calibration): an active sample. A review flag never changes it; only the owner's remove or move does. A copy
+    an unfinished journaled operation wrote (`pending_op`) isn't one until the operation completes."""
+    if isinstance(sample, Mapping):
+        if sample.get("pending_op"):
+            return False
+        state = sample.get("state")
+    elif isinstance(sample, sqlite3.Row):
+        state = sample["state"] if "state" in sample.keys() else None
+    else:
+        state = getattr(sample, "state", None)
+    return (state or ACTIVE) == ACTIVE
+
+
+def consent_ok(person, prefs: dict) -> bool:
+    """The one consent rule for keeping someone's voice: the wearer, or a person attested after the acknowledgment."""
+    return person is not None and bool(person["me"] or (prefs["acknowledged_at"] and person["attested_at"]))
+
+
+def flag_open(flag: dict | None) -> bool:
+    """A review flag the owner hasn't resolved for this evidence."""
+    if not flag or not flag.get("reasons"):
+        return False
+    resolved = flag.get("resolved") or {}
+    return resolved.get("fingerprint") != flag.get("evidence_fingerprint")
 
 
 @dataclass
@@ -56,6 +92,9 @@ class VoiceRow:
     clips: list[list[float]]
     model: str
     model_sha: str
+    f0: float | None = None
+    f0_voiced: int = 0
+    file: str | None = None  # the voices file it is from
 
     @property
     def mixed(self) -> bool:
@@ -73,11 +112,36 @@ def read_frontmatter(text: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def voices_name(embedder, audio_sha: str, transcript_sha: str) -> str:
-    """A conversation's voices file, keyed by everything the voices depend on (a new transcript
-    may number the voices differently)."""
+def voices_name(embedder, audio_sha: str, transcript_sha: str, clips: dict[str, list[list[float]]]) -> str:
+    """A conversation's voices file, keyed by everything the voices depend on: a new transcript may
+    number the voices differently, and other clip bounds (a corrected selection, same words and labels)
+    make other voices. The transcript's part stays last (`voices-*-<transcript8>.json` finds it)."""
     model = re.sub(r"[^A-Za-z0-9._-]+", "-", embedder.model).strip("-")[:40]
-    return f"voices-{model}-{embedder.model_sha[:8]}-{(audio_sha or '')[:16]}-{(transcript_sha or '')[:8]}.json"
+    return f"voices-{model}-{embedder.model_sha[:8]}-{(audio_sha or '')[:16]}-c{clip_bounds(clips)}-{(transcript_sha or '')[:8]}.json"
+
+
+def _spans(clips: list) -> list[list[float]]:
+    return [[round(float(a), 3), round(float(b), 3)] for a, b in clips]
+
+
+def clip_bounds(clips: dict[str, list[list[float]]]) -> str:
+    """A fingerprint of every label's clip bounds (`voices_name`'s `c…` part)."""
+    spans = {label: _spans(v) for label, v in sorted(clips.items()) if v}
+    return hashlib.sha256(json.dumps(spans, sort_keys=True).encode()).hexdigest()[:8]
+
+
+def same_clips(stored: list, current: list) -> bool:
+    """Whether a stored voice was embedded from these clip bounds: every clip it used is one of them
+    (embedding skips fragments too short to use, so it may hold fewer)."""
+    allowed = {tuple(c) for c in _spans(current or [])}
+    return all(tuple(c) in allowed for c in _spans(stored or []))
+
+
+def current_voices_file(names, transcript: dict) -> str | None:
+    """Of these voices file names, the one made from this transcript and its clip bounds, if any."""
+    sha = sha256_hex(canonical_json(transcript.get("segments") or []).encode())
+    tail = f"-c{clip_bounds(transcript.get('speaker_clips') or {})}-{sha[:8]}.json"
+    return next((n for n in sorted(names) if n.endswith(tail)), None)
 
 
 _KEEP = object()
@@ -90,6 +154,9 @@ class SpeakerStore:
         self.auto_assign_default = auto_assign_default
         # every read-modify-write of label states, in the API and in the worker (any process)
         self.lock = SpeakerLock(vault)
+        # (evidence_key, voice space): `rm_space` once per change, shared by renders, relabel and requests
+        self._space_cache: tuple | None = None
+        self._space_cache_lock = threading.Lock()
 
     # -- settings --------------------------------------------------------------------------------
 
@@ -182,6 +249,86 @@ class SpeakerStore:
         me = self.me()
         return build_models(self.samples(model, model_sha), op, wearer_id=me["id"] if me else None)
 
+    def ga_population(self, model: str, model_sha: str) -> list[tuple[str | None, bytes]]:
+        """What GA is the mean of, as (conversation, vector bytes): the label population `vector_labels` allows now
+        (the one consent rule: named for me or a consented person; any other label only with unknown-voice storage
+        on and its raw audio still there; never a forgotten one), plus the eligible samples of consented people that
+        aren't one of those voices already (a named label's sample is its voice: counted once)."""
+        prefs, people = self.settings(), {r["id"]: r for r in self.people()}
+        by_conv: dict[str, dict[str, bytes]] = {}
+        for r in self.db.query("SELECT conversation_id, label, vector FROM voices WHERE vector IS NOT NULL AND model=? AND model_sha=?",
+                               (model, model_sha)):  # fmt: skip
+            by_conv.setdefault(r["conversation_id"], {})[r["label"]] = r["vector"]
+        population: list[tuple[str | None, bytes]] = []
+        kept: dict[str, set[bytes]] = {}  # conversation → its allowed voices (a sample from one of them is that voice)
+        for conv_id, stored in sorted(by_conv.items()):
+            states = self.labels(conv_id)
+            keep = self.vector_labels(states, set(stored), raw=False, prefs=prefs, people=people)
+            if set(stored) - keep and prefs["unknown_voices_enabled"]:
+                row = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
+                if row is not None and self.raw_available(row):
+                    keep = self.vector_labels(states, set(stored), raw=True, prefs=prefs, people=people)
+            kept[conv_id] = {stored[label] for label in keep}
+            population += [(conv_id, stored[label]) for label in sorted(keep)]
+        for s in self.samples(model, model_sha):
+            raw = np.asarray(s.vector, dtype="<f4").tobytes()
+            if consent_ok(people.get(s.person_id), prefs) and raw not in kept.get(s.session or "", set()):
+                population.append((s.session, raw))
+        return population
+
+    def evidence_key(self, model: str, model_sha: str) -> str:
+        """A content digest of everything the voice space and the review queue depend on: every stored vector of
+        this model, every sample (state, revision, flag, vector), every label state, every conversation
+        (status, transcript, speakers revision), raw availability, people and consent, the speaker
+        settings file as stored (forgotten voices included) and any unfinished forget or journaled operation.
+        Hashing the rows themselves (milliseconds) rather than counting them: a replaced vector or a recovery
+        that reuses row ids must change it, so a value cached under it is never stale."""
+        h = hashlib.blake2b(digest_size=16)
+
+        def add(rows) -> None:
+            for row in rows:
+                h.update(repr(tuple(row)).encode())
+            h.update(b"|")
+
+        add(self.db.query("SELECT conversation_id, label, file, vector FROM voices WHERE vector IS NOT NULL AND model=? "
+                          "AND model_sha=? ORDER BY conversation_id, label", (model, model_sha)))  # fmt: skip
+        add(self.db.query("SELECT id, person_id, state, revision, flag_json, vector, model_sha FROM samples ORDER BY id"))
+        add(self.db.query("SELECT * FROM speaker_labels ORDER BY conversation_id, label"))
+        # every conversation (about a thousand rows, a few ms): the queue lists the newest with a transcript, and a
+        # window over all of them could miss one it lists
+        add(self.db.query("SELECT id, status, transcript_sha, speakers_revision, start FROM conversations ORDER BY id"))
+        add([(self.db.one("SELECT count(*) FROM chunks WHERE raw_deleted=1")[0],)])
+        add(self.db.query("SELECT id, me, attested_at, name FROM people ORDER BY id"))
+        settings = self.settings_path.read_bytes() if self.settings_path.exists() else b""
+        h.update(settings + b"|")
+        for folder in (self.vault.speakers / "forgetting", self.vault.speakers / "journal"):
+            names = sorted(p.name for p in folder.glob("*.json")) if folder.exists() else []
+            h.update(repr(names).encode() + b"|")
+        return f"{model}:{model_sha[:12]}:{h.hexdigest()}"
+
+    def rm_space(self, model: str, model_sha: str):
+        """GA (`ga_population`) and people's GA-centred centroids (`speakers.space`), in memory only; None without
+        any vector. Computed once per `evidence_key` (it reads every stored voice: per note render it kept the
+        server busy for hours after a relabel)."""
+        key = self.evidence_key(model, model_sha)
+        with self._space_cache_lock:
+            if self._space_cache is not None and self._space_cache[0] == key:
+                return self._space_cache[1]
+        space = self._rm_space(model, model_sha)
+        if self.evidence_key(model, model_sha) == key:  # nothing changed while it was built: safe to keep
+            with self._space_cache_lock:
+                self._space_cache = (key, space)
+        return space
+
+    def _rm_space(self, model: str, model_sha: str):
+        from .space import build_space
+
+        by_person: dict[str, list] = {}
+        for s in centroid_basis(self.samples(model, model_sha)):
+            by_person.setdefault(s.person_id, []).append(s.vector)
+        vectors = [np.frombuffer(v, dtype="<f4").astype(np.float32) for _, v in self.ga_population(model, model_sha)]
+        return build_space(vectors, by_person)
+
     def put_person(self, person_id: str, name: str, *, me: bool | None = None, attest: bool = False,
                    now: float | None = None) -> bool:  # fmt: skip
         """Create (201 → True) or update (False) a person. The People note is created once;
@@ -247,6 +394,7 @@ class SpeakerStore:
     def forget_voice(self, person_id: str, *, delete_note: bool = False) -> None:
         """Delete the person's voice data (samples, enrollment audio, consent). A global enrollment
         result keeps only its decision, so the reading is not learned again."""
+        self.begin_forget(person_id)
         results = self.vault.speakers / "enrollments"
         for path in sorted(results.glob("*.json")) if results.exists() else []:
             data = Vault.read_json(path) or {}
@@ -254,6 +402,8 @@ class SpeakerStore:
                 for key in ("person_id", "sample_id", "model", "model_sha"):
                     data.pop(key, None)
                 Vault.write_json(path, data | {"forgotten": True})
+        self._purge_lineage(person_id)
+        self._forget_calibration(person_id)
         folder = self.person_dir(person_id)
         if folder.exists():
             shutil.rmtree(folder)
@@ -262,7 +412,86 @@ class SpeakerStore:
         if delete_note and person is not None and person["note_path"]:
             remove(self.vault.root / person["note_path"])
         self.db.execute("DELETE FROM samples WHERE person_id=?", (person_id,))
+        if remove(self.forgetting_path(person_id)):  # complete
+            fsync_dir(self.forgetting_path(person_id).parent)
         self.scan_people()
+
+    def _purge_lineage(self, person_id: str) -> None:
+        """A sample moved to this person (directly, or A→B→this) left `moved` records holding this person's voice in
+        other folders, and an enrollment sample keeps its audio in the folder it was imported into: they go with
+        this person (history and all)."""
+        records: dict[tuple[str, str], tuple[Path, dict]] = {}
+        for path in sorted(self.vault.people.glob("*/samples/*.json")) if self.vault.people.exists() else []:
+            data = Vault.read_json(path) or {}
+            if data.get("state") == MOVED:
+                records[(path.parent.parent.name, path.stem)] = (path, data)
+
+        def reaches(key: tuple[str, str]) -> bool:
+            seen = set()
+            while key in records and key not in seen:
+                seen.add(key)
+                target = records[key][1].get("moved_to") or {}
+                if target.get("person_id") == person_id:
+                    return True
+                key = (target.get("person_id"), target.get("sample_id"))
+            return False
+
+        purge: set[str] = set()
+        for (owner, sample_id), (path, data) in records.items():
+            if owner == person_id or not reaches((owner, sample_id)):
+                continue
+            purge.add(self.vault.relpath(path))
+            if data.get("enrollment_id"):  # its audio and result are this person's voice too
+                for extra in (self.person_dir(owner) / "enrollment" / f"{data['enrollment_id']}.omiaudio",
+                              self.person_dir(owner) / "enrollments" / f"{data['enrollment_id']}.json"):  # fmt: skip
+                    purge.add(self.vault.relpath(extra))
+        # the whole set is decided and recorded before anything goes: a crash after deleting the middle of a chain
+        # (A→B→this) leaves A's link unfollowable, so a retry resumes this set rather than recomputing it
+        plan = self.forgetting_path(person_id)
+        purge |= set((Vault.read_json(plan) or {}).get("paths") or [])
+        Vault.write_json(plan, {"person_id": person_id, "paths": sorted(purge)})
+        for rel in sorted(purge):
+            path = self.vault.root / rel
+            remove(path)
+            if path.parent.name == "samples":
+                self.db.execute("DELETE FROM samples WHERE id=?", (path.stem,))
+
+    def begin_forget(self, person_id: str) -> None:
+        """The start of a forget, durable and idempotent (a retry continues the same forget): the per-person forget
+        count goes up once (work begun before it, an import being judged or a journaled operation, can tell and never
+        writes the voice back), then every journaled operation touching the person is cancelled and its intent
+        deleted. Raises rather than let the forget proceed past an operation it couldn't cancel."""
+        from . import journal
+
+        plan = self.forgetting_path(person_id)
+        if Vault.read_json(plan) is None:
+            current = Vault.read_json(self.settings_path) or {}
+            forgotten = dict(current.get("forgotten_voices") or {})
+            forgotten[person_id] = int(forgotten.get(person_id) or 0) + 1
+            self.update_settings(forgotten_voices=forgotten)
+            Vault.write_json(plan, {"person_id": person_id, "paths": []})
+        journal.cancel_for(self, person_id)
+
+    def forgetting_path(self, person_id: str) -> Path:
+        """A forget's recorded purge set (removed when the forget is complete)."""
+        return self.vault.speakers / "forgetting" / f"{person_id}.json"
+
+    def _forget_calibration(self, person_id: str) -> None:
+        """Calibration results about this person are removed too (the published one and every logged run)."""
+        path = self.vault.speakers / "calibration.json"
+        data = Vault.read_json(path)
+        if data and person_id in (data.get("people") or {}):
+            data["people"] = {k: v for k, v in data["people"].items() if k != person_id}
+            Vault.write_json(path, data)
+        log_path = self.vault.speakers / "calibration-log.jsonl"
+        lines = Vault.read_jsonl(log_path)
+        if any(person_id in (line.get("people") or {}) for line in lines):
+            kept = [line | {"people": {k: v for k, v in (line.get("people") or {}).items() if k != person_id}} for line in lines]
+            atomic_write_bytes(log_path, "".join(canonical_json(line) + "\n" for line in kept).encode())
+
+    def forget_count(self, person_id: str) -> int:
+        """How many times this person's voice was forgotten (`forget_voice`)."""
+        return int(((Vault.read_json(self.settings_path) or {}).get("forgotten_voices") or {}).get(person_id) or 0)
 
     def attested(self, person_id: str) -> bool:
         row = self.person(person_id)
@@ -272,30 +501,174 @@ class SpeakerStore:
 
     def add_sample(self, person_id: str, vector: np.ndarray, *, model: str, model_sha: str, source: str, seconds: float,
                    day: str | None, session: str | None, conversation_id: str | None = None, label: str | None = None,
-                   request_id: str | None = None, enrollment_id: str | None = None, now: float | None = None) -> str:  # fmt: skip
+                   request_id: str | None = None, enrollment_id: str | None = None, now: float | None = None,
+                   extra: dict | None = None, attested: bool | None = None, sample_id: str | None = None) -> str:  # fmt: skip
+        """A new confirmed voiceprint (`extra`: provenance such as clip bounds, caption and F0; `attested`:
+        the consent recorded with it, by default the person's attestation or a pendant enrollment; `sample_id`:
+        chosen by a journaled operation, which re-runs this idempotently)."""
         now = time.time() if now is None else now
-        sample_id = str(uuid.uuid4())
+        if sample_id is not None and self.read_sample(person_id, sample_id) is not None:
+            return sample_id
+        sample_id = sample_id or str(uuid.uuid4())
         person = self.person(person_id)
         data = {
             "sample_id": sample_id, "person_id": person_id, "person_name": person["name"] if person else None,
             "model": model, "model_sha": model_sha, "dim": int(len(vector)), "vector_b64": encode_vector(vector),
             "source": source, "seconds": round(float(seconds), 3), "created_at": now, "day": day, "session": session,
             "conversation_id": conversation_id, "label": label, "request_id": request_id, "enrollment_id": enrollment_id,
-            "attested": self.attested(person_id) or source == "enrollment",
+            "attested": (self.attested(person_id) or source == "enrollment") if attested is None else attested,
         }  # fmt: skip
+        data |= {k: v for k, v in (extra or {}).items() if v is not None and k not in data}
         Vault.write_json(self.person_dir(person_id) / "samples" / f"{sample_id}.json", data)
         self._index_sample(data)
+        self.samples_changed(now)
         return sample_id
+
+    def add_sample_fields(self, person_id: str, sample_id: str, fields: dict) -> bool:
+        """Add measurements to a sample file (F0 backfill and import): never overwrites a key it has, never
+        touches its state or revision. False when there was nothing to add."""
+        data = self.read_sample(person_id, sample_id)
+        if data is None:
+            return False
+        new = {k: v for k, v in fields.items() if k not in data}
+        if not new:
+            return False
+        data = data | new
+        self._publish_sample(person_id, sample_id, data)
+        return True
+
+    def _publish_sample(self, person_id: str, sample_id: str, data: dict) -> None:
+        """A changed sample file, then its index row. The index is marked as possibly behind the files first, and
+        unmarked only after its row is written: a crash in between leaves the mark, and `sync_samples` reloads."""
+        key = f"samples_dirty:{sample_id}:{int(data.get('revision') or 0)}"  # this change only
+        self.db.set_meta(key, "1")
+        Vault.write_json(self.sample_path(person_id, sample_id), data)
+        self._index_sample(data)
+        self.db.set_meta(key, None)
+
+    # -- review flags (`speakers.flags`) ----------------------------------------------------------
+
+    def apply_flags(self, now: float | None = None) -> int:
+        """Re-evaluate every eligible sample's review flag (call under the speaker lock); how many flags were
+        raised. A flag resolved for the same evidence stays resolved; a flag whose evidence went away is
+        cleared. Flags never change eligibility, so they don't ask for a recalibration."""
+        from . import flags
+
+        now = time.time() if now is None else now
+        raised = 0
+        groups = self.db.query("SELECT DISTINCT model, model_sha FROM samples")
+        for group in groups:
+            samples = self.samples(group["model"], group["model_sha"])
+            models = build_models(samples)
+            enrolled = {pid: m.centroid for pid, m in models.items() if m.enrollment_only and m.centroid is not None}
+            inputs = [flags.FlagInput(s.id, s.person_id, s.vector, s.f0, 2.0 if s.source == "enrollment" else 1.0) for s in samples]
+            found = flags.evaluate(inputs, enrolled)
+            for s in samples:
+                data = self.read_sample(s.person_id, s.id)
+                if data is None:
+                    continue
+                reasons, flag = found.get(s.id) or [], data.get("flag")
+                if reasons:
+                    fp = flags.fingerprint(reasons, data)
+                    if (flag or {}).get("evidence_fingerprint") == fp:
+                        continue
+                    new = {"reasons": reasons, "evidence_fingerprint": fp, "flagged_at": now, "rule": flags.VERSION}
+                    if (flag or {}).get("resolved"):
+                        new["resolved"] = flag["resolved"]  # an earlier answer, for other evidence: asked again
+                    self.update_sample(s.person_id, s.id, {"flag": new}, action="flag", by="calibration", request_id=None,
+                                       now=now, record={"reasons": reasons}, recalibrate=False)  # fmt: skip
+                    raised += flag_open(new)
+                elif flag_open(flag):
+                    self.update_sample(s.person_id, s.id, {"flag": None}, action="unflag", by="calibration", request_id=None,
+                                       now=now, recalibrate=False)  # fmt: skip
+        return raised
+
+    def resolve_flag(self, person_id: str, sample_id: str, decision: str, *, request_id: str | None, now: float | None = None,
+                     by: str = "user") -> dict:  # fmt: skip
+        """The owner answered a flag: recorded with its evidence fingerprint, so the same evidence never asks again."""
+        now = time.time() if now is None else now
+        data = self.read_sample(person_id, sample_id) or {}
+        flag = dict(data.get("flag") or {})
+        changes = {}
+        if flag:
+            flag["resolved"] = {"decision": decision, "at": now, "fingerprint": flag.get("evidence_fingerprint")}
+            changes["flag"] = flag
+        return self.update_sample(person_id, sample_id, changes, action=decision, by=by, request_id=request_id, now=now,
+                                  recalibrate=False)  # fmt: skip
 
     def _index_sample(self, data: dict) -> None:
         self.db.execute(
             """INSERT OR REPLACE INTO samples (id, person_id, model, model_sha, vector, source, seconds, day, session,
-                   conversation_id, label, request_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   conversation_id, label, request_id, created_at, state, revision, flag_json, f0)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (data["sample_id"], data["person_id"], data["model"], data["model_sha"],
              np.asarray(decode_vector(data["vector_b64"]), dtype="<f4").tobytes(), data["source"], data.get("seconds"),
              data.get("day"), data.get("session"), data.get("conversation_id"), data.get("label"), data.get("request_id"),
-             data.get("created_at") or 0.0),
+             data.get("created_at") or 0.0, PENDING if data.get("pending_op") else data.get("state") or ACTIVE,
+             int(data.get("revision") or 0),
+             json.dumps(data["flag"], sort_keys=True) if data.get("flag") else None, data.get("f0")),
         )  # fmt: skip
+
+    def sample_path(self, person_id: str, sample_id: str) -> Path:
+        return self.person_dir(person_id) / "samples" / f"{sample_id}.json"
+
+    def read_sample(self, person_id: str, sample_id: str) -> dict | None:
+        return Vault.read_json(self.sample_path(person_id, sample_id))
+
+    def find_sample(self, sample_id: str) -> dict | None:
+        """A sample file by id (the index says whose; the folders are the truth if it is behind)."""
+        row = self.db.one("SELECT person_id FROM samples WHERE id=?", (sample_id,))
+        if row is not None and (data := self.read_sample(row["person_id"], sample_id)) is not None:
+            return data
+        if not re.fullmatch(r"[0-9a-f-]{36}", sample_id or "") or not self.vault.people.exists():
+            return None
+        return next((Vault.read_json(p) for p in self.vault.people.glob(f"*/samples/{sample_id}.json")), None)
+
+    def update_sample(self, person_id: str, sample_id: str, changes: dict, *, action: str, by: str,
+                      request_id: str | None, now: float | None = None, record: dict | None = None,
+                      recalibrate: bool = True) -> dict:  # fmt: skip
+        """Change a sample file (the vault first, then the index; call under the speaker lock): `changes`
+        are merged (None removes a key), the revision goes up, and `history` gains {at, action, by,
+        request_id, ...record}. The vault is raised to format 6 before the first such write."""
+        now = time.time() if now is None else now
+        data = self.read_sample(person_id, sample_id)
+        if data is None:
+            raise KeyError(sample_id)
+        self.vault.raise_format(SAMPLE_FORMAT)
+        data = dict(data)
+        for key, value in changes.items():
+            if value is None:
+                data.pop(key, None)
+            else:
+                data[key] = value
+        data["revision"] = int(data.get("revision") or 0) + 1
+        data["history"] = list(data.get("history") or []) + [{"at": now, "action": action, "by": by,
+                                                               "request_id": request_id} | (record or {})]  # fmt: skip
+        self._publish_sample(person_id, sample_id, data)
+        if recalibrate:
+            self.samples_changed(now)
+        return data
+
+    def set_sample_state(self, person_id: str, sample_id: str, state: str, *, action: str, by: str,
+                         request_id: str | None, now: float | None = None, extra: dict | None = None,
+                         record: dict | None = None) -> dict:  # fmt: skip
+        if state not in SAMPLE_STATES:
+            raise ValueError(state)
+        before = (self.read_sample(person_id, sample_id) or {}).get("state") or ACTIVE
+        return self.update_sample(person_id, sample_id, {"state": state} | (extra or {}), action=action, by=by,
+                                  request_id=request_id, now=now, record={"from": before, "to": state} | (record or {}))  # fmt: skip
+
+    def reconcile(self) -> None:
+        """Before anything uses the samples: unfinished journaled operations finish (`speakers.journal`), and the
+        index catches up with the sample files."""
+        from . import journal
+
+        journal.reconcile(self)
+        self.sync_samples()
+
+    def samples_changed(self, now: float | None = None) -> None:
+        """People's voice evidence changed (a sample, a state, consent): recalibrate (debounced, `calibration`)."""
+        self.db.set_meta("calibrate_pending", repr(time.time() if now is None else now))
 
     def load_samples(self) -> int:
         """Rebuild the `samples` cache from the vault."""
@@ -309,11 +682,15 @@ class SpeakerStore:
                     count += 1
         return count
 
-    def samples(self, model: str, model_sha: str) -> list[Sample]:
+    def samples(self, model: str, model_sha: str, *, every_state: bool = False) -> list[Sample]:
+        """This model's samples that may teach anything (`sample_eligible`); `every_state`: removed and moved ones too.
+        Every model build starts from the files' truth (`reconcile`)."""
+        self.reconcile()
         return [
             Sample(r["id"], r["person_id"], np.frombuffer(r["vector"], dtype="<f4").astype(np.float32), r["source"],
-                   r["day"], r["session"], r["created_at"])
+                   r["day"], r["session"], r["created_at"], seconds=r["seconds"] or 0.0, state=r["state"], f0=r["f0"])
             for r in self.db.query("SELECT * FROM samples WHERE model=? AND model_sha=? ORDER BY created_at, id", (model, model_sha))
+            if every_state or sample_eligible(r)
         ]  # fmt: skip
 
     def remove_sample_ids(self, person_id: str, sample_ids: list[str]) -> int:
@@ -402,12 +779,17 @@ class SpeakerStore:
 
     def write_voices(self, conv_id: str, name: str, model: str, model_sha: str, voices: dict[str, LabelVoice],
                      keep_vectors: set[str]) -> None:  # fmt: skip
+        if any(getattr(v, "f0", None) is not None and label in keep_vectors for label, v in voices.items()):
+            # an older backend prunes vector_b64 but would keep f0 next to it: it must refuse this vault first
+            self.vault.raise_format(SAMPLE_FORMAT)
         labels = {}
         for label, voice in voices.items():
             entry = {"seconds": voice.seconds, "turns": voice.turns, "spread": voice.spread, "rms_db": voice.rms_db,
                      "clips": [[c.start, c.end] for c in voice.clips]}  # fmt: skip
             if voice.vector is not None and label in keep_vectors:
                 entry["vector_b64"] = encode_vector(voice.vector)
+                if getattr(voice, "f0", None) is not None:  # a voice feature too: kept and pruned with the vector
+                    entry |= {"f0": voice.f0, "f0_voiced": voice.f0_voiced}
             labels[label] = entry
         Vault.write_json(self.conv_dir(conv_id) / name, {"model": model, "model_sha": model_sha, "labels": labels})
         self.index_voices(conv_id, name)
@@ -418,11 +800,11 @@ class SpeakerStore:
             conn.execute("DELETE FROM voices WHERE conversation_id=?", (conv_id,))
             conn.executemany(
                 """INSERT INTO voices (conversation_id, label, file, model, model_sha, vector, seconds, turns, spread, rms_db,
-                       clips_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                       clips_json, f0, f0_voiced) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 [(conv_id, label, name, data.get("model"), data.get("model_sha"),
                   np.asarray(decode_vector(e["vector_b64"]), dtype="<f4").tobytes() if e.get("vector_b64") else None,
                   e.get("seconds") or 0.0, e.get("turns") or 0, e.get("spread") or 0.0, e.get("rms_db"),
-                  json.dumps(e.get("clips") or [])) for label, e in (data.get("labels") or {}).items()],
+                  json.dumps(e.get("clips") or []), e.get("f0"), e.get("f0_voiced")) for label, e in (data.get("labels") or {}).items()],
             )  # fmt: skip
 
     def keep_vectors(self, conv_id: str, labels: set[str]) -> bool:
@@ -445,6 +827,8 @@ class SpeakerStore:
         for label, entry in (data.get("labels") or {}).items():
             if label not in keep and entry.pop("vector_b64", None) is not None:
                 changed = True
+            if label not in keep and (entry.pop("f0", None), entry.pop("f0_voiced", None)) != (None, None):
+                changed = True
         if changed:
             Vault.write_json(path, data)
         stale = self.db.one(
@@ -455,19 +839,22 @@ class SpeakerStore:
             self.index_voices(conv_id, row["file"])
         return changed
 
-    def vector_labels(self, states: dict[str, dict], labels: set[str], *, raw: bool) -> set[str]:
+    def vector_labels(self, states: dict[str, dict], labels: set[str], *, raw: bool, prefs: dict | None = None,
+                      people: dict | None = None) -> set[str]:  # fmt: skip
         """Labels whose voice vector may be stored (docs/speaker-learning.md, "Privacy"): named for
         me, or for someone with consent (acknowledged and attested); any other label only while
         unknown voices are on and its raw audio exists. A forgotten label never."""
-        prefs = self.settings()
-        people = {r["id"]: r for r in self.people()}
+        prefs = self.settings() if prefs is None else prefs
+        people = {r["id"]: r for r in self.people()} if people is None else people
         keep = set()
         for label in labels:
             state = states.get(label) or {}
             if state.get("forgotten"):
                 continue
             person = people.get(state.get("person_id"))
-            if person is not None and (person["me"] or (prefs["acknowledged_at"] and person["attested_at"])):
+            if person is not None and self.forgetting_path(person["id"]).exists():
+                continue  # their forget hasn't finished: nothing of their voice is kept
+            if consent_ok(person, prefs):
                 keep.add(label)
             elif raw and prefs["unknown_voices_enabled"]:
                 keep.add(label)
@@ -505,7 +892,7 @@ class SpeakerStore:
         return {
             r["label"]: VoiceRow(r["label"], np.frombuffer(r["vector"], dtype="<f4").astype(np.float32) if r["vector"] else None,
                                  r["seconds"], r["turns"], r["spread"], r["rms_db"], json.loads(r["clips_json"]), r["model"],
-                                 r["model_sha"])
+                                 r["model_sha"], r["f0"], r["f0_voiced"] or 0, r["file"])
             for r in self.db.query("SELECT * FROM voices WHERE conversation_id=?", (conv_id,))
         }  # fmt: skip
 
@@ -513,7 +900,7 @@ class SpeakerStore:
         return {
             r["label"]: {"person_id": r["person_id"], "source": r["source"], "distance": r["distance"], "margin": r["margin"],
                          "evidence_s": r["evidence_s"], "not": json.loads(r["not_json"]), "forgotten": bool(r["forgotten"]),
-                         "samples": json.loads(r["samples_json"])}
+                         "samples": json.loads(r["samples_json"])} | ({"rm_basis": r["rm_basis"]} if r["rm_basis"] else {})
             for r in self.db.query("SELECT * FROM speaker_labels WHERE conversation_id=?", (conv_id,))
         }  # fmt: skip
 
@@ -555,6 +942,8 @@ class SpeakerStore:
                     or state.get("source") == "unknown"):  # fmt: skip
                 continue
             out[label] = {k: (sorted(state.get(k) or []) if k == "not" else state.get(k)) for k in keys}
+            if state.get("rm_basis"):  # how the label was centred for the recording-mean check (`speakers.space`)
+                out[label]["rm_basis"] = state["rm_basis"]
             if state.get("forgotten"):
                 out[label]["forgotten"] = True
             if state.get("samples"):  # the confirmations this assignment created: they move with it
@@ -570,10 +959,10 @@ class SpeakerStore:
             conn.execute("DELETE FROM speaker_labels WHERE conversation_id=?", (conv_id,))
             conn.executemany(
                 """INSERT INTO speaker_labels (conversation_id, label, person_id, source, distance, margin, evidence_s, not_json,
-                       forgotten, samples_json) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                       forgotten, samples_json, rm_basis) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 [(conv_id, label, s.get("person_id"), s.get("source"), s.get("distance"), s.get("margin"),
                   s.get("evidence_s"), json.dumps(sorted(s.get("not") or [])), int(bool(s.get("forgotten"))),
-                  json.dumps(sorted(s.get("samples") or []))) for label, s in states.items()],
+                  json.dumps(sorted(s.get("samples") or [])), s.get("rm_basis")) for label, s in states.items()],
             )  # fmt: skip
             conn.execute("UPDATE conversations SET speakers_revision=? WHERE id=?", (revision, conv_id))
 
@@ -602,12 +991,25 @@ class SpeakerStore:
 
     def sync_samples(self) -> bool:
         """Re-index voice samples if the index lost any (or kept a deleted one)."""
+        if not self._samples_stale():  # the lock-free fast path (a GET)
+            return False
+        # a rebuild reads every sample file and rewrites the index: never concurrently with a sample change (which
+        # holds the lock), or a stale read would overwrite it; decided again under the lock
+        with self.lock:
+            dirty = self._samples_stale()
+            if not dirty:
+                return False
+            self.load_samples()  # a file the index lost or kept, or a change whose index write never happened
+            for key in dirty[1]:  # exactly the changes this reload covered (a later one marks itself again)
+                self.db.set_meta(key, None)
+            return True
+
+    def _samples_stale(self) -> tuple[bool, list[str]] | None:
+        """(True, dirty markers) when the samples index is behind the sample files, else None."""
         files = {p.stem for p in self.vault.people.glob("*/samples/*.json")} if self.vault.people.exists() else set()
         indexed = {r["id"] for r in self.db.query("SELECT id FROM samples")}
-        if files == indexed:
-            return False
-        self.load_samples()
-        return True
+        dirty = [r["key"] for r in self.db.query("SELECT key FROM meta WHERE key LIKE 'samples_dirty:%'")]
+        return (True, dirty) if files != indexed or dirty else None
 
     def reference_voices(self, conv_id: str, name: str) -> None:
         """Record which voices file the (unchanged) label states now go with."""
@@ -620,6 +1022,17 @@ class SpeakerStore:
             data["transcript_sha"] = row["transcript_sha"] if row else None
         Vault.write_json(path, data | {"voices": name})
 
+    def labels_to_move(self, conv_id: str, transcript: dict) -> bool:
+        """Whether the label states need moving to this transcript (`move_labels`): they were made for
+        another one, or a voices file of this transcript's own clip bounds isn't named by speakers.json yet
+        (a crash after the voices file was written, before its reference: that file is the current evidence)."""
+        sha = sha256_hex(canonical_json(transcript.get("segments") or []).encode())
+        if self.labels_transcript(conv_id) not in (None, sha):
+            return True
+        _, referenced = self.referenced_voices(conv_id)
+        matching = current_voices_file([p.name for p in self.conv_dir(conv_id).glob("voices-*.json")], transcript)
+        return matching is not None and matching != referenced
+
     def referenced_voices(self, conv_id: str) -> tuple[bool, str | None]:
         """(speakers.json names its voices file, that file): the generation its labels were made against."""
         data = Vault.read_json(self.conv_dir(conv_id) / "speakers.json") or {}
@@ -630,7 +1043,7 @@ class SpeakerStore:
         return {
             label: VoiceRow(label, decode_vector(e["vector_b64"]) if e.get("vector_b64") else None, e.get("seconds") or 0.0,
                             e.get("turns") or 0, e.get("spread") or 0.0, e.get("rms_db"), e.get("clips") or [],
-                            data.get("model"), data.get("model_sha"))
+                            data.get("model"), data.get("model_sha"), e.get("f0"), e.get("f0_voiced") or 0, name)
             for label, e in (data.get("labels") or {}).items()
         }  # fmt: skip
 
@@ -697,6 +1110,11 @@ class SpeakerStore:
             keep = {data["voices"]} if data["voices"] else set()
             if sha and data.get("transcript_sha") not in (None, sha):
                 keep |= {p.name for p in files if (m := tag.search(p.name)) and m.group(1) == sha[:8]}
+            # the current transcript's own clip bounds, written before speakers.json could name it (a crash
+            # in between): kept for the move to adopt, never deleted in favour of other bounds
+            transcript = Vault.read_json(self.conv_dir(conv_id) / "transcript.json")
+            if transcript and (matching := current_voices_file([p.name for p in files], transcript)):
+                keep.add(matching)
         elif sha is None:
             return False
         else:  # speakers.json from before references: by transcript tag (its labels' own, while a move is pending)

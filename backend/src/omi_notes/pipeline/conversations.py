@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 from .. import operations
-from ..audio.diarize import LocalDiarizer, Turn, local_diarization_status
+from ..audio.diarize import LocalDiarizer, Turn, assign_speakers, local_diarization_status
 from ..audio.timeline import CaptureTimeline, Piece
 from ..db import Database
 from ..envelope import OPUS_CODECS, parse_envelope
@@ -673,6 +673,7 @@ class ConversationPipeline:
             # words: none ⇒ discarded as no speech; words ⇒ `speakers_unknown`, a terminal status that
             # keeps the audio and invents no speaker (docs/architecture.md #11).
         unlabeled = windowed and not turns
+        heard_turns: list[Turn] | None = None  # local turns that labelled words the sidecar left unattributed
         assembly = f"a{WINDOW_ASSEMBLY_FORMAT}" if WINDOW_ASSEMBLY_FORMAT > 1 else ""
         base = self._stt_base(stt, audio_sha)
         conv_dir = self.conv_dir(conv_id)
@@ -713,8 +714,16 @@ class ConversationPipeline:
             speakers = SpeakerResult(cached["response"], "unlabeled", False)
         elif windowed:
             speakers = SpeakerResult(cached["response"], "local", True)
+        elif linking and not has_speakers(cached["response"]) and (
+            heard := self._voices_under_words(conv_id, cached["response"], audio, audio_sha)
+        ):
+            # MOSS attributed none of its words (it can, on a short single utterance), but local diarization
+            # heard one voice under each utterance: it labels the words, and its own turns (not the coarse
+            # utterances) are the voiceprint evidence, as for text-only STT
+            speakers = SpeakerResult(heard[0], "local", True)
+            heard_turns = heard[1]
         elif linking and not has_speakers(cached["response"]):
-            # words, but none the sidecar could attribute: no speaker is invented (as for text-only STT)
+            # words, but none the sidecar or local diarization could attribute: no speaker is invented
             unlabeled = True
             speakers = SpeakerResult(cached["response"], "unlabeled", False)
         elif linking:
@@ -745,8 +754,18 @@ class ConversationPipeline:
             overlaps = overlap_spans((speakers.response.get("results") or {}).get("utterances") or [])
         else:
             overlaps = []
-        clips = {} if unlabeled else select_clips(label_turns(speakers.response, local_turns=turns),
-                                                  usable_spans(audio.blocks_out, self._losses_out(row, audio) + overlaps))
+        usable = usable_spans(audio.blocks_out, self._losses_out(row, audio) + overlaps)
+        if unlabeled:
+            clips = {}
+        elif heard_turns is not None:
+            # clips from the diarizer's own turns; a voice that labelled no words still keeps its audio out
+            spoke = {u.get("speaker") for u in (speakers.response.get("results") or {}).get("utterances") or []}
+            evidence = label_turns(speakers.response, local_turns=heard_turns)
+            evidence[" unlabelled"] = [(t.start, t.end) for t in heard_turns if t.speaker not in spoke and t.end > t.start]
+            clips = select_clips(evidence, usable)
+            clips.pop(" unlabelled", None)
+        else:
+            clips = select_clips(label_turns(speakers.response, local_turns=turns), usable)
         language = self.settings.stt_language
         if language == "multi" or linking:  # the local sidecar gets no language hint: use what it heard
             language = detected_language(cached["response"]) or language
@@ -788,7 +807,8 @@ class ConversationPipeline:
         return out
 
     def identify(self, conv_id: str, audio: ConversationAudio | None, audio_sha: str | None, clips: dict,
-                 transcript_sha: str, labels: set[str], *, consistent: bool = True) -> None:  # fmt: skip
+                 transcript_sha: str, labels: set[str], *, consistent: bool = True,
+                 clip_spans: dict | None = None) -> None:  # fmt: skip
         """Voices stage: label voiceprints while the PCM is in memory, then the pure assignment.
         Voices are inert until someone is enrolled or named and skipped without a speaker model;
         label states always move to a new transcript (`_carry_over`), voices or not."""
@@ -796,10 +816,12 @@ class ConversationPipeline:
         voices, name, fresh = None, None, False
         if embedder is not None and consistent and audio_sha and self.speakers.any_samples():
             # keyed by everything the voices depend on: a new transcript may number the voices differently
-            name = voices_name(embedder, audio_sha, transcript_sha)
+            spans = clip_spans if clip_spans is not None else {label: [[c.start, c.end] for c in cs] for label, cs in clips.items()}
+            name = voices_name(embedder, audio_sha, transcript_sha, spans)
             fresh = not (self.conv_dir(conv_id) / name).exists()
-            if fresh and audio is not None and clips:
-                voices = embed_voices(clips, audio.pcm, embedder)  # outside the lock: the slow part
+            if fresh and audio is not None:
+                # no clean clip at all is evidence too: an empty file replaces voices from other bounds
+                voices = embed_voices(clips, audio.pcm, embedder) if clips else {}  # outside the lock: the slow part
             elif fresh:
                 name, fresh = None, False  # no audio in hand (a recovery path): nothing to compute
         with self.speakers.lock:
@@ -816,8 +838,10 @@ class ConversationPipeline:
             if voices is not None:
                 models = self.speakers.models(embedder.model, embedder.model_sha, self.operating)
                 if models:
-                    states = speaker_match.assign(voices, current, models,
-                                                  auto_assign=self.speakers.settings()["auto_assign"], op=self.operating)  # fmt: skip
+                    # freshly embedded: every label's vector is in memory (the full recording mean)
+                    states = speaker_match.assign(voices, current, models, auto_assign=self.speakers.settings()["auto_assign"],
+                                                  op=self.operating, space=self.speakers.rm_space(embedder.model, embedder.model_sha),
+                                                  full_rm=fresh)  # fmt: skip
             if fresh:
                 keep = self.speakers.vector_labels(states, set(voices), raw=True)
                 self.speakers.write_voices(conv_id, name, embedder.model, embedder.model_sha, voices, keep)
@@ -836,9 +860,12 @@ class ConversationPipeline:
         transcript and its voices stage) are moved before anything uses their names."""
         segments = transcript.get("segments") or []
         sha = sha256_hex(canonical_json(segments).encode())
-        if self.speakers.labels_transcript(conv_id) not in (None, sha):
+        if self.speakers.current_transcript_sha(conv_id) != sha:
+            return  # a superseded copy (transcript.json is published outside the speaker lock): never moved back to it
+        if self.speakers.labels_to_move(conv_id, transcript):
             self.identify(conv_id, None, transcript.get("audio_sha"), {}, sha, {s["speaker"] for s in segments},
-                          consistent=transcript.get("speaker_labels_consistent", True))  # fmt: skip
+                          consistent=transcript.get("speaker_labels_consistent", True),
+                          clip_spans=transcript.get("speaker_clips") or {})  # fmt: skip
 
     def _carry_over(self, current: dict, old_voices: dict, new_voices: dict | None, labels: set[str],
                     had_forgotten: bool = False) -> dict:  # fmt: skip
@@ -902,6 +929,7 @@ class ConversationPipeline:
             return []
         prefs = self.speakers.settings()
         models_by_voice: dict[tuple[str, str], dict] = {}
+        spaces: dict[tuple[str, str], object] = {}
         changed: list[str] = []
         conv_ids = [r["conversation_id"] for r in self.db.query(
             "SELECT DISTINCT conversation_id FROM voices UNION SELECT DISTINCT conversation_id FROM speaker_labels")]  # fmt: skip
@@ -916,8 +944,10 @@ class ConversationPipeline:
             if key is not None:
                 if key not in models_by_voice:
                     models_by_voice[key] = self.speakers.models(*key, self.operating)
+                    spaces[key] = self.speakers.rm_space(*key)
+                # stored voices: only the consented labels' vectors (a partial recording mean)
                 states = speaker_match.assign(voices, current, models_by_voice[key], auto_assign=prefs["auto_assign"],
-                                              op=self.operating)  # fmt: skip
+                                              op=self.operating, space=spaces[key])  # fmt: skip
             else:
                 states = current
             known = {r["id"] for r in self.speakers.people()}
@@ -1061,15 +1091,18 @@ class ConversationPipeline:
         if embedder is None:
             return {}
         try:  # a hint is never worth failing a note for
+            from ..speakers.space import label_centre
+
             space = self.voice_space(embedder)
             voices = self.speakers.voices_of_labels(conv_id, transcript_sha)
             if space is None or not voices:
                 return {}
-            background, centroids = space
             # only voices made by the model the people's samples are in: other vectors aren't comparable
             vectors = {label: v.vector for label, v in voices.items()
                        if getattr(v, "vector", None) is not None and getattr(v, "model_sha", None) == embedder.model_sha}  # fmt: skip
-            found = possible_names(vectors, self.speakers.labels(conv_id), centroids, background=background)
+            # each label centred by this recording's (stored, consented) mean, else GA (`speakers.space`)
+            centres = {label: label_centre(v, list(vectors.values()), space.ga, full=False)[0] for label, v in vectors.items()}
+            found = possible_names(vectors, self.speakers.labels(conv_id), space.centroids, background=centres)
             people = {r["id"]: (r["name"], bool(r["me"])) for r in self.speakers.people()}
             return {label: people[pid] for label, pid in found.items() if pid in people}
         except Exception:
@@ -1126,18 +1159,13 @@ class ConversationPipeline:
                                      "check": "sidecar/asr/scripts/launchagent.sh status; ~/Library/Logs/omi-notes-asr.log"})  # fmt: skip
             self.db.set_meta("local_stt_alerted", repr(now))
 
-    def voice_space(self, embedder) -> tuple[np.ndarray, dict[str, np.ndarray]] | None:
-        """(background, person → centred centroid) for comparing voices with people (`speakers.space`), or None
-        without enough stored voices or any samples."""
-        from ..speakers.space import centred_centroids
-
-        background = self._background_voice("", embedder)
-        samples: dict[str, list[np.ndarray]] = {}
-        for sample in self.speakers.samples(embedder.model, embedder.model_sha):
-            samples.setdefault(sample.person_id, []).append(sample.vector)
-        if background is None or not samples:
+    def voice_space(self, embedder):
+        """GA and person → GA-centred centroid for comparing voices with people (`speakers.space.RmSpace`), or
+        None without enough consent-eligible stored voices for a stable GA, or without any samples."""
+        space = self.speakers.rm_space(embedder.model, embedder.model_sha)
+        if space is None or space.count < BACKGROUND_MIN_VOICES or not space.centroids:
             return None
-        return background, centred_centroids(samples, background)
+        return space
 
     def _background_voice(self, conv_id: str, embedder) -> np.ndarray | None:
         """The mean of other conversations' stored voices (same model): what every voice recorded here shares."""
@@ -1181,6 +1209,43 @@ class ConversationPipeline:
 
         return resolve_speakers(response, mode or self.settings.stt_diarization,
                                 lambda: self._local_turns(conv_id, audio, audio_sha))  # fmt: skip
+
+    def _voices_under_words(self, conv_id: str, response: dict, audio: ConversationAudio,
+                            audio_sha: str) -> tuple[dict, list[Turn]] | None:  # fmt: skip
+        """The sidecar's unattributed words labelled by local diarization, with its turns (the voiceprint
+        evidence), when for every utterance one voice alone covers at least half of it and no other voice
+        does too; else None (no diarizer, no turns, words where nobody or two voices alike were heard)."""
+        if self.providers.diarizer is None:
+            return None
+        try:
+            turns = self._local_turns(conv_id, audio, audio_sha)
+        except Exception as exc:  # sherpa/onnx failures come in assorted types: no evidence, not an error here
+            log.warning("conversation %s: local diarization failed: %s", conv_id, exc)
+            return None
+        utterances = [{k: v for k, v in u.items() if k != "unattributed"}
+                      for u in (response.get("results") or {}).get("utterances") or []]  # fmt: skip
+        if not turns or not utterances:
+            return None
+        labelled = []
+        for u in utterances:
+            start, end = float(u["start"]), float(u["end"])
+            if end <= start:
+                return None
+            # each voice's own coverage, its overlapping turns counted once (the union)
+            covered = {}
+            for speaker in {t.speaker for t in turns}:
+                spans = sorted((max(t.start, start), min(t.end, end)) for t in turns if t.speaker == speaker and t.end > start and t.start < end)
+                total, reach = 0.0, start
+                for a, b in spans:
+                    a = max(a, reach)
+                    if b > a:
+                        total, reach = total + b - a, b
+                covered[speaker] = total
+            majority = [speaker for speaker, seconds in covered.items() if seconds >= 0.5 * (end - start)]
+            if len(majority) != 1:
+                return None  # nobody, or two voices alike: no speaker is chosen by turn order
+            labelled.append(dict(u, speaker=majority[0]))
+        return dict(response, results=dict(response.get("results") or {}, utterances=labelled)), turns
 
     def _local_turns(self, conv_id: str, audio: ConversationAudio, audio_sha: str) -> list[Turn] | None:
         diarizer = self.providers.diarizer
@@ -1928,11 +1993,13 @@ HINT_GAP = 0.20  # ... and this much above the next person
 
 
 def possible_names(voices: dict[str, np.ndarray], states: dict[str, dict], centroids: dict[str, np.ndarray], *,
-                   background: np.ndarray, min_score: float = HINT_SCORE, gap: float = HINT_GAP) -> dict[str, str]:  # fmt: skip
+                   background: np.ndarray | dict[str, np.ndarray], min_score: float = HINT_SCORE,
+                   gap: float = HINT_GAP) -> dict[str, str]:  # fmt: skip
     """label → person id for unnamed labels whose voice clearly resembles one person in the centred space
-    (`speakers.space`): the nearest person, at least `min_score`, `gap` above the next; per person only the
-    closest such label, and nobody already named in this conversation or ruled out for that label ("not X",
-    kept unknown). A guess shown as a guess, never a name."""
+    (`speakers.space`; `background`: one for every label, or each label's own recording-mean centre): the
+    nearest person, at least `min_score`, `gap` above the next; per person only the closest such label, and
+    nobody already named in this conversation or ruled out for that label ("not X", kept unknown). A guess
+    shown as a guess, never a name."""
     from ..speakers.space import score
 
     named = {s.get("person_id") for s in states.values() if s.get("person_id")}
@@ -1941,7 +2008,8 @@ def possible_names(voices: dict[str, np.ndarray], states: dict[str, dict], centr
         state = states.get(label) or {}
         if state.get("person_id") or state.get("source") == "unknown" or label == "unknown":
             continue
-        scored = sorted(((score(vector, c, background), pid) for pid, c in centroids.items()), reverse=True)
+        centre = background[label] if isinstance(background, dict) else background
+        scored = sorted(((score(vector, c, centre), pid) for pid, c in centroids.items()), reverse=True)
         if not scored or scored[0][0] < min_score or (len(scored) > 1 and scored[0][0] - scored[1][0] < gap):
             continue
         value, pid = scored[0]  # the nearest of everyone; if that one is ruled out, no guess (not the runner-up)

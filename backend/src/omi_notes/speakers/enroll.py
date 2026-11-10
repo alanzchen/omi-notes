@@ -251,6 +251,10 @@ class EnrollmentProcessor:
         store = self.pipeline.speakers
         with store.lock:
             if verdict["state"] == "accepted":
+                store.reconcile()
+                wearer = store.me()
+                if wearer is not None and store.forgetting_path(wearer["id"]).exists():
+                    return False  # the wearer's forget hasn't finished: decided once it has (nothing is kept meanwhile)
                 request = f"enrollment:{w.enrollment_id}"  # a crash before the result: reuse the sample
                 store.sync_samples()  # (including one whose index write failed)
                 done = store.sample_for_request(request)

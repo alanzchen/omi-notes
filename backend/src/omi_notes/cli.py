@@ -86,7 +86,19 @@ def serve(
         logging.getLogger(__name__).exception("Cannot initialize server")
         raise
     options = {"log_config": None} if log_file_only else {}
+    _stack_dumps(settings)
     uvicorn.run(application, host=host or settings.host, port=port or settings.port, log_level="info", **options)
+
+
+def _stack_dumps(settings) -> None:
+    """`kill -USR1 <pid>` appends every thread's Python stack to logs/stacks.txt (diagnosing a busy server
+    without attaching a profiler; nothing else changes)."""
+    import faulthandler
+    import signal
+
+    path = settings.logs_dir / "stacks.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    faulthandler.register(signal.SIGUSR1, file=open(path, "a"), all_threads=True)  # noqa: SIM115 (kept open)
 
 
 @app.command()
@@ -780,6 +792,48 @@ def retry_failed() -> None:
 
 speakers_app = typer.Typer(no_args_is_help=True, help="Speaker recognition tools.")
 app.add_typer(speakers_app, name="speakers")
+
+
+def _counts(counts) -> None:
+    for key, n in sorted(counts.items(), key=lambda kv: (not kv[0].startswith(("measured", "imported")), kv[0])):
+        typer.echo(f"  {key} {n}")
+
+
+@speakers_app.command("measure-f0")
+def speakers_measure_f0() -> None:
+    """Add F0 (review evidence, never identity) to samples made before it was measured, from raw audio
+    where it still exists or the person's stored enrollment audio. Idempotent; only adds fields."""
+    from .speakers import f0
+
+    settings = _settings()
+    w = _worker(settings)
+    counts = f0.measure(w.pipeline)
+    if counts["measured"] or counts["unknown (too little voiced speech)"]:
+        w.pipeline.speakers.samples_changed()  # the worker re-evaluates review flags
+    typer.echo("F0 backfill:")
+    counts.setdefault("measured", 0)
+    _counts(counts)
+
+
+@speakers_app.command("import-f0")
+def speakers_import_f0(
+    bench_dir: Path = typer.Argument(..., help="The speaker bench (~/Developer/omi-asr-bench/spk) or its data folder"),
+    f0_file: Path = typer.Option(None, "--f0-file", help="Clip F0 values (default: <bench>/a0-20261109/q3_clip_f0_numpy.json)"),
+    tag: str = typer.Option("bench-20261108", help="Recorded as each imported sample's f0_source"),
+) -> None:
+    """Import F0 the production estimator measured on the speaker bench's clips, only for samples whose
+    conversation, label, voices generation, audio and clip bounds positively match, with the measurement's
+    voiced-frame gates. Never overwrites; reports what it skipped."""
+    from .speakers import f0
+
+    settings = _settings()
+    w = _worker(settings)
+    counts = f0.import_bench(w.pipeline.speakers, w.db, bench_dir, tag=tag, f0_file=f0_file)
+    if counts["imported"]:
+        w.pipeline.speakers.samples_changed()
+    typer.echo(f"F0 import from {bench_dir}:")
+    counts.setdefault("imported", 0)
+    _counts(counts)
 
 
 @speakers_app.command("bench")

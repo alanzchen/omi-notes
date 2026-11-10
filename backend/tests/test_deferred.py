@@ -403,7 +403,7 @@ def test_the_first_deferral_raises_the_vault_format_so_older_writers_refuse_it(c
 
     fakes(worker)
     busy(worker, monkeypatch)
-    assert vault_format(settings) < 5
+    assert vault_format(settings) < 7
     seen = []
     real = records.write_record
 
@@ -415,9 +415,9 @@ def test_the_first_deferral_raises_the_vault_format_so_older_writers_refuse_it(c
     monkeypatch.setattr("omi_notes.pipeline.worker.write_record", spy)
     short(client)
     worker.tick(T0 + 400)
-    assert seen == [5], "raised before the first record with a deferral block is written"
-    assert FORMAT >= 5
-    monkeypatch.setattr("omi_notes.vault.FORMAT", 4)  # a release from before deferral
+    assert seen == [7], "raised before the first record with a deferral block is written"
+    assert FORMAT >= 7
+    monkeypatch.setattr("omi_notes.vault.FORMAT", 6)  # the Voices release (4573e20): format 6, but no deferral
     try:
         Vault.open(settings)
     except VaultError as exc:
@@ -430,9 +430,22 @@ def test_a_stale_vault_handle_never_lowers_the_format(client, worker, settings):
     from omi_notes.vault import Vault
 
     stale = Vault.open(settings)
-    worker.vault.raise_format(5)
+    worker.vault.raise_format(7)
     stale.raise_format(3)
-    assert vault_format(settings) == 5
+    assert vault_format(settings) == 7
+
+
+def test_a_format_6_vault_from_the_voices_release_opens_and_is_never_lowered(settings):
+    """The deployed vault is format 6 (the Voices release) and holds no deferral state: this release opens it as is,
+    and the old deferral number (5) raises nothing; only the first deferral write takes it to 7."""
+    from omi_notes.vault import Vault
+
+    vault = Vault.open(settings)
+    vault.raise_format(6)
+    again = Vault.open(settings)
+    again.raise_format(5)
+    assert vault_format(settings) == 6
+    assert Vault.open(settings).format == 6
 
 
 def test_a_transcription_request_raises_the_vault_format_before_its_operation_file(client, worker, settings, monkeypatch):
@@ -449,7 +462,7 @@ def test_a_transcription_request_raises_the_vault_format_before_its_operation_fi
     worker.pipeline.vault.info["format"] = 2
     client.app.state.speakers.pipeline.vault.info["format"] = 2
     assert transcribe(client, row["id"]).status_code in (200, 202)
-    assert vault_format(settings) == 5
+    assert vault_format(settings) == 7
 
 
 def test_deferred_claims_stop_as_soon_as_chunks_arrive(client, worker):
@@ -504,6 +517,6 @@ def test_format_raises_from_separate_handles_are_serialized_and_never_go_down(cl
     t = threading.Thread(target=a.raise_format, args=(4,))
     t.start()
     in_write.wait(2)
-    b.raise_format(5)  # the worker deferring a session meanwhile
+    b.raise_format(7)  # the worker deferring a session meanwhile
     t.join()
-    assert written == sorted(written) and vault_format(settings) == 5, written
+    assert written == sorted(written) and vault_format(settings) == 7, written

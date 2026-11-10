@@ -781,3 +781,222 @@ def test_the_server_waits_for_a_maintenance_command_to_release_the_worker_lock()
 
     assert acquire_worker_lock(Lock(3), wait=5.0, step=0.01) is True
     assert acquire_worker_lock(Lock(10**6), wait=0.05, step=0.01) is False
+
+
+def all_unknown(request, n):
+    return httpx.Response(200, json={"segments": [{"start": 0.0, "end": 3.0, "speaker_id": "UNKNOWN", "text": "words"}]})
+
+
+class TurnsDiarizer:
+    tag = "fake-turns"
+
+    def __init__(self, turns):
+        self.turns = turns
+
+    def diarize(self, pcm):
+        from omi_notes.audio.diarize import Turn
+
+        return [Turn(*t) for t in self.turns]
+
+
+def test_words_moss_left_unattributed_take_the_one_voice_local_diarization_heard_under_them(client, worker):
+    # 01a119d4 (2026-11-08 22:13): MOSS gave one 9 s utterance no speaker, while the local diarizer heard one
+    # voice over all of it; the conversation failed as speakers_unknown though a speaker was in evidence
+    worker.providers._local_stt, _ = sidecar(all_unknown)
+    worker.providers._diarizer = TurnsDiarizer([(0.0, 9.0, 0)])
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    assert row["status"] == "done", row["error"]
+    transcript = json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text())
+    assert [s["speaker"] for s in transcript["segments"]] == ["S1"] and transcript["speaker_source"] == "local"
+
+
+@pytest.mark.parametrize("turns", [[], [(0.0, 0.5, 0)]], ids=["no-turns", "turns-not-under-the-words"])
+def test_unattributed_words_without_a_voice_heard_under_them_stay_speakers_unknown(client, worker, turns):
+    # 01a13b7a: the diarizer heard nobody; a speaker is never invented, nor taken from a turn beside the words
+    worker.providers._local_stt, _ = sidecar(all_unknown)
+    worker.providers._diarizer = TurnsDiarizer(turns)
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    assert row["status"] == "failed" and row["error_kind"] == "speakers_unknown"
+
+
+def voices_heard(turns, utterances=None):
+    """`_voices_under_words` on a 10 s unattributed utterance (Astra IT1-02's harness)."""
+    from types import SimpleNamespace
+
+    from omi_notes.audio.diarize import Turn
+    from omi_notes.pipeline.conversations import ConversationPipeline
+
+    p = object.__new__(ConversationPipeline)
+    p.providers = SimpleNamespace(diarizer=object())
+    p._local_turns = lambda *_: [Turn(*t) for t in turns]
+    utterances = utterances or [{"start": 0.0, "end": 10.0, "transcript": "words", "speaker": None, "unattributed": True}]
+    out = p._voices_under_words("c", {"results": {"utterances": utterances}}, None, "sha")
+    return out and out[0]
+
+
+@pytest.mark.parametrize("turns", [
+    [(0.0, 3.0, 0), (7.0, 10.0, 1)],  # 30% + 30%: neither voice is evidence for the whole
+    [(0.0, 3.0, 0), (0.0, 3.0, 1)],  # overlapping turns count once, not 60%
+    [(0.0, 5.0, 0), (5.0, 10.0, 1)],  # 50/50: ambiguous, never decided by input order
+    [(0.0, 6.0, 0), (0.0, 6.0, 1)],  # two voices over the same majority: ambiguous
+    [(0.0, 3.0, 0), (2.0, 4.0, 0)],  # one voice, overlapping turns: 40% by union, not 50%
+])
+def test_unattributed_words_take_a_voice_only_when_it_alone_covers_half(turns):
+    # Astra IT1-02: combined coverage of all voices was taken as evidence for whichever came first
+    assert voices_heard(turns) is None
+
+
+def test_the_one_voice_covering_most_of_the_words_labels_them():
+    assert voices_heard([(0.0, 6.0, 1), (6.0, 10.0, 0)])["results"]["utterances"][0]["speaker"] == 1
+    assert voices_heard([(0.0, 5.0, 7)])["results"]["utterances"][0]["speaker"] == 7
+
+
+@pytest.mark.parametrize("turns, clean", [
+    ([(0.0, 6.0, 0), (6.0, 10.0, 1)], (0.0, 6.0)),
+    # B holds no words of its own, yet its audio inside A's first turn keeps that turn out of A's voiceprint
+    ([(0.0, 4.0, 0), (3.5, 4.5, 1), (5.0, 9.0, 0)], (5.0, 9.0)),
+])
+def test_voiceprint_clips_from_labelled_words_come_from_the_diarizers_own_turns(client, worker, turns, clean):
+    # Astra IT1-03: A 0-6 s, B 6-10 s; A labels the whole utterance, but its clip must not take in B's 4 s
+    def response(request, n):
+        return httpx.Response(200, json={"segments": [{"start": 0.0, "end": 10.0, "speaker_id": "UNKNOWN", "text": "a synthetic utterance"}]})
+
+    worker.providers._local_stt, _ = sidecar(response)
+    worker.providers._diarizer = TurnsDiarizer(turns)
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(20, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    assert row["status"] == "done", row["error"]
+    transcript = json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text())
+    # (a turn next to another voice's, within the overlap guard, yields no clip at all: never a mixed one)
+    clips = transcript.get("speaker_clips", {}).get("S1", [])
+    assert all(clean[0] <= start and end <= clean[1] for start, end in clips), clips
+    assert clips or clean == (0.0, 6.0), "a clean turn of its own still gives a clip"
+
+
+def mixed_then_reprocessed(client, worker, later_turns):
+    """Astra IT2-02: a conversation whose voices were embedded from a mixed clip [0.25, 9.75] (as before
+    42cfe29: the whole utterance) is reprocessed with corrected evidence and the same words and labels."""
+    from omi_notes.speakers.service import SpeakerService
+
+    from .test_speaker_learning import PRIYA, FakeEmbedder, name_label, new_person
+
+    def response(request, n):
+        return httpx.Response(200, json={"segments": [{"start": 0.0, "end": 10.0, "speaker_id": "UNKNOWN", "text": "a synthetic utterance"}]})
+
+    worker.providers._local_stt, _ = sidecar(response)
+    worker.providers._diarizer = TurnsDiarizer([(0.0, 10.0, 0)])  # one voice heard over all of it: [0.25, 9.75]
+    worker.providers._embedder = FakeEmbedder()
+    client.app.state.speakers = SpeakerService(worker.pipeline)
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(6, ALAN, 7), voice(14, PRIYA, 8), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    person = new_person(client, "Wearer", me=True)
+    assert name_label(client, row["id"], "S1", person).json()["sample"] == "created"
+    assert client.app.state.speakers._clips(row["id"], json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text()))["S1"] == [[0.25, 9.75]]
+    worker.providers._diarizer = TurnsDiarizer(later_turns)
+    for p in worker.pipeline.conv_dir(row["id"]).glob("diarization-*.json"):
+        p.unlink()  # the corrected diarization (a cache of derived data, not audio)
+    worker.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1, force_restt = 1 WHERE id=?", (row["id"],))
+    worker.tick(T0 + 800)
+    (after,) = convs(worker)
+    assert after["status"] == "done", after["error"]
+    transcript = json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text())
+    return client.app.state.speakers._clips(row["id"], transcript), transcript
+
+
+@pytest.mark.parametrize("later_turns", [[(0.0, 6.0, 0), (7.0, 10.0, 1)], [(0.0, 6.0, 0), (6.0, 10.0, 1)]],
+                         ids=["clean-clip", "no-clean-clip"])
+def test_reprocessed_evidence_replaces_voices_embedded_from_other_clip_bounds(client, worker, later_turns):
+    served, transcript = mixed_then_reprocessed(client, worker, later_turns)
+    assert all(end <= 6.0 for _, end in served.get("S1", [])), served
+    assert served.get("S1", []) == transcript["speaker_clips"].get("S1", [])
+
+
+@pytest.mark.parametrize("boundary", ["before_identify", "before_reference"])
+def test_an_interrupted_clip_only_reprocess_never_serves_or_confirms_the_old_mixed_voice(client, worker, monkeypatch, boundary):
+    # Astra IT3-01: same words and labels, corrected clip bounds; a crash (a) before the voices stage or (b) after
+    # the corrected voices file was written but before speakers.json referenced it. The naming API offered the old
+    # 9.5 s clip and made a sample from its vector; at (b) cleanup also deleted the corrected file.
+    from .test_speaker_learning import PRIYA, FakeEmbedder, name_label, new_person
+    from omi_notes.speakers.service import SpeakerService
+
+    def response(request, n):
+        return httpx.Response(200, json={"segments": [{"start": 0.0, "end": 10.0, "speaker_id": "UNKNOWN", "text": "a synthetic utterance"}]})
+
+    worker.providers._local_stt, _ = sidecar(response)
+    worker.providers._diarizer = TurnsDiarizer([(0.0, 10.0, 0)])  # the old evidence: one voice over all of it
+    worker.providers._embedder = FakeEmbedder()
+    client.app.state.speakers = SpeakerService(worker.pipeline)
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(6, ALAN, 7), voice(14, PRIYA, 8), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    assert name_label(client, row["id"], "S1", new_person(client, "Wearer", me=True)).json()["sample"] == "created"
+    directory = worker.pipeline.conv_dir(row["id"])
+    old_file = worker.pipeline.speakers.voices_file(row["id"])
+
+    worker.providers._diarizer = TurnsDiarizer([(0.0, 6.0, 0), (7.0, 10.0, 1)])
+    for p in directory.glob("diarization-*.json"):
+        p.unlink()
+    worker.db.execute("UPDATE conversations SET force_restt = 1 WHERE id=?", (row["id"],))
+
+    def crash(*a, **kw):
+        raise SystemExit("synthetic crash")
+
+    with monkeypatch.context() as m:
+        if boundary == "before_identify":
+            m.setattr(worker.pipeline, "identify", crash)
+        else:
+            m.setattr(worker.pipeline.speakers, "write_labels", crash)
+        with pytest.raises(SystemExit):
+            worker.pipeline.transcribe(row["id"], T0 + 800)
+    transcript = json.loads((directory / "transcript.json").read_text())
+    assert transcript["speaker_clips"]["S1"] == [[0.25, 5.75]]
+    corrected = [p.name for p in directory.glob("voices-*.json") if p.name != old_file]
+
+    answer = name_label(client, row["id"], "S1", new_person(client, "Someone else"))
+    assert answer.status_code == 200, answer.text
+    label = next(v for v in answer.json()["labels"] if v["label"] == "S1")
+    assert label["clips"][0]["seconds"] == 5.5, label["clips"]
+    assert client.app.state.speakers._clips(row["id"], transcript)["S1"] == [[0.25, 5.75]]
+    assert all((directory / name).exists() for name in corrected), "the corrected voices file is kept"
+    used = worker.pipeline.speakers.voices_file(row["id"])
+    if boundary == "before_reference" or answer.json()["sample"] == "created":
+        # the corrected file is adopted (or a confirmation rebuilt it from raw audio): never the old vector
+        assert used != old_file and json.loads((directory / used).read_text())["labels"]["S1"]["clips"] == [[0.25, 5.75]]
+
+
+def test_a_stored_voice_that_skipped_a_too_short_fragment_still_describes_its_transcript():
+    # 72 live conversations: the voices file holds the clips actually embedded, without a 0.13 s fragment
+    from omi_notes.speakers.store import same_clips
+
+    assert same_clips([[760.95, 770.95], [751.34, 758.95]], [[760.95, 770.95], [784.12, 784.25], [751.34, 758.95]])
+    assert not same_clips([[0.25, 9.75]], [[0.25, 5.75]])
+
+
+def test_moving_labels_with_a_superseded_transcript_changes_nothing(client, worker):
+    # Astra IT4-01: GET read transcript T1, waited for the lock, and repaired with T1 after T2 was published
+    # and named: speakers.json went back to T1's hash, the name was lost and T2's voices file was deleted
+    from .test_speaker_learning import FakeEmbedder, name_label, new_person
+
+    worker.providers._local_stt, _ = sidecar(all_unknown)
+    worker.providers._diarizer = TurnsDiarizer([(0.0, 9.0, 0)])
+    worker.providers._embedder = FakeEmbedder()
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(8, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    person = new_person(client, "Wearer", me=True)
+    assert name_label(client, row["id"], "S1", person).status_code == 200
+    directory = worker.pipeline.conv_dir(row["id"])
+    current = json.loads((directory / "transcript.json").read_text())
+    store = worker.pipeline.speakers
+    before = (store.labels_transcript(row["id"]), store.voices_file(row["id"]), (directory / "speakers.json").read_bytes())
+    stale = dict(current, segments=[dict(s, text=s["text"] + " (earlier)") for s in current["segments"]])
+    with store.lock:
+        worker.pipeline.move_labels(row["id"], stale)
+    assert (store.labels_transcript(row["id"]), store.voices_file(row["id"]), (directory / "speakers.json").read_bytes()) == before
+    assert store.labels(row["id"])["S1"]["person_id"] == person

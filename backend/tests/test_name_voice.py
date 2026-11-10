@@ -95,7 +95,8 @@ def test_keep_unknown_is_durable_and_is_not_the_seven_day_dismissal(env):
     assert all(labels(client, row["id"])["S2"]["person_id"] is None for row in rows)
     speakers_settings = json.loads((settings.vault_dir / "_omi" / "speakers" / "settings.json").read_text())
     assert s["id"] not in (speakers_settings.get("dismissed") or {})  # not a cooldown
-    assert json.loads((settings.vault_dir / "_omi" / "VAULT.json").read_text())["format"] >= 4  # (5 once a short session was deferred)
+    # at least 4 ("keep unknown"); the voices stage's F0 already raised it to 6 (7 once a short session was deferred)
+    assert json.loads((settings.vault_dir / "_omi" / "VAULT.json").read_text())["format"] >= 4
     assert s["id"] not in {x["id"] for x in get(client, "/v1/speakers/suggestions")["suggestions"]}
 
     # long after any cooldown, and after the index is rebuilt from the vault, it is still unknown

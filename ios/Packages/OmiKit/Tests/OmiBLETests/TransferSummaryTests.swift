@@ -206,4 +206,89 @@ import OmiWatchKit
             #expect(normal.contains("Open Omi Notes on the iPhone"), "an ordinary backlog keeps its advice")
         }
     }
+
+    func summary(_ report: WatchReport) -> TransferSummary {
+        var snap = EngineSnapshot.answered
+        snap.ready = true; snap.serverConfigured = true; snap.watchReport = report
+        snap.transfer.meter.start(atMono: 0, wall: now)
+        return TransferSummary.evaluate(snapshot: snap, server: reachable(), status: nil, statusAt: nil, watchInstalled: true, nowMono: 0, now: now)
+    }
+
+    /// ASTRA-IT11-01: a report without `orphan_parts` (an older Watch app, or no stats at all) read as
+    /// zero kept parts, so a legacy Watch could show all sent. Missing is unknown; only an explicit 0 is none.
+    @Test func aMissingKeptPartsCountIsUnknownNotZero() {
+        let legacy = WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now, deviceId: "watch-1")
+        let noKey = WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now, deviceId: "watch-1", stats: ["awaiting_ack": 0])
+        let zero = WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now, deviceId: "watch-1", stats: ["orphan_parts": 0])
+        #expect(legacy.keptParts == nil && noKey.keptParts == nil && zero.keptParts == 0)
+        for r in [legacy, noKey] {
+            let t = summary(r)
+            #expect(t.watch.keptOnWatch == nil)
+            #expect(!t.everythingSent && t.watchFraction == nil, "unknown kept parts are not none")
+            #expect(!WatchSummary.onWatchLine(r, lastReceivedAt: now, now: now).contains("Everything sent"))
+        }
+        let t = summary(zero)
+        #expect(t.everythingSent && t.watchFraction == 1, "an explicit 0 is proof")
+        #expect(WatchSummary.onWatchLine(zero, lastReceivedAt: now, now: now).hasPrefix("Everything sent to this iPhone"))
+    }
+
+    /// ASTRA-20261109-IT1-04: the Transfers line still said "Nothing left on the Watch" for a fresh report
+    /// with no waiting parts and no kept-parts count, while the Watch detail said kept parts weren't
+    /// reported. A missing count never implies empty storage; an explicit 0 still completes normally.
+    @Test func aMissingKeptPartsCountNeverSaysNothingLeftOnTheWatch() {
+        let legacy = WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now, deviceId: "watch-1")
+        let t = summary(legacy)
+        #expect(t.watch.keptOnWatch == nil)
+        #expect(t.watchLine(now: now) == "Nothing waiting; kept parts not reported")
+        #expect(WatchSummary.onWatchLine(legacy, lastReceivedAt: nil, now: now).hasPrefix(t.watchLine(now: now)), "both screens agree")
+        let zero = summary(WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now, stats: ["orphan_parts": 0]))
+        #expect(zero.watchLine(now: now) == "Nothing left on the Watch" && zero.everythingSent)
+        let waiting = summary(WatchReport(state: .idle, since: nil, waitingParts: 2, waitingSeconds: 120, at: now))
+        #expect(waiting.watchLine(now: now) == "2 parts left on the Watch")
+    }
+
+    /// ASTRA-IT11-02: at the cap, any kept audio made the reason say there's no room because it can't be
+    /// sent, even when sendable audio over the cap would free room once the iPhone takes it. The
+    /// "can't be sent" reason is only for kept audio that fills the cap (or the disk) by itself.
+    @Test func theCapReasonBlamesKeptAudioOnlyWhenItAloneFillsTheCap() throws {
+        let cap = WatchStorage.maximumWaiting
+        let mixed = try #require(WatchStorage.pauseReason(freeBytes: 2_000_000_000, waitingBytes: cap, keptBytes: 100_000_000))
+        #expect(mixed.contains("Open Omi Notes on the iPhone"), "sending the rest frees room: \(mixed)")
+        let keptOnly = try #require(WatchStorage.pauseReason(freeBytes: 2_000_000_000, waitingBytes: cap, keptBytes: cap))
+        #expect(keptOnly.contains("can't be sent") && !keptOnly.contains("Resume"))
+        let fullDisk = try #require(WatchStorage.pauseReason(freeBytes: 100_000_000, waitingBytes: 50_000_000, keptBytes: 50_000_000))
+        #expect(fullDisk.contains("can't be sent") && !fullDisk.contains("send what's waiting"), "nothing sendable: \(fullDisk)")
+        let fullDiskMixed = try #require(WatchStorage.pauseReason(freeBytes: 100_000_000, waitingBytes: 50_000_000, keptBytes: 10_000_000))
+        #expect(fullDiskMixed.contains("send what's waiting"))
+    }
+
+    /// ASTRA-IT11-03: a positive kept-parts count was shown as current even from a stale or future-dated
+    /// report. It is a statement about now only from a fresh report.
+    @Test func keptPartsFromAnOldOrFutureReportAreNotCurrent() {
+        let kept: [String: Int] = ["orphan_parts": 2]
+        let fresh = summary(WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now.addingTimeInterval(-60), stats: kept))
+        #expect(fresh.watchLine(now: now) == "2 parts kept on the Watch, can't be sent")
+        let stale = summary(WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now.addingTimeInterval(-3 * 3600), stats: kept))
+        #expect(!stale.watchLine(now: now).contains("kept") && stale.watchLine(now: now).hasPrefix("Last Watch report"))
+        let future = summary(WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now.addingTimeInterval(3600), stats: kept))
+        #expect(future.watchLine(now: now) == "Watch report time is ahead of this iPhone")
+        let ok = summary(WatchReport(state: .idle, since: nil, waitingParts: 3, waitingSeconds: 180, at: now, stats: ["orphan_parts": 0]))
+        #expect(ok.watchLine(now: now) == "3 parts left on the Watch")
+    }
+
+    /// ASTRA-IT11-04: with both waiting and kept parts, the line named only the kept ones and then said
+    /// "They move when both are nearby", about parts that can't be sent. Both are named; the advice is
+    /// about the waiting audio only, and never given for kept parts alone.
+    @Test func aMixedBacklogNamesBothAndAdvisesOnlyAboutSendableAudio() {
+        let mixed = WatchReport(state: .recording, since: now, waitingParts: 3, waitingSeconds: 180, at: now, stats: ["orphan_parts": 2])
+        let line = WatchSummary.onWatchLine(mixed, lastReceivedAt: nil, now: now)
+        #expect(line.contains("3 min") && line.contains("2 parts kept"), "\(line)")
+        #expect(!line.contains("They move"), "\(line)")
+        #expect(line.contains("The waiting audio moves when both are nearby"), "\(line)")
+        let keptOnly = WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now, stats: ["orphan_parts": 2])
+        let k = WatchSummary.onWatchLine(keptOnly, lastReceivedAt: nil, now: now)
+        #expect(k.hasPrefix("2 parts kept on the Watch, can't be sent") && !k.contains("moves"), "\(k)")
+        let waiting = WatchReport(state: .recording, since: now, waitingParts: 3, waitingSeconds: 180, at: now, stats: ["orphan_parts": 0])
+        #expect(WatchSummary.onWatchLine(waiting, lastReceivedAt: nil, now: now).hasSuffix("They move when both are nearby with Omi Notes open."))
+    }
 }

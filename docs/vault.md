@@ -31,10 +31,16 @@ operational index. Copy the folder anywhere, point a backend at it, and it rebui
     events/YYYY-MM-DD.jsonl               {event_id, received_at, body} — append-only (torn tail repaired before appending)
     conversations/YYYY-MM/<id>/conversation.json   decision + render + failure (+ retry, resolution, deferral) blocks — rewritten atomically (server only)
     conversations/YYYY-MM/<id>/{stt,diarization,llm,voices}-*.json, transcript.json   write-once
-    people/<person_id>/samples/<sample_id>.json    voiceprint {model, model_sha, dim, vector_b64, source, seconds, created_at}
-    people/<person_id>/enrollment/<id>.omiaudio    wearer's own consented enrollment audio (FLAC bytes; non-attachment extension)
-    people/<person_id>/enrollments/<id>.json       enrollment result
+    people/<person_id>/samples/<sample_id>.json    voiceprint {model, model_sha, dim, vector_b64, source, seconds, created_at,
+                                                   clips?, voices_file?, caption?, f0?/f0_source?, import?, state?, revision?,
+                                                   history?, flag?, moved_to?/moved_from?} — rewritten (server only)
+    people/<person_id>/enrollment/<id>.omiaudio    consented enrollment speech (pendant or imported; FLAC bytes; non-attachment extension)
+    people/<person_id>/enrollments/<id>.json       enrollment result (an import's: its source and what it merged)
     speakers/settings.json                         recognition acknowledgment, unknown-voice opt-in, dismissed suggestions
+    speakers/calibration.json                      the last published (informational) speaker calibration + its input fingerprint
+    speakers/calibration-log.jsonl                 one line per published calibration — append-only (rewritten only to forget a person)
+    speakers/journal/<op_id>.json                  an unfinished multi-file sample operation (move, reject, merge, undo) — removed on completion
+    speakers/forgetting/<person_id>.json           a forget in progress: its recorded purge set (paths only) — removed on completion
     displaced/<sha>.md                             user-edited note versions set aside by an explicit "overwrite"
     operations/<request_id>.json                   app retries, keeps and transcription requests: accepted → done | failed | superseded (see "Operations")
 ```
@@ -42,19 +48,28 @@ operational index. Copy the folder anywhere, point a backend at it, and it rebui
 `VAULT.json` `format` is 1 until the first app retry raises it to 2 (records may then carry retry
 state), the first keep from the phone raises it to 3 (records may carry `resolution`), and the
 first "keep unknown" of a voice raises it to 4 (`speakers.json` label states may be
-`source: "unknown"`), and the first deferred short session or transcription request raises it to 5
-(records may carry `deferral`, `_omi/operations/` may hold `kind: "transcribe"`); an older backend
-refuses a newer vault instead of rewriting records without that state. Every `VAULT.json`
-read-modify-write (a format raise, render settings, creation, migration) holds `vault-meta.lock`:
-a process-wide lock shared by all handles on the vault plus a `flock` under LOCK_DIR. That covers
-the API, the worker and the CLI as separate processes on this host, and it also covers commands
-that run inline because they took the worker lock. A raise re-reads the file under the lock, so
-concurrent raises never lower the format. Other hosts are kept out by the writer lease.
+`source: "unknown"`), the first sample state or review flag (or voices-file F0) raises it to 6 (voice samples
+may be `removed` or `moved` and carry `history` and `flag`; 5 is unused), and the first deferred short session or
+transcription request raises it to 7 (records may carry `deferral`, `_omi/operations/` may hold
+`kind: "transcribe"`). An older backend refuses a newer vault instead of rewriting records without that state (or
+training on a removed voiceprint). Additive fields an older backend safely ignores (sample F0, clip bounds,
+captions, import provenance, `rm_basis` in label evidence, voices-file F0 next to a kept vector) raise nothing.
 
-**Rollback:** once the vault is format 5, roll back only to a release that reads format 5 (this
-deferral work or later); an older one refuses to start rather than erase deferral and request
-history. Never lower the marker by hand. Setting `DEFER_SPEECH_SECONDS=0` stops new deferrals but
-does not lower the format.
+Every `VAULT.json` read-modify-write (a format raise, render settings, creation, migration) holds
+`vault-meta.lock`: a process-wide lock shared by all handles on the vault plus a `flock` under LOCK_DIR. That
+covers the API, the worker and the CLI as separate processes on this host, and commands that run inline because
+they took the worker lock. A write re-reads the file under the lock and merges into it, keeping the higher format,
+so concurrent writers never lower it. Other hosts are kept out by the writer lease.
+
+**Why deferral is 7, not 5.** The deferral work first claimed format 5, but the Voices release (`4573e20`) shipped
+format 6 first and the deployed vault is at 6. A release that reads 6 but predates deferral would rewrite records
+without their `deferral` block and ignore `transcribe` operations, so deferral needs a number above 6. A format-6
+vault written by the Voices release has no deferral state, and this release reads it unchanged; the first deferral
+write raises it to 7, after which only releases at or after the recording-classes merge start.
+
+**Rollback:** once the vault is format 7, roll back only to a release that reads format 7 (the recording-classes
+merge or later); an older one refuses to start rather than erase deferral and request history. Never lower the
+marker by hand. Setting `DEFER_SPEECH_SECONDS=0` stops new deferrals but does not lower the format.
 
 `<conversation dir>/priority.json` `{format, state: important|less_useful|auto, set_at, revision,
 request_id, requests, source: app|pendant, event_id?}` is the owner's explicit choice (made in the app,
@@ -67,7 +82,7 @@ changes nothing else (note, path, keep/discard, statistics). Older backends igno
 conversation with under `DEFER_SPEECH_SECONDS` (60) of speech (not an enrollment, not under 1.5 s). The
 status stays `closed`; the index column `deferral` is derived from it, so a rebuild reproduces the deferred
 state, and `requested` (the owner's transcription request) survives restarts, rebuilds and retries. The
-block stays after the session is transcribed, as history. The vault is raised to format 5 before the first block (or `transcribe` operation) is
+block stays after the session is transcribed, as history. The vault is raised to format 7 before the first block (or `transcribe` operation) is
 written, so a release that would drop it refuses the vault (see the format note above). The render index's `recording_class` may
 be `{revision, outcome: "not_applicable"}` for a deterministic discard: the owner's choice it handled
 without applying.

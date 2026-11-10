@@ -33,6 +33,7 @@ from ..rebuild import advance_processed
 from ..records import record_from_row, write_record
 from ..settings import Settings
 from ..speakers import enroll
+from ..speakers.calibration import Calibrator
 from ..views import LISTED
 from ..util import uuid7_for
 from ..vault import LEASE_RENEW_SECONDS, LeaseError, Vault
@@ -86,6 +87,8 @@ class Worker:
         self.providers = providers
         self.pipeline = ConversationPipeline(settings, db, self.providers, self.vad.vad.name, self.vad.warning)
         self.enrollments = enroll.EnrollmentProcessor(self)
+        self.calibrator = Calibrator(self.pipeline)
+        self.warm = None  # set by the API: rebuilds its cached review queue and voice space after each tick
         self.params = seg.Params(
             gap=settings.conversation_gap_seconds,
             provisional_wait_open=settings.provisional_wait_open_seconds,
@@ -111,6 +114,14 @@ class Worker:
             return {"chunks": 0, "segmentation_changes": 0, "conversations": 0, "read_only": blocked}
         if not self._reconciled:
             self.pipeline.reconcile_days()  # daily indexes may be stale after a crash
+            try:
+                self.pipeline.speakers.reconcile()  # a journaled sample operation a crash interrupted finishes first
+            except Exception:
+                log.exception("could not finish interrupted speaker operations")
+            try:
+                self.calibrator.reconcile()  # a missing or stale speaker calibration (a rebuild, a restart) is redone
+            except Exception:
+                log.exception("could not check the speaker calibration")
             self._reconciled = True
         self.pipeline.reconcile_moves(now)
         chunks = self.process_chunks(now)
@@ -135,6 +146,15 @@ class Worker:
                 self.enrollments.run(now)
             except Exception:
                 log.exception("could not process voice enrollments")
+            try:
+                self.calibrator.run(now)  # review flags and the informational calibration (debounced, nightly)
+            except Exception:
+                log.exception("could not calibrate speaker recognition")
+            if self.warm is not None:
+                try:
+                    self.warm()  # the API's caches, so a request never rebuilds them
+                except Exception:
+                    log.exception("could not warm the voice review queue")
             try:
                 self.operations.run(self.pipeline)
             except Exception:

@@ -19,12 +19,15 @@ import numpy as np
 import soundfile as sf
 
 from .. import operations
+from ..audio import pitch
 from ..ingest import ApiError
 from ..util import UUID_RE, iso_utc_epoch
 from . import enroll
 from . import match as speaker_match
 from . import suggest as speaker_suggest
-from .store import voices_name
+from . import journal
+from .review import Review, status_line
+from .store import consent_ok, same_clips, sample_eligible, voices_name
 from ..vault import Vault
 from .voices import Clip, embed_voices
 
@@ -49,25 +52,85 @@ class SpeakerService:
         self.store = pipeline.speakers
         self.db = pipeline.db
         self.vault = pipeline.vault
+        self.review = Review(self)
 
     # -- people ----------------------------------------------------------------------------------
 
     def people(self) -> list[dict]:
         self.store.scan_people()
+        self.store.sync_samples()
         embedder = self.pipeline.providers.embedder
         key = (embedder.model, embedder.model_sha) if embedder else None
         models = self.store.models(*key, self.pipeline.operating) if key else {}
+        auto_assign = self.store.settings()["auto_assign"]
+        calibration = self.calibration_people()
         out = []
         for p in self.store.people():
-            rows = self.db.query("SELECT * FROM samples WHERE person_id=?", (p["id"],))
+            rows = [r for r in self.db.query("SELECT * FROM samples WHERE person_id=?", (p["id"],)) if sample_eligible(r)]
             model = models.get(p["id"])
+            counts = self.review.counts(p["id"])
+            measured = calibration.get("people", {}).get(p["id"], {}).get("measured")
             out.append({
                 "id": p["id"], "name": p["name"], "me": bool(p["me"]), "note_path": p["note_path"],
                 "samples": len(rows), "sessions": len({r["session"] for r in rows if r["session"]}),
                 "auto_active": bool(model and model.active),
                 "voice_ready": bool(model and model.centroid is not None),
+                **counts, "status_line": status_line(model, counts["samples_active"], auto_assign),
+                "calibrated_at": calibration.get("computed_at"), "measured": measured,
             })  # fmt: skip
         return out
+
+    def import_enrollment(self, person_id: str, fields: dict, upload) -> tuple[int, dict]:
+        """`POST /v1/people/{id}/enrollments/import` (`speakers.imports`)."""
+        from .imports import Importer
+
+        return Importer(self).run(person_id, fields, upload)
+
+    def calibration_people(self) -> dict:
+        """The last published calibration (`speakers.calibration`), {} before the first."""
+        return Vault.read_json(self.vault.speakers / "calibration.json") or {}
+
+    def calibration(self) -> dict:
+        """`GET /v1/speakers/calibration`: the last published calibration and whether its inputs changed since."""
+        from .calibration import Calibrator
+
+        calibrator = Calibrator(self.pipeline)
+        current = calibrator.current()
+        return {"calibration": current,
+                "stale": current is None or current.get("fingerprint") != calibrator.fingerprint(),
+                "pending": self.db.meta("calibrate_pending") is not None}  # fmt: skip
+
+    # -- review and samples (`speakers.review`) ---------------------------------------------------
+
+    def warm(self) -> None:
+        """Rebuild what changed since the last request (the review queue's order and, through it, the voice
+        space) so requests only slice cached results; a no-op when nothing changed. Called by the worker."""
+        if self.pipeline.providers.embedder is not None:
+            self.review.entries()
+
+    def review_items(self, limit: int, offset: int = 0) -> dict:
+        return self.review.page(limit, offset)
+
+    def review_decide(self, item_id: str, body: dict) -> dict:
+        return self.review.decide(item_id, body)
+
+    def person_samples(self, person_id: str, state: str | None) -> list[dict]:
+        return self.review.person_samples(person_id, state)
+
+    def sample_action(self, sample_id: str, action: str, body: dict) -> dict:
+        if not UUID_RE.match(sample_id):
+            raise ApiError(404, "not_found", "unknown sample")
+        request_id = body.get("request_id")
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 100:
+            raise ApiError(422, "invalid_body", "request_id is required")
+        expected = body.get("expected_revision")
+        if expected is not None and (not isinstance(expected, int) or isinstance(expected, bool)):
+            raise ApiError(422, "invalid_body", "expected_revision must be an integer")
+        person_id = body.get("person_id")
+        if action == "move" and (not isinstance(person_id, str) or not UUID_RE.match(person_id)):
+            raise ApiError(422, "invalid_body", "a move needs person_id (a lowercase UUID)")
+        result = self.review.sample_decision(sample_id, action, request_id, expected_revision=expected, person_id=person_id)
+        return result | {"request_id": request_id, "undo_token": request_id}
 
     def put_person(self, person_id: str, body: dict) -> tuple[int, dict]:
         if not UUID_RE.match(person_id):
@@ -84,6 +147,7 @@ class SpeakerService:
         with self.store.lock:
             created = self.store.put_person(person_id, name.strip(), me=me, attest=attest)
             self.db.set_meta("relabel_pending", "1")  # names/me shape rendering and prompts
+            self.store.samples_changed()  # consent or the wearer may have changed: recalibrate
         person = next(p for p in self.people() if p["id"] == person_id)
         return (201 if created else 200), person
 
@@ -95,7 +159,10 @@ class SpeakerService:
             # forgotten, before anything can move them (a pending or in-flight move to a new
             # transcript carries the marker instead of dropping the association); 3. pending moves
             # finish and voices generations nothing depends on go; 4. vectors, then the voice data.
-            # A retry after a crash finishes whatever is left.
+            # A retry after a crash finishes whatever is left. An interrupted journaled operation finishes first; one
+            # touching this person that can't is cancelled (with the forget's durable start), or the forget stops.
+            self.store.reconcile()
+            self.store.begin_forget(person_id)
             self.pipeline.sync_labels_everywhere()
             affected = self.store.labeled_with(person_id)
             for conv_id in affected:
@@ -112,6 +179,7 @@ class SpeakerService:
             self.store.remove_obsolete_voices_everywhere()
             self.store.reconcile_vectors()
             self.store.forget_voice(person_id, delete_note=delete_note)
+            self.store.samples_changed()
             self.db.set_meta("relabel_pending", "1")
         return affected
 
@@ -130,15 +198,35 @@ class SpeakerService:
         return json.loads(path.read_text())
 
     def _clips(self, conv_id: str, transcript: dict) -> dict[str, list[list[float]]]:
-        stored = {label: v.clips for label, v in self.store.voices(conv_id).items() if v.clips}
+        stored = {label: v.clips for label, v in self.store.voices(conv_id).items() if v.clips and self._current(v, transcript)}
         return stored | {k: v for k, v in (transcript.get("speaker_clips") or {}).items() if k not in stored}
+
+    @staticmethod
+    def _current(voice, transcript: dict) -> bool:
+        """A stored voice still describes this transcript: embedded from its clip bounds (a transcript from
+        before `speaker_clips` has nothing to compare). Otherwise (an interrupted reprocess with corrected
+        bounds) it is never offered or confirmed: the transcript's clips are, and the voice is rebuilt."""
+        if "speaker_clips" not in transcript:
+            return True
+        return same_clips(voice.clips, (transcript.get("speaker_clips") or {}).get(voice.label) or [])
 
     def audio_available(self, row) -> bool:
         return self.store.raw_available(row)
 
     def conversation_speakers(self, conv_id: str) -> dict:
-        row = self._conversation(conv_id)
+        self._conversation(conv_id)
+        self.store.reconcile()  # the revision shown is the one after recovery (what a change will be checked against)
         transcript = self._transcript(conv_id)
+        # the recovery a change runs first, when there is any (checked without waiting for the lock), so the
+        # revision shown is the one a change will meet; decided again under the lock on the transcript then
+        # current (a reprocess may have published a newer one meanwhile), never on the copy read before
+        if self.store.labels_to_move(conv_id, transcript):
+            with self.store.lock:
+                transcript = self._transcript(conv_id)
+                if self.store.labels_to_move(conv_id, transcript):
+                    self.store.sync_conversation(conv_id)
+                    self.pipeline.move_labels(conv_id, transcript)
+        row = self._conversation(conv_id)
         return {
             "revision": row["speakers_revision"],
             "transcript_sha": row["transcript_sha"],
@@ -212,13 +300,19 @@ class SpeakerService:
             raise ApiError(422, "invalid_body", "keep_unknown is a boolean and excludes person_id")
         with self.store.lock:
             self.store.sync_conversation(conv_id)  # an earlier attempt may have failed after its file write
-            self.store.sync_samples()
-            row = self._conversation(conv_id)
+            # recovery first: it may change this label (and its revision); everything below reads after it
+            self.store.reconcile()
+            self._conversation(conv_id)
             transcript = self._transcript(conv_id)
             self.pipeline.move_labels(conv_id, transcript)  # states of an earlier transcript don't apply
             row = self._conversation(conv_id)
             if label not in {s["speaker"] for s in transcript.get("segments") or []}:
                 raise ApiError(404, "not_found", f"conversation has no speaker {label}")
+            # before anything (a retry's answer included): an unfinished operation on this label or these people, or
+            # an unfinished forget of the person named, must not be built on or raced
+            current = (self.store.labels(conv_id).get(label) or {}).get("person_id")
+            journal.blocking(self.store, {not_person, current}, labels={(conv_id, label)})
+            journal.forgetting(self.store, {person_id})
             done = self.store.request_result(conv_id, request_id)
             if done is not None:  # a retry of an applied request: finish its work, answer with the current state
                 self.db.set_meta("relabel_pending", "1")
@@ -304,13 +398,27 @@ class SpeakerService:
         day = datetime.fromtimestamp(row["start"], self.pipeline.tz).date().isoformat()
         sample_id = self.store.add_sample(person_id, voice.vector, model=embedder.model, model_sha=embedder.model_sha,
                                           source="user", seconds=voice.seconds, day=day, session=row["id"],
-                                          conversation_id=row["id"], label=label, request_id=request_id)  # fmt: skip
+                                          conversation_id=row["id"], label=label, request_id=request_id,
+                                          extra=self._provenance(row, transcript, label, voice))  # fmt: skip
         return "created", sample_id
+
+    def _provenance(self, row, transcript: dict, label: str, voice) -> dict:
+        """What a new sample keeps besides its vector: the clip bounds and voices file it was embedded from
+        (so it can be played and re-measured), the phrase it overlaps (a caption that outlives the audio)
+        and its F0, measured at the voices stage while the PCM was in hand (`audio.pitch`)."""
+        spans = [[c.start, c.end] if isinstance(c, Clip) else [float(c[0]), float(c[1])] for c in voice.clips]
+        clips = self._clip_list(row["id"], transcript, label, spans)
+        out = {"clips": spans, "voices_file": getattr(voice, "file", None), "audio_sha": row["audio_sha"],
+               "caption": next((c["text"] for c in clips if c["text"]), None)}  # fmt: skip
+        if getattr(voice, "f0", None) is not None:
+            out |= {"f0": voice.f0, "f0_voiced": voice.f0_voiced, "f0_source": "voices-stage", "f0_estimator": pitch.ESTIMATOR}
+        return out
 
     def _label_voice(self, row, transcript: dict, label: str, embedder):
         """The label's voice: stored, else recomputed from raw audio (kept in the voices file)."""
         stored = self.store.voices(row["id"]).get(label)
-        if stored is not None and stored.vector is not None and (stored.model, stored.model_sha) == (embedder.model, embedder.model_sha):
+        if stored is not None and stored.vector is not None and (stored.model, stored.model_sha) == (embedder.model, embedder.model_sha) \
+                and self._current(stored, transcript):
             return stored
         clips = transcript.get("speaker_clips") or {}
         if not clips.get(label) or not self.audio_available(row):
@@ -320,11 +428,11 @@ class SpeakerService:
         voices = embed_voices(all_clips, audio.pcm, embedder)
         # `label` is about to be confirmed for someone who passed the consent checks (`_sample_for`)
         keep = {label} | self.store.vector_labels(self.store.labels(row["id"]), set(voices), raw=True)
-        name = voices_name(embedder, row["audio_sha"], row["transcript_sha"])
+        name = voices_name(embedder, row["audio_sha"], row["transcript_sha"], clips)
         self.store.write_voices(row["id"], name, embedder.model, embedder.model_sha, voices, keep)
         self.store.reference_voices(row["id"], name)
         self.store.remove_other_voices(row["id"], name)
-        return voices.get(label)
+        return self.store.voices(row["id"]).get(label)  # as stored (with its file), or None
 
     def resummarize(self, conv_id: str) -> None:
         if self._conversation(conv_id)["enrollment_id"]:
@@ -365,7 +473,8 @@ class SpeakerService:
         models = self.store.models(*key, self.pipeline.operating) if key else {}
         dismissed = {k: float(v) for k, v in prefs["dismissed"].items()}
         found = speaker_suggest.suggestions(candidates, models, me_exists=self.store.me() is not None, dismissed=dismissed,
-                                            now=now, limit=len(candidates) or 1)  # fmt: skip
+                                            now=now, limit=len(candidates) or 1,
+                                            space=self.store.rm_space(*key) if key else None)  # fmt: skip
         del excerpts
         return found, prefs
 
@@ -469,7 +578,9 @@ class SpeakerService:
         undone: set[str] = set()
         skipped: set[str] = set()
         with self.store.lock:
-            self.store.sync_samples()
+            self.store.reconcile()
+            if journal.pending(self.store):  # an undo reads the state those operations would still change
+                raise ApiError(409, "recovery_pending", "an earlier change to voices is still being recovered; try again later")
             for path in sorted(self.vault.conversations.glob("*/*/speakers.json")):
                 conv_id = path.parent.name
                 requests = (Vault.read_json(path) or {}).get("requests") or {}
@@ -482,6 +593,10 @@ class SpeakerService:
                         undone.add(conv_id)
                         continue
                     self.store.sync_conversation(conv_id)
+                    if rec.get("moved") or rec.get("rejected"):  # a journaled sample operation (`speakers.review`)
+                        why = self.review.undo_label_op(conv_id, key, rec, undo_id)
+                        (skipped if why else undone).add(conv_id)
+                        continue
                     states = self.store.labels(conv_id)
                     label = rec["label"]
                     current = self.store.persisted({label: states.get(label) or {}}).get(label)
@@ -491,8 +606,14 @@ class SpeakerService:
                         continue
                     before = dict(rec["before"] or {})
                     withdrawn = rec.get("withdrawn") or {}
+                    if any(self.store.forgetting_path(p).exists() for p in (before.get("person_id"), withdrawn.get("person_id")) if p):
+                        skipped.add(conv_id)  # that person's forget hasn't finished: nothing of theirs comes back
+                        continue
                     if before.get("person_id") and self.store.person(before["person_id"]) is None:
                         skipped.add(conv_id)  # that person was forgotten since: never brought back
+                        continue
+                    if withdrawn.get("samples") and not consent_ok(self.store.person(withdrawn["person_id"]), self.store.settings()):
+                        skipped.add(conv_id)  # their voiceprints come back only with their current consent
                         continue
                     if withdrawn.get("samples") and not self.store.can_restore(withdrawn["person_id"], withdrawn["samples"], key):
                         skipped.add(conv_id)  # their voiceprints are gone (forgotten, or past the window): no partial undo
@@ -508,9 +629,10 @@ class SpeakerService:
                     if row and row["note_path"]:
                         self.pipeline._set(conv_id, needs_render=1, next_attempt_at=None)
                     undone.add(conv_id)
-            if undone:
+            samples = self.review.undo(request_id, undo_id)  # sample decisions (review, remove, restore, move)
+            if undone or samples["undone"]:
                 self._relabel()
-        return {"undone": sorted(undone), "skipped": sorted(skipped - undone)}
+        return {"undone": sorted(undone), "skipped": sorted(skipped - undone), "samples": samples}
 
     # -- settings --------------------------------------------------------------------------------
 
@@ -546,6 +668,7 @@ class SpeakerService:
             before = self.store.settings()
             self.store.update_settings(**changes)
             self.store.reconcile_vectors()  # e.g. unknown voices off or the acknowledgment withdrawn
+            self.store.samples_changed()
             if "auto_assign" in changes and changes["auto_assign"] != before["auto_assign"]:
                 self.db.set_meta("relabel_pending", "1")
         return self.get_settings()
@@ -553,6 +676,8 @@ class SpeakerService:
     # -- clips -----------------------------------------------------------------------------------
 
     def clip_wav(self, clip_id: str) -> bytes:
+        if clip_id.startswith("sample."):
+            return self.review.clip_wav(clip_id)
         conv_id, _, rest = clip_id.partition(".")
         label, _, index = rest.partition(".")
         if not UUID_RE.match(conv_id) or not label or not index.isdigit():

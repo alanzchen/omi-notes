@@ -25,8 +25,9 @@ public struct TransferSummary: Equatable, Sendable {
         public var converting: Int
         /// Watch audio files queued here for the server.
         public var waitingForServer: Int
-        /// Audio parts the Watch keeps but can't send (from its report): never "all sent" while > 0.
-        public var keptOnWatch: Int = 0
+        /// Audio parts the Watch keeps but can't send (from its report): never "all sent" unless it
+        /// reported 0 (nil: an older Watch app that doesn't say, or no report).
+        public var keptOnWatch: Int? = 0
         /// Of the waiting parts, re-checks: parts the iPhone had no checksum receipt for (mostly converted by
         /// an older build), sent after new audio. Still unacknowledged: they stay in every total and nothing
         /// says "all sent" while any remain; they are only named apart.
@@ -101,7 +102,7 @@ public struct TransferSummary: Equatable, Sendable {
             reportFresh: report.map { now.timeIntervalSince($0.at) <= WatchSummary.fresh && $0.at <= now.addingTimeInterval(60) } ?? false,
             waitingParts: report?.waitingParts, waitingSeconds: report?.waitingSeconds,
             receivedOnPhone: s.watchReceived, lastReceivedAt: s.watchLastReceiptAt,
-            converting: s.watchPending, waitingForServer: s.watchWaitingUpload, keptOnWatch: report?.keptParts ?? 0,
+            converting: s.watchPending, waitingForServer: s.watchWaitingUpload, keptOnWatch: report?.keptParts,
             recheckParts: report?.recheckParts ?? 0, recheckSeconds: report?.recheckSeconds ?? 0)
 
         let m = s.transfer.meter
@@ -221,6 +222,31 @@ public struct TransferSummary: Equatable, Sendable {
         guard watch.inUse == true, watch.reportAt != nil, watch.reportFresh, watch.keptOnWatch == 0, let waiting = watch.waitingParts else { return nil }
         let total = watch.receivedOnPhone + waiting
         return total > 0 ? Double(watch.receivedOnPhone) / Double(total) : 1
+    }
+
+    /// The Watch → iPhone line. Counts from the Watch's report (kept parts too) are statements about
+    /// now only while the report is fresh and not dated ahead of this iPhone.
+    public func watchLine(now: Date) -> String {
+        let w = watch
+        func plural(_ n: Int, _ one: String, _ many: String) -> String { "\(n) \(n == 1 ? one : many)" }
+        if w.inUse == nil { return "Checking for Apple Watch" }
+        if let at = w.reportAt, w.reportFresh {
+            if let kept = w.keptOnWatch, kept > 0 { return "\(plural(kept, "part", "parts")) kept on the Watch, can't be sent" }
+            if let parts = w.newParts {
+                let recheck = w.recheckParts > 0 ? "re-checking \(plural(w.recheckParts, "older part", "older parts"))" : nil
+                // "Nothing left" needs the Watch to have reported its kept parts (0); an older Watch app
+                // that doesn't say gets the Watch detail's wording, never an empty Watch.
+                let empty = w.keptOnWatch == 0 ? "Nothing left on the Watch" : "Nothing waiting; kept parts not reported"
+                return parts == 0 ? (recheck.map { "R" + $0.dropFirst() } ?? empty)
+                    : "\(plural(parts, "part", "parts")) left on the Watch" + (recheck.map { " · \($0)" } ?? "")
+            }
+            return "Last Watch report \(SystemHealth.relative(at, now))"
+        }
+        if let at = w.reportAt, at <= now.addingTimeInterval(60) {
+            return "Last Watch report \(SystemHealth.relative(at, now))"  // not current: no claim about now
+        }
+        if w.reportAt != nil { return "Watch report time is ahead of this iPhone" }
+        return "No report from the Watch yet"
     }
 
     /// Everything reached the server as far as anyone can tell: this iPhone sent all it had, and the

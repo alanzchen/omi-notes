@@ -45,6 +45,26 @@ relative to `/Users/alan/Developer/_ref/omi`.
   Before activation: suggestions only. Enrollment alone does not activate auto-naming.
   Auto names carry an "auto" badge and
   show similarity evidence (distance, margin, seconds), never a "probability".
+- **Owner rule** (`match.OwnerRule`, versioned; evidence study `spk/a0-20261109`, Revision 4 of the
+  voices-hub plan): a pure restriction on top of everything here. The wearer is auto-named only on the
+  label with the highest raw cosine to their centroid in a conversation with ≥ 2 labels, at raw cosine
+  ≥ **0.88**; in a single-label conversation at raw ≥ **0.80**. A second over-split wearer label stays
+  unnamed. A stored label whose vector wasn't kept still counts towards "≥ 2 labels", so a relabel
+  never applies the single-label rule to a conversation the voices stage saw with several voices.
+- **Recording-mean (rm) agreement** (`speakers/space.py`): anyone else is auto-named only when the rm
+  ranking puts the same person first too. GA, the mean of the currently consent-eligible stored
+  label population (`vector_labels`, raw availability included for unknown voices) plus consented
+  people's eligible samples that aren't already their conversation's stored voice (each voice once),
+  is computed in memory whenever models are built and never persisted; people's centroids are the median of their GA-centred samples. A label is centred
+  by its conversation's mean: all label vectors at the voices stage (`rm_basis: conversation`), the
+  stored consented ones in a relabel (`partial`), GA with fewer than 2 or when the label lies within
+  0.20 of that mean (`ga`). `rm_basis` is kept in the label's evidence in `speakers.json`. No
+  threshold is loosened. rm also orders "possibly X" hints (≥ 200 GA vectors) and picks who a
+  recurring unknown voice might be.
+- **Enrollment-only model:** once a person holds ≥ 60 s of enrollment speech (pendant or imported),
+  their centroid comes from enrollment samples alone. The activation gates are unchanged, and such a
+  model is active only if every confirmation also matches the enrollment-only centroid (threshold and
+  margin).
 - **Continuous wearer speech:** once enrolled and active, a single long turn can qualify with
   ≥ 10 s of evidence, ≥ 2 disjoint clean clips of ≥ 3 s each, and a stricter distance < 0.25.
   Margin and mixed-voice checks still apply. This avoids rejecting a long monologue just because
@@ -82,7 +102,99 @@ relative to `/Users/alan/Developer/_ref/omi`.
   `speakers.json`; the person's labels are marked forgotten *before* anything may move them (a
   pending or in-flight move to a new transcript then carries the marker instead of dropping the
   association); pending moves finish; unreferenced voices files go; vectors are pruned; the
-  person's voice data is deleted.
+  person's voice data is deleted — removed and moved samples and their history included, every
+  `moved` record in other folders whose chain (A→B→this person) reaches this person, with the
+  enrollment audio and result such a record owns, and this person's entries in `calibration.json`
+  and its log. A durable per-person forget count (`settings.json` `forgotten_voices`) is written
+  first, so work begun before the forget (an import being judged) never writes the voice back.
+
+## Voices hub
+
+The app's 声纹 hub (features `voice_review`, `voice_calibration`, `enrollment_import`). Nothing here
+deletes a voiceprint except forgetting a person; everything else is a state change with history.
+
+- **Sample states** (vault format 6, raised under the per-vault meta lock before the first state or
+  flag is written, so an older backend refuses the vault instead of training on a removed sample):
+  each sample file may carry `state` (`active` | `removed` | `moved`; absent = active), `revision`,
+  `history` [{at, action, by, request_id, from?, to?, …}] and `flag` {reasons, evidence_fingerprint,
+  flagged_at, resolved?: {decision, at, fingerprint}}. **`store.sample_eligible`** (active only) is
+  the one rule for what feeds matching, activation, hints, suggestions, GA and calibration. A flag
+  never changes eligibility. New samples also keep their `clips` (submitted-audio bounds), `voices_file`,
+  `audio_sha`, a `caption` (the phrase they overlap) and F0.
+- **F0** (`audio/pitch.py`, numpy YIN from the evidence study: 30 ms window, 10 ms hop, 70–400 Hz,
+  energetic voiced frames): measured at the voices stage while the PCM is in hand and kept in the
+  voices file only next to a kept vector. A clip needs ≥ 20 voiced frames, a sample ≥ 100, else F0 is
+  unknown. `omi-notes speakers measure-f0` backfills from raw audio (or a person's enrollment audio);
+  `omi-notes speakers import-f0 <bench>` imports the production estimator's clip values the evidence
+  study computed on the 2026-11-08 bench (`a0-20261109/q3_clip_f0_numpy.json`), only on positive
+  matches: the conversation (start within 0.05 s), label, voices generation (named on both sides),
+  audio sha, and every clip's start and end within 0.05 s, one to one; with the same gates (≥ 20 voiced
+  frames per clip, ≥ 100 per sample) and a duration-weighted median, recording `f0_source`, estimator,
+  clip ids, voiced frames and aggregation. Both only add fields, never overwrite, and report what they
+  skipped. F0 is review evidence, never identity.
+- **Review flags** (`speakers/flags.py`; computed by the calibration run): `pitch` — outside the
+  person's own band, median ± max(25 Hz, 2.5 × MAD × 1.4826), no fixed 165 Hz split; `score` — raw
+  cosine to the robust centroid (geometric median; the enrollment-only centroid when there is one)
+  below median − 3 × MAD × 1.4826; `enrollment` — ≥ 0.50 from an enrollment-only model. Statistics
+  need ≥ 5 samples. Flags only order the review queue. A confirm records the flag's evidence
+  fingerprint (reasons + the sample's F0 measurement), so unchanged evidence never asks again.
+- **Review queue** (`speakers/review.py`): flagged samples first, then recent automatic names and
+  "possibly X" labels (newest 60 conversations), then other active samples never confirmed. An item
+  id is bound to its revision (`s.<sample>.<revision>`, `l.<conversation>.<label>.<speakers
+  revision>.<proposed person>.<evidence digest>`): a decision on a changed item, or on a label item
+  whose proposed person or evidence (samples, their states and revisions, consent) changed, is
+  `409 stale_review`. confirm resolves a sample's flag or names a label. reject soft-removes the
+  sample; while its label still lists it under that person, the label's other samples of them are
+  removed too and the label becomes "not X". move copies the sample — with every other sample its
+  label gave that person — to the other person and renames that label, so later retractions follow
+  the moved samples. Label decisions go through the naming path. `request_id` deduplicates durably
+  (sample `history`, or `speakers.json` requests); the existing undo reverts sample decisions only
+  where the label (person, source, samples, blocks), every original and every copy are as the decision
+  left them, never brings back a forgotten person, and needs that person's current consent (so does a
+  restore). A sample an import merge replaced can't be restored while the union that replaced it
+  counts. A clip is cut from raw audio while it exists (`playable: false` with the caption kept
+  otherwise; audio is never fabricated).
+- **Journaled operations** (`speakers/journal.py`): a move, a label-linked reject, an import merge
+  and the undo of a move or reject change several files, so each is written as an intent
+  (`_omi/speakers/journal/<id>.json`, ids chosen up front, preconditions checked under the speaker
+  lock), applied in steps that are each idempotent and leave a safe state (a copy carries
+  `pending_op` and is ineligible until its operation completes; an undo makes the copy pending again
+  before restoring the original), and completed by deleting the intent. Incomplete operations roll
+  forward before every model build, sample decision, undo, import and forget, and at worker startup.
+  Each records the forget generation of everyone involved: a replay after one of them was forgotten,
+  or after the person it gives a voice to lost consent, is cancelled (its applied part rolled back,
+  pending copies removed, the intent deleted) instead of applied. While an operation can't be
+  finished, decisions, label assignments, imports and undo touching its people, samples or label are
+  `409 recovery_pending` (checked before a retry is answered). A replay restores a label only while
+  its decision is still what the operation left; an undo of a move past its commit point (the
+  originals count again) always rolls forward. While a forget is unfinished, nothing new is kept for
+  that person (`409 forget_in_progress`). A moved enrollment that would duplicate the destination's
+  audio is `409 superseded`.
+  A forget starts durably (forget count, purge plan in `_omi/speakers/forgetting/`) and cancels every
+  operation touching the person before anything else, or stops. A moved or rejected label keeps
+  only the new person's samples; the old person's other ids are detached and restored by undo.
+- **Calibration** (`speakers/calibration.py`, informational, never changes activation): per person,
+  consistency with the robust centroid, and the matcher's actual decision evaluated with each
+  conversation left out (models and the rm space rebuilt without it, user-named labels as truth):
+  positive conversations (a miss is an error), named-other-person negatives (naming this person there
+  is an error) and target-absent conversations (only user-reviewed ones; 0 for now), each with a
+  one-sided 95 % Clopper–Pearson upper bound. `measured` exists only when such counts do; there is no
+  pooled accuracy. Published to `_omi/speakers/calibration.json` only if its input fingerprint
+  (eligible sample ids and states, consent and the unknown-voice preference, wearer, model, operating
+  points, the GA population, owner/flag/calibration versions, the user-named labels evaluated), taken
+  under the speaker lock, still matches when it is published under the lock; each run is appended to
+  `calibration-log.jsonl`. Runs 60 s after the last sample or consent change, nightly at 03:10 local
+  (judged from the file, so a rebuild doesn't repeat it), and on startup when missing or stale.
+- **Enrollment import** (`speakers/imports.py`): a range of an existing recording (seconds from its
+  start; raw audio required) or an uploaded m4a/wav ≤ 20 min, with `confirm_person: true` and the
+  person's name echoed. Non-owners need the acknowledgment and their attestation, checked explicitly.
+  The pendant enrollment's checks apply (≥ 20 s VAD speech, one voice, held-out clip). The import id
+  derives from (person, source sha256, start, end); a range an earlier import of the same source
+  covers returns it, an overlapping one is judged as the union (cut from the whole upload for files)
+  and replaces what it covers in one journaled merge, so repeated audio never adds seconds. The person,
+  their consent and forget count are checked again under the lock before anything is written. The sample is `source: enrollment` with `import` provenance and
+  the source conversation as its session; the speech is kept as `.omiaudio` in the person's folder
+  and deleted on forget.
 
 ## Enrollment (wearer, through the pendant)
 
@@ -179,7 +291,13 @@ later). Unknown embeddings are pruned with raw retention.
 
 | Endpoint | Shape |
 |---|---|
-| `GET /v1/people` | `{people:[{id,name,me,note_path,samples,sessions,auto_active,voice_ready}]}` |
+| `GET /v1/people` | `{people:[{id,name,me,note_path,samples,sessions,auto_active,voice_ready,samples_active,samples_flagged,samples_removed,review_count,status_line,calibrated_at,measured}]}`; `samples` = active samples; `status_line` one plain line ("已启用", "停用：样本不一致", "需要更多样本"); `measured` null unless held-out counts exist: `{conversations, found_at_least, negative_conversations, wrong_at_most, target_absent_conversations, confidence}` |
+| `GET /v1/people/{id}/samples?state=active\|flagged\|removed\|moved` | `{samples:[{id,person_id,state,revision,source,seconds,created_at,day,label,f0,f0_source,flag:{reasons,open,resolved}\|null,moved_to,moved_from,playable,clip?:{id,seconds,started_at},text,conversation,device,review_id}]}` |
+| `POST /v1/samples/{id}/remove` / `restore` / `move` | `{request_id, expected_revision?, person_id (move)}` → `{sample, request_id, undo_token}`; repeated `request_id` answers the same; restore only from `removed` (else 409); a move to someone without consent is `409 consent_required` |
+| `GET /v1/speakers/review?limit=10&offset=0` | `{items:[{id,kind:sample\|label,person_id,person_name,sample_id?,label?,reasons,playable,clip?,text,conversation:{id,started_at,title},device}], total, next_offset}`; treat `id` as opaque. `limit` ≤ 50; `offset` indexes the queue's order (flagged samples, automatic names and hints, unconfirmed samples), `next_offset` is null at the end, so a phone that skips items can page past them |
+| `POST /v1/speakers/review/{id}` | `{decision: confirm\|reject\|move, person_id?, request_id}` → `{item_id,decision,request_id,undo_token,…}`; a changed item is `409 stale_review` |
+| `GET /v1/speakers/calibration` | `{calibration: <calibration.json>\|null, stale, pending}` |
+| `POST /v1/people/{id}/enrollments/import` | JSON `{conversation_id, start, end, confirm_person: true, person_name}` or multipart (`file` m4a/wav ≤ 20 min, `confirm_person`, `person_name`, `start?`, `end?`) → 201 new / 200 already enrolled from this audio `{import_id,state,speech_s,sample_id,person_id,merged,source}`; `422 not_enough_speech` / `enrollment_rejected` / `person_name_mismatch`, `409 consent_required` / `import_conflict`, `410 audio_expired`; a WAV at another rate is resampled by ffmpeg |
 | `PUT /v1/people/{uuid}` | `{name, me?, attest_knows?}` → 201/200 (client-minted id ⇒ idempotent; creates `People/<Name>.md`) |
 | `DELETE /v1/people/{id}[?delete_note=true]` | forget voice (and optionally the note) |
 | `GET /v1/conversations/{id}/speakers` | `{revision, transcript_sha, labels:[{label,person_id,name,source,distance,margin,evidence_s,clip_id,clips:[{id,seconds,started_at,text}],excerpt,kept_unknown}], audio_available}` |
@@ -189,10 +307,10 @@ later). Unknown embeddings are pruned with raw retention.
 | `POST /v1/speakers/suggestions/{id}/dismiss` | 204 (hidden for 7 days; older phones) |
 | `POST /v1/speakers/suggestions/{id}/assign` | `{person_id, request_id}` → `{relabeled_conversations}`; each member label is assigned under `request_id:<conversation>:<label>` |
 | `POST /v1/speakers/suggestions/{id}/keep-unknown` | `{request_id}` → `{conversations}`; permanent (vault format 4) |
-| `POST /v1/speakers/undo` | `{request_id, undo_request_id}` → `{undone:[conversation ids], skipped:[…]}`; idempotent per `undo_request_id` |
+| `POST /v1/speakers/undo` | `{request_id, undo_request_id}` → `{undone:[conversation ids], skipped:[…], samples:{undone:[sample ids], skipped:[{id, reason}]}}`; idempotent per `undo_request_id`; also reverts sample decisions (review, remove, restore, move) made under `request_id` |
 | `GET /v1/speakers/settings` / `PUT` | `{acknowledged_at, unknown_voices_enabled, auto_assign}` |
 | `GET /v1/speakers/enrollments/{enrollment_id}` | `{state, speech_s, reason?}` |
-| `GET /v1/clips/{clip_id}` | `audio/wav` 16 kHz mono PCM16 ≤ 10 s, rendered on demand; bounds validated to the label's turns; `410 Gone` when raw is expired |
+| `GET /v1/clips/{clip_id}` | `audio/wav` 16 kHz mono PCM16 ≤ 10 s, rendered on demand; bounds validated to the label's turns; `410 Gone` when raw is expired. `sample.<sample id>.<i>`: a sample's own clip (or the start of its enrollment audio) |
 
 The app downloads clips with an authenticated `URLSession` data task and plays them with
 `AVAudioPlayer(data:)` — never a token in a URL, never Opus on the phone.

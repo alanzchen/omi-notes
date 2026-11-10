@@ -157,19 +157,31 @@ struct ServerView: View {
     }
 
     private func configurationSection(_ st: ServerStatus) -> some View {
-        Section {
-            LabeledContent("Transcription", value: providerLabel(st.stt))
-            if let d = st.stt?.diarization { LabeledContent("Speaker separation", value: diarizationLabel(d)) }
-            LabeledContent("Summaries", value: st.llm?.provider == "none" ? "Turned off" : providerLabel(st.llm))
-            if let dir = st.notesDir { LabeledContent("Notes folder", value: dir).font(.footnote) }
+        let stt = st.transcriptionLabel, llm = st.summariesLabel
+        return Section {
+            // the dots are only as current as the last answer: re-evaluated as it ages, without a new one
+            TimelineView(.periodic(from: .now, by: 30)) { context in
+                ServiceRow(title: "Transcription", label: model.serviceLabels(now: context.date)?.transcription ?? stt)
+            }
+            TimelineView(.periodic(from: .now, by: 30)) { context in
+                ServiceRow(title: "Summaries", label: model.serviceLabels(now: context.date)?.summaries ?? llm)
+            }
+            if let dir = st.notesDir { LabeledContent("Notes folder", value: dir).font(.footnote).lineLimit(1).truncationMode(.head) }
             LabeledContent("Server version", value: st.serverVersion ?? "—")
             if let started = st.serverStartedAt.flatMap(ISO8601UTC.parse) {
                 LabeledContent("Running since", value: started.formatted(date: .abbreviated, time: .shortened))
             }
+            if !stt.details.isEmpty || !llm.details.isEmpty {
+                DisclosureGroup("Details") {
+                    ServiceDetails(title: "Transcription", details: stt.details)
+                    ServiceDetails(title: "Summaries", details: llm.details)
+                }
+                .font(.subheadline)
+            }
         } header: {
             Text("Configuration")
         } footer: {
-            Text("Set on the server. Your server decides which services receive your audio and transcripts. “Ready” means configured; it isn't a test that the service works.")
+            Text("Set on the server, which decides where your audio and transcripts go. A green dot means configured or answering, not that a transcript worked; grey means the server hasn't answered recently.")
         }
     }
 
@@ -179,22 +191,6 @@ struct ServerView: View {
                 LabeledContent("Server", value: host)
             }
             NavigationLink(model.serverURL == nil ? "Connect a server" : "Change server", value: Page.connection)
-        }
-    }
-
-    private func providerLabel(_ p: ServerStatus.Provider?) -> String {
-        guard let p else { return "—" }
-        let name = [p.provider, p.model].compactMap { $0 }.joined(separator: " · ")
-        let ready = p.ready == false ? " (not set up)" : ""
-        return (name.isEmpty ? "—" : name) + ready
-    }
-
-    private func diarizationLabel(_ mode: String) -> String {
-        switch mode {
-        case "local": return "On the server"
-        case "provider": return "By the transcription service"
-        case "off": return "Off"
-        default: return "Automatic"
         }
     }
 }

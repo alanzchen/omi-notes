@@ -62,6 +62,31 @@ public struct WatchSummary: Equatable, Sendable {
         return WatchSummary(configured: false, title: "Set up Apple Watch", detail: nil, tone: .quiet)
     }
 
+    /// The Watch detail's "On the Watch" line, as of its report: the recorded length waiting (from the
+    /// Watch's own parts, never a count × 60 s), parts kept that can't be sent, and, when waiting audio
+    /// hasn't arrived for a while, what helps (about the sendable audio only). Re-checks are named but
+    /// still unacknowledged; unknown kept parts (older Watch apps) never allow "everything sent".
+    public static func onWatchLine(_ r: WatchReport, lastReceivedAt: Date?, now: Date) -> String {
+        let kept = r.keptParts ?? 0
+        let newParts = max(0, r.waitingParts - r.recheckParts)
+        let waiting: String? = r.waitingParts == 0 ? nil
+            : newParts == 0 ? "Re-checking \(r.recheckParts) older part\(r.recheckParts == 1 ? "" : "s") with this iPhone"
+            : (r.waitingSeconds ?? 0) > 0 ? "\(Self.capitalizedFirst(WaitingAudio.text(r.waitingSeconds!))) of audio not on this iPhone yet"
+            : "Some audio not on this iPhone yet"
+        let keptText = kept > 0 ? "\(kept) part\(kept == 1 ? "" : "s") kept on the Watch, can't be sent" : nil
+        let parts = [waiting, keptText].compactMap { $0 }.joined(separator: " · ")
+        let what = !parts.isEmpty ? parts
+            : r.keptParts == nil ? "Nothing waiting; kept parts not reported"
+            : "Everything sent to this iPhone"
+        // waiting, and nothing has arrived for a while: what helps
+        let stuck = r.waitingParts > 0 && (lastReceivedAt.map { now.timeIntervalSince($0) > 15 * 60 } ?? true)
+        let advice = !stuck ? "" : kept > 0 ? ". The waiting audio moves when both are nearby with Omi Notes open."
+            : ". They move when both are nearby with Omi Notes open."
+        return "\(what) · reported \(SystemHealth.relative(r.at, now))" + advice
+    }
+
+    static func capitalizedFirst(_ s: String) -> String { s.prefix(1).uppercased() + s.dropFirst() }
+
     static func time(_ date: Date, _ now: Date) -> String {
         Calendar.current.isDate(date, inSameDayAs: now)
             ? date.formatted(date: .omitted, time: .shortened)
