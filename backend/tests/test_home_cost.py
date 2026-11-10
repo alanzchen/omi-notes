@@ -71,10 +71,11 @@ def rows_for(day_offset: int, per_day: int, prefix: str, *, base: float) -> list
     return out
 
 
-def populate(db, *, older: int = 0, newer: int = 0, crowd: int = 0, per_day: int = 12) -> None:
+def populate(db, *, older: int = 0, newer: int = 0, crowd: int = 0, others: int = 0, per_day: int = 12) -> None:
     """The same 5 days of answers in every size, plus history: `older` days before them, `newer` days after them
     (a deep page then has many newer rows above it), and `crowd` more done notes earlier on DAY (a day's page
-    then has many more rows of that day below it)."""
+    then has many more rows of that day below it), and `others` newer monologue notes, short and long (a kind's page
+    then has many newer rows of other kinds above it)."""
     now = time.time()
     rows = [r for d in range(5) for r in rows_for(d, per_day, "r", base=T0)]
     rows += [r for d in range(older) for r in rows_for(d, per_day, "o", base=T0 - 400 * 86400)]
@@ -86,6 +87,12 @@ def populate(db, *, older: int = 0, newer: int = 0, crowd: int = 0, per_day: int
             "id": f"c{k:06d}", "speech_seconds": 20.0 if k % 2 else 600.0, "status": "done", "deferral": None,
             "note_path": f"Conversations/c{k}.md", "edited": 0, "relevance": None,
             "index_json": json.dumps({"recording_class": {"class": "dialogue", "revision": 0}})})  # fmt: skip
+    for k in range(others):
+        start = T0 + 400 * 86400 + k * 600
+        rows.append(rows_for(0, 1, "w", base=start)[0] | {
+            "id": f"w{k:06d}", "speech_seconds": 20.0 if k % 2 else 600.0, "status": "done", "deferral": None,
+            "note_path": f"Conversations/w{k}.md", "edited": 0, "relevance": None,
+            "index_json": json.dumps({"recording_class": {"class": "monologue", "revision": 0}})})  # fmt: skip
     cols = list(rows[0]) + ["created_at", "updated_at"]
     with db.tx() as conn:
         conn.executemany(f"INSERT INTO conversations ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
@@ -104,6 +111,11 @@ PATHS = {
     "day short page": (f"/v1/conversations/recent?limit=3&day={DAY}&short=true", "crowd", False),
     "day long page": (f"/v1/conversations/recent?limit=2&day={DAY}&short=false", "crowd", False),
     "day page": (f"/v1/conversations/recent?limit=3&day={DAY}", "crowd", False),
+    # combined filters: fewer matches than the limit, so a wrong index walks every nonmatching row
+    "class day page": (f"/v1/conversations/recent?limit=10&class=passive&day={DAY}", "crowd", False),
+    "class short page": ("/v1/conversations/recent?limit=50&class=passive&short=true", "others", True),
+    "class long page": ("/v1/conversations/recent?limit=50&class=dialogue&short=false", "others", True),
+    "class day short page": (f"/v1/conversations/recent?limit=10&class=passive&day={DAY}&short=true", "crowd", False),
 }
 
 

@@ -21,6 +21,19 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 KINDS = ("monologue", "dialogue", "passive", "undetermined")
+# The listing index for each set of equality filters (kind, day, short): its leading columns are exactly those
+# filters, then (start, id), so the page is a seek and the LIMIT ends the walk. Named in the query (INDEXED BY):
+# without statistics the planner may pick an index that walks every nonmatching row.
+LIST_INDEXES = {
+    frozenset(): "conversations_listed",
+    frozenset({"kind"}): "conversations_listed_kind",
+    frozenset({"day"}): "conversations_listed_day",
+    frozenset({"short"}): "conversations_listed_short",
+    frozenset({"day", "short"}): "conversations_listed_day_short",
+    frozenset({"kind", "day"}): "conversations_listed_kind_day",
+    frozenset({"kind", "short"}): "conversations_listed_kind_short",
+    frozenset({"kind", "day", "short"}): "conversations_listed_kind_day_short",
+}
 FILL_BATCH = 500
 TOTALS = ("short", "deferred", "requested", "issues")
 

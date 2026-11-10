@@ -285,7 +285,9 @@ def create_app(
             # a row value: an index seek to the cursor (an OR of two comparisons walked every newer row)
             where += " AND (start, id) < (?, ?)"
             params += [cursor[0], cursor[1]]
-        rows = db.query(f"SELECT * FROM conversations WHERE {where} ORDER BY start DESC, id DESC LIMIT ?", (*params, limit + 1))
+        filters = frozenset(k for k, v in (("kind", recording_class), ("day", day), ("short", short)) if v is not None)
+        rows = db.query(f"SELECT * FROM conversations INDEXED BY {home.LIST_INDEXES[filters]} WHERE {where} "
+                        "ORDER BY start DESC, id DESC LIMIT ?", (*params, limit + 1))  # fmt: skip
         page = rows[:limit]
         return {
             "conversations": [views.summary_row(pipeline, r) for r in page],
