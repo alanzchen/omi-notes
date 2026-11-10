@@ -278,8 +278,8 @@ class SpeakerStore:
 
     def evidence_key(self, model: str, model_sha: str) -> str:
         """A content digest of everything the voice space and the review queue depend on: every stored vector of
-        this model, every sample (state, revision, flag, vector), every label state, the recent conversations
-        the queue lists (status, transcript, speakers revision), raw availability, people and consent, the speaker
+        this model, every sample (state, revision, flag, vector), every label state, every conversation
+        (status, transcript, speakers revision), raw availability, people and consent, the speaker
         settings file as stored (forgotten voices included) and any unfinished forget or journaled operation.
         Hashing the rows themselves (milliseconds) rather than counting them: a replaced vector or a recovery
         that reuses row ids must change it, so a value cached under it is never stale."""
