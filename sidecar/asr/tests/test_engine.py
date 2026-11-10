@@ -321,3 +321,25 @@ def test_a_first_answer_that_aligns_to_nothing_is_a_failed_piece_too():
     e.models = (FakeMoss([]), FakeQwen(), NoAlignment())
     with pytest.raises(IncompleteTranscription):
         e.transcribe(speech(15), [])
+
+
+def test_a_moss_loop_on_a_short_window_stops_at_its_small_cap_and_still_fails_honestly():
+    # 2026-11-09 20:08 (01a1c313, 7.3 s): MOSS looped to 16,384 tokens, then Qwen hit its cap: an honest 422,
+    # but after 97 s of GPU. The loop now stops at the short-window cap; the outcome is the same.
+    from omi_asr.engine import IncompleteTranscription
+
+    class LoopingMoss(FakeMoss):
+        def __init__(self):
+            super().__init__([])
+            self.caps = []
+
+        def generate(self, audio, max_tokens=0, **_):
+            self.caps.append(max_tokens)
+            return SimpleNamespace(segments=[], generation_tokens=max_tokens)
+
+    moss = LoopingMoss()
+    e = Engine()
+    e.models = (moss, CappingQwen(limit=0), FakeAligner())
+    with pytest.raises(IncompleteTranscription):
+        e.transcribe(speech(7.3), [])
+    assert moss.caps and max(moss.caps) <= 1024

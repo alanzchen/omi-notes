@@ -1,5 +1,6 @@
 """Window planning, budgets and truncation (pure; no models)."""
 
+import math
 import numpy as np
 
 from omi_asr import plan
@@ -16,7 +17,7 @@ def speech(seconds: float, gaps: list[tuple[float, float]] = (), seed: int = 0) 
 
 
 def test_max_tokens_is_at_least_16k_and_fits_the_context():
-    assert plan.moss_max_tokens(60) == 16_384
+    assert plan.moss_max_tokens(60) == 2_400  # 40 per second for short windows (2026-11-10)
     assert plan.moss_max_tokens(15 * 60) == 18_000            # 20 per second
     big = plan.moss_max_tokens(20 * 60)                        # 20/s = 24k; the 15.8k prompt leaves 24.9k
     assert big == 24_000 and big + 13.2 * 1200 <= plan.MOSS_CONTEXT
@@ -61,3 +62,18 @@ def test_qwen_chunks_are_cut_at_moss_pauses_and_at_most_180_s():
     cuts = plan.chunk_cuts(lines, 600)
     assert cuts[0] == 0 and cuts[-1] == 600 and abs(cuts[1] - 158.5) < 1e-6
     assert all(b - a <= 180 for a, b in zip(cuts, cuts[1:]))
+
+
+def test_a_short_window_s_moss_cap_scales_with_its_length_but_long_windows_keep_theirs():
+    # 2026-11-09 20:08: MOSS looped on a 7 s window to the 16,384-token floor (97 s of GPU) before the request failed
+    # honestly; real windows in the sidecar log ran 5.4-9.9 tokens per audio second
+    from omi_asr import plan
+
+    assert plan.moss_max_tokens(7) == 1024
+    assert plan.moss_max_tokens(60) == 2400  # 40 per second: 4x the densest real window
+    for seconds in (5, 30, 120, 300):
+        assert plan.moss_max_tokens(seconds) >= max(1024, 40 * seconds) - 1
+    for seconds in (410, 600, 750, 900, 1200):  # unchanged where 40/s reaches the old floor
+        old = max(256, min(plan.MOSS_CONTEXT - math.ceil(plan.MOSS_PROMPT_TOKENS_PER_SECOND * seconds) - 256,
+                           max(16_384, math.ceil(20 * seconds))))
+        assert plan.moss_max_tokens(seconds) == old
