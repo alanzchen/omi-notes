@@ -871,3 +871,49 @@ def test_sixty_seconds_of_enrollment_make_the_centroid_enrollment_only_and_the_g
     found = fl.evaluate([fl.FlagInput(s.id, s.person_id, s.vector) for s in enrolled + stray], {"alan": model.centroid})
     assert all("enrollment" in found[s.id] for s in stray) and not found["e0"]
 
+
+
+# -- latency: the voice space and the review queue are computed once per change ---------------------------
+
+
+def test_the_voice_space_is_computed_once_until_what_it_depends_on_changes(env, monkeypatch):
+    # live 2026-11-09: every note render rebuilt GA from every stored vector (a speakers.json read per
+    # conversation), 521 renders queued after a deploy kept the server above 200 % CPU and requests took 23 s
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    store = worker.pipeline.speakers
+    calls = {"n": 0}
+    real = store.ga_population
+
+    def counted(*a, **kw):
+        calls["n"] += 1
+        return real(*a, **kw)
+
+    monkeypatch.setattr(store, "ga_population", counted)
+    emb = worker.providers.embedder
+    first = store.rm_space(emb.model, emb.model_sha)
+    for _ in range(5):
+        assert store.rm_space(emb.model, emb.model_sha) is first
+    assert calls["n"] == 1, "unchanged inputs reuse the space"
+    r = client.post(f"/v1/samples/{ids[0]}/remove", json={"request_id": "rm-1", "expected_revision": 0}, headers=AUTH)
+    assert r.status_code in (200, 409), r.text
+    if r.status_code == 200:
+        assert store.rm_space(emb.model, emb.model_sha) is not first and calls["n"] == 2, "a sample change recomputes it"
+
+
+def test_a_review_page_is_a_slice_of_a_queue_built_once_per_change(env, monkeypatch):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    review_queue = client.app.state.speakers.review
+    builds = {"n": 0}
+    real = review_queue._entries
+
+    def counted(*a, **kw):
+        builds["n"] += 1
+        return real(*a, **kw)
+
+    monkeypatch.setattr(review_queue, "_entries", counted)
+    whole = client.get("/v1/speakers/review?limit=50", headers=AUTH).json()
+    for offset in range(whole["total"]):
+        assert client.get(f"/v1/speakers/review?limit=1&offset={offset}", headers=AUTH).status_code == 200
+    assert builds["n"] == 1, "pages slice one built queue"

@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
 import time
 import uuid
 from collections.abc import Mapping
@@ -153,6 +154,9 @@ class SpeakerStore:
         self.auto_assign_default = auto_assign_default
         # every read-modify-write of label states, in the API and in the worker (any process)
         self.lock = SpeakerLock(vault)
+        # (evidence_key, voice space): `rm_space` once per change, shared by renders, relabel and requests
+        self._space_cache: tuple | None = None
+        self._space_cache_lock = threading.Lock()
 
     # -- settings --------------------------------------------------------------------------------
 
@@ -272,9 +276,34 @@ class SpeakerStore:
                 population.append((s.session, raw))
         return population
 
+    def evidence_key(self, model: str, model_sha: str) -> tuple:
+        """A cheap digest (a few aggregate queries) of everything the voice space and the review queue depend on:
+        samples and their states, stored vectors, label states, consent and the wearer, the speaker settings.
+        Any change to those changes it, so a value cached under it is never stale."""
+        samples = tuple(self.db.one("SELECT count(*), coalesce(sum(revision), 0), coalesce(max(created_at), 0), "
+                                    "coalesce(sum(length(state)), 0) FROM samples"))  # fmt: skip
+        voices = tuple(self.db.one("SELECT count(*), coalesce(sum(rowid), 0), coalesce(max(rowid), 0) FROM voices "
+                                   "WHERE vector IS NOT NULL AND model=? AND model_sha=?", (model, model_sha)))  # fmt: skip
+        labels = tuple(self.db.one("SELECT count(*), coalesce(sum(speakers_revision), 0) FROM conversations"))
+        raw_gone = self.db.one("SELECT count(*) FROM chunks WHERE raw_deleted=1")[0]  # unknown voices need raw audio
+        people = tuple((r["id"], r["me"], r["attested_at"]) for r in self.people())
+        return (model, model_sha, samples, voices, labels, raw_gone, people,
+                json.dumps(self.settings(), sort_keys=True, default=str))
+
     def rm_space(self, model: str, model_sha: str):
         """GA (`ga_population`) and people's GA-centred centroids (`speakers.space`), in memory only; None without
-        any vector."""
+        any vector. Computed once per `evidence_key` (it reads every stored voice: per note render it kept the
+        server busy for hours after a relabel)."""
+        key = self.evidence_key(model, model_sha)
+        with self._space_cache_lock:
+            if self._space_cache is not None and self._space_cache[0] == key:
+                return self._space_cache[1]
+        space = self._rm_space(model, model_sha)
+        with self._space_cache_lock:
+            self._space_cache = (key, space)
+        return space
+
+    def _rm_space(self, model: str, model_sha: str):
         from .space import build_space
 
         by_person: dict[str, list] = {}

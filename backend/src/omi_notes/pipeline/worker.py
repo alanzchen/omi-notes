@@ -86,6 +86,7 @@ class Worker:
         self.pipeline = ConversationPipeline(settings, db, self.providers, self.vad.vad.name, self.vad.warning)
         self.enrollments = enroll.EnrollmentProcessor(self)
         self.calibrator = Calibrator(self.pipeline)
+        self.warm = None  # set by the API: rebuilds its cached review queue and voice space after each tick
         self.params = seg.Params(
             gap=settings.conversation_gap_seconds,
             provisional_wait_open=settings.provisional_wait_open_seconds,
@@ -146,6 +147,11 @@ class Worker:
                 self.calibrator.run(now)  # review flags and the informational calibration (debounced, nightly)
             except Exception:
                 log.exception("could not calibrate speaker recognition")
+            if self.warm is not None:
+                try:
+                    self.warm()  # the API's caches, so a request never rebuilds them
+                except Exception:
+                    log.exception("could not warm the voice review queue")
             try:
                 self.operations.run(self.pipeline)
             except Exception:

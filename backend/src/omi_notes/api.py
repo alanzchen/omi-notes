@@ -100,6 +100,7 @@ def create_app(
             if start_worker:
                 w = worker or Worker(settings, db)
                 w.take_over = take_over
+                w.warm = app.state.speakers.warm  # the API's review queue and voice space, rebuilt off the request path
                 if not acquire_worker_lock(w.lock, wait=settings.worker_lock_wait_seconds):
                     raise VaultBusy(f"a separate `omi-notes worker` (pid {w.lock.owner()}) is processing this vault; "
                                     "run `omi-notes serve --no-worker` next to it")  # fmt: skip

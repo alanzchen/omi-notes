@@ -102,6 +102,12 @@ class SpeakerService:
 
     # -- review and samples (`speakers.review`) ---------------------------------------------------
 
+    def warm(self) -> None:
+        """Rebuild what changed since the last request (the review queue's order and, through it, the voice
+        space) so requests only slice cached results; a no-op when nothing changed. Called by the worker."""
+        if self.pipeline.providers.embedder is not None:
+            self.review.entries()
+
     def review_items(self, limit: int, offset: int = 0) -> dict:
         return self.review.page(limit, offset)
 

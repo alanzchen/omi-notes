@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import io
 import json
+import threading
 import time
 import uuid
 
@@ -60,6 +61,8 @@ class Review:
         self.store = service.store
         self.db = service.db
         self.pipeline = service.pipeline
+        self._cache: tuple | None = None  # (evidence_key, entries)
+        self._cache_lock = threading.Lock()
 
     # -- views -----------------------------------------------------------------------------------
 
@@ -165,7 +168,29 @@ class Review:
         then unconfirmed samples), with the queue's `total` and the `next_offset` (None at the end), so a phone
         that skips items can page past them. Only the page's items are built."""
         now = time.time() if now is None else now
+        entries = self.entries(now)
+        offset = max(0, offset)
+        chosen = entries[offset:offset + limit]
+        evidence = self._evidence() if any(kind == "label" for kind, _ in chosen) else ""
+        out = [self._sample_item(v) if kind == "sample" else self._label_item(*v, evidence=evidence) for kind, v in chosen]
+        end = offset + len(chosen)
+        return {"items": out, "total": len(entries), "next_offset": end if end < len(entries) else None}
+
+    def entries(self, now: float | None = None) -> list[tuple]:
+        """The queue's order, built once per `evidence_key` (a page is a slice of it); the worker warms it."""
+        now = time.time() if now is None else now
         self.store.sync_samples()
+        embedder = self.pipeline.providers.embedder
+        key = self.store.evidence_key(embedder.model, embedder.model_sha) if embedder else None
+        with self._cache_lock:
+            if key is not None and self._cache is not None and self._cache[0] == key:
+                return self._cache[1]
+        built = self._entries(now)
+        with self._cache_lock:
+            self._cache = (key, built) if key is not None else None
+        return built
+
+    def _entries(self, now: float) -> list[tuple]:
         flagged, rest = [], []
         for r in self.db.query("SELECT * FROM samples ORDER BY created_at DESC, id"):
             if not sample_eligible(r):
@@ -180,12 +205,7 @@ class Review:
         entries = [("sample", d) for *_, d in sorted(flagged, key=lambda x: (x[0], x[1]))]
         entries += [("label", key) for key in self._label_keys(now)]
         entries += [("sample", d) for d in rest]
-        offset = max(0, offset)
-        chosen = entries[offset:offset + limit]
-        evidence = self._evidence() if any(kind == "label" for kind, _ in chosen) else ""
-        out = [self._sample_item(v) if kind == "sample" else self._label_item(*v, evidence=evidence) for kind, v in chosen]
-        end = offset + len(chosen)
-        return {"items": out, "total": len(entries), "next_offset": end if end < len(entries) else None}
+        return entries
 
     def label_items(self, limit: int, now: float) -> list[dict]:
         """Recent automatic names and "possibly X" hints, newest conversation first."""
