@@ -173,6 +173,9 @@ class Review:
         chosen = entries[offset:offset + limit]
         evidence = self._evidence() if any(kind == "label" for kind, _ in chosen) else ""
         out = [self._sample_item(v) if kind == "sample" else self._label_item(*v, evidence=evidence) for kind, v in chosen]
+        names = {p["id"]: p["name"] for p in self.store.people()}
+        for item in out:  # the person each item asks about, by name (the phone never shows a placeholder)
+            item["person_name"] = names.get(item.get("person_id"))
         end = offset + len(chosen)
         return {"items": out, "total": len(entries), "next_offset": end if end < len(entries) else None}
 

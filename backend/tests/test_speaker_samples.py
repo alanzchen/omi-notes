@@ -917,3 +917,13 @@ def test_a_review_page_is_a_slice_of_a_queue_built_once_per_change(env, monkeypa
     for offset in range(whole["total"]):
         assert client.get(f"/v1/speakers/review?limit=1&offset={offset}", headers=AUTH).status_code == 200
     assert builds["n"] == 1, "pages slice one built queue"
+
+
+def test_every_review_item_names_the_person_it_asks_about(env):
+    # TestFlight 49 feedback "TA 是谁？": the phone showed "是 TA 吗?" when its separately loaded people list
+    # was empty; each item now carries the name itself
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    flag_one(worker, me, ids[0])
+    items = review(client, limit=50)
+    assert items and all(i.get("person_name") == "Alan" for i in items if i["person_id"] == me)
