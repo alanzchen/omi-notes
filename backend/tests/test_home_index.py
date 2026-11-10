@@ -80,7 +80,7 @@ def full_scans(db, statements) -> list[str]:
         for d in details:
             if not d.startswith("SCAN conversations"):
                 continue
-            paged = "USING INDEX conversations_start" in d and "LIMIT" in sql
+            paged = re.search(r"USING INDEX conversations_(start|listed)$", d) is not None and "LIMIT" in sql
             filtered = re.search(r"\b(kind|day)\s*(=|IN)|json_extract\(index_json|speech_seconds", sql)
             if not paged or filtered:
                 out.append(f"{sql}\n  -> {details}")

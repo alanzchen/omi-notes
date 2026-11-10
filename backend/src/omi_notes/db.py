@@ -22,7 +22,13 @@ from pathlib import Path
 
 from .spool import make_dirs_durable
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
+
+# Rows the app lists: voice-enrollment readings are never conversations; set-aside recordings (under 1.5 s of
+# speech) are kept with their audio but listed nowhere. The listing indexes are partial on exactly this text, so
+# a query that includes it walks only listed rows.
+LISTED = ("enrollment_id IS NULL AND COALESCE(waiting_for, '') <> 'voice enrollment' "
+          "AND COALESCE(relevance, '') <> 'too_short'")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -258,7 +264,9 @@ CREATE INDEX IF NOT EXISTS conversations_device ON conversations(device_id, star
 -- index lookups, never a scan of every conversation
 CREATE INDEX IF NOT EXISTS conversations_start ON conversations(start, id);
 CREATE INDEX IF NOT EXISTS conversations_day ON conversations(day, speech_seconds);
-CREATE INDEX IF NOT EXISTS conversations_kind ON conversations(kind, start, id);
+-- the list pages newest first by a (start, id) row-value cursor: a seek, never a walk over newer rows
+CREATE INDEX IF NOT EXISTS conversations_listed ON conversations(start, id) WHERE @LISTED@;
+CREATE INDEX IF NOT EXISTS conversations_listed_kind ON conversations(kind, start, id) WHERE @LISTED@;
 CREATE INDEX IF NOT EXISTS conversations_unsummarized_deferred ON conversations(start) WHERE deferral IS NOT NULL AND note_path IS NULL;
 
 -- decision.known_through: speech from (capture, seq) is known to a finalized conversation iff
@@ -348,6 +356,7 @@ CREATE VIEW IF NOT EXISTS event_times AS
     SELECT e.*, COALESCE(k.capture_started_at + e.offset_us / 1e6, e.at) AS t
     FROM events e LEFT JOIN captures k ON k.capture_id = e.capture_id;
 """
+SCHEMA = SCHEMA.replace("@LISTED@", LISTED)
 
 _SEAL = "raw/<dev>/<cap>/seal.json"
 _HEADER = "chunk envelope header (or <seq>.gone tombstone header)"

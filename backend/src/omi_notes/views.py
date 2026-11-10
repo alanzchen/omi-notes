@@ -19,6 +19,8 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from .db import LISTED as _LISTED
+
 from .notes.schema import ConversationNotes
 from .notes.writer import UserRegionError, extract_my_notes, generated_sha, read_note_id
 from .util import canonical_json, iso_utc_epoch, sha256_hex
@@ -27,10 +29,8 @@ PREVIEW_CHARS = 160
 SEGMENT_PAGE = 500
 ISSUE_LIMIT = 20
 
-# Rows the app lists: voice-enrollment readings are never conversations.
-# set-aside recordings (under 1.5 s of speech) are kept with their audio but listed nowhere
-LISTED = ("enrollment_id IS NULL AND COALESCE(waiting_for, '') <> 'voice enrollment' "
-          "AND COALESCE(relevance, '') <> 'too_short'")
+# Rows the app lists (`db.LISTED`: the listing indexes are partial on it)
+LISTED = _LISTED
 # a failure the owner dismissed from the phone (that very failure; a later one shows again)
 NOT_DISMISSED = ("NOT (COALESCE(json_extract(resolution, '$.kind'), '') = 'dismissed' "
                  "AND json_extract(resolution, '$.failure.id') IS failure_id)")

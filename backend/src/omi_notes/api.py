@@ -282,8 +282,9 @@ def create_app(
             cursor = views.parse_cursor(before)
             if cursor is None:
                 raise ApiError(422, "invalid_cursor", "before must be a cursor returned by this endpoint")
-            where += " AND (start < ? OR (start = ? AND id < ?))"
-            params += [cursor[0], cursor[0], cursor[1]]
+            # a row value: an index seek to the cursor (an OR of two comparisons walked every newer row)
+            where += " AND (start, id) < (?, ?)"
+            params += [cursor[0], cursor[1]]
         rows = db.query(f"SELECT * FROM conversations WHERE {where} ORDER BY start DESC, id DESC LIMIT ?", (*params, limit + 1))
         page = rows[:limit]
         return {
