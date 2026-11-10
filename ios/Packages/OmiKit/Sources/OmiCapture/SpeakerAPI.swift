@@ -58,6 +58,41 @@ extension APIClient {
         return try await json("POST", "/v1/speakers/undo", body: Body(requestId: requestId, undoRequestId: undoRequestId))
     }
 
+    // MARK: 声纹 hub (servers with `voice_review`)
+
+    /// The next questions, suspicious first (the server's order).
+    /// One page from `offset` (an index into the server's order; an older server ignores it).
+    public func reviewItems(limit: Int, offset: Int? = nil) async throws -> ReviewItemsResponse {
+        let query = "limit=\(limit)" + (offset.map { $0 > 0 ? "&offset=\($0)" : "" } ?? "")
+        return try await json("GET", "/v1/speakers/review", query: query)
+    }
+
+    /// `confirm`, `reject` or `move` (with `personId`). A changed item → `APIError.http(409, "stale_review: …")`.
+    public func decideReview(_ itemId: String, decision: String, personId: String? = nil, requestId: String) async throws -> ReviewDecisionAnswer {
+        struct Body: Encodable { var decision: String; var personId: String?; var requestId: String }
+        return try await json("POST", "/v1/speakers/review/\(Self.pathSegment(itemId))",
+                              body: Body(decision: decision, personId: personId, requestId: requestId))
+    }
+
+    /// A person's samples in one state (`active`, `flagged`, `removed`, `moved`).
+    public func samples(personId: String, state: String) async throws -> [VoiceSample] {
+        let r: VoiceSamplesResponse = try await json("GET", "/v1/people/\(personId)/samples", query: "state=\(state)")
+        return r.samples
+    }
+
+    /// `remove`, `restore` or `move` (with `personId`); `expectedRevision` refuses a sample changed since it was listed.
+    public func sampleAction(_ sampleId: String, action: String, personId: String? = nil, expectedRevision: Int?,
+                             requestId: String) async throws -> SampleActionAnswer {
+        struct Body: Encodable { var requestId: String; var expectedRevision: Int?; var personId: String? }
+        return try await json("POST", "/v1/samples/\(sampleId)/\(action)",
+                              body: Body(requestId: requestId, expectedRevision: expectedRevision, personId: personId))
+    }
+
+    /// Review item ids carry `.`-separated parts (labels too); anything else a path can't hold is escaped.
+    static func pathSegment(_ s: String) -> String {
+        s.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))) ?? s
+    }
+
     public func dismissSuggestion(_ id: String) async throws {
         _ = try await raw("POST", "/v1/speakers/suggestions/\(id)/dismiss")
     }
@@ -130,6 +165,21 @@ extension APIClient {
         do { return try Self.snakeDecoder.decode(T.self, from: data) } catch { throw APIError.decoding("\(error)") }
     }
 
+    /// The voices calls answer in tens of milliseconds; this only bounds a stuck connection.
+    static let voicesTimeout: TimeInterval = 20
+
+    /// A GET (idempotent) that hit a network problem is tried once more before failing; anything else
+    /// is sent once (a decision is retried only by the owner, with the same request id).
+    private static func send(_ req: URLRequest, session: URLSession) async throws -> (Data, URLResponse) {
+        do {
+            return try await session.data(for: req)
+        } catch {
+            guard let trouble = NetworkTrouble(error) else { throw error }
+            guard req.httpMethod == "GET" else { throw trouble }
+            do { return try await session.data(for: req) } catch { throw NetworkTrouble(error) ?? error }
+        }
+    }
+
     private func raw(_ method: String, _ path: String, query: String? = nil, body: Data? = nil, accept: String = "application/json") async throws -> Data {
         guard let url = endpoint.url(path, query: query) else { throw APIError.notConfigured }
         var req = URLRequest(url: url)
@@ -140,10 +190,13 @@ extension APIClient {
             req.httpBody = body
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
+        req.timeoutInterval = Self.voicesTimeout
         let data: Data
         let resp: URLResponse
         do {
-            (data, resp) = try await session.data(for: req)
+            (data, resp) = try await Self.send(req, session: session)
+        } catch let trouble as NetworkTrouble {
+            throw trouble
         } catch {
             throw APIError.transport((error as NSError).localizedDescription)
         }
@@ -154,4 +207,33 @@ extension APIClient {
         }
         return data
     }
+}
+
+/// A network problem in words the owner can act on (never "The request timed out.").
+public enum NetworkTrouble: Error, Equatable, Sendable, LocalizedError {
+    /// The request timed out.
+    case slow
+    /// No connection, or the server couldn't be reached.
+    case unreachable
+
+    public init?(_ error: Error) {
+        if let trouble = error as? NetworkTrouble { self = trouble; return }
+        guard let url = error as? URLError else { return nil }
+        switch url.code {
+        case .timedOut: self = .slow
+        case .notConnectedToInternet, .networkConnectionLost, .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
+             .dataNotAllowed, .internationalRoamingOff, .secureConnectionFailed:
+            self = .unreachable
+        default: return nil
+        }
+    }
+
+    public var message: String {
+        switch self {
+        case .slow: return "网络有点慢，点这里重试"
+        case .unreachable: return "连不上服务器"
+        }
+    }
+
+    public var errorDescription: String? { message }
 }

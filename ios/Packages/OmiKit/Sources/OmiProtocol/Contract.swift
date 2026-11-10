@@ -465,6 +465,12 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
     public var supportsDismiss: Bool { features?.contains("dismiss") == true }
     /// Clip text, suggestion scope, durable "keep unknown" and undo for naming voices.
     public var supportsNameVoice: Bool { features?.contains("name_voice") == true }
+    /// The 声纹 hub: review queue, per-person samples (remove / restore / move) and their undo.
+    public var supportsVoiceReview: Bool { features?.contains("voice_review") == true }
+    /// People carry the last calibration time and held-out counts (`measured`).
+    public var supportsVoiceCalibration: Bool { features?.contains("voice_calibration") == true }
+    /// `POST /v1/people/{id}/enrollments/import`.
+    public var supportsEnrollmentImport: Bool { features?.contains("enrollment_import") == true }
     /// A note's recording can be played (`/v1/conversations/{id}/recording`).
     public var supportsRecording: Bool { features?.contains("recording") == true }
     /// Value assessments, highlights and the owner's priority choice.

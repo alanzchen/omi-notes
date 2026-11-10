@@ -26,6 +26,10 @@ public struct VoiceItem: Identifiable, Equatable, Sendable {
     public var otherDay: SpeakerClip?
     /// Every conversation naming this voice changes (one for a single speaker).
     public var scope: [ConversationContext]
+    /// For a speaker taken from the review queue: the speakers revision (and transcript, when known)
+    /// it was heard against. Naming it is refused if the conversation changed since.
+    public var reviewedRevision: Int?
+    public var reviewedTranscript: String?
 
     public var id: String {
         switch target {
@@ -96,6 +100,8 @@ public final class NameVoiceFlow {
     public private(set) var busy = false
     public private(set) var error: String?
     public var undoWindow: Duration = .seconds(6)
+
+    public static let changedSinceReview = "这段已更新，请重新听"
 
     private let speakers: SpeakersModel
     private var revisions: [String: Int]
@@ -169,14 +175,26 @@ public final class NameVoiceFlow {
                     try await speakers.keepUnknown(s, requestId: requestId)
                 }
             case .label(let conv, let label):
-                let revision = try await revision(of: conv)
+                let revision: Int
+                if let reviewed = item.reviewedRevision {
+                    // what was heard must still be what is named: compare with the conversation now
+                    let fresh = try await speakers.speakers(conversationId: conv)
+                    let transcriptChanged = item.reviewedTranscript.map { $0 != fresh.transcriptSha } ?? false
+                    guard fresh.revision == reviewed, !transcriptChanged else {
+                        error = Self.changedSinceReview
+                        return false
+                    }
+                    revision = reviewed
+                } else {
+                    revision = try await self.revision(of: conv)
+                }
                 let result = try await speakers.assignLabel(conversationId: conv, label: label, personId: person?.id,
                                                             keepUnknown: keepUnknown, revision: revision, requestId: requestId)
                 revisions[conv] = result.revision
             }
         } catch APIError.http(409, _) {
             if case .label(let conv, _) = item.target { revisions[conv] = nil }
-            error = "The speakers changed on the server meanwhile. Check and try again."
+            error = item.reviewedRevision != nil ? Self.changedSinceReview : "The speakers changed on the server meanwhile. Check and try again."
             return false
         } catch {
             self.error = "Couldn't save: \(SpeakersModel.describe(error))"
