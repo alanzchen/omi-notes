@@ -1165,19 +1165,19 @@ class ConversationPipeline:
     def provisional_wearer(self) -> tuple[str, np.ndarray, np.ndarray] | None:
         """(generation key, centred centroid, GA) of the wearer's voice when it can identify him: a "me" person
         whose model is active (the automatic-naming gate, `match.activation`) and has a centred centroid; None
-        otherwise (the provisional class is then `undetermined`). Rebuilt only when the Voices calibration
-        generation (the published `calibration.json` fingerprint), the wearer or the voice model changes, so the
-        per-tick check is one small file read."""
+        otherwise (the provisional class is then `undetermined`).
+
+        Cached under the current evidence (`SpeakerStore.evidence_key`, the digest the voice space is cached
+        under: samples and their states, label states, people and consent, forgets and journaled operations),
+        never under the published calibration, which lags a rejection or consent change and survives a forget.
+        The generation key names what the class depends on: the wearer, his model's samples and the voice
+        model, so evidence that changes nothing of his model (another conversation finishing) redoes nothing."""
         embedder = self.providers.embedder
         me = self.speakers.me()
         if embedder is None or me is None:
             return None
-        try:
-            fingerprint = (Vault.read_json(self.vault.speakers / "calibration.json") or {}).get("fingerprint")
-        except (OSError, ValueError):
-            fingerprint = None
-        generation = (fingerprint, me["id"], embedder.model_sha)
-        if self._wearer_cache is not None and self._wearer_cache[0] == generation:
+        evidence = (self.speakers.evidence_key(embedder.model, embedder.model_sha), me["id"])
+        if self._wearer_cache is not None and self._wearer_cache[0] == evidence:
             return self._wearer_cache[1]
         wearer = None
         model = self.speakers.models(embedder.model, embedder.model_sha, self.operating).get(me["id"])
@@ -1185,9 +1185,10 @@ class ConversationPipeline:
             space = self.voice_space(embedder)
             centroid = space.centroids.get(me["id"]) if space else None
             if centroid is not None:
-                key = sha256_hex(f"{fingerprint}|{me['id']}|{embedder.model_sha}|{deferral.RULE_WINDOWS}".encode())[:16]
-                wearer = (key, centroid, space.ga)
-        self._wearer_cache = (generation, wearer)
+                samples = sorted(f"{s.id}:{getattr(s, 'state', 'active')}" for s in model.samples)
+                basis = f"{me['id']}|{embedder.model_sha}|{deferral.RULE_WINDOWS}|{','.join(samples)}"
+                wearer = (sha256_hex(basis.encode())[:16], centroid, space.ga)
+        self._wearer_cache = (evidence, wearer)
         return wearer
 
     def refresh_provisional(self, now: float, *, limit: int = PROVISIONAL_BATCH) -> int:
@@ -1223,6 +1224,9 @@ class ConversationPipeline:
                 features: dict = {"speech_s": row["speech_seconds"]}
                 if wearer is not None:
                     features["windows"] = self._wearer_windows(row, wearer)
+                    current = self.provisional_wearer()  # scoring takes a while: the evidence may have changed
+                    if (current[0] if current else None) != key:
+                        continue  # never committed from revoked evidence; due again under the new generation
                 cls, confidence, rule = deferral.provisional_class(features)
                 provisional = {"class": cls, "confidence": confidence, "rule_id": rule, "model": key}
                 self._commit(row["id"], deferral=json.dumps(block | {"provisional": provisional}, sort_keys=True),

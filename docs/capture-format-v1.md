@@ -498,7 +498,7 @@ isn't active) it is `undetermined` (未确定) and `model` is null. Once it can,
 speech against his voice in the background and the class becomes `monologue` or `dialogue` (`confidence:
 "low"`, `rule_id: "wearer-windows-v1"`, `model`: the wearer generation it was made with), or stays
 `undetermined` without confirmed wearer speech. It is never `passive` (a voice can't prove the wearer absent),
-and a borderline case is `dialogue`. It is re-derived whenever the Voices calibration generation changes. A class change on a deferred session
+and a borderline case is `dialogue`. It is re-derived whenever the wearer's model changes (his samples, their states, consent or a forget). A class change on a deferred session
 is stored and shown, and schedules nothing; the first summary applies it. Raw audio is kept as always.
 
 ### `POST /v1/conversations/{id}/transcribe` (servers with `deferred_transcription`)

@@ -18,7 +18,7 @@ enrollments and recordings under 1.5 s (set aside without a note) are never defe
 voice model that can identify him (a "me" person whose model is active, `ConversationPipeline.provisional_wearer`)
 the answer is `undetermined`, never a guess, and nothing is decoded. With one, the worker scores short windows of
 the session's speech against his centred centroid (`speakers.space`) in the background (`refresh_provisional`),
-and again whenever the Voices calibration generation, the wearer or the voice model changes (the block's `model`
+and again whenever the wearer, his model's samples or the voice model change (the block's `model`
 names the generation it was made with). A voice can confirm the wearer, never prove him absent, so the provisional
 class is never `passive`; a borderline case takes the more conversational class (dialogue over monologue).
 """

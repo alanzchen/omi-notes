@@ -116,24 +116,6 @@ def test_one_unreadable_session_never_stalls_the_others(client, worker, monkeypa
     assert provisional(worker, first["id"])["class"] == "undetermined"
 
 
-def test_the_wearer_follows_the_voices_calibration_generation(client, worker, settings, monkeypatch):
-    """`provisional_wearer` rebuilds the wearer's model only when the published calibration's fingerprint (or the
-    wearer, or the voice model) changes: a cheap check on every tick."""
-    pipeline = worker.pipeline
-    worker.providers._embedder = FakeEmbedder()
-    monkeypatch.setattr(pipeline.speakers, "me", lambda: {"id": "p-me", "name": "Alan"})
-    built = []
-    monkeypatch.setattr(pipeline.speakers, "models", lambda *a: built.append(1) or {})
-    path = settings.vault_dir / "_omi" / "speakers" / "calibration.json"
-    Vault.write_json(path, {"fingerprint": "a"})
-    assert pipeline.provisional_wearer() is None and pipeline.provisional_wearer() is None
-    assert len(built) == 1
-    Vault.write_json(path, {"fingerprint": "b"})  # samples or consent changed: a new generation
-    pipeline.provisional_wearer()
-    assert len(built) == 2
-    assert json.loads(path.read_text())["fingerprint"] == "b"
-
-
 # -- the work queue (Astra, review of main 9b11b7c) -------------------------------------------------------------------
 
 
@@ -189,3 +171,65 @@ def test_a_settled_queue_costs_nothing_whatever_the_number_of_deferred_sessions(
         _, cost = steps.measure(lambda: worker.pipeline.refresh_provisional(T0 + 1))
         costs.append(cost)
     assert costs[1] <= costs[0] * 1.3 + 500, costs
+
+
+# -- the wearer follows the current evidence (Astra, review of main 9b11b7c) ------------------------------------------
+
+
+class Evidence:
+    """The speaker store as the provisional wearer sees it: an evidence digest, the wearer's model and the space."""
+
+    def __init__(self, worker, monkeypatch):
+        from types import SimpleNamespace
+
+        from omi_notes.speakers.space import RmSpace
+
+        self.key, self.active, self.samples, self.models_built = "e1", True, ["s1", "s2", "s3"], 0
+        embedder = worker.providers._embedder = FakeEmbedder()
+        _, centroid, ga = wearer_of(embedder)
+        store = worker.pipeline.speakers
+        monkeypatch.setattr(store, "me", lambda: {"id": "p-me", "name": "Alan"})
+        monkeypatch.setattr(store, "evidence_key", lambda model, sha: self.key)
+
+        def models(*_a):
+            self.models_built += 1
+            samples = [SimpleNamespace(id=i, state="active") for i in self.samples]
+            return {"p-me": SimpleNamespace(active=self.active, samples=samples, centroid=centroid)}
+
+        monkeypatch.setattr(store, "models", models)
+        monkeypatch.setattr(worker.pipeline, "voice_space", lambda e: RmSpace(ga=ga, centroids={"p-me": centroid}, count=500))
+
+
+def test_a_revoked_wearer_is_never_served_from_the_cache(client, worker, settings, monkeypatch):
+    """Rejecting samples, a consent change or a forget changes the evidence at once, while the published calibration
+    (debounced, and kept by a forget) still says the same: the wearer must follow the evidence."""
+    ev = Evidence(worker, monkeypatch)
+    Vault.write_json(settings.vault_dir / "_omi" / "speakers" / "calibration.json", {"fingerprint": "same"})
+    pipeline = worker.pipeline
+    first = pipeline.provisional_wearer()
+    assert first is not None and pipeline.provisional_wearer()[0] == first[0] and ev.models_built == 1, "cached"
+    ev.key, ev.active = "e2", False  # a sample rejected: the model is no longer active
+    assert pipeline.provisional_wearer() is None
+    ev.key, ev.active = "e3", True
+    assert pipeline.provisional_wearer()[0] == first[0], "the same samples: the same generation, nothing to redo"
+    ev.key, ev.samples = "e4", ["s1", "s2"]
+    assert pipeline.provisional_wearer()[0] != first[0], "other samples: another generation"
+
+
+def test_a_result_is_committed_only_if_the_wearer_is_still_the_same(client, worker, monkeypatch):
+    ev = Evidence(worker, monkeypatch)
+    (conv,) = deferred_rows(worker, 1, model=None)
+    pipeline = worker.pipeline
+
+    def windows(row, wearer):
+        ev.key, ev.active = "e9", False  # revoked while the session was being scored
+        return [(9.0, 0.9)]
+
+    monkeypatch.setattr(pipeline, "_wearer_windows", windows)
+    pipeline.refresh_provisional(T0)
+    row = worker.db.one("SELECT deferral, prov_due FROM conversations WHERE id=?", (conv,))
+    assert json.loads(row["deferral"])["provisional"]["class"] == "undetermined", "never a class from revoked evidence"
+    pipeline.refresh_provisional(T0 + 1)
+    row = worker.db.one("SELECT deferral, prov_due FROM conversations WHERE id=?", (conv,))
+    assert json.loads(row["deferral"])["provisional"] == {"class": "undetermined", "confidence": None,
+                                                          "rule_id": "none-v1", "model": None}
