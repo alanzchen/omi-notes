@@ -76,6 +76,17 @@ struct VoicePersonView: View {
             }
         }
         .animation(.snappy, value: samples.undoable)
+        #if DEBUG
+        // simulator automation: `-OmiNotesDebugVoicesTab active|flagged|removed`
+        .onAppear {
+            switch UserDefaults.standard.string(forKey: "OmiNotesDebugVoicesTab") {
+            case "active": samples.tab = .active
+            case "flagged": samples.tab = .flagged
+            case "removed": samples.tab = .removed
+            default: break
+            }
+        }
+        #endif
         .task(id: samples.tab) {
             player.stop()
             if speakers.serverSupportsVoiceReview { await samples.load() }

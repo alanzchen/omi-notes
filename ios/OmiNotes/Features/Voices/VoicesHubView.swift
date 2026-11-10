@@ -15,6 +15,9 @@ struct VoicesHubView: View {
     @State private var reviewing = false
     @State private var showEnrollment = false
     @State private var showSettings = false
+    #if DEBUG
+    @State private var debugRoute: Route?
+    #endif
 
     private var speakers: SpeakersModel { model.speakers }
     private var cards: [Person] { VoicesHub.cards(speakers.people) }
@@ -60,10 +63,26 @@ struct VoicesHubView: View {
         .sheet(isPresented: $showEnrollment) { EnrollmentView(model: model) }
         .sheet(isPresented: $showSettings) { RecognitionSettingsView(model: model) }
         #if DEBUG
+        // simulator automation: `-OmiNotesDebugVoices review|unknown|person:<name>` opens that screen
+        .navigationDestination(item: $debugRoute) { route in
+            switch route {
+            case .person(let id): VoicePersonView(model: model, personId: id)
+            case .unknownVoices: UnknownVoicesView(model: model)
+            }
+        }
         .onAppear {
             if let name = UserDefaults.standard.string(forKey: "OmiNotesDebugEnrollment") {
                 speakers.debugShowEnrollment(name)
                 showEnrollment = true
+            }
+        }
+        .task {
+            guard let raw = UserDefaults.standard.string(forKey: "OmiNotesDebugVoices") else { return }
+            await speakers.refresh()
+            if raw == "review" { reviewing = true }
+            if raw == "unknown" { debugRoute = .unknownVoices }
+            if raw.hasPrefix("person:"), let p = speakers.people.first(where: { $0.name == raw.dropFirst(7) }) {
+                debugRoute = .person(p.id)
             }
         }
         #endif

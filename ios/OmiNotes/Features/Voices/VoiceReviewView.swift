@@ -48,7 +48,19 @@ struct VoiceReviewView: View {
             }
             .animation(.snappy, value: queue.current?.id)
         }
-        .task { if queue.items.isEmpty, queue.phase == .loading { await queue.load() } }
+        .task {
+            if queue.items.isEmpty, queue.phase == .loading { await queue.load() }
+            #if DEBUG
+            // simulator automation: `-OmiNotesDebugVoicesSkip <n>` skips n cards, `-OmiNotesDebugVoicesAnswer
+            // confirm|reject` answers the next one and keeps its undo toast up
+            let defaults = UserDefaults.standard
+            for _ in 0..<defaults.integer(forKey: "OmiNotesDebugVoicesSkip") { queue.skip() }
+            if let raw = defaults.string(forKey: "OmiNotesDebugVoicesAnswer") {
+                queue.undoWindow = .seconds(600)
+                await queue.decide(raw == "reject" ? .reject : .confirm)
+            }
+            #endif
+        }
         .task(id: queue.current?.id) {
             player.stop()
             if let item = queue.current, item.canPlay, let clip = item.clip {
