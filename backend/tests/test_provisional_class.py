@@ -197,7 +197,9 @@ class Evidence:
             return {"p-me": SimpleNamespace(active=self.active, samples=samples, centroid=centroid)}
 
         monkeypatch.setattr(store, "models", models)
-        monkeypatch.setattr(worker.pipeline, "voice_space", lambda e: RmSpace(ga=ga, centroids={"p-me": centroid}, count=500))
+        self.ga, self.centroid = ga, centroid
+        monkeypatch.setattr(worker.pipeline, "voice_space",
+                            lambda e: RmSpace(ga=self.ga, centroids={"p-me": self.centroid}, count=500))
 
 
 def test_a_revoked_wearer_is_never_served_from_the_cache(client, worker, settings, monkeypatch):
@@ -233,3 +235,38 @@ def test_a_result_is_committed_only_if_the_wearer_is_still_the_same(client, work
     row = worker.db.one("SELECT deferral, prov_due FROM conversations WHERE id=?", (conv,))
     assert json.loads(row["deferral"])["provisional"] == {"class": "undetermined", "confidence": None,
                                                           "rule_id": "none-v1", "model": None}
+
+
+def test_forgetting_someone_else_moves_the_generation_through_the_background_voice(client, worker, monkeypatch):
+    """Astra (re-review of fix-50): forgetting another person changes GA, and with it the wearer's centred centroid
+    and every score, while his own samples stay the same. The generation must name every scoring dependency."""
+    import numpy as np
+
+    ev = Evidence(worker, monkeypatch)
+    pipeline = worker.pipeline
+    before = pipeline.provisional_wearer()[0]
+    ev.key = "e-forgot-priya"
+    ev.ga = ev.ga + 0.05  # her voices left the background mean
+    ev.centroid = ev.centroid / np.linalg.norm(ev.centroid)
+    assert pipeline.provisional_wearer()[0] != before
+
+
+def test_the_last_evidence_check_and_the_commit_hold_the_speaker_lock(client, worker, monkeypatch):
+    """Consent and forget changes take the speaker lock: the final check and the commit run under it, so neither can
+    land between them."""
+    Evidence(worker, monkeypatch)
+    (conv,) = deferred_rows(worker, 1, model=None)
+    pipeline = worker.pipeline
+    monkeypatch.setattr(pipeline, "_wearer_windows", lambda row, wearer: [(9.0, 0.9)])
+    held = []
+    real_commit, real_wearer = pipeline._commit, pipeline.provisional_wearer
+
+    def depth():
+        return getattr(pipeline.speakers.lock._local, "depth", 0)
+
+    monkeypatch.setattr(pipeline, "_commit", lambda *a, **k: held.append(("commit", depth())) or real_commit(*a, **k))
+    monkeypatch.setattr(pipeline, "provisional_wearer", lambda: held.append(("check", depth())) or real_wearer())
+    pipeline.refresh_provisional(T0)
+    assert json.loads(worker.db.one("SELECT deferral FROM conversations WHERE id=?", (conv,))["deferral"])[
+        "provisional"]["class"] == "monologue"
+    assert held[-2:] == [("check", 1), ("commit", 1)], held

@@ -17,6 +17,7 @@ conversation is advanced only under a durable claim, so two processes never work
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -1170,8 +1171,9 @@ class ConversationPipeline:
         Cached under the current evidence (`SpeakerStore.evidence_key`, the digest the voice space is cached
         under: samples and their states, label states, people and consent, forgets and journaled operations),
         never under the published calibration, which lags a rejection or consent change and survives a forget.
-        The generation key names what the class depends on: the wearer, his model's samples and the voice
-        model, so evidence that changes nothing of his model (another conversation finishing) redoes nothing."""
+        The generation key names everything a score depends on: the wearer and his samples, the voice model, the
+        rule, his centred centroid and the background voice (GA), exactly; evidence that changes none of these (a
+        conversation finishing without a stored voice) redoes nothing."""
         embedder = self.providers.embedder
         me = self.speakers.me()
         if embedder is None or me is None:
@@ -1185,9 +1187,14 @@ class ConversationPipeline:
             space = self.voice_space(embedder)
             centroid = space.centroids.get(me["id"]) if space else None
             if centroid is not None:
+                # every scoring dependency: the wearer, the voice model, the rule, and the exact centred centroid
+                # and background (GA) the windows are scored with; GA moves when anyone's voices enter or leave
+                # the consented population (a forget of someone else), changing every score
                 samples = sorted(f"{s.id}:{getattr(s, 'state', 'active')}" for s in model.samples)
-                basis = f"{me['id']}|{embedder.model_sha}|{deferral.RULE_WINDOWS}|{','.join(samples)}"
-                wearer = (sha256_hex(basis.encode())[:16], centroid, space.ga)
+                h = hashlib.sha256(f"{me['id']}|{embedder.model_sha}|{deferral.RULE_WINDOWS}|{','.join(samples)}|".encode())
+                h.update(np.ascontiguousarray(centroid, dtype="<f8").tobytes())
+                h.update(np.ascontiguousarray(space.ga, dtype="<f8").tobytes())
+                wearer = (h.hexdigest()[:16], centroid, space.ga)
         self._wearer_cache = (evidence, wearer)
         return wearer
 
@@ -1224,13 +1231,17 @@ class ConversationPipeline:
                 features: dict = {"speech_s": row["speech_seconds"]}
                 if wearer is not None:
                     features["windows"] = self._wearer_windows(row, wearer)
-                    current = self.provisional_wearer()  # scoring takes a while: the evidence may have changed
-                    if (current[0] if current else None) != key:
-                        continue  # never committed from revoked evidence; due again under the new generation
                 cls, confidence, rule = deferral.provisional_class(features)
                 provisional = {"class": cls, "confidence": confidence, "rule_id": rule, "model": key}
-                self._commit(row["id"], deferral=json.dumps(block | {"provisional": provisional}, sort_keys=True),
-                             prov_due=0, prov_retry_at=0)
+                # scoring takes a while: the evidence is checked again, and the result committed, under the speaker
+                # lock that consent changes and forgets take, so none can land in between
+                with self.speakers.lock:
+                    if wearer is not None:
+                        current = self.provisional_wearer()
+                        if (current[0] if current else None) != key:
+                            continue  # never committed from revoked evidence; due again under the new generation
+                    self._commit(row["id"], deferral=json.dumps(block | {"provisional": provisional}, sort_keys=True),
+                                 prov_due=0, prov_retry_at=0)
                 done += 1
             except Exception:
                 log.exception("could not derive the provisional class of %s", r["id"])
