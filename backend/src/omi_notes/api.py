@@ -271,8 +271,8 @@ def create_app(
             where += " AND day = ?"
             params.append(day)
         if short is not None:  # under (or at least) the short-session threshold of detected speech
-            where += " AND speech_seconds " + ("< ?" if short else ">= ?")
-            params.append(views.short_seconds(pipeline))
+            where += " AND short = ?"  # the indexed flag (`home.py`), against the same threshold as `short_s`
+            params.append(int(short))
         if recording_class is not None:  # filtered before paging, so a page is full and the cursor stays valid
             if recording_class not in home.KINDS:
                 raise ApiError(422, "invalid_class", "class must be monologue, dialogue, passive or undetermined")
@@ -291,7 +291,7 @@ def create_app(
             "conversations": [views.summary_row(pipeline, r) for r in page],
             "next_cursor": views.make_cursor(page[-1]) if len(rows) > limit else None,
             # each listed day of this page in full, whatever the filter and paging: short sessions and what needs a look
-            "days": home.day_totals(db, {views.local_day(pipeline, r) for r in page}, views.short_seconds(pipeline)),
+            "days": home.day_totals(db, {views.local_day(pipeline, r) for r in page}),
             "short_s": views.short_seconds(pipeline),
         }
 

@@ -45,10 +45,10 @@ def populate(db, days: int, per_day: int) -> None:
                 status, speech, note, deferral = ("failed" if k == 2 else "done"), 30.0, f"Conversations/{cid}.md", None
             index = json.dumps({"recording_class": {"class": kind, "revision": 0}}) if note else None
             rows.append((cid, "d", start, start + 60, status, speech, note, deferral, index,
-                         home.day_of(start, CHICAGO), now, now))  # fmt: skip
+                         home.day_of(start, CHICAGO), home.is_short(speech, 60.0), now, now))  # fmt: skip
     db.conn().executemany(
         "INSERT INTO conversations (id, device_id, start, end, status, speech_seconds, note_path, deferral, index_json, "
-        "day, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)  # fmt: skip
+        "day, short, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)  # fmt: skip
 
 
 class Recorder:
@@ -126,7 +126,7 @@ def test_home_list_queries_use_indexes_and_a_fixed_number_of_statements(client, 
         assert counts == test_home_list_queries_use_indexes_and_a_fixed_number_of_statements.small
 
 
-def test_day_totals_count_the_whole_day_in_one_query_without_a_python_loop(client, worker, monkeypatch):
+def test_day_totals_are_one_lookup_without_a_python_loop(client, worker, monkeypatch):
     populate(worker.db, 2, 30)
     from omi_notes import deferral
 
@@ -139,8 +139,7 @@ def test_day_totals_count_the_whole_day_in_one_query_without_a_python_loop(clien
     # 20 short per day (k % 3 in (1, 2)): 10 deferred waiting, one failure (k == 2)
     assert body["days"] == {day: {"short": 20, "deferred": 10, "requested": 0, "issues": 1}}
     assert len(calls) <= 1, "per-row predicates run only for the page's own rows"
-    totals = [s for s, _ in rec.on_conversations() if "GROUP BY day" in s]
-    assert len(totals) == 1
+    assert [s for s, _ in rec.statements if "day_totals" in s] == ["SELECT * FROM day_totals WHERE day IN (?)"]
 
 
 def test_the_kind_filter_lists_undetermined_and_owner_choices_and_survives_a_rebuild(client, worker, settings, monkeypatch):
@@ -173,7 +172,8 @@ def test_days_are_written_with_the_row_and_redone_when_the_timezone_changes(clie
     worker.tick(late.timestamp() + 400)
     (row,) = convs(worker)
     assert row["day"] == "2026-09-25"
-    home.ensure_days(worker.db, "Europe/Paris")
+    home.ensure_home(worker.db, "Europe/Paris", 60.0)
     assert convs(worker)[0]["day"] == "2026-09-26"
     worker.db.execute("UPDATE conversations SET day=NULL")
-    assert home.fill_days(worker.db, CHICAGO) == 1 and convs(worker)[0]["day"] == "2026-09-25"
+    assert home.fill_home(worker.db, CHICAGO, 60.0) == 1 and convs(worker)[0]["day"] == "2026-09-25"
+    assert convs(worker)[0]["short"] == 1

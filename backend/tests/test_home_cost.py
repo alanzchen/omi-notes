@@ -93,10 +93,7 @@ def populate(db, *, older: int = 0, newer: int = 0, crowd: int = 0, per_day: int
     with db.tx() as conn:
         conn.executemany(f"INSERT INTO conversations ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
                          [(*(r[c] for c in cols[:-2]), now, now) for r in rows])  # fmt: skip
-    if hasattr(home, "ensure_home"):
-        home.ensure_home(db, "America/Chicago", 60.0)
-    else:  # before the fix (to see the tests fail first)
-        home.ensure_days(db, "America/Chicago")
+    home.ensure_home(db, "America/Chicago", 60.0)
 
 
 DAY = home.day_of(T0 - 86400, CHICAGO)
@@ -107,6 +104,9 @@ PATHS = {
     "first page": ("/v1/conversations/recent?limit=20", "older", True),
     "cursor page": (f"/v1/conversations/recent?limit=20&before={CURSOR}", "newer", True),
     "class page": (f"/v1/conversations/recent?limit=5&class=dialogue&before={CURSOR}", "newer", True),
+    "day short page": (f"/v1/conversations/recent?limit=3&day={DAY}&short=true", "crowd", False),
+    "day long page": (f"/v1/conversations/recent?limit=2&day={DAY}&short=false", "crowd", False),
+    "day page": (f"/v1/conversations/recent?limit=3&day={DAY}", "crowd", False),
 }
 
 

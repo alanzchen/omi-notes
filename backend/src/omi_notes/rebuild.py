@@ -264,8 +264,8 @@ def apply_record(conn, record: dict, sha: str, now: float, vault: Vault | None =
         values["class_choice"] = _class_choice(vault, values["id"])
     current = conn.execute("SELECT * FROM conversations WHERE id=?", (values["id"],)).fetchone()
     values["record_sha"] = sha
-    if current is None or current["start"] != values["start"]:
-        values["day"] = None  # filled in the vault's timezone when the index is opened (`home.ensure_days`)
+    if current is None or current["start"] != values["start"] or current["speech_seconds"] != values.get("speech_seconds"):
+        values["day"] = None  # day and short flag filled when the index is opened, or by the worker (`home.py`)
     if current is None:
         values.update(created_at=values.get("finalized_at") or now, updated_at=now,
                       needs_render=int(values.get("note_path") is not None))  # fmt: skip
@@ -473,7 +473,7 @@ def open_index(settings: Settings, vault: Vault, *, sweep_orphans: bool = True, 
             sweep(db, vault)
         from . import home
 
-        home.ensure_days(db, home.timezone_name(settings, vault))
+        home.ensure_home(db, home.timezone_name(settings, vault), home.short_threshold(settings))
     return db
 
 

@@ -166,7 +166,8 @@ class Worker:
                 except Exception:
                     log.exception("could not apply recording-class choices")
             try:
-                home.fill_days(self.db, self.pipeline.tz)  # a row some write path left without its Home day
+                # a row some write path left without its Home day
+                home.fill_home(self.db, self.pipeline.tz, home.short_threshold(self.settings))
             except Exception:
                 log.exception("could not fill conversation days")
             if not self._ready_chunks():  # background: deferred sessions' provisional class for this wearer generation
@@ -783,7 +784,8 @@ class Worker:
                 "start_explicit": int(c.start_explicit),
                 "end_explicit": int(c.end_explicit),
                 "waiting_for": c.waiting_for or None,
-                "day": home.day_of(c.start, self.pipeline.tz),  # Home's indexed day (`home.py`)
+                "day": home.day_of(c.start, self.pipeline.tz),  # Home's indexed day and short flag (`home.py`)
+                "short": home.is_short(c.speech_seconds, home.short_threshold(self.settings)),
             }
             current = open_rows.get(conv_id)
             if current is None:

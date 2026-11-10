@@ -29,6 +29,19 @@ SCHEMA_VERSION = 11
 # a query that includes it walks only listed rows.
 LISTED = ("enrollment_id IS NULL AND COALESCE(waiting_for, '') <> 'voice enrollment' "
           "AND COALESCE(relevance, '') <> 'too_short'")
+# a failure the owner dismissed from the phone (that very failure; a later one shows again)
+NOT_DISMISSED = ("NOT (COALESCE(json_extract(resolution, '$.kind'), '') = 'dismissed' "
+                 "AND json_extract(resolution, '$.failure.id') IS failure_id)")
+# Home's per-day counts, as SQL over one row: the same predicates as `deferral.waiting`, `views.deferred_view`
+# ("requested") and `views.issues` plus a failure not dismissed
+WAITING = ("(deferral IS NOT NULL AND status IN ('closed','transcribing','summarizing') AND note_path IS NULL "
+           "AND retry_op IS NULL AND transcribe_op IS NULL AND json_extract(deferral, '$.requested') IS NULL)")
+REQUESTED = (f"(deferral IS NOT NULL AND status IN ('closed','transcribing','summarizing') AND note_path IS NULL "
+             f"AND NOT {WAITING})")
+ISSUE = (f"((status = 'failed' AND {NOT_DISMISSED})"
+         " OR (status = 'failed' AND note_path IS NOT NULL AND COALESCE(failed_stage, '') <> 'summarizing')"
+         " OR (edited AND NOT frozen AND note_path IS NOT NULL)"
+         " OR (status IN ('done','discarded') AND needs_render AND error IS NOT NULL AND next_attempt_at IS NOT NULL))")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -245,6 +258,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     transcribe_op TEXT,
     rerun INTEGER NOT NULL DEFAULT 0,
     day TEXT,
+    short INTEGER,
     class_choice TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
@@ -256,17 +270,59 @@ CREATE TABLE IF NOT EXISTS conversations (
         WHEN note_path IS NOT NULL THEN json_extract(index_json, '$.recording_class.class')
         WHEN deferral IS NOT NULL AND status <> 'failed'
             THEN COALESCE(class_choice, json_extract(deferral, '$.provisional.class'), 'undetermined')
-    END) VIRTUAL
+    END) VIRTUAL,
+    -- what the row adds to its day's totals (`day_totals`, kept by the triggers below)
+    t_short INTEGER GENERATED ALWAYS AS (CASE WHEN day IS NOT NULL AND short = 1 AND status <> 'open' AND @LISTED@
+        THEN 1 ELSE 0 END) VIRTUAL,
+    t_deferred INTEGER GENERATED ALWAYS AS (CASE WHEN t_short = 1 AND @WAITING@ THEN 1 ELSE 0 END) VIRTUAL,
+    t_requested INTEGER GENERATED ALWAYS AS (CASE WHEN t_short = 1 AND @REQUESTED@ THEN 1 ELSE 0 END) VIRTUAL,
+    t_issue INTEGER GENERATED ALWAYS AS (CASE WHEN t_short = 1 AND @ISSUE@ THEN 1 ELSE 0 END) VIRTUAL
 );
 CREATE INDEX IF NOT EXISTS conversations_status ON conversations(status);
 CREATE INDEX IF NOT EXISTS conversations_device ON conversations(device_id, start);
 -- Home's request paths (`/v1/conversations/recent`): a page, a day, a kind and a day's short-session totals are
 -- index lookups, never a scan of every conversation
 CREATE INDEX IF NOT EXISTS conversations_start ON conversations(start, id);
-CREATE INDEX IF NOT EXISTS conversations_day ON conversations(day, speech_seconds);
+CREATE INDEX IF NOT EXISTS conversations_day ON conversations(day);
 -- the list pages newest first by a (start, id) row-value cursor: a seek, never a walk over newer rows
 CREATE INDEX IF NOT EXISTS conversations_listed ON conversations(start, id) WHERE @LISTED@;
 CREATE INDEX IF NOT EXISTS conversations_listed_kind ON conversations(kind, start, id) WHERE @LISTED@;
+-- a day's page (all, or its short or longer sessions) in list order: the LIMIT ends the walk
+CREATE INDEX IF NOT EXISTS conversations_listed_day ON conversations(day, start, id) WHERE @LISTED@;
+CREATE INDEX IF NOT EXISTS conversations_listed_day_short ON conversations(day, short, start, id) WHERE @LISTED@;
+CREATE INDEX IF NOT EXISTS conversations_listed_short ON conversations(short, start, id) WHERE @LISTED@;
+
+-- Per local day, over its listed short sessions: how many, how many wait deferred, how many were asked for and
+-- aren't done, how many need a look. Kept by these triggers in the same statement (so the same transaction) as
+-- every change of a conversation row; `home.rebuild_totals` recomputes it from the rows.
+CREATE TABLE IF NOT EXISTS day_totals (
+    day TEXT PRIMARY KEY,
+    short INTEGER NOT NULL DEFAULT 0,
+    deferred INTEGER NOT NULL DEFAULT 0,
+    requested INTEGER NOT NULL DEFAULT 0,
+    issues INTEGER NOT NULL DEFAULT 0
+);
+CREATE TRIGGER IF NOT EXISTS conversations_totals_insert AFTER INSERT ON conversations WHEN NEW.t_short = 1 BEGIN
+    INSERT INTO day_totals (day, short, deferred, requested, issues)
+        VALUES (NEW.day, 1, NEW.t_deferred, NEW.t_requested, NEW.t_issue)
+        ON CONFLICT(day) DO UPDATE SET short = short + 1, deferred = deferred + excluded.deferred,
+            requested = requested + excluded.requested, issues = issues + excluded.issues;
+END;
+CREATE TRIGGER IF NOT EXISTS conversations_totals_update AFTER UPDATE ON conversations
+WHEN OLD.day IS NOT NEW.day OR OLD.t_short <> NEW.t_short OR OLD.t_deferred <> NEW.t_deferred
+    OR OLD.t_requested <> NEW.t_requested OR OLD.t_issue <> NEW.t_issue BEGIN
+    UPDATE day_totals SET short = short - OLD.t_short, deferred = deferred - OLD.t_deferred,
+        requested = requested - OLD.t_requested, issues = issues - OLD.t_issue
+        WHERE day = OLD.day AND OLD.t_short = 1;
+    INSERT INTO day_totals (day, short, deferred, requested, issues)
+        SELECT NEW.day, 1, NEW.t_deferred, NEW.t_requested, NEW.t_issue WHERE NEW.t_short = 1
+        ON CONFLICT(day) DO UPDATE SET short = short + 1, deferred = deferred + excluded.deferred,
+            requested = requested + excluded.requested, issues = issues + excluded.issues;
+END;
+CREATE TRIGGER IF NOT EXISTS conversations_totals_delete AFTER DELETE ON conversations WHEN OLD.t_short = 1 BEGIN
+    UPDATE day_totals SET short = short - 1, deferred = deferred - OLD.t_deferred,
+        requested = requested - OLD.t_requested, issues = issues - OLD.t_issue WHERE day = OLD.day;
+END;
 CREATE INDEX IF NOT EXISTS conversations_unsummarized_deferred ON conversations(start) WHERE deferral IS NOT NULL AND note_path IS NULL;
 
 -- decision.known_through: speech from (capture, seq) is known to a finalized conversation iff
@@ -356,7 +412,8 @@ CREATE VIEW IF NOT EXISTS event_times AS
     SELECT e.*, COALESCE(k.capture_started_at + e.offset_us / 1e6, e.at) AS t
     FROM events e LEFT JOIN captures k ON k.capture_id = e.capture_id;
 """
-SCHEMA = SCHEMA.replace("@LISTED@", LISTED)
+SCHEMA = (SCHEMA.replace("@LISTED@", LISTED).replace("@WAITING@", WAITING).replace("@REQUESTED@", REQUESTED)
+          .replace("@ISSUE@", ISSUE))
 
 _SEAL = "raw/<dev>/<cap>/seal.json"
 _HEADER = "chunk envelope header (or <seq>.gone tombstone header)"
@@ -365,6 +422,8 @@ _CAPTURE_JSON = "raw/<dev>/<cap>/capture.json evidence for deleted chunks"
 
 # table -> column -> where its value comes from on a rebuild.
 COLUMN_SOURCES: dict[str, dict[str, str]] = {
+    "day_totals": {c: "operational — derived from conversations rows by triggers (`home.rebuild_totals`)"
+                   for c in ("day", "short", "deferred", "requested", "issues")},
     "meta": {
         "key": "operational — written by the rebuild (schema_version, vault_id, vault_path, complete, replay_pending, read_only)",
         "value": "operational — see key",
@@ -501,7 +560,13 @@ COLUMN_SOURCES: dict[str, dict[str, str]] = {
         "rerun": "operational — a reprocess (lane 1) in progress, kept through its summary; reset by a rebuild",
         "day": "operational — the local day of conversation.json start in the vault's timezone (`home.py`; refilled "
                "when the timezone changes)",
+        "short": "operational — speech_seconds under the short-session threshold (`home.py`; refilled with `day` "
+                 "when the threshold changes)",
         "class_choice": "<conversation dir>/class.json class (the owner's recording-class choice; NULL for auto)",
+        "t_short": "generated — what the row adds to day_totals",
+        "t_deferred": "generated — what the row adds to day_totals",
+        "t_requested": "generated — what the row adds to day_totals",
+        "t_issue": "generated — what the row adds to day_totals",
         "kind": "generated — from note_path, index_json recording_class, deferral provisional and class_choice",
         "created_at": "operational",
         "updated_at": "operational",

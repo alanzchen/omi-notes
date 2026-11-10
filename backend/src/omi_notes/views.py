@@ -20,6 +20,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from .db import LISTED as _LISTED
+from .db import NOT_DISMISSED as _NOT_DISMISSED
 
 from .notes.schema import ConversationNotes
 from .notes.writer import UserRegionError, extract_my_notes, generated_sha, read_note_id
@@ -32,8 +33,7 @@ ISSUE_LIMIT = 20
 # Rows the app lists (`db.LISTED`: the listing indexes are partial on it)
 LISTED = _LISTED
 # a failure the owner dismissed from the phone (that very failure; a later one shows again)
-NOT_DISMISSED = ("NOT (COALESCE(json_extract(resolution, '$.kind'), '') = 'dismissed' "
-                 "AND json_extract(resolution, '$.failure.id') IS failure_id)")
+NOT_DISMISSED = _NOT_DISMISSED
 
 _SERVICE = {"transcribing": "transcription service", "summarizing": "summary service"}
 
@@ -384,7 +384,9 @@ def recording_view(pipeline, row: sqlite3.Row) -> dict | None:
 
 def short_seconds(pipeline) -> float:
     """Detected speech below which a session is short: deferred on the server, folded on the phone."""
-    return float(pipeline.settings.defer_speech_seconds or 60.0)
+    from .home import short_threshold
+
+    return short_threshold(pipeline.settings)
 
 
 def local_day(pipeline, row) -> str:
