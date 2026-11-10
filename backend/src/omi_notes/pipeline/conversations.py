@@ -1061,11 +1061,11 @@ class ConversationPipeline:
                 from ..speakers.space import score
 
                 space = self.voice_space(embedder)
-                centroid = space[1].get(me["id"]) if space else None
+                centroid = space.centroids.get(me["id"]) if space else None
                 if centroid is not None:
                     for label, v in self.speakers.voices_of_labels(conv_id, transcript_sha).items():
                         if getattr(v, "vector", None) is not None and getattr(v, "model_sha", None) == embedder.model_sha:
-                            scores[label] = score(v.vector, centroid, space[0])
+                            scores[label] = score(v.vector, centroid, space.ga)
             except Exception:
                 log.exception("could not score voices against the wearer for %s", conv_id)
         confirmed = ("user", "auto")

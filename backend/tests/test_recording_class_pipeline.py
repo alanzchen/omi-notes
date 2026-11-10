@@ -445,3 +445,32 @@ def test_a_choice_time_that_is_not_finite_or_not_a_date_is_unreadable_and_the_li
         assert r.json()["conversations"][0]["recording_class"]["choice_unreadable"]
         assert client.get(f"/v1/conversations/{row['id']}", headers=AUTH).status_code == 200
     assert worker.pipeline.reconcile_classes(T0 + 450) == 0
+
+
+def test_the_wearer_score_uses_the_voices_recording_mean_space(client, worker, monkeypatch):
+    """The Voices backend's `voice_space` is an `RmSpace` (not a tuple): the class must still get each label's
+    centred score against the wearer, never silently lose it to an exception."""
+    from types import SimpleNamespace
+
+    from omi_notes.speakers.space import RmSpace
+
+    from .test_speaker_learning import FakeEmbedder
+
+    worker.providers._embedder = FakeEmbedder()
+    one_voice(client)
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    pipeline = worker.pipeline
+    embedder = pipeline.providers.embedder
+    assert embedder is not None
+    rng = np.random.default_rng(3)
+    ga, me = rng.normal(size=8), rng.normal(size=8)
+    me /= np.linalg.norm(me)
+    space = RmSpace(ga=ga, centroids={"p-me": me}, count=500)
+    monkeypatch.setattr(pipeline, "voice_space", lambda _embedder: space)
+    monkeypatch.setattr(pipeline.speakers, "me", lambda: {"id": "p-me"})
+    labelled = SimpleNamespace(vector=ga + me, model_sha=embedder.model_sha)
+    monkeypatch.setattr(pipeline.speakers, "voices_of_labels", lambda conv_id, sha: {"S1": labelled})
+    transcript = {"segments": [{"start": 0.0, "end": 8.0, "speaker": "S1", "text": "hello there"}]}
+    out = pipeline.auto_class(row["id"], transcript, row["transcript_sha"])
+    assert out["class"] == "monologue" and out["wearer_s"] == 8.0, out
