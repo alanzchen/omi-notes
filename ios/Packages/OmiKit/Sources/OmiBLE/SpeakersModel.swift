@@ -95,6 +95,10 @@ public final class SpeakersModel {
     }
 
     public var me: Person? { people.first { $0.isMe } }
+    /// This server's people list has answered at least once (an unreachable server says nothing about who is enrolled).
+    public private(set) var peopleLoaded = false
+    /// The hub's "录入我的声音": only once a people list from this server says there is no 我.
+    public var needsWearer: Bool { peopleLoaded && me == nil }
     public var others: [Person] { people.filter { !$0.isMe } }
 
     /// Injectable for tests (no network).
@@ -119,6 +123,7 @@ public final class SpeakersModel {
         generation += 1
         loadedFor = nil
         people = []
+        peopleLoaded = false
         settings = nil
         suggestions = []
         error = nil
@@ -170,7 +175,9 @@ public final class SpeakersModel {
         guard current() else { return }  // answered for a server (or vault) no longer shown
         var problems: [Error] = []
         switch p {
-        case .success(let newPeople): people = newPeople
+        case .success(let newPeople):
+            people = newPeople
+            peopleLoaded = true
         case .failure(let e): problems.append(e)
         }
         let s = await settingsAnswer

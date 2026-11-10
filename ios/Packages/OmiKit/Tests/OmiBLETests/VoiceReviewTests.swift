@@ -339,6 +339,26 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
         #expect(speakers.reviewTotal == nil)
     }
 
+    /// Nightly walkthrough 2026-11-10: with the server unreachable the hub offered "录入我的声音" to
+    /// a wearer whose voice is already enrolled; it asks only once a people list says there is no 我.
+    @Test func theHubAsksForTheWearersVoiceOnlyWhenThePeopleListSaysThereIsNone() async throws {
+        let speakers = try speakers()
+        #expect(!speakers.needsWearer, "nothing loaded yet")
+        VoicesHubStub.routes["GET /v1/status"] = [(-2, "")]
+        VoicesHubStub.routes["GET /v1/people"] = [(-2, "")]
+        VoicesHubStub.routes["GET /v1/speakers/settings"] = [(-2, "")]
+        await speakers.refresh()
+        #expect(speakers.error != nil && !speakers.needsWearer, "offline: unknown, not missing")
+        VoicesHubStub.routes["GET /v1/people"] = [(200, #"{"people":[{"id":"p","name":"Priya"}]}"#)]
+        await speakers.refresh()
+        #expect(speakers.needsWearer)
+        VoicesHubStub.routes["GET /v1/people"] = [(200, #"{"people":[{"id":"p","name":"Alan","me":true}]}"#)]
+        await speakers.refresh()
+        #expect(!speakers.needsWearer)
+        speakers.serverChanged()
+        #expect(!speakers.needsWearer, "another server's list is not this one's")
+    }
+
     @Test func answeringAFullWindowLeavesMoreToFetch() async throws {
         let queue = VoiceReviewQueue(speakers: try speakers())
         let fifty = Self.batch((1...50).map { Self.item("s.y\($0).1", sample: "y\($0)") })

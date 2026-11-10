@@ -27,7 +27,7 @@ struct VoicesHubView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 if speakers.serverSupportsVoiceReview { reviewCard }
-                if speakers.me == nil { teachCard }
+                if speakers.needsWearer { teachCard }
                 ForEach(cards) { p in
                     NavigationLink(value: Route.person(p.id)) { personCard(p) }.buttonStyle(.plain)
                 }
