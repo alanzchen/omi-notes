@@ -86,7 +86,19 @@ def serve(
         logging.getLogger(__name__).exception("Cannot initialize server")
         raise
     options = {"log_config": None} if log_file_only else {}
+    _stack_dumps(settings)
     uvicorn.run(application, host=host or settings.host, port=port or settings.port, log_level="info", **options)
+
+
+def _stack_dumps(settings) -> None:
+    """`kill -USR1 <pid>` appends every thread's Python stack to logs/stacks.txt (diagnosing a busy server
+    without attaching a profiler; nothing else changes)."""
+    import faulthandler
+    import signal
+
+    path = settings.logs_dir / "stacks.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    faulthandler.register(signal.SIGUSR1, file=open(path, "a"), all_threads=True)  # noqa: SIM115 (kept open)
 
 
 @app.command()
