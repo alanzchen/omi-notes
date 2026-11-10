@@ -239,12 +239,12 @@ import OmiWatchKit
         let legacy = WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now, deviceId: "watch-1")
         let t = summary(legacy)
         #expect(t.watch.keptOnWatch == nil)
-        #expect(t.watchLine(now: now) == "Nothing waiting; kept parts not reported")
-        #expect(WatchSummary.onWatchLine(legacy, lastReceivedAt: nil, now: now).hasPrefix(t.watchLine(now: now)), "both screens agree")
+        #expect(t.watchLine(now: now) == "没有待发录音（保留部分未报告）")
+        #expect(!WatchSummary.onWatchLine(legacy, lastReceivedAt: nil, now: now).contains("Everything sent"), "neither screen calls it empty")
         let zero = summary(WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now, stats: ["orphan_parts": 0]))
-        #expect(zero.watchLine(now: now) == "Nothing left on the Watch" && zero.everythingSent)
+        #expect(zero.watchLine(now: now) == "手表上已无录音" && zero.everythingSent)
         let waiting = summary(WatchReport(state: .idle, since: nil, waitingParts: 2, waitingSeconds: 120, at: now))
-        #expect(waiting.watchLine(now: now) == "2 parts left on the Watch")
+        #expect(waiting.watchLine(now: now) == "还剩 2 分钟录音")
     }
 
     /// ASTRA-IT11-02: at the cap, any kept audio made the reason say there's no room because it can't be
@@ -267,13 +267,13 @@ import OmiWatchKit
     @Test func keptPartsFromAnOldOrFutureReportAreNotCurrent() {
         let kept: [String: Int] = ["orphan_parts": 2]
         let fresh = summary(WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now.addingTimeInterval(-60), stats: kept))
-        #expect(fresh.watchLine(now: now) == "2 parts kept on the Watch, can't be sent")
+        #expect(fresh.watchLine(now: now) == "无可发送的录音" && fresh.problemLine(now: now) == "手表上有录音无法发送")
         let stale = summary(WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now.addingTimeInterval(-3 * 3600), stats: kept))
-        #expect(!stale.watchLine(now: now).contains("kept") && stale.watchLine(now: now).hasPrefix("Last Watch report"))
+        #expect(stale.watchLine(now: now) == "等待手表报告" && stale.problemLine(now: now) == "手表报告已过时")
         let future = summary(WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now.addingTimeInterval(3600), stats: kept))
-        #expect(future.watchLine(now: now) == "Watch report time is ahead of this iPhone")
+        #expect(future.watchLine(now: now) == "等待手表报告" && future.problemLine(now: now) == "手表时间与 iPhone 不一致")
         let ok = summary(WatchReport(state: .idle, since: nil, waitingParts: 3, waitingSeconds: 180, at: now, stats: ["orphan_parts": 0]))
-        #expect(ok.watchLine(now: now) == "3 parts left on the Watch")
+        #expect(ok.watchLine(now: now) == "还剩 3 分钟录音" && ok.problemLine(now: now) == nil)
     }
 
     /// ASTRA-IT11-04: with both waiting and kept parts, the line named only the kept ones and then said
@@ -292,57 +292,123 @@ import OmiWatchKit
         #expect(WatchSummary.onWatchLine(waiting, lastReceivedAt: nil, now: now).hasSuffix("They move when both are nearby with Omi Notes open."))
     }
 
-    // TRANSFERS-50 (Alan, 2026-11-09: "uploading 卡片很多余"): no state label like "Uploading"; one
-    // status line says what is left and, while bytes move, about how long.
+    // TRANSFERS-50 (Alan, 2026-11-09/10: "uploading 卡片很多余"; "都有进度条了我为什么要知道文件数量"): no
+    // state heading and no file or part counts on the main screen. A problem line only when something is
+    // wrong; the time estimate sits on the iPhone → server bar; the Watch bar says how much audio is left.
 
-    @Test func theStatusLineSaysWhatIsLeftAndAboutHowLong() throws {
-        let backlog = try #require(TransferSummary.debugFixture("backlog", now: now)).statusLine
-        #expect(backlog.text == "5,135 files · about 13 h left" && !backlog.attention)
-        let sending = try #require(TransferSummary.debugFixture("sending", now: now)).statusLine
-        #expect(sending.text == "38 files · under 1 min left", "9.4 MB at 1.24 MB/s")
-        var one = try #require(TransferSummary.debugFixture("sending", now: now))
-        one.phone.queuedFiles = 1
-        #expect(one.statusLine.text == "1 file · under 1 min left")
-        #expect(try #require(TransferSummary.debugFixture("waiting", now: now)).statusLine.text == "38 files waiting to send",
-                "no speed, no estimate")
-        for name in ["backlog", "sending", "waiting", "offline", "retrying", "kept-aside", "all-sent", "unknown-watch"] {
-            let line = try #require(TransferSummary.debugFixture(name, now: now)).statusLine.text
-            #expect(!line.contains("Uploading") && !line.contains("~<"), "\(name): \(line)")
+    func fixture(_ name: String) throws -> TransferSummary { try #require(TransferSummary.debugFixture(name, now: now)) }
+    static let names = ["backlog", "sending", "waiting", "offline", "retrying", "kept-aside", "all-sent", "unknown-watch"]
+
+    @Test func theMainLinesNameNoCounts() throws {
+        for name in Self.names {
+            let t = try fixture(name)
+            let lines = [t.problemLine(now: now), t.phoneLine, t.watchLine(now: now), t.serverLine(now: now), t.cardLine(now: now)?.text].compactMap { $0 }
+            for line in lines {
+                for word in ["file", "part", "to process", "left on", "Uploading"] {
+                    #expect(!line.contains(word), "\(name): \(line)")
+                }
+                #expect(!line.contains(/\d\s*(个|件|份|段)/), "no counted items: \(name): \(line)")
+                #expect(t.phone.queuedFiles == 0 || !line.contains(t.phone.queuedFiles.formatted()), "\(name): \(line)")
+            }
         }
     }
 
-    @Test func theTimeLeftReadsAsARoughFigure() {
-        #expect(TransferSummary.timeLeftText(20) == "under 1 min left")
-        #expect(TransferSummary.timeLeftText(25 * 60) == "about 25 min left")
-        #expect(TransferSummary.timeLeftText(13.4 * 3600) == "about 13 h left")
-        #expect(TransferSummary.timeLeftText(3 * 86_400) == "about 3 days left")
+    @Test func theEstimateSitsOnTheServerBarAndNeedsAMeasuredRate() throws {
+        let backlog = try fixture("backlog")
+        let bytes = { (n: Int64) in ByteCountFormatter.string(fromByteCount: n, countStyle: .file) }
+        #expect(backlog.phoneLine == "\(bytes(46_600_000)) / \(bytes(46_600_000 + 5_390_000_000)) · 约 13 小时")
+        #expect(!backlog.phoneLine.contains("/s"), "the speed is in Details while there are byte totals")
+        #expect(try fixture("sending").phoneLine.hasSuffix(" · 不到 1 分钟"))
+        let waiting = try fixture("waiting")
+        #expect(waiting.phoneLine == "待上传 \(bytes(9_400_000))", "no rate, no estimate: \(waiting.phoneLine)")
+        #expect(TransferSummary.estimateText(25 * 60) == "约 25 分钟")
+        #expect(TransferSummary.estimateText(3 * 86_400) == "约 3 天")
+        var onlyRate = waiting
+        onlyRate.phone.since = nil; onlyRate.phone.queuedBytes = 0; onlyRate.phone.rate = 48_200
+        #expect(onlyRate.phoneLine == "48.2 KB/s", "the speed when it is the only progress signal")
     }
 
-    @Test func problemsLeadTheStatusLine() throws {
-        let offline = try #require(TransferSummary.debugFixture("offline", now: now)).statusLine
-        #expect(offline.text == "Can't reach the server (timed out) · 38 files waiting" && offline.attention)
-        let retrying = try #require(TransferSummary.debugFixture("retrying", now: now)).statusLine
-        #expect(retrying.text == "2 files failed, retrying soon · 38 files waiting" && retrying.attention)
-        let kept = try #require(TransferSummary.debugFixture("kept-aside", now: now)).statusLine
-        #expect(kept.text == "1 file kept aside, not uploaded" && kept.attention)
-        var unknown = try #require(TransferSummary.debugFixture("waiting", now: now))
-        unknown.phone.state = .unknown
-        #expect(unknown.statusLine.text == "38 files waiting · not measured right now" && !unknown.statusLine.attention)
+    @Test func theWatchBarSaysHowMuchAudioIsLeftAndUnknownIsNeverZero() throws {
+        func line(_ r: WatchReport) -> String { summary(r).watchLine(now: now) }
+        #expect(line(WatchReport(state: .recording, since: nil, waitingParts: 4, waitingSeconds: 720, at: now)) == "还剩 12 分钟录音")
+        #expect(line(WatchReport(state: .recording, since: nil, waitingParts: 4, waitingSeconds: 45, at: now)) == "还剩 45 秒录音")
+        #expect(line(WatchReport(state: .recording, since: nil, waitingParts: 4, waitingSeconds: 3_900, at: now)) == "还剩 1 小时 5 分钟录音")
+        #expect(line(WatchReport(state: .recording, since: nil, waitingParts: 4, waitingSeconds: nil, at: now)) == "手表未报告剩余时长",
+                "parts without a duration: unknown, not 0")
+        #expect(line(WatchReport(state: .recording, since: nil, waitingParts: 4, waitingSeconds: 0, at: now)) == "手表未报告剩余时长",
+                "parts waiting are never \"0 s left\"")
+        #expect(line(WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now, stats: ["orphan_parts": 0])) == "手表上已无录音")
+        let stale = WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now.addingTimeInterval(-3 * 3600), stats: ["orphan_parts": 0])
+        #expect(line(stale) == "等待手表报告", "an old report is no statement about now")
+        var unknown = try fixture("unknown-watch")
+        #expect(unknown.watchLine(now: now) == "正在检查 Apple Watch")
+        unknown.watch.inUse = true
+        #expect(unknown.watchLine(now: now) == "等待手表报告")
     }
 
-    @Test func theStatusLineSaysAllSentOnlyWithEvidence() throws {
-        let all = try #require(TransferSummary.debugFixture("all-sent", now: now))
-        #expect(all.statusLine.text == "All sent" && !all.statusLine.attention)
-        var stale = all
-        stale.watch.reportFresh = false
-        #expect(stale.statusLine.text == "iPhone sent everything · waiting for a Watch report")
-        var unknownKept = all
-        unknownKept.watch.keptOnWatch = nil
-        #expect(unknownKept.statusLine.text == "iPhone sent everything · the Watch hasn't confirmed it's empty")
-        var parts = all
-        parts.watch.waitingParts = 3
-        #expect(parts.statusLine.text == "iPhone sent everything · the Watch still has audio")
-        let noWatch = try #require(TransferSummary.debugFixture("unknown-watch", now: now))
-        #expect(noWatch.statusLine.text == "iPhone sent everything · waiting for a Watch report", "an unknown Watch is not an empty one")
+    @Test func aProblemLineOnlyWhenSomethingIsWrong() throws {
+        for name in ["backlog", "sending", "waiting", "all-sent", "unknown-watch"] {
+            #expect(try fixture(name).problemLine(now: now) == nil, "\(name)")
+        }
+        #expect(try fixture("offline").problemLine(now: now) == "连不上服务器")
+        #expect(try fixture("retrying").problemLine(now: now) == "上传失败，稍后重试")
+        #expect(try fixture("kept-aside").problemLine(now: now) == "有文件被搁置，未上传")
+        var t = try fixture("waiting")
+        t.phone.state = .paused("storage")
+        #expect(t.problemLine(now: now) == "上传已暂停")
+        t.phone.state = .offline(TransferSummary.rejectedReason)
+        #expect(t.problemLine(now: now) == "服务器拒绝了这台 iPhone")
+        t = try fixture("all-sent")
+        t.server.reachable = false
+        #expect(t.problemLine(now: now) == "连不上服务器", "unreachable with nothing queued is still a problem")
+        t = try fixture("waiting")
+        t.watch.reportFresh = false
+        t.watch.reportAt = now.addingTimeInterval(-3 * 3600)
+        #expect(t.problemLine(now: now) == "手表报告已过时")
+        t.watch.reportAt = now.addingTimeInterval(3600)
+        #expect(t.problemLine(now: now) == "手表时间与 iPhone 不一致")
+        t = try fixture("waiting")
+        t.watch.keptOnWatch = 2
+        #expect(t.problemLine(now: now) == "手表上有录音无法发送")
+        t.phone.state = .offline("timed out")
+        #expect(t.problemLine(now: now) == "连不上服务器 · 手表上有录音无法发送")
+    }
+
+    @Test func theServerLineIsAStateNotACount() throws {
+        var t = try fixture("all-sent")
+        #expect(t.serverLine(now: now) == "服务器处理中")
+        t.server.chunksPending = 0; t.server.conversationsPending = 0
+        #expect(t.everythingSent && t.serverLine(now: now) == "已是最新")
+        t.watch.waitingParts = 2
+        #expect(t.serverLine(now: now) == "服务器已处理完收到的录音", "not up to date while the Watch still has audio")
+        t.server.conversationsPending = nil
+        #expect(t.serverLine(now: now) == nil, "a missing count is unknown")
+        t = try fixture("all-sent")
+        t.server.checkedAt = now.addingTimeInterval(-600)
+        #expect(t.serverLine(now: now) == nil, "an old answer says nothing about now")
+        t = try fixture("all-sent")
+        t.server.reachable = false
+        #expect(t.serverLine(now: now) == nil, "the problem line says it")
+    }
+
+    @Test func timesReadInChineseAndAFutureTimeIsNoAge() {
+        #expect(TransferSummary.agoText(now.addingTimeInterval(-20), now: now) == "刚刚")
+        #expect(TransferSummary.agoText(now.addingTimeInterval(-25 * 60), now: now) == "25 分钟前")
+        #expect(TransferSummary.agoText(now.addingTimeInterval(-3 * 3600), now: now) == "3 小时前")
+        #expect(TransferSummary.agoText(now.addingTimeInterval(-2 * 86_400), now: now) == "2 天前")
+        #expect(TransferSummary.agoText(now.addingTimeInterval(3600), now: now) == "晚于本机时间")
+    }
+
+    @Test func theDevicesCardShowsAProblemOrAnEstimate() throws {
+        let backlog = try #require(try fixture("backlog").cardLine(now: now))
+        #expect(backlog.text == "约 13 小时传完" && !backlog.attention)
+        let offline = try #require(try fixture("offline").cardLine(now: now))
+        #expect(offline.text == "连不上服务器" && offline.attention)
+        #expect(try fixture("waiting").cardLine(now: now) == nil)
+        #expect(try fixture("all-sent").cardLine(now: now)?.text == "全部已发送")
+        var unknown = try fixture("all-sent")
+        unknown.watch.waitingParts = nil
+        #expect(unknown.cardLine(now: now) == nil, "no all-sent while the Watch is unknown")
     }
 }
+

@@ -120,7 +120,7 @@ public struct TransferSummary: Equatable, Sendable {
         } else if case .unreachable(let why) = server, s.outbox.pendingCount > 0 {
             state = .offline(why)
         } else if case .unauthorized = server {
-            state = .offline("the server rejected this phone")
+            state = .offline(Self.rejectedReason)
         } else if s.upload.backingOff > 0 {
             state = .retrying
         } else if s.outbox.pendingCount > 0 || flight.uploads > 0 {
@@ -207,44 +207,116 @@ public struct TransferSummary: Equatable, Sendable {
         return Double(phone.queuedBytes) / rate
     }
 
-    /// "under 1 min left", "about 25 min left", "about 13 h left", "about 3 days left": a round
-    /// figure, never a promise.
-    public static func timeLeftText(_ seconds: Double) -> String {
-        if seconds < 60 { return "under 1 min left" }
-        if seconds < 3600 { return "about \(Int((seconds / 60).rounded())) min left" }
-        if seconds < 48 * 3600 { return "about \(Int((seconds / 3600).rounded())) h left" }
-        return "about \(Int((seconds / 86_400).rounded())) days left"
+
+    /// `.offline` reason when the server answered 401 (this iPhone's token was rejected).
+    public static let rejectedReason = "the server rejected this phone"
+
+    // MARK: main-screen lines (Chinese, no file or part counts: the bars show progress; counts live in Details)
+
+    /// "不到 1 分钟", "约 25 分钟", "约 13 小时", "约 3 天": a round figure, never a promise.
+    public static func estimateText(_ seconds: Double) -> String {
+        if seconds < 60 { return "不到 1 分钟" }
+        if seconds < 3600 { return "约 \(Int((seconds / 60).rounded())) 分钟" }
+        if seconds < 48 * 3600 { return "约 \(Int((seconds / 3600).rounded())) 小时" }
+        return "约 \(Int((seconds / 86_400).rounded())) 天"
     }
 
-    /// The one status line (the Transfers screen and the Devices card): what is still queued on this
-    /// iPhone and, while bytes move, about how long it takes. No state label ("Uploading"): the bars
-    /// show that something moves. A problem leads the line; "All sent" only with `everythingSent`.
-    public var statusLine: (text: String, attention: Bool) {
-        let p = phone
-        func files(_ n: Int) -> String { "\(n.formatted()) \(n == 1 ? "file" : "files")" }
-        let waiting = p.queuedFiles > 0 ? files(p.queuedFiles) + " waiting" : nil
-        func join(_ parts: String?...) -> String { parts.compactMap { $0 }.joined(separator: " · ") }
-        switch p.state {
-        case .sending:
-            let left = p.queuedFiles > 0 ? files(p.queuedFiles) : "Sending"
-            return (join(left, phoneTimeLeft.map(Self.timeLeftText)), false)
-        case .waiting: return (waiting.map { $0 + " to send" } ?? "Waiting to send", false)
-        case .retrying: return (join("\(files(p.retryingFiles)) failed, retrying soon", waiting), true)
-        case .offline(let why): return (join("Can't reach the server (\(why))", waiting), true)
-        case .paused(let why): return (join("Uploads paused", why), true)
-        case .preparing(let n): return ("Preparing \(n) Watch \(n == 1 ? "part" : "parts")", false)
-        case .keptAside(let n): return ("\(files(n)) kept aside, not uploaded", true)
-        case .queueUnreadable: return ("Can't read the upload queue", true)
-        case .allSent:
-            if everythingSent { return ("All sent", false) }
-            let w = watch
-            let has = (w.waitingParts ?? 0) > 0 || (w.keptOnWatch ?? 0) > 0 || w.converting > 0 || w.waitingForServer > 0
-            // a missing count (an older Watch app) is neither audio nor its absence
-            return (join("iPhone sent everything", !w.reportFresh ? "waiting for a Watch report"
-                         : has ? "the Watch still has audio" : "the Watch hasn't confirmed it's empty"), false)
-        case .notConfigured: return ("No server connected", true)
-        case .unknown: return (waiting.map { $0 + " · not measured right now" } ?? "Not measured right now", false)
+    /// "45 秒", "12 分钟", "1 小时 5 分钟".
+    public static func durationText(_ seconds: Int) -> String {
+        if seconds < 60 { return "\(seconds) 秒" }
+        if seconds < 3600 { return "\(Int((Double(seconds) / 60).rounded())) 分钟" }
+        let m = (seconds % 3600) / 60
+        return "\(seconds / 3600) 小时" + (m > 0 ? " \(m) 分钟" : "")
+    }
+
+    /// "刚刚", "25 分钟前", "3 小时前", "2 天前"; a time more than a minute ahead has no age.
+    public static func agoText(_ date: Date, now: Date) -> String {
+        let s = now.timeIntervalSince(date)
+        if s < -60 { return "晚于本机时间" }
+        if s < 60 { return "刚刚" }
+        if s < 3600 { return "\(Int(s / 60)) 分钟前" }
+        if s < 86_400 { return "\(Int(s / 3600)) 小时前" }
+        return "\(Int(s / 86_400)) 天前"
+    }
+
+    /// What is wrong right now, or nil when nothing is: shown only then, without counts.
+    public func problemLine(now: Date) -> String? {
+        var out: [String] = []
+        switch phone.state {
+        case .notConfigured: out.append("未连接服务器")
+        case .paused: out.append("上传已暂停")
+        case .offline(let why): out.append(why == Self.rejectedReason ? "服务器拒绝了这台 iPhone" : "连不上服务器")
+        case .retrying: out.append("上传失败，稍后重试")
+        case .keptAside: out.append("有文件被搁置，未上传")
+        case .queueUnreadable: out.append("无法读取上传队列")
+        case .sending, .waiting, .preparing, .allSent, .unknown: break
         }
+        if server.reachable == false, out.isEmpty { out.append("连不上服务器") }
+        if phone.keptAside > 0, phone.state != .keptAside(phone.keptAside) { out.append("有文件被搁置，未上传") }
+        let w = watch
+        if w.inUse == true, let at = w.reportAt {
+            if !w.reportFresh {
+                // the same window as `reportFresh`: more than a minute ahead of this iPhone is a clock problem
+                out.append(at > now.addingTimeInterval(60) ? "手表时间与 iPhone 不一致" : "手表报告已过时")
+            } else if let kept = w.keptOnWatch, kept > 0 {
+                out.append("手表上有录音无法发送")
+            }
+        }
+        return out.isEmpty ? nil : out.joined(separator: " · ")
+    }
+
+    /// The iPhone → server bar's line: bytes confirmed / known total, and while bytes move the
+    /// estimate. The speed only when it is the only progress signal (it stays in Details otherwise).
+    public var phoneLine: String {
+        let p = phone
+        func bytes(_ n: Int64) -> String { ByteCountFormatter.string(fromByteCount: n, countStyle: .file) }
+        var line: String
+        if p.since != nil, p.deliveredAudioBytes > 0 {
+            line = "\(bytes(p.deliveredAudioBytes)) / \(bytes(p.deliveredAudioBytes + p.queuedBytes))"
+        } else if p.queuedBytes > 0 {
+            line = "待上传 \(bytes(p.queuedBytes))"
+        } else if let rate = p.rate {
+            return Self.rateText(rate)
+        } else {
+            return p.state == .allSent ? "已全部上传" : "暂未统计"
+        }
+        if let left = phoneTimeLeft { line += " · " + Self.estimateText(left) }
+        return line
+    }
+
+    /// The Watch → iPhone bar's line: how much audio is still on the Watch, from a current report.
+    /// A stale, future-dated or missing report says nothing about now; a missing figure is never 0.
+    public func watchLine(now: Date) -> String {
+        let w = watch
+        if w.inUse == nil { return "正在检查 Apple Watch" }
+        guard w.reportAt != nil, w.reportFresh, let parts = w.waitingParts else { return "等待手表报告" }
+        if parts == 0 {
+            // "已无录音" needs the Watch to have reported its kept parts (0); an older Watch app doesn't say
+            switch w.keptOnWatch {
+            case 0?: return "手表上已无录音"
+            case nil: return "没有待发录音（保留部分未报告）"
+            default: return "无可发送的录音"
+            }
+        }
+        guard let seconds = w.waitingSeconds, seconds > 0 else { return "手表未报告剩余时长" }
+        return "还剩 \(Self.durationText(seconds))录音"
+    }
+
+    /// The server's state from its last answer: working, or done with what it has. nil when that
+    /// answer is missing, older than 5 minutes, partial, or the server isn't reachable (the problem
+    /// line says so).
+    public func serverLine(now: Date) -> String? {
+        guard server.reachable != false, let at = server.checkedAt, now.timeIntervalSince(at) <= 300, at <= now.addingTimeInterval(60),
+              let work = serverWork, !work.atLeast || work.left > 0 else { return nil }
+        if work.left > 0 { return "服务器处理中" }
+        return everythingSent ? "已是最新" : "服务器已处理完收到的录音"
+    }
+
+    /// The Devices card's line: a problem, else the estimate, else "全部已发送" with evidence; else nothing.
+    public func cardLine(now: Date) -> (text: String, attention: Bool)? {
+        if let problem = problemLine(now: now) { return (problem, true) }
+        if let left = phoneTimeLeft { return (Self.estimateText(left) + "传完", false) }
+        return everythingSent ? ("全部已发送", false) : nil
     }
 
     /// iPhone → server bar: audio bytes the server confirmed since the app opened, of those plus
@@ -264,30 +336,6 @@ public struct TransferSummary: Equatable, Sendable {
         return total > 0 ? Double(watch.receivedOnPhone) / Double(total) : 1
     }
 
-    /// The Watch → iPhone line. Counts from the Watch's report (kept parts too) are statements about
-    /// now only while the report is fresh and not dated ahead of this iPhone.
-    public func watchLine(now: Date) -> String {
-        let w = watch
-        func plural(_ n: Int, _ one: String, _ many: String) -> String { "\(n) \(n == 1 ? one : many)" }
-        if w.inUse == nil { return "Checking for Apple Watch" }
-        if let at = w.reportAt, w.reportFresh {
-            if let kept = w.keptOnWatch, kept > 0 { return "\(plural(kept, "part", "parts")) kept on the Watch, can't be sent" }
-            if let parts = w.newParts {
-                let recheck = w.recheckParts > 0 ? "re-checking \(plural(w.recheckParts, "older part", "older parts"))" : nil
-                // "Nothing left" needs the Watch to have reported its kept parts (0); an older Watch app
-                // that doesn't say gets the Watch detail's wording, never an empty Watch.
-                let empty = w.keptOnWatch == 0 ? "Nothing left on the Watch" : "Nothing waiting; kept parts not reported"
-                return parts == 0 ? (recheck.map { "R" + $0.dropFirst() } ?? empty)
-                    : "\(plural(parts, "part", "parts")) left on the Watch" + (recheck.map { " · \($0)" } ?? "")
-            }
-            return "Last Watch report \(SystemHealth.relative(at, now))"
-        }
-        if let at = w.reportAt, at <= now.addingTimeInterval(60) {
-            return "Last Watch report \(SystemHealth.relative(at, now))"  // not current: no claim about now
-        }
-        if w.reportAt != nil { return "Watch report time is ahead of this iPhone" }
-        return "No report from the Watch yet"
-    }
 
     /// Everything reached the server as far as anyone can tell: this iPhone sent all it had, and the
     /// Watch (if one is in use) reported, recently, nothing waiting or being prepared.

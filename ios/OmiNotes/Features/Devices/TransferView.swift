@@ -1,17 +1,12 @@
 import OmiBLE
 import SwiftUI
 
-/// Words for the transfer screens (one place, so the card and the page say the same thing).
+/// Words for the transfer screens (one place, so the card and the page say the same thing). The
+/// Transfers screen and its Devices card read in Chinese (Alan's wording); the lines themselves come
+/// from `TransferSummary`, where they are tested.
 enum TransferText {
-    /// "45 s", "3 min 50 s", "1 h 2 min".
-    static func duration(_ seconds: Double) -> String {
-        let s = Int(seconds.rounded())
-        if s < 60 { return "\(s) s" }
-        if s < 3600 { return s % 60 == 0 ? "\(s / 60) min" : "\(s / 60) min \(s % 60) s" }
-        return "\(s / 3600) h \((s % 3600) / 60) min"
-    }
-
-    static func plural(_ n: Int, _ one: String, _ many: String) -> String { "\(n) \(n == 1 ? one : many)" }
+    /// Details only: "N 个文件" (counts never appear on the main screen).
+    static func count(_ n: Int, _ unit: String) -> String { "\(n.formatted()) 个\(unit)" }
 
     /// The live summary (or, debug builds, the `-OmiNotesDebugTransferState` synthetic fixture).
     @MainActor static func summary(_ model: AppModel, watchInstalled: Bool?, now: Date) -> TransferSummary {
@@ -40,14 +35,14 @@ enum TransferText {
     }
 
     static let explanations = [
-        "Watch → iPhone counts parts this iPhone has stored safely, of those plus the parts the Watch last reported. iOS doesn't report a part's progress while it travels, so this bar moves when the Watch reports (every few minutes while recording) and when a part arrives.",
-        "iPhone → Server counts audio your server confirmed since the app was opened, of that plus what is still queued here. Speed comes from the uploads' own progress reports while this screen is open. Time left is the queue at the current speed; recording continues and the speed changes, so it is a rough guide.",
-        "In the background iOS decides when uploads run, so nothing here is live then. Handed to iOS are uploads iOS may still be waiting to run. Each file is confirmed once, when your server says it stored it; files stay on this iPhone until then.",
-        "Audio on the server isn't a note yet: notes appear after the server has transcribed and summarized it.",
+        "Watch → iPhone：这台 iPhone 已安全保存的部分，占它们加上手表最近报告的待发部分的比例。iOS 不报告传输途中的进度，所以这条进度条只在手表报告时（录音时每几分钟一次）和收到一部分时移动。",
+        "iPhone → 服务器：自打开 App 以来服务器确认收到的录音，占它加上这里仍在排队的录音的比例。速度来自本页打开期间上传自身的进度报告。剩余时间按当前速度估算；录音在继续、速度会变，只作粗略参考。",
+        "在后台由 iOS 决定何时上传，所以那时这里的数字不是实时的。“已交给 iOS”是 iOS 可能尚未开始的上传。每个文件在服务器确认已保存时才算送达；在此之前一直保留在这台 iPhone 上。",
+        "服务器上的录音还不是笔记：服务器转写并总结之后，笔记才会出现。",
     ]
 }
 
-/// Devices: one quiet card with the status line; tap for the details.
+/// Devices: one quiet card; under its title only a problem, an estimate, or "全部已发送".
 struct TransferCardView: View {
     let model: AppModel
     let watchInstalled: Bool?
@@ -56,7 +51,8 @@ struct TransferCardView: View {
     var body: some View {
         // re-evaluated every second: a rate stops showing as soon as bytes stop
         TimelineView(.periodic(from: .now, by: 1)) { context in
-            TransferCardRow(summary: TransferText.summary(model, watchInstalled: watchInstalled, now: context.date), open: open)
+            TransferCardRow(summary: TransferText.summary(model, watchInstalled: watchInstalled, now: context.date),
+                            now: context.date, open: open)
         }
     }
 }
@@ -64,19 +60,22 @@ struct TransferCardView: View {
 /// The card from one summary (no model).
 struct TransferCardRow: View {
     let summary: TransferSummary
+    let now: Date
     var open: () -> Void
 
     var body: some View {
-        let status = summary.statusLine
+        let line = summary.cardLine(now: now)
         Card {
             Button(action: open) {
                 HStack(spacing: 12) {
                     Image(systemName: "arrow.up.arrow.down").font(.system(size: 13, weight: .semibold)).foregroundStyle(Pendant.iconForeground)
                         .frame(width: 30, height: 30).background(Pendant.iconBackground, in: .rect(cornerRadius: 10))
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Transfers").font(.headline)
-                        Text(status.text).font(.subheadline.monospacedDigit())
-                            .foregroundStyle(status.attention ? Pendant.warnForeground : Pendant.secondary).lineLimit(1).minimumScaleFactor(0.8)
+                        Text("传输").font(.headline)
+                        if let line {
+                            Text(line.text).font(.subheadline.monospacedDigit())
+                                .foregroundStyle(line.attention ? Pendant.warnForeground : Pendant.secondary).lineLimit(1).minimumScaleFactor(0.8)
+                        }
                     }
                     Spacer(minLength: 0)
                     Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(Pendant.chevron)
@@ -85,14 +84,14 @@ struct TransferCardRow: View {
             }
             .buttonStyle(.plain)
             .accessibilityElement(children: .combine)
-            .accessibilityHint("Opens transfer details")
+            .accessibilityHint("打开传输详情")
         }
     }
 }
 
-/// One status line, one bar per hop, then the counters and explanations folded away. Live only
-/// while open; every number comes from its own source (the Watch's report, this iPhone's uploads,
-/// the server's last status).
+/// One bar per hop, a problem line only when something is wrong, then the counters and
+/// explanations folded away. Live only while open; every number comes from its own source (the
+/// Watch's report, this iPhone's uploads, the server's last status).
 struct TransferDetailView: View {
     let model: AppModel
     let watchInstalled: Bool?
@@ -102,13 +101,13 @@ struct TransferDetailView: View {
             TransferDetailContent(summary: TransferText.summary(model, watchInstalled: watchInstalled, now: context.date),
                                   now: context.date, synthetic: TransferText.synthetic)
         }
-        .navigationTitle("Transfers")
+        .navigationTitle("传输")
         .navigationBarTitleDisplayMode(.inline)
     }
 }
 
-/// The page from one summary (no model), so a fixed summary renders it too. No state label
-/// ("Uploading") and no percentages: the status line and the bars already say both.
+/// The page from one summary (no model), so a fixed summary renders it too. No heading, state
+/// label, percentage or count on the main screen: the bars show progress; counts live in Details.
 struct TransferDetailContent: View {
     let summary: TransferSummary
     let now: Date
@@ -134,12 +133,17 @@ struct TransferDetailContent: View {
                         .foregroundStyle(Pendant.synthetic).padding(.horizontal, 7).padding(.vertical, 2)
                         .background(Pendant.syntheticBackground, in: .rect(cornerRadius: 6)).frame(maxWidth: .infinity)
                 }
-                status(t)
-                if t.watch.inUse != false { watchHop(t) }
-                phoneHop(t)
-                serverLine(t)
-                fold("Details", isOn: $showDetails) { details(t) }
-                fold("How this works", isOn: $showHow) { explanations }
+                if let problem = t.problemLine(now: now) {
+                    Label(problem, systemImage: "exclamationmark.circle").font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Pendant.warnForeground).padding(.horizontal, 4)
+                }
+                if t.watch.inUse != false { hop("Watch → iPhone", fraction: t.watchFraction, line: t.watchLine(now: now)) }
+                hop("iPhone → 服务器", fraction: t.phoneFraction, line: t.phoneLine)
+                if let server = t.serverLine(now: now) {
+                    Text(server).font(.footnote).foregroundStyle(Pendant.secondary).padding(.horizontal, 4)
+                }
+                fold("详情", isOn: $showDetails) { details(t) }
+                fold("说明", isOn: $showHow) { explanations }
             }
             .padding(.horizontal, 16).padding(.top, 8).padding(.bottom, 24)
         }
@@ -147,16 +151,7 @@ struct TransferDetailContent: View {
         .foregroundStyle(Pendant.ink)
     }
 
-    // MARK: status
-
-    /// The one status line: what is left and about how long; a problem leads it.
-    private func status(_ t: TransferSummary) -> some View {
-        let s = t.statusLine
-        return Text(s.text).font(.title3.weight(.semibold).monospacedDigit())
-            .foregroundStyle(s.attention ? Pendant.warnForeground : Pendant.ink).lineLimit(2).minimumScaleFactor(0.8)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 4).padding(.vertical, 4)
-    }
+    // MARK: hops
 
     private func hop(_ title: String, fraction: Double?, line: String) -> some View {
         Card {
@@ -183,37 +178,6 @@ struct TransferDetailContent: View {
             .accessibilityHidden(true)
     }
 
-    private func watchHop(_ t: TransferSummary) -> some View {
-        hop("Watch → iPhone", fraction: t.watchFraction, line: t.watchLine(now: now))
-    }
-
-    private func phoneHop(_ t: TransferSummary) -> some View {
-        let p = t.phone
-        var parts: [String] = []
-        if p.since != nil, p.deliveredAudioBytes > 0 {
-            parts.append("\(Fmt.bytes(p.deliveredAudioBytes)) of \(Fmt.bytes(p.deliveredAudioBytes + p.queuedBytes))")
-        } else if p.queuedBytes > 0 {
-            parts.append("\(Fmt.bytes(p.queuedBytes)) queued")
-        }
-        if let rate = p.rate { parts.append(TransferSummary.rateText(rate)) }
-        let line = parts.isEmpty ? (p.state == .allSent ? "Nothing queued" : "Not measured right now") : parts.joined(separator: " · ")
-        return hop("iPhone → Server", fraction: t.phoneFraction, line: line)
-    }
-
-    private func serverLine(_ t: TransferSummary) -> some View {
-        let s = t.server
-        var text = "Server"
-        var offline = false
-        if case .offline = t.phone.state { offline = true }
-        // the status line already leads with "Can't reach the server"
-        if s.reachable == false, !offline { text += " · not reachable" }
-        if let work = t.serverWork {
-            text += work.left == 0 ? " · nothing to process" : " · \(work.atLeast ? "at least " : "")\(work.left.formatted()) to process"
-        }
-        if let at = s.checkedAt { text += " · checked \(Fmt.relative(at))" }
-        return Text(text).font(.footnote).foregroundStyle(Pendant.secondary).lineLimit(1).minimumScaleFactor(0.8).padding(.horizontal, 4)
-    }
-
     // MARK: folded
 
     private func fold(_ title: String, isOn: Binding<Bool>, @ViewBuilder content: () -> some View) -> some View {
@@ -228,7 +192,7 @@ struct TransferDetailContent: View {
                 .padding(.horizontal, 4).padding(.top, 6).contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityValue(isOn.wrappedValue ? "Expanded" : "Collapsed")
+            .accessibilityValue(isOn.wrappedValue ? "已展开" : "已收起")
             if isOn.wrappedValue { content() }
         }
     }
@@ -238,7 +202,7 @@ struct TransferDetailContent: View {
         HStack(spacing: 12) {
             Text(title).foregroundStyle(Pendant.secondary).lineLimit(1)
             Spacer(minLength: 8)
-            Text(value ?? "Unknown").monospacedDigit().lineLimit(1).layoutPriority(1)
+            Text(value ?? "未知").monospacedDigit().lineLimit(1).layoutPriority(1)
                 .foregroundStyle(attention ? Pendant.warnForeground : value == nil ? Pendant.secondary : Pendant.ink)
         }
         .font(.subheadline)
@@ -246,51 +210,60 @@ struct TransferDetailContent: View {
         .accessibilityElement(children: .combine)
     }
 
-    /// Counters only: nothing the status line, a bar's line or the server line already says.
+    private func ago(_ date: Date) -> String { TransferSummary.agoText(date, now: now) }
+
+    /// Every counter, including the counts the main screen leaves out.
     @ViewBuilder private func details(_ t: TransferSummary) -> some View {
         let p = t.phone, w = t.watch, s = t.server
         let counting = p.since != nil
         Card {
             VStack(spacing: 0) {
-                row("Queued size", Fmt.bytes(p.queuedBytes))
-                if p.queuedAudioFiles > 0 { row("Queued audio", TransferText.duration(p.queuedAudioSeconds)) }
-                if p.queuedAudioUnknown > 0 { row("Audio of unknown length", TransferText.plural(p.queuedAudioUnknown, "file", "files")) }
-                row("Handed to iOS", counting ? TransferText.plural(p.inFlightUploads, "upload", "uploads") : nil)
-                if counting, p.inFlightTotal > 0 { row("In those uploads", "\(Fmt.bytes(p.inFlightSent)) of \(Fmt.bytes(p.inFlightTotal))") }
-                row(p.since.map { "Sent since \($0.formatted(date: .omitted, time: .shortened))" } ?? "Sent", counting ? Fmt.bytes(p.networkBytes) : nil)
-                row("Confirmed audio", counting ? "\(p.deliveredAudioFiles.formatted()) · \(Fmt.bytes(p.deliveredAudioBytes))" : nil)
-                if p.deliveredOtherFiles > 0 { row("Confirmed other", p.deliveredOtherFiles.formatted()) }
-                if p.retryingAttempts > 0 { row("Failed, will retry", p.retryingAttempts.formatted(), attention: true) }
-                if p.heldAttempts > 0 { row("Stopped attempts", p.heldAttempts.formatted(), attention: true) }
-                if p.keptAside > 0, p.state != .keptAside(p.keptAside) { row("Kept aside", TransferText.plural(p.keptAside, "file", "files"), attention: true) }
+                row("速度", p.rate.map(TransferSummary.rateText) ?? (counting ? "无" : nil))
+                row("排队文件", TransferText.count(p.queuedFiles, "文件"))
+                row("排队大小", Fmt.bytes(p.queuedBytes))
+                if p.queuedAudioFiles > 0 { row("排队录音", TransferSummary.durationText(Int(p.queuedAudioSeconds.rounded()))) }
+                if p.queuedAudioUnknown > 0 { row("时长未知的录音", TransferText.count(p.queuedAudioUnknown, "文件")) }
+                row("已交给 iOS", counting ? TransferText.count(p.inFlightUploads, "上传") : nil)
+                if counting, p.inFlightTotal > 0 { row("这些上传中", "\(Fmt.bytes(p.inFlightSent)) / \(Fmt.bytes(p.inFlightTotal))") }
+                row(p.since.map { "\($0.formatted(date: .omitted, time: .shortened)) 起已发送" } ?? "已发送", counting ? Fmt.bytes(p.networkBytes) : nil)
+                row("已确认录音", counting ? "\(TransferText.count(p.deliveredAudioFiles, "文件")) · \(Fmt.bytes(p.deliveredAudioBytes))" : nil)
+                if p.deliveredOtherFiles > 0 { row("已确认其他", TransferText.count(p.deliveredOtherFiles, "文件")) }
+                if p.retryingAttempts > 0 { row("失败，将重试", "\(p.retryingAttempts.formatted()) 次", attention: true) }
+                if p.heldAttempts > 0 { row("已停止的尝试", "\(p.heldAttempts.formatted()) 次", attention: true) }
+                if p.keptAside > 0 { row("已搁置", TransferText.count(p.keptAside, "文件"), attention: true) }
             }
             .padding(.vertical, 4)
         }
         if w.inUse == true {
             Card {
                 VStack(spacing: 0) {
-                    row("Watch report", w.reportAt.map { (w.reportFresh ? "" : "Old · ") + Fmt.relative($0) })
-                    if let seconds = w.waitingSeconds, w.reportAt != nil { row("Audio on the Watch", TransferText.duration(Double(seconds))) }
-                    if w.recheckParts > 0, w.reportAt != nil { row("Of it, re-checking", TransferText.plural(w.recheckParts, "older part", "older parts")) }
-                    row("Received from Watch", TransferText.plural(w.receivedOnPhone, "part", "parts"))
-                    row("Last received", w.lastReceivedAt.map { Fmt.relative($0) } ?? "Not since launch")
-                    if w.converting > 0 { row("Preparing", TransferText.plural(w.converting, "part", "parts")) }
-                    row("Watch audio queued", TransferText.plural(w.waitingForServer, "file", "files"))
+                    row("手表报告", w.reportAt.map { (w.reportFresh ? "" : "已过时 · ") + ago($0) })
+                    if w.reportAt != nil {
+                        if let parts = w.waitingParts { row("手表上的待发部分", TransferText.count(parts, "部分")) }
+                        if let seconds = w.waitingSeconds { row("手表上的录音", TransferSummary.durationText(seconds)) }
+                        if w.recheckParts > 0 { row("其中重新核对", TransferText.count(w.recheckParts, "较早部分")) }
+                        row("无法发送的部分", w.keptOnWatch.map { TransferText.count($0, "部分") }, attention: (w.keptOnWatch ?? 0) > 0)
+                    }
+                    row("已从手表收到", TransferText.count(w.receivedOnPhone, "部分"))
+                    row("上次收到", w.lastReceivedAt.map(ago) ?? "启动后未收到")
+                    if w.converting > 0 { row("准备中", TransferText.count(w.converting, "部分")) }
+                    row("排队中的手表录音", TransferText.count(w.waitingForServer, "文件"))
                 }
                 .padding(.vertical, 4)
             }
         }
         Card {
             VStack(spacing: 0) {
-                row("Audio to process", s.chunksPending.map { $0.formatted() })
-                row("Conversations to process", s.conversationsPending.map { $0.formatted() })
-                row("Last note", s.lastNoteAt.map { Fmt.relative($0) })
+                row("服务器检查", s.checkedAt.map(ago))
+                row("待处理录音", s.chunksPending.map { $0.formatted() })
+                row("待处理对话", s.conversationsPending.map { $0.formatted() })
+                row("上一条笔记", s.lastNoteAt.map(ago))
             }
             .padding(.vertical, 4)
         }
         if SyncActivityCoordinator.available {
             Card {
-                Toggle("Show sync on the Lock Screen", isOn: Binding(get: { !lockScreenOff }, set: { lockScreenOff = !$0 }))
+                Toggle("在锁定屏幕上显示同步", isOn: Binding(get: { !lockScreenOff }, set: { lockScreenOff = !$0 }))
                     .font(.subheadline).padding(.horizontal, 16).padding(.vertical, 8)
             }
         }
@@ -304,8 +277,4 @@ struct TransferDetailContent: View {
         }
         .padding(.horizontal, 4)
     }
-}
-
-private extension String {
-    var nilIfEmpty: String? { isEmpty ? nil : self }
 }
