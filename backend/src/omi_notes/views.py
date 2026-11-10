@@ -388,9 +388,14 @@ def short_seconds(pipeline) -> float:
 
 
 def local_day(pipeline, row) -> str:
+    """The row's indexed local day (`home.py`), computed only for a row the worker hasn't filled yet."""
     from datetime import datetime
 
-    return datetime.fromtimestamp(row["start"], pipeline.tz).date().isoformat()
+    try:
+        day = row["day"]
+    except (IndexError, KeyError):
+        day = None
+    return day or datetime.fromtimestamp(row["start"], pipeline.tz).date().isoformat()
 
 
 def deferred_view(row: sqlite3.Row) -> dict | None:
@@ -404,38 +409,6 @@ def deferred_view(row: sqlite3.Row) -> dict | None:
     op = deferral.requested_op(row)
     return {"state": "waiting" if deferral.waiting(row) else "requested", "operation_id": op,
             "threshold_s": block.get("threshold_s"), "provisional_class": (block.get("provisional") or {}).get("class")}  # fmt: skip
-
-
-def day_aggregates(pipeline, days: set[str]) -> dict:
-    """Per local day, over every listed conversation of that day (not one page, not one filter): how many short
-    sessions there are, how many wait deferred, how many the owner asked to transcribe and aren't done, and how
-    many carry a failure or issue, so the phone's folded row shows them all."""
-    from datetime import date, datetime, timedelta
-
-    from . import deferral
-
-    out: dict = {}
-    threshold = short_seconds(pipeline)
-    for day in sorted(days):
-        d = date.fromisoformat(day)
-        lo = datetime(d.year, d.month, d.day, tzinfo=pipeline.tz)
-        rows = pipeline.db.query(f"SELECT * FROM conversations WHERE {LISTED} AND start >= ? AND start < ? AND status <> 'open' "
-                                 "AND speech_seconds < ?", (lo.timestamp(), (lo + timedelta(days=1)).timestamp(), threshold))  # fmt: skip
-        out[day] = {
-            "short": len(rows),
-            "deferred": sum(1 for r in rows if deferral.waiting(r)),
-            "requested": sum(1 for r in rows if (deferred_view(r) or {}).get("state") == "requested"),
-            "issues": sum(1 for r in rows if (r["status"] == "failed" and _not_dismissed(r)) or issues(r)),
-        }
-    return out
-
-
-def _not_dismissed(row) -> bool:
-    try:
-        res = json.loads(row["resolution"]) if row["resolution"] else {}
-    except json.JSONDecodeError:
-        return True
-    return not (isinstance(res, dict) and res.get("kind") == "dismissed" and (res.get("failure") or {}).get("id") == row["failure_id"])
 
 
 def parse_cursor(cursor: str) -> tuple[float, str] | None:

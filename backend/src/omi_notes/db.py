@@ -238,13 +238,28 @@ CREATE TABLE IF NOT EXISTS conversations (
     deferral TEXT,
     transcribe_op TEXT,
     rerun INTEGER NOT NULL DEFAULT 0,
+    day TEXT,
+    class_choice TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     finalized_at REAL,
-    done_at REAL
+    done_at REAL,
+    -- the kind Home lists a conversation under (`home.py`): the class its note was made for; before any note, a
+    -- deferred session's owner choice or provisional class; NULL when not classified (yet)
+    kind TEXT GENERATED ALWAYS AS (CASE
+        WHEN note_path IS NOT NULL THEN json_extract(index_json, '$.recording_class.class')
+        WHEN deferral IS NOT NULL AND status <> 'failed'
+            THEN COALESCE(class_choice, json_extract(deferral, '$.provisional.class'), 'undetermined')
+    END) VIRTUAL
 );
 CREATE INDEX IF NOT EXISTS conversations_status ON conversations(status);
 CREATE INDEX IF NOT EXISTS conversations_device ON conversations(device_id, start);
+-- Home's request paths (`/v1/conversations/recent`): a page, a day, a kind and a day's short-session totals are
+-- index lookups, never a scan of every conversation
+CREATE INDEX IF NOT EXISTS conversations_start ON conversations(start, id);
+CREATE INDEX IF NOT EXISTS conversations_day ON conversations(day, speech_seconds);
+CREATE INDEX IF NOT EXISTS conversations_kind ON conversations(kind, start, id);
+CREATE INDEX IF NOT EXISTS conversations_unsummarized_deferred ON conversations(start) WHERE deferral IS NOT NULL AND note_path IS NULL;
 
 -- decision.known_through: speech from (capture, seq) is known to a finalized conversation iff
 -- seq <= known_through[capture] (the seal flush is virtual chunk last + 1).
@@ -475,6 +490,10 @@ COLUMN_SOURCES: dict[str, dict[str, str]] = {
         "transcribe_op": "operational — an accepted transcription request not yet in conversation.json (the sweeper "
                          "sets it again from _omi/operations/ after a rebuild)",
         "rerun": "operational — a reprocess (lane 1) in progress, kept through its summary; reset by a rebuild",
+        "day": "operational — the local day of conversation.json start in the vault's timezone (`home.py`; refilled "
+               "when the timezone changes)",
+        "class_choice": "<conversation dir>/class.json class (the owner's recording-class choice; NULL for auto)",
+        "kind": "generated — from note_path, index_json recording_class, deferral provisional and class_choice",
         "created_at": "operational",
         "updated_at": "operational",
     },

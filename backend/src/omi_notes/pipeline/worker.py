@@ -21,7 +21,7 @@ import threading
 import time
 from collections import OrderedDict
 
-from .. import __version__, deferral, operations, priority, search
+from .. import __version__, deferral, home, operations, priority, search
 from ..audio.timeline import RING_RECORD_SECONDS, CaptureTimeline, ChunkDecode
 from ..audio.vad import MIN_SPEECH, VadChoice, VadStream, make_vad
 from ..db import Database
@@ -165,6 +165,10 @@ class Worker:
                     self.pipeline.reconcile_classes(now)
                 except Exception:
                     log.exception("could not apply recording-class choices")
+            try:
+                home.fill_days(self.db, self.pipeline.tz)  # a row some write path left without its Home day
+            except Exception:
+                log.exception("could not fill conversation days")
             # chunks still waiting to be decoded are work too: deferred short sessions wait for them
             advanced = self.pipeline.run(now, idle=lambda: not self._ready_chunks())
             try:
@@ -774,12 +778,14 @@ class Worker:
                 "start_explicit": int(c.start_explicit),
                 "end_explicit": int(c.end_explicit),
                 "waiting_for": c.waiting_for or None,
+                "day": home.day_of(c.start, self.pipeline.tz),  # Home's indexed day (`home.py`)
             }
             current = open_rows.get(conv_id)
             if current is None:
                 self.db.execute(
-                    "INSERT INTO conversations (id, device_id, start, end, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
-                    (conv_id, device, c.start, c.end, "open", now, now),
+                    "INSERT INTO conversations (id, device_id, start, end, status, created_at, updated_at, day) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (conv_id, device, c.start, c.end, "open", now, now, fields["day"]),
                 )
                 current = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
                 changes += 1

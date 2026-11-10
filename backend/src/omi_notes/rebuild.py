@@ -261,8 +261,11 @@ def apply_record(conn, record: dict, sha: str, now: float, vault: Vault | None =
     values, known = row_from_record(record)
     if vault is not None:
         _resume_newer_transcript(vault, values)
+        values["class_choice"] = _class_choice(vault, values["id"])
     current = conn.execute("SELECT * FROM conversations WHERE id=?", (values["id"],)).fetchone()
     values["record_sha"] = sha
+    if current is None or current["start"] != values["start"]:
+        values["day"] = None  # filled in the vault's timezone when the index is opened (`home.ensure_days`)
     if current is None:
         values.update(created_at=values.get("finalized_at") or now, updated_at=now,
                       needs_render=int(values.get("note_path") is not None))  # fmt: skip
@@ -280,6 +283,17 @@ def apply_record(conn, record: dict, sha: str, now: float, vault: Vault | None =
         [(values["id"], cap, seq) for cap, seq in known.items()],
     )
     # Speech this conversation knows about is claimed (segmentation re-derives the exact claims).
+
+
+def _class_choice(vault: Vault, conv_id: str) -> str | None:
+    """The owner's recording-class choice in `class.json` (the `class_choice` column); None for auto, none, or an
+    unreadable file (shown as an issue by the API, which reads the file itself)."""
+    try:
+        data = Vault.read_json(vault.conversation_dir(conv_id) / "class.json")
+    except (OSError, ValueError):
+        return None
+    chosen = data.get("class") if isinstance(data, dict) else None
+    return chosen if chosen in ("monologue", "dialogue", "passive") else None
 
 
 def _resume_newer_transcript(vault: Vault, values: dict) -> None:
@@ -457,6 +471,9 @@ def open_index(settings: Settings, vault: Vault, *, sweep_orphans: bool = True, 
         db = Database(target)
         if sweep_orphans and not db.meta("read_only"):
             sweep(db, vault)
+        from . import home
+
+        home.ensure_days(db, home.timezone_name(settings, vault))
     return db
 
 

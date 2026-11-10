@@ -262,12 +262,12 @@ def test_every_index_column_declares_its_vault_source(tmp_path):
     tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
     missing = []
     for table in tables:
-        for column in (r[1] for r in conn.execute(f"PRAGMA table_info({table})")):
+        for column in (r[1] for r in conn.execute(f"PRAGMA table_xinfo({table})")):
             if not COLUMN_SOURCES.get(table, {}).get(column):
                 missing.append(f"{table}.{column}")
     assert not missing, f"columns without a declared vault source: {missing}"
     stale = [f"{t}.{c}" for t, cols in COLUMN_SOURCES.items() for c in cols
-             if t not in tables or c not in {r[1] for r in conn.execute(f"PRAGMA table_info({t})")}]  # fmt: skip
+             if t not in tables or c not in {r[1] for r in conn.execute(f"PRAGMA table_xinfo({t})")}]  # fmt: skip
     assert not stale, f"declared sources for columns that no longer exist: {stale}"
 
 

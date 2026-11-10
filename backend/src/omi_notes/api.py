@@ -17,7 +17,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.requests import ClientDisconnect
 
-from . import PROTOCOL_VERSION, __version__, operations, phone_log, priority, recording, search, views, watch_perf
+from . import PROTOCOL_VERSION, __version__, home, operations, phone_log, priority, recording, search, views, watch_perf
 from .audio import aac
 from .envelope import MAX_BODY_BYTES
 from .ingest import ApiError, Ingest, capture_status
@@ -266,17 +266,17 @@ def create_app(
         limit = max(1, min(limit, 200))
         where, params = views.LISTED, []
         pipeline = app.state.speakers.pipeline
-        if day is not None:  # one local day (the server's timezone), filtered before paging
-            lo, hi = _day(day, pipeline.tz), _day(day, pipeline.tz, next_day=True)
-            where += " AND start >= ? AND start < ?"
-            params += [lo, hi]
+        if day is not None:  # one local day (the server's timezone; the indexed `day` column), filtered before paging
+            _day(day, pipeline.tz)  # validated
+            where += " AND day = ?"
+            params.append(day)
         if short is not None:  # under (or at least) the short-session threshold of detected speech
             where += " AND speech_seconds " + ("< ?" if short else ">= ?")
             params.append(views.short_seconds(pipeline))
         if recording_class is not None:  # filtered before paging, so a page is full and the cursor stays valid
-            if recording_class not in ("monologue", "dialogue", "passive"):
-                raise ApiError(422, "invalid_class", "class must be monologue, dialogue or passive")
-            where += " AND json_extract(index_json, '$.recording_class.class') = ?"
+            if recording_class not in home.KINDS:
+                raise ApiError(422, "invalid_class", "class must be monologue, dialogue, passive or undetermined")
+            where += " AND kind = ?"  # the indexed kind a row is listed under (`home.py`)
             params.append(recording_class)
         if before is not None:
             cursor = views.parse_cursor(before)
@@ -290,7 +290,7 @@ def create_app(
             "conversations": [views.summary_row(pipeline, r) for r in page],
             "next_cursor": views.make_cursor(page[-1]) if len(rows) > limit else None,
             # each listed day of this page in full, whatever the filter and paging: short sessions and what needs a look
-            "days": views.day_aggregates(pipeline, {views.local_day(pipeline, r) for r in page}),
+            "days": home.day_totals(db, {views.local_day(pipeline, r) for r in page}, views.short_seconds(pipeline)),
             "short_s": views.short_seconds(pipeline),
         }
 
@@ -363,6 +363,8 @@ def create_app(
             applied = (json.loads(row["index_json"] or "{}").get("recording_class") or {}) if row else {}
             # stored in the vault only: the worker sees the newer choice and summarizes again (reconcile_classes)
             out = rclass.put(pipeline, conv_id, body, applied)
+            if row is not None:  # the file is written: its index copy lists the row under the chosen kind
+                home.set_choice(db, conv_id, (rclass.read(pipeline, conv_id) or {}).get("class"))
             if row is not None and not row["note_path"]:
                 # no summary yet (deferred, or still queued): the choice only changes the provisional kind shown; the
                 # first summary reads it. Nothing is scheduled.
