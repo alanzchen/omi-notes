@@ -291,4 +291,58 @@ import OmiWatchKit
         let waiting = WatchReport(state: .recording, since: now, waitingParts: 3, waitingSeconds: 180, at: now, stats: ["orphan_parts": 0])
         #expect(WatchSummary.onWatchLine(waiting, lastReceivedAt: nil, now: now).hasSuffix("They move when both are nearby with Omi Notes open."))
     }
+
+    // TRANSFERS-50 (Alan, 2026-11-09: "uploading 卡片很多余"): no state label like "Uploading"; one
+    // status line says what is left and, while bytes move, about how long.
+
+    @Test func theStatusLineSaysWhatIsLeftAndAboutHowLong() throws {
+        let backlog = try #require(TransferSummary.debugFixture("backlog", now: now)).statusLine
+        #expect(backlog.text == "5,135 files · about 13 h left" && !backlog.attention)
+        let sending = try #require(TransferSummary.debugFixture("sending", now: now)).statusLine
+        #expect(sending.text == "38 files · under 1 min left", "9.4 MB at 1.24 MB/s")
+        var one = try #require(TransferSummary.debugFixture("sending", now: now))
+        one.phone.queuedFiles = 1
+        #expect(one.statusLine.text == "1 file · under 1 min left")
+        #expect(try #require(TransferSummary.debugFixture("waiting", now: now)).statusLine.text == "38 files waiting to send",
+                "no speed, no estimate")
+        for name in ["backlog", "sending", "waiting", "offline", "retrying", "kept-aside", "all-sent", "unknown-watch"] {
+            let line = try #require(TransferSummary.debugFixture(name, now: now)).statusLine.text
+            #expect(!line.contains("Uploading") && !line.contains("~<"), "\(name): \(line)")
+        }
+    }
+
+    @Test func theTimeLeftReadsAsARoughFigure() {
+        #expect(TransferSummary.timeLeftText(20) == "under 1 min left")
+        #expect(TransferSummary.timeLeftText(25 * 60) == "about 25 min left")
+        #expect(TransferSummary.timeLeftText(13.4 * 3600) == "about 13 h left")
+        #expect(TransferSummary.timeLeftText(3 * 86_400) == "about 3 days left")
+    }
+
+    @Test func problemsLeadTheStatusLine() throws {
+        let offline = try #require(TransferSummary.debugFixture("offline", now: now)).statusLine
+        #expect(offline.text == "Can't reach the server (timed out) · 38 files waiting" && offline.attention)
+        let retrying = try #require(TransferSummary.debugFixture("retrying", now: now)).statusLine
+        #expect(retrying.text == "2 files failed, retrying soon · 38 files waiting" && retrying.attention)
+        let kept = try #require(TransferSummary.debugFixture("kept-aside", now: now)).statusLine
+        #expect(kept.text == "1 file kept aside, not uploaded" && kept.attention)
+        var unknown = try #require(TransferSummary.debugFixture("waiting", now: now))
+        unknown.phone.state = .unknown
+        #expect(unknown.statusLine.text == "38 files waiting · not measured right now" && !unknown.statusLine.attention)
+    }
+
+    @Test func theStatusLineSaysAllSentOnlyWithEvidence() throws {
+        let all = try #require(TransferSummary.debugFixture("all-sent", now: now))
+        #expect(all.statusLine.text == "All sent" && !all.statusLine.attention)
+        var stale = all
+        stale.watch.reportFresh = false
+        #expect(stale.statusLine.text == "iPhone sent everything · waiting for a Watch report")
+        var unknownKept = all
+        unknownKept.watch.keptOnWatch = nil
+        #expect(unknownKept.statusLine.text == "iPhone sent everything · the Watch hasn't confirmed it's empty")
+        var parts = all
+        parts.watch.waitingParts = 3
+        #expect(parts.statusLine.text == "iPhone sent everything · the Watch still has audio")
+        let noWatch = try #require(TransferSummary.debugFixture("unknown-watch", now: now))
+        #expect(noWatch.statusLine.text == "iPhone sent everything · waiting for a Watch report", "an unknown Watch is not an empty one")
+    }
 }

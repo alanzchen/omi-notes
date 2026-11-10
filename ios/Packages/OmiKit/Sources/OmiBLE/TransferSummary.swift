@@ -207,6 +207,46 @@ public struct TransferSummary: Equatable, Sendable {
         return Double(phone.queuedBytes) / rate
     }
 
+    /// "under 1 min left", "about 25 min left", "about 13 h left", "about 3 days left": a round
+    /// figure, never a promise.
+    public static func timeLeftText(_ seconds: Double) -> String {
+        if seconds < 60 { return "under 1 min left" }
+        if seconds < 3600 { return "about \(Int((seconds / 60).rounded())) min left" }
+        if seconds < 48 * 3600 { return "about \(Int((seconds / 3600).rounded())) h left" }
+        return "about \(Int((seconds / 86_400).rounded())) days left"
+    }
+
+    /// The one status line (the Transfers screen and the Devices card): what is still queued on this
+    /// iPhone and, while bytes move, about how long it takes. No state label ("Uploading"): the bars
+    /// show that something moves. A problem leads the line; "All sent" only with `everythingSent`.
+    public var statusLine: (text: String, attention: Bool) {
+        let p = phone
+        func files(_ n: Int) -> String { "\(n.formatted()) \(n == 1 ? "file" : "files")" }
+        let waiting = p.queuedFiles > 0 ? files(p.queuedFiles) + " waiting" : nil
+        func join(_ parts: String?...) -> String { parts.compactMap { $0 }.joined(separator: " · ") }
+        switch p.state {
+        case .sending:
+            let left = p.queuedFiles > 0 ? files(p.queuedFiles) : "Sending"
+            return (join(left, phoneTimeLeft.map(Self.timeLeftText)), false)
+        case .waiting: return (waiting.map { $0 + " to send" } ?? "Waiting to send", false)
+        case .retrying: return (join("\(files(p.retryingFiles)) failed, retrying soon", waiting), true)
+        case .offline(let why): return (join("Can't reach the server (\(why))", waiting), true)
+        case .paused(let why): return (join("Uploads paused", why), true)
+        case .preparing(let n): return ("Preparing \(n) Watch \(n == 1 ? "part" : "parts")", false)
+        case .keptAside(let n): return ("\(files(n)) kept aside, not uploaded", true)
+        case .queueUnreadable: return ("Can't read the upload queue", true)
+        case .allSent:
+            if everythingSent { return ("All sent", false) }
+            let w = watch
+            let has = (w.waitingParts ?? 0) > 0 || (w.keptOnWatch ?? 0) > 0 || w.converting > 0 || w.waitingForServer > 0
+            // a missing count (an older Watch app) is neither audio nor its absence
+            return (join("iPhone sent everything", !w.reportFresh ? "waiting for a Watch report"
+                         : has ? "the Watch still has audio" : "the Watch hasn't confirmed it's empty"), false)
+        case .notConfigured: return ("No server connected", true)
+        case .unknown: return (waiting.map { $0 + " · not measured right now" } ?? "Not measured right now", false)
+        }
+    }
+
     /// iPhone → server bar: audio bytes the server confirmed since the app opened, of those plus
     /// the bytes still queued. nil when nothing is known (not counting, or nothing at all).
     public var phoneFraction: Double? {
