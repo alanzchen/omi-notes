@@ -413,3 +413,72 @@ def test_the_dense_window_over_http_is_complete_or_422_and_health_stays_up():
         if status == 200:
             assert len(r.json()["segments"]) == 75
         assert client.get("/health").status_code == 200
+
+
+class PrefixMoss(DenseMoss):
+    """Astra's IT3 counterexamples (nightly-2026-11-10-it3, test_repair_edges.py): a greedy decoder gives the same
+    67 replies (to 26.8 s) on every try, then an unfinished segment that loops for `loop` tokens; a try with a
+    larger cap than that ends on its own, still without a reply after 26.8 s."""
+
+    def __init__(self, loop):
+        super().__init__()
+        self.loop = loop
+
+    def generate(self, audio, max_tokens=0, **_):
+        self.caps.append(max_tokens)
+        full = 67 * self.cost + self.loop
+        lines = [{"start": round(i * self.step, 2), "end": round((i + 1) * self.step, 2), "speaker_id": f"S0{i % 2 + 1}",
+                  "text": f"[{i * self.step:.2f}][S0{i % 2 + 1}] r{i}"} for i in range(min(67, max_tokens // self.cost))]  # fmt: skip
+        return SimpleNamespace(segments=lines, generation_tokens=min(full, max_tokens))
+
+
+def test_a_retry_that_ends_below_its_cap_still_has_its_unworded_tail_checked():
+    # ASTRA-20261110-IT3-01: 1200/1200, then 2006/4800 with the same 67 replies; Qwen fails throughout. The
+    # retry's normal stop erased the cap hit and the 3.2 s tail passed the 25% allowance: a 200 ending at 26.8 s
+    from omi_asr.engine import IncompleteTranscription
+
+    moss = PrefixMoss(loop=800)
+    e = Engine()
+    e.models = (moss, CappingQwen(limit=0), FakeAligner())
+    with pytest.raises(IncompleteTranscription):
+        e.transcribe(speech(30), [])
+    assert moss.caps == [1200, 4800]
+
+
+class OneWordQwen(FakeQwen):
+    def generate(self, audio, hotwords=None, max_tokens=0, **_):
+        return SimpleNamespace(text="tailword", generation_tokens=2, language=["English"])
+
+
+class AtAligner:
+    def generate(self, chunk, text, language):
+        return SimpleNamespace(items=[SimpleNamespace(text=text, start_time=27.0, end_time=28.0)])
+
+
+def test_qwen_wording_only_part_of_a_capped_tail_does_not_make_the_window_complete():
+    # ASTRA-20261110-IT3-02: both MOSS tries capped at 26.8 s; Qwen aligns one word at 27-28 s and nothing up to
+    # 30 s, without being marked failed: a 200 ending at 28 s
+    from omi_asr.engine import IncompleteTranscription
+
+    e = Engine()
+    e.models = (PrefixMoss(loop=6000), OneWordQwen(), AtAligner())
+    with pytest.raises(IncompleteTranscription):
+        e.transcribe(speech(30), [])
+
+
+def test_a_capped_window_with_a_silent_tail_still_passes():
+    samples = speech(30)
+    samples[round(26.8 * SR) :] = 0.0
+    e = Engine()
+    e.models = (PrefixMoss(loop=6000), CappingQwen(limit=0), FakeAligner())
+    out = e.transcribe(samples, [])
+    assert len(out["segments"]) == 67 and out["omi_asr"]["truncated_unresolved"] == 1
+
+
+def test_a_retry_that_completes_the_window_is_counted_and_returns_every_reply_with_a_good_qwen():
+    moss = DenseMoss()
+    e = Engine()
+    e.models = (moss, FakeQwen(), FakeAligner())
+    out = e.transcribe(speech(30), [])
+    assert moss.caps == [1200, 4800] and out["omi_asr"]["capped_then_complete"] == 1
+    assert max(s["end"] for s in out["segments"]) >= 29.5

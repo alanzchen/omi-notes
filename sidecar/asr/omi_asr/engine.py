@@ -45,18 +45,26 @@ def _uncovered_speech(pcm: np.ndarray, a: float, b: float, covered: list[tuple[f
     return float((loud & ~hit).sum()) * frame / plan.SR, float(loud.sum()) * frame / plan.SR
 
 
-def _check_truncated_tail(pcm: np.ndarray, capped: list[tuple[float, float]], lines: list[dict], start: float) -> None:
-    """Past the last line of a MOSS answer cut off by its cap, only Qwen has words: speech there in a span Qwen
-    failed on would vanish, so none of it is allowed (no share for noise, unlike `_check_fallback`)."""
+TAIL_UNCOVERED_MAX = 0.5  # s of speech past MOSS's last line that neither MOSS nor an aligned Qwen word may reach
+TAIL_WORD_GAP = 1.0  # s between neighbouring words (or lines) still counted as one stretch of speech
+
+
+def _check_tail(pcm: np.ndarray, lines: list[dict], units: list, start: float, stop: float) -> None:
+    """Past the last line of a MOSS answer that hit its cap (or stopped long before the speech did), the words
+    are whatever Qwen aligned there. Its speech must be reached by a MOSS line or an aligned Qwen word (each
+    +-SLACK; gaps under TAIL_WORD_GAP between them are within the speech they cover) but for
+    TAIL_UNCOVERED_MAX: a failed, empty or partial Qwen piece there is an incomplete transcript, not a shorter
+    one. Quiet audio (below the energy threshold) needs no words."""
     last = max((line["end"] for line in lines), default=start)
-    for a, b in capped:
-        if b <= last + SLACK:
-            continue
-        missing, _ = _uncovered_speech(pcm, max(a, last + SLACK), b, [])
-        if missing >= 0.2:
-            raise IncompleteTranscription(
-                f"MOSS stopped at its cap at {last:.1f} s and Qwen failed on {a:.1f}-{b:.1f} s: {missing:.1f} s of speech has no words"
-            )
+    covered: list[tuple[float, float]] = []
+    for x, y in sorted([(line["start"], line["end"]) for line in lines] + [(u.start, u.end) for u in units]):
+        if covered and x - covered[-1][1] <= TAIL_WORD_GAP:
+            covered[-1] = (covered[-1][0], max(covered[-1][1], y))
+        else:
+            covered.append((x, y))
+    missing, _ = _uncovered_speech(pcm, last, stop, covered)
+    if missing > TAIL_UNCOVERED_MAX:
+        raise IncompleteTranscription(f"MOSS's answer stopped at {last:.1f} s and {missing:.1f} s of speech up to {stop:.1f} s has no words")
 
 
 QWEN_SPLITS = 6  # a capped chunk is halved, and each capped piece again, until 20 s or less (this only bounds it)
@@ -145,7 +153,7 @@ class Engine:
             mx.reset_peak_memory()
             t0 = time.perf_counter()
             duration = len(pcm) / plan.SR
-            stats = {"windows": 0, "resplits": 0, "truncated_unresolved": 0, "moss_retries": 0, "unlabeled_windows": 0, "qwen_chunks": 0,
+            stats = {"windows": 0, "resplits": 0, "truncated_unresolved": 0, "moss_retries": 0, "capped_then_complete": 0, "unlabeled_windows": 0, "qwen_chunks": 0,
                      "qwen_split": 0, "qwen_without_context": 0, "qwen_capped": 0, "qwen_unaligned": 0, "units": 0, "units_outside_lines": 0, "lines_with_moss_text": 0}  # fmt: skip
             lines: list[dict] = []
             languages: list[str] = []
@@ -173,8 +181,9 @@ class Engine:
             }
 
     def _moss(self, moss, pcm: np.ndarray, a: float, b: float, depth: int, stats: dict) -> list[tuple[list[dict], float, float, bool]]:
-        """MOSS on [a, b] (absolute s): [(lines, window start, window end, still truncated)], cut again at the
-        middle pause while truncated."""
+        """MOSS on [a, b] (absolute s): [(lines, window start, window end, tail unproven)], cut again at the
+        middle pause while truncated. The tail is unproven while truncated, and also when any try hit its cap:
+        a retry that then stops on its own may still have no words for the end."""
         import mlx.core as mx
 
         window = pcm[round(a * plan.SR) : round(b * plan.SR)]
@@ -184,7 +193,8 @@ class Engine:
         stats["windows"] += 1
         relative = moss_lines(r.segments)
         retry = plan.moss_retry_tokens(seconds)
-        if relative and retry > cap and int(r.generation_tokens) >= cap:
+        cap_hit = int(r.generation_tokens) >= cap  # evidence a retry ending below its own cap doesn't erase
+        if relative and retry > cap and cap_hit:
             # lines, then the short cap: dense speech, not a loop (a loop gives no lines and fails at the short cap)
             stats["moss_retries"] += 1
             log.warning("MOSS hit its short cap on %.0f s (tokens %d/%d): trying it with %d", seconds, r.generation_tokens, cap, retry)
@@ -202,7 +212,9 @@ class Engine:
             stats["truncated_unresolved"] += 1
             log.warning("MOSS still truncated on %.0f s at %.0f s (tokens %d/%d)", seconds, a, r.generation_tokens, cap)
             return [(moss_lines(r.segments, offset=a), a, b, True)]
-        return [(moss_lines(r.segments, offset=a), a, b, False)]
+        if cap_hit:
+            stats["capped_then_complete"] += 1
+        return [(moss_lines(r.segments, offset=a), a, b, cap_hit)]
 
     def _qwen(self, qwen, aligner, pcm: np.ndarray, a: float, b: float, context: list[str], stats: dict,
               languages: list[str], capped: list[tuple[float, float]], splits: int = QWEN_SPLITS) -> list:  # fmt: skip
@@ -268,7 +280,7 @@ class Engine:
         lines = [dict(line) for line in lines]
         _check_fallback(pcm, capped, lines)
         if truncated:
-            _check_truncated_tail(pcm, capped, lines, start)
+            _check_tail(pcm, lines, units, start, stop)
         if not lines:
             if not units:
                 return []
