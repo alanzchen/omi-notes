@@ -270,10 +270,11 @@ def put(pipeline, conv_id: str, body: dict, applied: dict | None) -> dict:
             current = read(pipeline, conv_id) or {"format": 1, "class": "auto", "revision": 0, "set_at": 0, "requests": []}
         except UnreadableChoice as exc:
             raise ApiError(409, "unreadable", str(exc)) from exc
-        if request_id in current.get("requests", []):
-            return view(applied, current, applied_flag=True)
-        if when_epoch <= float(current.get("set_at") or 0):
-            return view(applied, current, applied_flag=False)  # an older choice than the stored one: the newer stands
+        if request_id in current.get("requests", []) or when_epoch <= float(current.get("set_at") or 0):
+            # a replay, or an older choice than the stored one (the newer stands): before answering, the index holds
+            # the stored choice, so an earlier write whose indexing failed is never acknowledged unfinished
+            _index_choice(pipeline, conv_id, current)
+            return view(applied, current, applied_flag=request_id in current.get("requests", []))
         data = {"format": 1, "class": chosen, "set_at": when_epoch, "revision": int(current.get("revision", 0)) + 1,
                 "request_id": request_id, "requests": (list(current.get("requests", [])) + [request_id])[-REQUEST_MEMORY:],
                 "source": "app",
@@ -284,9 +285,14 @@ def put(pipeline, conv_id: str, body: dict, applied: dict | None) -> dict:
         # interrupted between the two (`repair_choices`).
         pipeline.db.execute("INSERT OR IGNORE INTO class_pending (conversation_id) VALUES (?)", (conv_id,))
         Vault.write_json(_path(pipeline, conv_id), data)
-        home.set_choice(pipeline.db, conv_id, chosen)
-        pipeline.db.execute("DELETE FROM class_pending WHERE conversation_id=?", (conv_id,))
+        _index_choice(pipeline, conv_id, data)
         return view(applied, data, applied_flag=True)
+
+
+def _index_choice(pipeline, conv_id: str, stored: dict | None) -> None:
+    """The index copy of the stored choice, and its pending mark cleared (the caller holds class.lock)."""
+    home.set_choice(pipeline.db, conv_id, (stored or {}).get("class"))
+    pipeline.db.execute("DELETE FROM class_pending WHERE conversation_id=?", (conv_id,))
 
 
 def repair_choices(pipeline, *, limit: int = 50) -> int:
@@ -302,7 +308,6 @@ def repair_choices(pipeline, *, limit: int = 50) -> int:
                 choice = read(pipeline, conv_id)
             except UnreadableChoice:
                 continue
-            home.set_choice(pipeline.db, conv_id, (choice or {}).get("class"))
-            pipeline.db.execute("DELETE FROM class_pending WHERE conversation_id=?", (conv_id,))
+            _index_choice(pipeline, conv_id, choice)
             done += 1
     return done

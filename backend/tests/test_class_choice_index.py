@@ -79,3 +79,25 @@ def test_an_index_update_a_crash_interrupted_is_repaired(client, worker, setting
     row = worker.db.one("SELECT class_choice, kind FROM conversations WHERE id=?", (conv,))
     assert row["class_choice"] == "monologue" and row["kind"] == "monologue"
     assert worker.db.query("SELECT * FROM class_pending") == []
+
+
+def test_a_replayed_request_never_acknowledges_an_unfinished_index_update(client, worker, settings, monkeypatch):
+    """Astra (re-review of fix-50): after the file was written and indexing failed, the phone's retry of the same
+    request (or an older one) answered applied while the index still had no choice and the mark stayed. A replay
+    indexes the stored choice first, under the same lock."""
+    conv = deferred(client, worker, monkeypatch)
+    real = home.set_choice
+    monkeypatch.setattr(home, "set_choice", lambda *a: (_ for _ in ()).throw(RuntimeError("index write failed")))
+    try:
+        choose(client, conv, "monologue", "r1", "2026-11-08T20:00:00Z")
+    except RuntimeError:
+        pass
+    monkeypatch.setattr(home, "set_choice", real)
+    for rid, at in (("r1", "2026-11-08T20:00:00Z"), ("r0", "2026-11-08T19:00:00Z")):  # the same request, an older one
+        worker.db.execute("UPDATE conversations SET class_choice=NULL WHERE id=?", (conv,))
+        worker.db.execute("INSERT OR IGNORE INTO class_pending (conversation_id) VALUES (?)", (conv,))
+        r = choose(client, conv, "monologue" if rid == "r1" else "passive", rid, at)
+        assert r.status_code == 200, r.text
+        row = worker.db.one("SELECT class_choice, kind FROM conversations WHERE id=?", (conv,))
+        assert row["class_choice"] == "monologue" and row["kind"] == "monologue", (rid, dict(row))
+        assert worker.db.query("SELECT * FROM class_pending") == [], rid
