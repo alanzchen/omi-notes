@@ -294,8 +294,9 @@ class SpeakerStore:
                           "AND model_sha=? ORDER BY conversation_id, label", (model, model_sha)))  # fmt: skip
         add(self.db.query("SELECT id, person_id, state, revision, flag_json, vector, model_sha FROM samples ORDER BY id"))
         add(self.db.query("SELECT * FROM speaker_labels ORDER BY conversation_id, label"))
-        add(self.db.query("SELECT id, status, transcript_sha, speakers_revision, start FROM conversations ORDER BY start DESC "
-                          "LIMIT 200"))  # fmt: skip (the queue's recent conversations, with margin)
+        # every conversation (about a thousand rows, a few ms): the queue lists the newest with a transcript, and a
+        # window over all of them could miss one it lists
+        add(self.db.query("SELECT id, status, transcript_sha, speakers_revision, start FROM conversations ORDER BY id"))
         add([(self.db.one("SELECT count(*) FROM chunks WHERE raw_deleted=1")[0],)])
         add(self.db.query("SELECT id, me, attested_at, name FROM people ORDER BY id"))
         settings = self.settings_path.read_bytes() if self.settings_path.exists() else b""

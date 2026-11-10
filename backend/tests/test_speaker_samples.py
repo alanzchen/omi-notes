@@ -953,3 +953,22 @@ def test_the_evidence_key_changes_while_a_forget_is_unfinished(env):
     plan.parent.mkdir(parents=True, exist_ok=True)
     plan.write_text("{}")
     assert store.evidence_key(emb.model, emb.model_sha) != before, "an unfinished forget is evidence too"
+
+
+def test_the_evidence_key_covers_every_conversation_the_queue_can_list(env):
+    # Astra: the key hashed the newest 200 conversations of any kind, the queue lists the newest 60 with a
+    # transcript; 201 newer untranscribed ones hid a reviewable conversation's revision and a stale item came back
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    store = worker.pipeline.speakers
+    emb = worker.providers.embedder
+    cols = [r["name"] for r in worker.db.query("PRAGMA table_info(conversations)")]
+    template = dict(worker.db.one("SELECT * FROM conversations WHERE id=?", (rows[0]["id"],)))
+    for i in range(205):
+        fake = dict(template, id=f"zz-{i:04d}", start=template["start"] + 10_000 + i, transcript_sha=None, status="discarded",
+                    note_path=None)  # fmt: skip
+        worker.db.execute(f"INSERT INTO conversations ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                          tuple(fake[c] for c in cols))  # fmt: skip
+    before = store.evidence_key(emb.model, emb.model_sha)
+    worker.db.execute("UPDATE conversations SET speakers_revision = speakers_revision + 1 WHERE id=?", (rows[0]["id"],))
+    assert store.evidence_key(emb.model, emb.model_sha) != before
