@@ -814,6 +814,7 @@ class Worker:
                 block = None if verdict else deferral.decide(self.settings.defer_speech_seconds, c.speech_seconds, now,
                                                              too_short_s=TOO_SHORT_S)  # fmt: skip
                 fields["deferral"] = json.dumps(block, sort_keys=True) if block else None
+                fields["prov_due"] = int(block is not None)  # its provisional class for the current wearer
                 if block:  # an older release would drop the block on its next rewrite: it must refuse the vault
                     self.vault.raise_format(deferral.VAULT_FORMAT)
                 if verdict and verdict[0] == "inside":

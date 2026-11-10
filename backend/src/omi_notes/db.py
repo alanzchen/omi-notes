@@ -263,6 +263,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     day TEXT,
     short INTEGER,
     class_choice TEXT,
+    prov_due INTEGER NOT NULL DEFAULT 0,
+    prov_retry_at REAL NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     finalized_at REAL,
@@ -330,6 +332,8 @@ CREATE TRIGGER IF NOT EXISTS conversations_totals_delete AFTER DELETE ON convers
         requested = requested - OLD.t_requested, issues = issues - OLD.t_issue WHERE day = OLD.day;
 END;
 CREATE INDEX IF NOT EXISTS conversations_unsummarized_deferred ON conversations(start) WHERE deferral IS NOT NULL AND note_path IS NULL;
+-- the provisional-class work queue (`refresh_provisional`): runnable first, newest first; settled rows aren't in it
+CREATE INDEX IF NOT EXISTS conversations_provisional_due ON conversations(prov_retry_at, start DESC) WHERE prov_due = 1;
 
 -- decision.known_through: speech from (capture, seq) is known to a finalized conversation iff
 -- seq <= known_through[capture] (the seal flush is virtual chunk last + 1).
@@ -569,6 +573,9 @@ COLUMN_SOURCES: dict[str, dict[str, str]] = {
         "short": "operational — speech_seconds under the short-session threshold (`home.py`; refilled with `day` "
                  "when the threshold changes)",
         "class_choice": "<conversation dir>/class.json class (the owner's recording-class choice; NULL for auto)",
+        "prov_due": "operational — the provisional class waits for the current wearer generation (`refresh_provisional`;"
+                    " every deferred session is due again after a rebuild)",
+        "prov_retry_at": "operational — a provisional-class attempt that failed waits until then",
         "t_short": "generated — what the row adds to day_totals",
         "t_deferred": "generated — what the row adds to day_totals",
         "t_requested": "generated — what the row adds to day_totals",

@@ -5,6 +5,7 @@ generation or the wearer's activation changes. Fakes only."""
 from __future__ import annotations
 
 import json
+import time
 
 import numpy as np
 
@@ -131,3 +132,60 @@ def test_the_wearer_follows_the_voices_calibration_generation(client, worker, se
     pipeline.provisional_wearer()
     assert len(built) == 2
     assert json.loads(path.read_text())["fingerprint"] == "b"
+
+
+# -- the work queue (Astra, review of main 9b11b7c) -------------------------------------------------------------------
+
+
+def deferred_rows(worker, n: int, *, model: str | None, start: float = T0, due: bool = True) -> list[str]:
+    """`n` closed deferred sessions inserted into the index, newest last; `model`: their provisional generation."""
+    now = time.time()
+    block = json.dumps({"policy": "short_speech", "threshold_s": 60.0, "speech_s": 9.0, "decided_at": 0,
+                        "provisional": {"class": "undetermined", "confidence": None, "rule_id": "none-v1", "model": model}})
+    ids = [f"d{k:06d}" for k in range(n)]
+    cols = "id, device_id, start, end, status, deferral, speech_seconds, created_at, updated_at, finalized_at"
+    rows = [(cid, "d", start + k * 60, start + k * 60 + 30, "closed", block, 9.0, now, now, now) for k, cid in enumerate(ids)]
+    with worker.db.tx() as conn:
+        conn.executemany(f"INSERT INTO conversations ({cols}) VALUES ({', '.join('?' * 10)})", rows)
+        if not due:
+            conn.execute("UPDATE conversations SET prov_due = 0")
+    return ids
+
+
+def test_unreadable_newer_sessions_never_starve_an_older_one(client, worker, monkeypatch):
+    ids = deferred_rows(worker, 30, model=None)
+    oldest = ids[0]
+    embedder = FakeEmbedder()
+    monkeypatch.setattr(worker.pipeline, "provisional_wearer", lambda: wearer_of(embedder))
+    tried = []
+
+    def audio(row, *a, **k):
+        tried.append(row["id"])
+        if row["id"] != oldest:
+            raise OSError("chunk unreadable")
+        return worker.pipeline.__class__.conversation_audio(worker.pipeline, row, *a, **k)
+
+    monkeypatch.setattr(worker.pipeline, "conversation_audio", audio)
+    monkeypatch.setattr(worker.pipeline, "_wearer_windows", lambda row, wearer: (audio(row), [(5.0, 0.9)])[1])
+    for t in range(12):  # each tick takes a few; the failing ones back off
+        worker.pipeline.refresh_provisional(T0 + t)
+    assert oldest in tried, "every runnable session is reached while 29 newer ones keep failing"
+    row = worker.db.one("SELECT deferral, prov_due FROM conversations WHERE id=?", (oldest,))
+    assert json.loads(row["deferral"])["provisional"]["model"] == "k1" and row["prov_due"] == 0
+    failing = worker.db.one("SELECT prov_due, prov_retry_at FROM conversations WHERE id=?", (ids[-1],))
+    assert failing["prov_due"] == 1 and failing["prov_retry_at"] > T0, "backed off in the index, still to do"
+
+
+def test_a_settled_queue_costs_nothing_whatever_the_number_of_deferred_sessions(client, worker, settings, monkeypatch):
+    from .test_home_cost import Steps
+
+    monkeypatch.setattr(worker.pipeline, "provisional_wearer", lambda: None)
+    steps = Steps(monkeypatch)
+    costs = []
+    for n in (50, 5000):
+        worker.db.execute("DELETE FROM conversations")
+        deferred_rows(worker, n, model=None, due=False)
+        worker.pipeline.refresh_provisional(T0)  # the generation check
+        _, cost = steps.measure(lambda: worker.pipeline.refresh_provisional(T0 + 1))
+        costs.append(cost)
+    assert costs[1] <= costs[0] * 1.3 + 500, costs

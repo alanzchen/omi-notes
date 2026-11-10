@@ -306,7 +306,6 @@ class ConversationPipeline:
         self._stub_written: dict[str, float] = {}
         self._class_rank: dict[str, int] = {}  # conversation → summarizing priority (recording class), this process
         self._wearer_cache: tuple[tuple, tuple | None] | None = None  # (generation, provisional wearer)
-        self._provisional_backoff: dict[str, float] = {}  # conversation → when to try its provisional class again
         self._idle_claims = 0  # idle claims made with both re-runs and deferred sessions waiting (IDLE_FAIR_EVERY)
         self._engine_deaths: dict[tuple[str, str], tuple[int, int]] = {}  # (conversation, audio) -> (counted, successes then)
         self._local_successes = 0  # sidecar transcriptions that worked, in this process
@@ -1198,35 +1197,40 @@ class ConversationPipeline:
         the record's `deferral` block, then the index (its `kind`). One unreadable session backs off alone."""
         wearer = self.provisional_wearer()
         key = wearer[0] if wearer else None
-        rows = self.db.query(
-            "SELECT id FROM conversations WHERE deferral IS NOT NULL AND note_path IS NULL AND status = 'closed' "
-            "AND json_extract(deferral, '$.provisional.model') IS NOT ? ORDER BY start DESC LIMIT ?",
-            (key, limit * 4))  # fmt: skip
+        if self.db.meta("provisional_key") != (key or "none"):
+            # another wearer generation: every unsummarized deferred session is due (one pass, then settled rows
+            # leave the queue; a rebuilt index has no key, so all are due once)
+            with self.db.tx() as conn:
+                conn.execute("UPDATE conversations SET prov_due = 1, prov_retry_at = 0 "
+                             "WHERE deferral IS NOT NULL AND note_path IS NULL")
+                conn.execute("INSERT INTO meta (key, value) VALUES ('provisional_key', ?) "
+                             "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key or "none",))
+        # runnable rows only, newest first: one backing off never holds back another
+        rows = self.db.query("SELECT id FROM conversations WHERE prov_due = 1 AND prov_retry_at <= ? "
+                             "ORDER BY prov_retry_at, start DESC LIMIT ?", (now, limit))  # fmt: skip
         done = 0
         for r in rows:
-            if done >= limit:
-                break
-            if self._provisional_backoff.get(r["id"], 0) > now:
-                continue
             token = self.claim(r["id"])
             if token is None:
                 continue  # being worked on: next time
             try:
                 row = self._row(r["id"])
                 block = deferral.block(row)
-                if block is None or row["note_path"] or row["status"] != "closed":
+                if block is None or row["note_path"] or row["status"] != "closed" or (
+                        (block.get("provisional") or {}).get("model") == key):
+                    self._set(row["id"], prov_due=0, prov_retry_at=0)  # nothing to derive (any more)
                     continue
                 features: dict = {"speech_s": row["speech_seconds"]}
                 if wearer is not None:
                     features["windows"] = self._wearer_windows(row, wearer)
                 cls, confidence, rule = deferral.provisional_class(features)
                 provisional = {"class": cls, "confidence": confidence, "rule_id": rule, "model": key}
-                self._commit(row["id"], deferral=json.dumps(block | {"provisional": provisional}, sort_keys=True))
-                self._provisional_backoff.pop(row["id"], None)
+                self._commit(row["id"], deferral=json.dumps(block | {"provisional": provisional}, sort_keys=True),
+                             prov_due=0, prov_retry_at=0)
                 done += 1
             except Exception:
                 log.exception("could not derive the provisional class of %s", r["id"])
-                self._provisional_backoff[r["id"]] = now + PROVISIONAL_BACKOFF
+                self._set(r["id"], prov_retry_at=now + PROVISIONAL_BACKOFF)
             finally:
                 self.release(r["id"], token)
         return done
