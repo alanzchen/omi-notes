@@ -689,6 +689,8 @@ def last_note_at(db) -> str | None:
     """When the newest useful note was first written (discarded and enrollment rows excluded)."""
     from .db import LAST_NOTE
 
-    # the newest entry of a partial index over useful notes, not a scan of every conversation
-    r = db.one(f"SELECT done_at AS t FROM conversations WHERE {LAST_NOTE} ORDER BY done_at DESC LIMIT 1")
+    # the newest entry of a partial index over useful notes, not a scan of every conversation: named, because without
+    # statistics the planner prefers the status index and sorts every done note
+    r = db.one(f"SELECT done_at AS t FROM conversations INDEXED BY conversations_last_note WHERE {LAST_NOTE} "
+               "ORDER BY done_at DESC LIMIT 1")
     return iso_utc_epoch(r["t"]) if r and r["t"] else None

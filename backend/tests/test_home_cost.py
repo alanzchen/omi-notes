@@ -30,13 +30,10 @@ class Steps:
         self.n = 0
         self.on = False
         real = Database.conn
-        seen = set()
 
         def conn(db):
             c = real(db)
-            if id(c) not in seen:
-                seen.add(id(c))
-                c.set_progress_handler(self._tick, STEP)
+            c.set_progress_handler(self._tick, STEP)  # every time: a closed connection's id can be reused
             return c
 
         monkeypatch.setattr(Database, "conn", conn)

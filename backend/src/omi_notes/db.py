@@ -297,7 +297,7 @@ CREATE INDEX IF NOT EXISTS conversations_listed_day ON conversations(day, start,
 CREATE INDEX IF NOT EXISTS conversations_listed_day_short ON conversations(day, short, start, id) WHERE @LISTED@;
 CREATE INDEX IF NOT EXISTS conversations_listed_short ON conversations(short, start, id) WHERE @LISTED@;
 -- the status card: notes changed outside My Notes, and the newest note (`queue_counts`, `views.last_note_at`)
-CREATE INDEX IF NOT EXISTS conversations_conflicted ON conversations(id) WHERE @CONFLICTED@;
+CREATE INDEX IF NOT EXISTS conversations_conflicted ON conversations(start) WHERE @CONFLICTED@;
 CREATE INDEX IF NOT EXISTS conversations_last_note ON conversations(done_at) WHERE @LAST_NOTE@;
 
 -- class.json choices whose index copy (`conversations.class_choice`) is being written: a crash between the file and
