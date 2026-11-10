@@ -479,7 +479,10 @@ a cached detail when it moves) and `deferred` (below), and to the response `shor
 threshold, 60) and `days`: for each day of this page's entries, that whole day's short sessions, whatever
 the page or filter: `{"2026-11-08": {"short": 9, "deferred": 7, "requested": 1, "issues": 1}}` (`issues`:
 failed, or carrying an issue). `day=YYYY-MM-DD` and `short=true|false` (under `short_s` of speech, or at
-least it) filter before paging.
+least it) filter before paging, and so does `class=monologue|dialogue|passive|undetermined` on servers with
+`recording_class`: the kind the entry is listed under (its note's class; before a note, a deferred session's
+choice or provisional class). Every filter, page and the `days` totals are index lookups on the server
+(`home.py`): their cost follows the page, never the number of conversations.
 
 #### Deferred short sessions (`features` contains `deferred_transcription`)
 
@@ -489,8 +492,13 @@ provisional closure and late audio are unchanged) and kept in the vault. Its `st
 `state.code` is `deferred`, and `deferred` is `{"state": "waiting"|"requested", "operation_id", "threshold_s",
 "provisional_class"}` until it has a note (then null). The server transcribes it on its own only when nothing
 else is runnable, its summary included. Its `recording_class` is provisional until then: `{class:
-"undetermined", provisional: true, rule_id, model, …}` (`model`: the identity of the model a provisional rule
-depends on, null for now), or the owner's choice (`overridden: true`). A class change on a deferred session
+"undetermined", provisional: true, rule_id, model, …}`, or the owner's choice (`overridden: true`). The
+provisional class needs the wearer: while his voice model can't identify him (no "me" person, or his model
+isn't active) it is `undetermined` (未确定) and `model` is null. Once it can, the server scores the session's
+speech against his voice in the background and the class becomes `monologue` or `dialogue` (`confidence:
+"low"`, `rule_id: "wearer-windows-v1"`, `model`: the wearer generation it was made with), or stays
+`undetermined` without confirmed wearer speech. It is never `passive` (a voice can't prove the wearer absent),
+and a borderline case is `dialogue`. It is re-derived whenever the Voices calibration generation changes. A class change on a deferred session
 is stored and shown, and schedules nothing; the first summary applies it. Raw audio is kept as always.
 
 ### `POST /v1/conversations/{id}/transcribe` (servers with `deferred_transcription`)

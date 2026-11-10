@@ -78,7 +78,9 @@ demand, never derived, never overwritten by a re-summary, untouched by rebuilds 
 changes nothing else (note, path, keep/discard, statistics). Older backends ignore the file.
 
 `conversation.json` `deferral` `{policy: "short_speech", threshold_s, speech_s, decided_at, provisional:
-{class, confidence, rule_id, model}, requested?: {op, at}}` is written when segmentation finalizes a
+{class, confidence, rule_id, model}, requested?: {op, at}}` (`provisional.model`: the wearer generation the
+class was derived with, null without an identifiable wearer; the worker rewrites the block when it changes) is
+written when segmentation finalizes a
 conversation with under `DEFER_SPEECH_SECONDS` (60) of speech (not an enrollment, not under 1.5 s). The
 status stays `closed`; the index column `deferral` is derived from it, so a rebuild reproduces the deferred
 state, and `requested` (the owner's transcription request) survives restarts, rebuilds and retries. The

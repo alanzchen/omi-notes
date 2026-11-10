@@ -14,8 +14,13 @@ nothing else is runnable (`pipeline.run`), or at normal priority once the owner 
 (`POST /v1/conversations/{id}/transcribe`, an operation like a retry). Its raw audio is kept like all audio. Voice
 enrollments and recordings under 1.5 s (set aside without a note) are never deferred.
 
-`provisional_class` is the one place a transcription-free classifier plugs in. Until there is one it answers
-`undetermined`: missing evidence is never `passive`.
+`provisional_class` is the one place a transcription-free classifier plugs in. It needs the wearer: without a
+voice model that can identify him (a "me" person whose model is active, `ConversationPipeline.provisional_wearer`)
+the answer is `undetermined`, never a guess, and nothing is decoded. With one, the worker scores short windows of
+the session's speech against his centred centroid (`speakers.space`) in the background (`refresh_provisional`),
+and again whenever the Voices calibration generation, the wearer or the voice model changes (the block's `model`
+names the generation it was made with). A voice can confirm the wearer, never prove him absent, so the provisional
+class is never `passive`; a borderline case takes the more conversational class (dialogue over monologue).
 """
 
 from __future__ import annotations
@@ -25,7 +30,10 @@ import json
 POLICY = "short_speech"
 VAULT_FORMAT = 7  # raised before the first `deferral` block or `transcribe` operation is written (6 is the Voices release's)
 UNDETERMINED = "undetermined"
-RULE_NONE = "none-v1"  # no transcription-free classifier yet
+RULE_NONE = "none-v1"  # no wearer model to compare against: undetermined
+RULE_WINDOWS = "wearer-windows-v1"  # windows of speech scored against an identifiable wearer
+WINDOW_S = 3.0  # speech is scored in windows this long (a shorter remainder of at least MIN_WINDOW_S counts too)
+MIN_WINDOW_S = 1.5
 # The identity of the model a provisional rule depends on (e.g. the wearer's voice model: a rule like "monologue only
 # if the wearer's voice share is high, the SNR good and there is one voice" is only as good as that model). None: the
 # rule uses no model. A rule that does records it, so a recalibrated voice model can tell which decisions to redo.
@@ -33,12 +41,37 @@ PROVISIONAL_MODEL: str | None = None
 
 
 def provisional_class(features: dict) -> tuple[str, str | None, str]:
-    """(class, confidence, rule_id) for a conversation nobody has transcribed yet, from transcription-free features
-    (speech seconds, and whatever a later classifier reads). Without a classifier, or without enough evidence, the
-    answer is `undetermined` (never `passive`: a quiet recording isn't proof the owner was absent; a short clip is
-    never called passive or dialogue). The block records `PROVISIONAL_MODEL` with the rule."""
-    del features
-    return UNDETERMINED, None, RULE_NONE
+    """(class, confidence, rule_id) for a conversation nobody has transcribed yet, from transcription-free features.
+    `windows`: [(seconds, centred score against the wearer)] when his model can identify him, else absent. Without
+    it, or without confirmed wearer speech, the answer is `undetermined`: never `passive` (quiet isn't proof the
+    owner was absent), never a guess. Thresholds are the transcribed classifier's (`recording_class`)."""
+    from .recording_class import EVIDENCE_S, MONOLOGUE_SHARE, NOT_WEARER, STRONG
+
+    windows = features.get("windows")
+    if not windows:
+        return UNDETERMINED, None, RULE_NONE
+    total = sum(s for s, _ in windows)
+    wearer = sum(s for s, score in windows if score >= STRONG)
+    other = sum(s for s, score in windows if score <= NOT_WEARER)
+    if wearer < EVIDENCE_S:
+        return UNDETERMINED, None, RULE_WINDOWS
+    if other >= EVIDENCE_S:
+        return "dialogue", "low", RULE_WINDOWS
+    if wearer >= MONOLOGUE_SHARE * total:
+        return "monologue", "low", RULE_WINDOWS
+    return "dialogue", "low", RULE_WINDOWS  # borderline: the more conversational class
+
+
+def windows(spans: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Speech spans cut into scoring windows of WINDOW_S (a remainder under MIN_WINDOW_S joins the window before)."""
+    out: list[tuple[float, float]] = []
+    for a, b in spans:
+        t = a
+        while b - t >= MIN_WINDOW_S:
+            end = b if b - t < WINDOW_S + MIN_WINDOW_S else t + WINDOW_S
+            out.append((t, end))
+            t = end
+    return out
 
 
 def decide(threshold_s: float, speech_s: float, now: float, *, too_short_s: float) -> dict | None:

@@ -104,6 +104,8 @@ LOCAL_STT_DOWN = "local transcription (the omi-asr sidecar) is unavailable; wait
 LOCAL_STT_WAIT = 60.0  # how often a waiting conversation looks again
 LOCAL_STT_ALERT_AFTER = 600.0
 ENGINE_DEATHS_MAX = 3  # the sidecar failing on the same audio this often: a failure, not an outage
+PROVISIONAL_BATCH = 4  # deferred sessions whose provisional class is re-derived per worker tick
+PROVISIONAL_BACKOFF = 15 * 60
 LINKS_FORMAT = 1  # `links-v<n>-<stt file>`: the speaker-linked response (bump when linking changes)
 BACKGROUND_MIN_VOICES = 200  # stored voices needed for a stable background (speaker linking)
 # why a kept `speakers_unknown` conversation has no summary (shown in its note)
@@ -303,6 +305,8 @@ class ConversationPipeline:
         self._status_written: tuple[float, str] | None = None
         self._stub_written: dict[str, float] = {}
         self._class_rank: dict[str, int] = {}  # conversation → summarizing priority (recording class), this process
+        self._wearer_cache: tuple[tuple, tuple | None] | None = None  # (generation, provisional wearer)
+        self._provisional_backoff: dict[str, float] = {}  # conversation → when to try its provisional class again
         self._idle_claims = 0  # idle claims made with both re-runs and deferred sessions waiting (IDLE_FAIR_EVERY)
         self._engine_deaths: dict[tuple[str, str], tuple[int, int]] = {}  # (conversation, audio) -> (counted, successes then)
         self._local_successes = 0  # sidecar transcriptions that worked, in this process
@@ -1158,6 +1162,89 @@ class ConversationPipeline:
                                      "url": self.settings.stt_local_url,
                                      "check": "sidecar/asr/scripts/launchagent.sh status; ~/Library/Logs/omi-notes-asr.log"})  # fmt: skip
             self.db.set_meta("local_stt_alerted", repr(now))
+
+    def provisional_wearer(self) -> tuple[str, np.ndarray, np.ndarray] | None:
+        """(generation key, centred centroid, GA) of the wearer's voice when it can identify him: a "me" person
+        whose model is active (the automatic-naming gate, `match.activation`) and has a centred centroid; None
+        otherwise (the provisional class is then `undetermined`). Rebuilt only when the Voices calibration
+        generation (the published `calibration.json` fingerprint), the wearer or the voice model changes, so the
+        per-tick check is one small file read."""
+        embedder = self.providers.embedder
+        me = self.speakers.me()
+        if embedder is None or me is None:
+            return None
+        try:
+            fingerprint = (Vault.read_json(self.vault.speakers / "calibration.json") or {}).get("fingerprint")
+        except (OSError, ValueError):
+            fingerprint = None
+        generation = (fingerprint, me["id"], embedder.model_sha)
+        if self._wearer_cache is not None and self._wearer_cache[0] == generation:
+            return self._wearer_cache[1]
+        wearer = None
+        model = self.speakers.models(embedder.model, embedder.model_sha, self.operating).get(me["id"])
+        if model is not None and model.active:
+            space = self.voice_space(embedder)
+            centroid = space.centroids.get(me["id"]) if space else None
+            if centroid is not None:
+                key = sha256_hex(f"{fingerprint}|{me['id']}|{embedder.model_sha}|{deferral.RULE_WINDOWS}".encode())[:16]
+                wearer = (key, centroid, space.ga)
+        self._wearer_cache = (generation, wearer)
+        return wearer
+
+    def refresh_provisional(self, now: float, *, limit: int = PROVISIONAL_BATCH) -> int:
+        """Re-derive the provisional class of deferred sessions made with another wearer generation (a background
+        worker step, a few sessions per tick). Without an identifiable wearer every one is `undetermined` again
+        without decoding anything; with one, its speech is scored in windows (`deferral.windows`). Vault first:
+        the record's `deferral` block, then the index (its `kind`). One unreadable session backs off alone."""
+        wearer = self.provisional_wearer()
+        key = wearer[0] if wearer else None
+        rows = self.db.query(
+            "SELECT id FROM conversations WHERE deferral IS NOT NULL AND note_path IS NULL AND status = 'closed' "
+            "AND json_extract(deferral, '$.provisional.model') IS NOT ? ORDER BY start DESC LIMIT ?",
+            (key, limit * 4))  # fmt: skip
+        done = 0
+        for r in rows:
+            if done >= limit:
+                break
+            if self._provisional_backoff.get(r["id"], 0) > now:
+                continue
+            token = self.claim(r["id"])
+            if token is None:
+                continue  # being worked on: next time
+            try:
+                row = self._row(r["id"])
+                block = deferral.block(row)
+                if block is None or row["note_path"] or row["status"] != "closed":
+                    continue
+                features: dict = {"speech_s": row["speech_seconds"]}
+                if wearer is not None:
+                    features["windows"] = self._wearer_windows(row, wearer)
+                cls, confidence, rule = deferral.provisional_class(features)
+                provisional = {"class": cls, "confidence": confidence, "rule_id": rule, "model": key}
+                self._commit(row["id"], deferral=json.dumps(block | {"provisional": provisional}, sort_keys=True))
+                self._provisional_backoff.pop(row["id"], None)
+                done += 1
+            except Exception:
+                log.exception("could not derive the provisional class of %s", r["id"])
+                self._provisional_backoff[r["id"]] = now + PROVISIONAL_BACKOFF
+            finally:
+                self.release(r["id"], token)
+        return done
+
+    def _wearer_windows(self, row, wearer) -> list[tuple[float, float]]:
+        """[(seconds, centred score against the wearer)] over the session's speech, in windows."""
+        from ..speakers.space import score
+
+        _key, centroid, ga = wearer
+        audio = self.conversation_audio(row)
+        embedder = self.providers.embedder
+        out = []
+        for a, b in deferral.windows([(float(x), float(y)) for x, y in audio.blocks_out]):
+            pcm = audio.pcm[int(round(a * 16000)) : int(round(b * 16000))]
+            if len(pcm) < 8000:
+                continue
+            out.append((b - a, score(np.asarray(embedder.embed(pcm), dtype=np.float64), centroid, ga)))
+        return out
 
     def voice_space(self, embedder):
         """GA and person → GA-centred centroid for comparing voices with people (`speakers.space.RmSpace`), or

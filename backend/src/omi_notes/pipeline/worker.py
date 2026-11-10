@@ -169,6 +169,11 @@ class Worker:
                 home.fill_days(self.db, self.pipeline.tz)  # a row some write path left without its Home day
             except Exception:
                 log.exception("could not fill conversation days")
+            if not self._ready_chunks():  # background: deferred sessions' provisional class for this wearer generation
+                try:
+                    self.pipeline.refresh_provisional(now)
+                except Exception:
+                    log.exception("could not refresh provisional classes")
             # chunks still waiting to be decoded are work too: deferred short sessions wait for them
             advanced = self.pipeline.run(now, idle=lambda: not self._ready_chunks())
             try:
