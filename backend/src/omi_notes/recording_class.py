@@ -19,6 +19,7 @@ import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from . import home
 from .ingest import ApiError
 from .lock import SpeakerLock
 from .util import iso_utc_epoch
@@ -278,5 +279,30 @@ def put(pipeline, conv_id: str, body: dict, applied: dict | None) -> dict:
                 "source": "app",
                 # what the automatic rule said when the owner chose: training evidence for the thresholds
                 "auto_at_choice": {k: auto.get(k) for k in ("class", "confidence", "wearer_share", "version")}}  # fmt: skip
+        # the index copy (`class_choice`, Home's kind) changes under the same lock as the file: a concurrent choice
+        # can't index its older value over a newer one. The pending mark lets the worker finish an update a crash
+        # interrupted between the two (`repair_choices`).
+        pipeline.db.execute("INSERT OR IGNORE INTO class_pending (conversation_id) VALUES (?)", (conv_id,))
         Vault.write_json(_path(pipeline, conv_id), data)
+        home.set_choice(pipeline.db, conv_id, chosen)
+        pipeline.db.execute("DELETE FROM class_pending WHERE conversation_id=?", (conv_id,))
         return view(applied, data, applied_flag=True)
+
+
+def repair_choices(pipeline, *, limit: int = 50) -> int:
+    """Index copies of class choices a crash left between the file and the index (`class_pending`): set again from
+    `class.json` under the same lock. An unreadable file is reported elsewhere (`views.recording_view`); its mark
+    stays until it can be read."""
+    rows = pipeline.db.query("SELECT conversation_id FROM class_pending LIMIT ?", (limit,))
+    done = 0
+    for r in rows:
+        conv_id = r["conversation_id"]
+        with SpeakerLock(pipeline.vault, name="class.lock"):
+            try:
+                choice = read(pipeline, conv_id)
+            except UnreadableChoice:
+                continue
+            home.set_choice(pipeline.db, conv_id, (choice or {}).get("class"))
+            pipeline.db.execute("DELETE FROM class_pending WHERE conversation_id=?", (conv_id,))
+            done += 1
+    return done

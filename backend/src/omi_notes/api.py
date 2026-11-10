@@ -363,9 +363,7 @@ def create_app(
             row = db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
             applied = (json.loads(row["index_json"] or "{}").get("recording_class") or {}) if row else {}
             # stored in the vault only: the worker sees the newer choice and summarizes again (reconcile_classes)
-            out = rclass.put(pipeline, conv_id, body, applied)
-            if row is not None:  # the file is written: its index copy lists the row under the chosen kind
-                home.set_choice(db, conv_id, (rclass.read(pipeline, conv_id) or {}).get("class"))
+            out = rclass.put(pipeline, conv_id, body, applied)  # the file, then its index copy, under one lock
             if row is not None and not row["note_path"]:
                 # no summary yet (deferred, or still queued): the choice only changes the provisional kind shown; the
                 # first summary reads it. Nothing is scheduled.

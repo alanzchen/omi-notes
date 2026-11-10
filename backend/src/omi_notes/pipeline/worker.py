@@ -22,6 +22,7 @@ import time
 from collections import OrderedDict
 
 from .. import __version__, deferral, home, operations, priority, search
+from .. import recording_class as rclass
 from ..audio.timeline import RING_RECORD_SECONDS, CaptureTimeline, ChunkDecode
 from ..audio.vad import MIN_SPEECH, VadChoice, VadStream, make_vad
 from ..db import Database
@@ -170,6 +171,10 @@ class Worker:
                 home.fill_home(self.db, self.pipeline.tz, home.short_threshold(self.settings))
             except Exception:
                 log.exception("could not fill conversation days")
+            try:
+                rclass.repair_choices(self.pipeline)  # a class choice's index copy a crash left unwritten
+            except Exception:
+                log.exception("could not repair class choices")
             if not self._ready_chunks():  # background: deferred sessions' provisional class for this wearer generation
                 try:
                     self.pipeline.refresh_provisional(now)

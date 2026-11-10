@@ -300,6 +300,10 @@ CREATE INDEX IF NOT EXISTS conversations_listed_short ON conversations(short, st
 CREATE INDEX IF NOT EXISTS conversations_conflicted ON conversations(id) WHERE @CONFLICTED@;
 CREATE INDEX IF NOT EXISTS conversations_last_note ON conversations(done_at) WHERE @LAST_NOTE@;
 
+-- class.json choices whose index copy (`conversations.class_choice`) is being written: a crash between the file and
+-- the index leaves the mark, and the worker sets the copy from the file (`recording_class.repair_choices`)
+CREATE TABLE IF NOT EXISTS class_pending (conversation_id TEXT PRIMARY KEY);
+
 -- Per local day, over its listed short sessions: how many, how many wait deferred, how many were asked for and
 -- aren't done, how many need a look. Kept by these triggers in the same statement (so the same transaction) as
 -- every change of a conversation row; `home.rebuild_totals` recomputes it from the rows.
@@ -432,6 +436,7 @@ _CAPTURE_JSON = "raw/<dev>/<cap>/capture.json evidence for deleted chunks"
 
 # table -> column -> where its value comes from on a rebuild.
 COLUMN_SOURCES: dict[str, dict[str, str]] = {
+    "class_pending": {"conversation_id": "operational — a class.json write whose index copy isn't confirmed yet"},
     "day_totals": {c: "operational — derived from conversations rows by triggers (`home.rebuild_totals`)"
                    for c in ("day", "short", "deferred", "requested", "issues")},
     "meta": {
