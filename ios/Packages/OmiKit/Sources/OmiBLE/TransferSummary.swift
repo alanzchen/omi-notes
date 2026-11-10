@@ -306,6 +306,7 @@ public struct TransferSummary: Equatable, Sendable {
     /// answer is missing, older than 5 minutes, partial, or the server isn't reachable (the problem
     /// line says so).
     public func serverLine(now: Date) -> String? {
+        if case .offline = phone.state { return nil }
         guard server.reachable != false, let at = server.checkedAt, now.timeIntervalSince(at) <= 300, at <= now.addingTimeInterval(60),
               let work = serverWork, !work.atLeast || work.left > 0 else { return nil }
         if work.left > 0 { return "服务器处理中" }

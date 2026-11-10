@@ -389,6 +389,7 @@ import OmiWatchKit
         t = try fixture("all-sent")
         t.server.reachable = false
         #expect(t.serverLine(now: now) == nil, "the problem line says it")
+        #expect(try fixture("offline").serverLine(now: now) == nil, "no server state beside \"连不上服务器\"")
     }
 
     @Test func timesReadInChineseAndAFutureTimeIsNoAge() {
