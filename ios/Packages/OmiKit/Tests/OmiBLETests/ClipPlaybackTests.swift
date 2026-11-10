@@ -24,6 +24,17 @@ final class ClipServer {
         return try await withCheckedThrowingContinuation { waiting[id, default: []].append($0) }
     }
     func answer(_ id: String) { waiting.removeValue(forKey: id)?.forEach { $0.resume(returning: Data("wav-\(id)".utf8)) } }
+    /// Answers only the oldest request still waiting for `id`, with its own bytes.
+    func answerOldest(_ id: String, with body: String) {
+        guard var queue = waiting[id], !queue.isEmpty else { return }
+        queue.removeFirst().resume(returning: Data(body.utf8))
+        waiting[id] = queue.isEmpty ? nil : queue
+    }
+    func answerNewest(_ id: String, with body: String) {
+        guard var queue = waiting[id], !queue.isEmpty else { return }
+        queue.removeLast().resume(returning: Data(body.utf8))
+        waiting[id] = queue.isEmpty ? nil : queue
+    }
     func fail(_ id: String) { waiting.removeValue(forKey: id)?.forEach { $0.resume(throwing: URLError(.timedOut)) } }
 }
 
@@ -49,6 +60,69 @@ final class ClipServer {
     }
 
     func settle() async { for _ in 0..<30 { await Task.yield() } }
+
+    /// Astra review: a re-transcription can change whose voice `conv.S1.0` is, so the same clip id from a
+    /// newer review item (or after a refresh) is fetched again, never played from the old bytes.
+    @Test func theSameClipIdFromAnotherGenerationIsFetchedAgain() async {
+        let r = rig(.pause)
+        Task { await r.playback.load("c.S1.0", version: "l.c.S1.2.p.x", fetch: r.fetch) }
+        await settle()
+        r.server.answer("c.S1.0")
+        await settle()
+        #expect(r.playback.loadedId == ClipPlayback.key("c.S1.0", version: "l.c.S1.2.p.x"))
+        Task { await r.playback.load("c.S1.0", version: "l.c.S1.3.p.x", fetch: r.fetch) }
+        await settle()
+        #expect(r.server.requests == ["c.S1.0", "c.S1.0"])  // the server is asked with the clip id
+        r.server.answer("c.S1.0")
+        await settle()
+        Task { await r.playback.load("c.S1.0", version: "l.c.S1.2.p.x", fetch: r.fetch) }
+        await settle()
+        #expect(r.server.requests.count == 2)  // that generation is still cached
+        r.playback.invalidate()
+        #expect(r.playback.loadedId == nil)
+        Task { await r.playback.load("c.S1.0", version: "l.c.S1.2.p.x", fetch: r.fetch) }
+        await settle()
+        #expect(r.server.requests.count == 3)  // a refresh forgets every cached clip
+        #expect(ClipPlayback.key("a", version: nil) == "a")
+    }
+
+    /// Astra recheck: a download still on its way when the list is fetched again must not put its
+    /// (possibly another voice's) bytes back into the cache.
+    @Test func aDownloadPendingAcrossAnInvalidationIsNotCached() async {
+        let r = rig(.pause)
+        Task { await r.playback.load("a", fetch: r.fetch) }
+        await settle()
+        r.playback.invalidate()
+        r.server.answerOldest("a", with: "old")
+        await settle()
+        #expect(r.playback.data == nil)
+        Task { await r.playback.load("a", fetch: r.fetch) }
+        await settle()
+        #expect(r.server.requests == ["a", "a"])  // asked again, not served from before the invalidation
+    }
+
+    /// ...nor overwrite (or clean up) the newer request's entry when it finishes after it.
+    @Test func anOlderDownloadFinishingLastLeavesTheNewerClip() async {
+        let r = rig(.pause)
+        Task { await r.playback.load("a", fetch: r.fetch) }
+        await settle()
+        r.playback.invalidate()
+        Task { await r.playback.load("a", fetch: r.fetch) }
+        await settle()
+        r.server.answerNewest("a", with: "new")
+        await settle()
+        #expect(r.playback.data == Data("new".utf8))
+        r.server.answerOldest("a", with: "old")
+        await settle()
+        #expect(r.playback.data == Data("new".utf8))
+        Task { await r.playback.load("b", fetch: r.fetch) }
+        await settle()
+        r.server.answer("b")
+        await settle()
+        Task { await r.playback.load("a", fetch: r.fetch) }
+        await settle()
+        #expect(r.server.requests == ["a", "a", "b"] && r.playback.data == Data("new".utf8))
+    }
 
     @Test func closingWhileTheClipDownloadsPlaysNothingAfterwards() async {
         let r = rig()

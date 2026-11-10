@@ -62,6 +62,12 @@ public final class SpeakersModel {
     public private(set) var serverSupportsEnrollment: Bool?
     /// The server supports the "Name this voice" flow (clip text, scope, keep unknown, undo).
     public private(set) var serverSupportsNameVoice = false
+    /// The 声纹 hub's review queue and per-person samples.
+    public private(set) var serverSupportsVoiceReview = false
+    /// People carry their last calibration and held-out counts.
+    public private(set) var serverSupportsVoiceCalibration = false
+    /// The review queue's size, from a server that pages it (nil: unknown, count flagged samples).
+    public private(set) var reviewTotal: Int?
     public var enrollment: Enrollment = .idle
 
     private let engine: OmiEngine
@@ -118,6 +124,9 @@ public final class SpeakersModel {
         error = nil
         serverSupportsEnrollment = nil
         serverSupportsNameVoice = false
+        serverSupportsVoiceReview = false
+        serverSupportsVoiceCalibration = false
+        reviewTotal = nil
         switch enrollment {
         case .idle: break
         case .checking, .reading: cancelEnrollment()
@@ -148,20 +157,48 @@ public final class SpeakersModel {
         guard current() else { return }
         serverSupportsEnrollment = status?.supportsVoiceEnrollment
         serverSupportsNameVoice = status?.supportsNameVoice == true
-        do {
-            async let p = api.people()
-            async let s = api.speakerSettings()
-            let (newPeople, newSettings) = try await (p, s)
-            let newSuggestions = newSettings.unknownVoicesEnabled == true ? (try await api.speakerSuggestions()) : []
-            guard current() else { return }  // answered for a server (or vault) no longer shown
-            people = newPeople
-            settings = newSettings
-            suggestions = newSuggestions
-            loadedFor = config
-            error = nil
-        } catch {
-            if current() { self.error = Self.describe(error) }
+        serverSupportsVoiceReview = status?.supportsVoiceReview == true
+        serverSupportsVoiceCalibration = status?.supportsVoiceCalibration == true
+        // This server's answers may be shown from here on (a failed call below keeps what it had).
+        loadedFor = config
+        // Each part on its own: one slow or failing call (suggestions, the queue total) never leaves
+        // the people list empty, and a failed people call keeps the last good list.
+        async let peopleAnswer = Self.attempt { try await api.people() }
+        async let settingsAnswer = Self.attempt { try await api.speakerSettings() }
+        // people are shown as soon as their own answer arrives, while settings may still be on their way
+        let p = await peopleAnswer
+        guard current() else { return }  // answered for a server (or vault) no longer shown
+        var problems: [Error] = []
+        switch p {
+        case .success(let newPeople): people = newPeople
+        case .failure(let e): problems.append(e)
         }
+        let s = await settingsAnswer
+        guard current() else { return }
+        switch s {
+        case .success(let newSettings):
+            settings = newSettings
+            if newSettings.unknownVoicesEnabled {
+                let answer = await Self.attempt { try await api.speakerSuggestions() }
+                guard current() else { return }
+                switch answer {
+                case .success(let newSuggestions): suggestions = newSuggestions
+                case .failure(let e): problems.append(e)
+                }
+            } else {
+                suggestions = []
+            }
+        case .failure(let e): problems.append(e)
+        }
+        // the queue's size, for the hub (one item is enough to learn it); unknown is not an error
+        let total = serverSupportsVoiceReview ? (try? await api.reviewItems(limit: 1))?.total : nil
+        guard current() else { return }
+        reviewTotal = total
+        error = problems.first.map(Self.describe)
+    }
+
+    private static func attempt<T: Sendable>(_ call: @Sendable () async throws -> T) async -> Result<T, Error> {
+        do { return .success(try await call()) } catch { return .failure(error) }
     }
 
     // MARK: Settings
@@ -205,13 +242,35 @@ public final class SpeakersModel {
         }
     }
 
-    public func forgetVoice(_ person: Person, deleteNote: Bool = false) async {
+    /// True only once the server confirmed it; otherwise `error` says why.
+    @discardableResult
+    public func forgetVoice(_ person: Person, deleteNote: Bool = false) async -> Bool {
         do {
             try await api().deletePerson(id: person.id, deleteNote: deleteNote)
-            await refresh()
+            error = nil
+        } catch APIError.http(409, let detail) {
+            error = VoiceConflict(detail).message
+            return false
         } catch {
             self.error = Self.describe(error)
+            return false
         }
+        await refresh()
+        return true
+    }
+
+    /// The owner attests this person knows their voice is recognized (`PUT /v1/people/{id}` with
+    /// `attest_knows`); with the acknowledgment, that is the person's consent for voice samples.
+    @discardableResult
+    public func attest(_ person: Person) async -> Bool {
+        do {
+            try await api().putPerson(id: person.id, PutPersonRequest(name: person.name, attestKnows: true))
+        } catch {
+            self.error = Self.describe(error)
+            return false
+        }
+        await refresh()
+        return true
     }
 
     public func assign(_ suggestion: SpeakerSuggestion, to person: Person) async {
@@ -284,6 +343,30 @@ public final class SpeakersModel {
     }
 
     public func clip(_ clipId: String) async throws -> Data { try await api().clip(clipId) }
+
+    // MARK: 声纹 hub (errors are thrown to the screen's model)
+
+    public func reviewItems(limit: Int, offset: Int? = nil) async throws -> ReviewItemsResponse {
+        try await api().reviewItems(limit: limit, offset: offset)
+    }
+
+    public func decideReview(_ itemId: String, decision: String, personId: String?, requestId: String) async throws -> ReviewDecisionAnswer {
+        try await api().decideReview(itemId, decision: decision, personId: personId, requestId: requestId)
+    }
+
+    public func samples(personId: String, state: String) async throws -> [VoiceSample] {
+        try await api().samples(personId: personId, state: state)
+    }
+
+    public func sampleAction(_ sampleId: String, action: String, personId: String?, expectedRevision: Int?,
+                             requestId: String) async throws -> SampleActionAnswer {
+        try await api().sampleAction(sampleId, action: action, personId: personId, expectedRevision: expectedRevision, requestId: requestId)
+    }
+
+    /// Puts back a hub decision (review, remove, restore, move) by its undo token.
+    public func undo(token: String) async throws -> UndoNamingResponse {
+        try await api().undoNaming(requestId: token, undoRequestId: "undo-" + token)
+    }
 
     // MARK: Enrollment
 

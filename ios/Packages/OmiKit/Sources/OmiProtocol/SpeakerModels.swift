@@ -13,9 +13,23 @@ public struct Person: Codable, Identifiable, Equatable, Hashable, Sendable {
     /// Automatic naming is active for this person (activation gate passed).
     public var autoActive: Bool?
     public var voiceReady: Bool?
+    // The 声纹 hub (servers with `voice_review` / `voice_calibration`); absent from older servers.
+    public var samplesActive: Int?
+    public var samplesFlagged: Int?
+    public var samplesRemoved: Int?
+    /// Flagged samples waiting for the owner's answer.
+    public var reviewCount: Int?
+    /// The server's one plain line for the person's card ("已启用", "停用：样本不一致", …).
+    public var statusLine: String?
+    /// When the last calibration ran (ISO-8601 UTC).
+    public var calibratedAt: String?
+    /// Held-out counts and bounds; nil unless the calibration counted any.
+    public var measured: MeasuredPerformance?
 
     public init(id: String, name: String, me: Bool? = nil, notePath: String? = nil, samples: Int? = nil,
-                sessions: Int? = nil, autoActive: Bool? = nil, voiceReady: Bool? = nil) {
+                sessions: Int? = nil, autoActive: Bool? = nil, voiceReady: Bool? = nil,
+                samplesActive: Int? = nil, samplesFlagged: Int? = nil, samplesRemoved: Int? = nil, reviewCount: Int? = nil,
+                statusLine: String? = nil, calibratedAt: String? = nil, measured: MeasuredPerformance? = nil) {
         self.id = id
         self.name = name
         self.me = me
@@ -24,6 +38,13 @@ public struct Person: Codable, Identifiable, Equatable, Hashable, Sendable {
         self.sessions = sessions
         self.autoActive = autoActive
         self.voiceReady = voiceReady
+        self.samplesActive = samplesActive
+        self.samplesFlagged = samplesFlagged
+        self.samplesRemoved = samplesRemoved
+        self.reviewCount = reviewCount
+        self.statusLine = statusLine
+        self.calibratedAt = calibratedAt
+        self.measured = measured
     }
 
     public var isMe: Bool { me == true }
@@ -156,6 +177,20 @@ public struct SpeakerSuggestion: Decodable, Identifiable, Equatable, Sendable {
 public struct UndoNamingResponse: Decodable, Equatable, Sendable {
     public var undone: [String]
     public var skipped: [String]
+    /// Sample decisions (review, remove, restore, move) the request made (servers with `voice_review`).
+    public var samples: SampleUndo?
+
+    public struct SampleUndo: Decodable, Equatable, Sendable {
+        public var undone: [String]?
+        public var skipped: [Skip]?
+        public struct Skip: Decodable, Equatable, Sendable {
+            public var id: String
+            public var reason: String?
+        }
+    }
+
+    /// Something the request changed was put back.
+    public var undidAnything: Bool { !undone.isEmpty || !(samples?.undone ?? []).isEmpty }
 }
 
 public struct SuggestionsResponse: Decodable, Sendable { public var suggestions: [SpeakerSuggestion] }
