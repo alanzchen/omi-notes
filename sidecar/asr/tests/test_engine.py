@@ -36,12 +36,12 @@ class FakeQwen:
 
 
 class FakeAligner:
-    """Spreads the words evenly over the chunk."""
+    """Spreads the words evenly over the chunk, nearly touching (as words of continuous speech are)."""
 
     def generate(self, chunk, text, language):
         words, seconds = text.split(), len(chunk) / SR
         step = seconds / max(len(words), 1)
-        return SimpleNamespace(items=[SimpleNamespace(text=w, start_time=i * step, end_time=(i + 0.8) * step)
+        return SimpleNamespace(items=[SimpleNamespace(text=w, start_time=i * step, end_time=(i + 0.9) * step)
                                       for i, w in enumerate(words)])  # fmt: skip
 
 
@@ -482,3 +482,45 @@ def test_a_retry_that_completes_the_window_is_counted_and_returns_every_reply_wi
     out = e.transcribe(speech(30), [])
     assert moss.caps == [1200, 4800] and out["omi_asr"]["capped_then_complete"] == 1
     assert max(s["end"] for s in out["segments"]) >= 29.5
+
+
+class PlacedQwen(FakeQwen):
+    def __init__(self, positions):
+        super().__init__()
+        self.positions = positions
+
+    def generate(self, audio, hotwords=None, max_tokens=0, **_):
+        return SimpleNamespace(text=" ".join(f"word{i}" for i in range(len(self.positions))), generation_tokens=8, language=["English"])
+
+
+class PlacedAligner:
+    def __init__(self, positions):
+        self.positions = positions
+
+    def generate(self, chunk, text, language):
+        return SimpleNamespace(items=[SimpleNamespace(text=w, start_time=a, end_time=b) for w, (a, b) in zip(text.split(), self.positions, strict=True)])
+
+
+def test_chained_short_holes_in_a_capped_tail_add_up_and_make_it_incomplete():
+    # ASTRA-20261110-IT3FIX-01: three 0.1 s words at 27.6, 28.6 and 29.6 s after MOSS's last line at 26.8 s; each hole
+    # is under 1 s, so bridging them certified 1.5 s of speech without a word (a 200)
+    from omi_asr.engine import IncompleteTranscription
+
+    positions = [(27.6, 27.7), (28.6, 28.7), (29.6, 29.7)]
+    e = Engine()
+    e.models = (PrefixMoss(loop=6000), PlacedQwen(positions), PlacedAligner(positions))
+    with pytest.raises(IncompleteTranscription):
+        e.transcribe(np.full(30 * SR, 0.1, np.float32), [])
+
+
+def test_quiet_pauses_between_the_words_of_a_capped_tail_need_no_words():
+    positions = [(27.6, 27.7), (28.6, 28.7), (29.6, 29.7)]
+    samples = np.full(30 * SR, 0.1, np.float32)
+    samples[round(26.8 * SR) :] = 0.0
+    for a, b in positions:
+        samples[round(a * SR) : round(b * SR)] = 0.1
+    e = Engine()
+    e.models = (PrefixMoss(loop=6000), PlacedQwen(positions), PlacedAligner(positions))
+    out = e.transcribe(samples, [])
+    assert out["omi_asr"]["truncated_unresolved"] == 1
+    assert [s["speaker_id"] for s in out["segments"]][-1] == "UNKNOWN" and max(s["end"] for s in out["segments"]) >= 29.6

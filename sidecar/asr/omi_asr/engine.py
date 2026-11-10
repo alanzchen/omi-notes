@@ -45,23 +45,17 @@ def _uncovered_speech(pcm: np.ndarray, a: float, b: float, covered: list[tuple[f
     return float((loud & ~hit).sum()) * frame / plan.SR, float(loud.sum()) * frame / plan.SR
 
 
-TAIL_UNCOVERED_MAX = 0.5  # s of speech past MOSS's last line that neither MOSS nor an aligned Qwen word may reach
-TAIL_WORD_GAP = 1.0  # s between neighbouring words (or lines) still counted as one stretch of speech
+TAIL_UNCOVERED_MAX = 0.5  # s of speech past MOSS's last line, in total, that no MOSS line or aligned Qwen word reaches
 
 
 def _check_tail(pcm: np.ndarray, lines: list[dict], units: list, start: float, stop: float) -> None:
     """Past the last line of a MOSS answer that hit its cap (or stopped long before the speech did), the words
     are whatever Qwen aligned there. Its speech must be reached by a MOSS line or an aligned Qwen word (each
-    +-SLACK; gaps under TAIL_WORD_GAP between them are within the speech they cover) but for
-    TAIL_UNCOVERED_MAX: a failed, empty or partial Qwen piece there is an incomplete transcript, not a shorter
-    one. Quiet audio (below the energy threshold) needs no words."""
+    +-SLACK), all its holes together leaving at most TAIL_UNCOVERED_MAX: a failed, empty or partial Qwen piece
+    there is an incomplete transcript, not a shorter one. Quiet audio (below the energy threshold), pauses
+    between words included, needs no words."""
     last = max((line["end"] for line in lines), default=start)
-    covered: list[tuple[float, float]] = []
-    for x, y in sorted([(line["start"], line["end"]) for line in lines] + [(u.start, u.end) for u in units]):
-        if covered and x - covered[-1][1] <= TAIL_WORD_GAP:
-            covered[-1] = (covered[-1][0], max(covered[-1][1], y))
-        else:
-            covered.append((x, y))
+    covered = [(line["start"], line["end"]) for line in lines] + [(u.start, u.end) for u in units]
     missing, _ = _uncovered_speech(pcm, last, stop, covered)
     if missing > TAIL_UNCOVERED_MAX:
         raise IncompleteTranscription(f"MOSS's answer stopped at {last:.1f} s and {missing:.1f} s of speech up to {stop:.1f} s has no words")
