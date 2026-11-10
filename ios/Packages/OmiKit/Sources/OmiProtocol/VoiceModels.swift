@@ -125,6 +125,8 @@ public struct ReviewItem: Decodable, Identifiable, Equatable, Hashable, Sendable
     /// `sample` or `label`.
     public var kind: String?
     public var personId: String?
+    /// The name of the person asked about (servers from 5410801; null without a person).
+    public var personName: String?
     public var sampleId: String?
     public var label: String?
     public var reasons: [String]?
@@ -193,6 +195,24 @@ public struct SampleActionAnswer: Decodable, Equatable, Sendable {
 public enum VoicesHub {
     /// Reasons a label item carries because of naming, not doubt.
     static let namingReasons: Set<String> = ["auto", "possible"]
+
+    /// What the review card asks.
+    public enum ReviewQuestion: Equatable, Sendable {
+        /// "是 Alan 吗？"
+        case isThis(personId: String, name: String)
+        /// No one to name: "这是谁？" with a person picker, never a placeholder name.
+        case whoIsThis
+    }
+
+    /// The item's own name first (it never depends on the people list having loaded), then the people list.
+    public static func reviewQuestion(_ item: ReviewItem, people: [Person]) -> ReviewQuestion {
+        guard let pid = item.personId else { return .whoIsThis }
+        let candidates = [item.personName, people.first { $0.id == pid }?.name]
+        guard let name = candidates.compactMap({ $0?.trimmingCharacters(in: .whitespaces) }).first(where: { !$0.isEmpty }) else {
+            return .whoIsThis
+        }
+        return .isThis(personId: pid, name: name)
+    }
 
     /// Your card first, then everyone else in the server's order.
     public static func cards(_ people: [Person]) -> [Person] {

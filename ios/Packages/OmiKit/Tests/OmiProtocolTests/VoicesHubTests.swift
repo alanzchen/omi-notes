@@ -249,6 +249,32 @@ import Testing
         #expect(VoicesHub.reviewBadge(total: 0, flagged: 148) == nil)
     }
 
+    // MARK: Build 48 feedback ("TA 是谁？")
+
+    /// The server names the person each item asks about (`person_name`, main 5410801); it comes first,
+    /// so the question never depends on the people list having loaded.
+    @Test func theItemsOwnNameIsAskedFirst() throws {
+        let item = try decode(ReviewItem.self, #"{"id":"s.a.1","kind":"sample","person_id":"p-alan","person_name":"Alan"}"#)
+        #expect(item.personName == "Alan")
+        #expect(VoicesHub.reviewQuestion(item, people: []) == .isThis(personId: "p-alan", name: "Alan"))
+        #expect(VoicesHub.reviewQuestion(item, people: [Person(id: "p-alan", name: "Alan Chen")]) == .isThis(personId: "p-alan", name: "Alan"))
+    }
+
+    @Test func withoutTheItemsNameThePeopleListNamesIt() throws {
+        let item = try decode(ReviewItem.self, #"{"id":"s.a.1","person_id":"p-alan","person_name":null}"#)
+        #expect(VoicesHub.reviewQuestion(item, people: [Person(id: "p-alan", name: "Alan")]) == .isThis(personId: "p-alan", name: "Alan"))
+    }
+
+    /// Nobody to name: ask who it is, never "是 TA 吗？".
+    @Test func anItemWithoutANameAsksWhoItIs() throws {
+        let noPerson = try decode(ReviewItem.self, #"{"id":"l.c.S1.2..x","kind":"label","person_id":null,"person_name":null,"label":"S1"}"#)
+        #expect(VoicesHub.reviewQuestion(noPerson, people: [Person(id: "p-alan", name: "Alan")]) == .whoIsThis)
+        let unknownName = try decode(ReviewItem.self, #"{"id":"s.a.1","person_id":"p-gone"}"#)
+        #expect(VoicesHub.reviewQuestion(unknownName, people: []) == .whoIsThis)
+        let blank = try decode(ReviewItem.self, #"{"id":"s.a.1","person_id":"p-alan","person_name":"  "}"#)
+        #expect(VoicesHub.reviewQuestion(blank, people: []) == .whoIsThis)
+    }
+
     /// `GET /v1/speakers/review?limit&offset` pages: `next_offset` (null at the end) and `total`.
     @Test func aReviewPageDecodesItsPaging() throws {
         let page = try decode(ReviewItemsResponse.self, #"{"items":[{"id":"s.a.1"}],"next_offset":50,"total":163}"#)

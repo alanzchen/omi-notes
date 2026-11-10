@@ -33,6 +33,11 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
         var queue = Self.routes[key] ?? [(404, #"{"error":"not_found","detail":"no route"}"#)]
         let (status, text) = queue.count > 1 ? queue.removeFirst() : queue[0]
         Self.routes[key] = queue
+        // -1: the request times out; -2: no connection (what URLSession reports, before any response)
+        if status < 0 {
+            client?.urlProtocol(self, didFailWithError: URLError(status == -1 ? .timedOut : .notConnectedToInternet))
+            return
+        }
         let resp = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
         client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(text.utf8))
@@ -415,6 +420,93 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
         #expect(await speakers.attest(Person(id: "p-gigi", name: "Gigi")))
         let body = try #require(sent("PUT", "/v1/people/p-gigi").first?.body)
         #expect(body["attest_knows"] as? Bool == true && body["name"] as? String == "Gigi")
+    }
+
+    // MARK: Build 48 feedback: "TA 是谁？" and "The request timed out."
+
+    static let settingsJSON = #"{"acknowledged_at":"2026-10-03T16:00:00.000Z","unknown_voices_enabled":true,"auto_assign":true}"#
+    static let peopleJSON = #"{"people":[{"id":"p-alan","name":"Alan","me":true}]}"#
+
+    /// One slow call (suggestions timed out on the phone) must not leave the people list empty.
+    @Test func peopleLoadEvenWhenSuggestionsFail() async throws {
+        let speakers = try speakers()
+        VoicesHubStub.routes["GET /v1/status"] = [(200, #"{"features":["voice_review"]}"#)]
+        VoicesHubStub.routes["GET /v1/people"] = [(200, Self.peopleJSON)]
+        VoicesHubStub.routes["GET /v1/speakers/settings"] = [(200, Self.settingsJSON)]
+        VoicesHubStub.routes["GET /v1/speakers/suggestions"] = [(-1, "")]
+        await speakers.refresh()
+        #expect(speakers.people.map(\.name) == ["Alan"] && speakers.settings?.unknownVoicesEnabled == true)
+        #expect(speakers.error == NetworkTrouble.slow.message)
+    }
+
+    @Test func peopleLoadEvenWhenSettingsFail() async throws {
+        let speakers = try speakers()
+        VoicesHubStub.routes["GET /v1/people"] = [(200, Self.peopleJSON)]
+        VoicesHubStub.routes["GET /v1/speakers/settings"] = [(503, #"{"error":"x","detail":"down"}"#)]
+        await speakers.refresh()
+        #expect(speakers.people.map(\.name) == ["Alan"] && speakers.error != nil)
+    }
+
+    @Test func aFailedPeopleCallKeepsTheLastGoodPeople() async throws {
+        let speakers = try speakers()
+        VoicesHubStub.routes["GET /v1/people"] = [(200, Self.peopleJSON), (503, #"{"error":"x","detail":"down"}"#)]
+        VoicesHubStub.routes["GET /v1/speakers/settings"] = [(200, Self.settingsJSON)]
+        VoicesHubStub.routes["GET /v1/speakers/suggestions"] = [(200, #"{"suggestions":[]}"#)]
+        await speakers.refresh()
+        await speakers.refresh()
+        #expect(speakers.people.map(\.name) == ["Alan"] && speakers.error != nil)
+    }
+
+    /// An idempotent GET is tried once more before the error shows; the server is fast now.
+    @Test func aTimedOutGetIsRetriedOnce() async throws {
+        let speakers = try speakers()
+        VoicesHubStub.routes["GET /v1/people"] = [(-1, ""), (200, Self.peopleJSON)]
+        VoicesHubStub.routes["GET /v1/speakers/settings"] = [(200, Self.settingsJSON)]
+        VoicesHubStub.routes["GET /v1/speakers/suggestions"] = [(200, #"{"suggestions":[]}"#)]
+        await speakers.refresh()
+        #expect(speakers.people.map(\.name) == ["Alan"] && speakers.error == nil)
+        #expect(sent("GET", "/v1/people").count == 2)
+        VoicesHubStub.routes["GET /v1/clips/c.S1.0"] = [(-2, ""), (200, "RIFF")]
+        #expect(try await speakers.clip("c.S1.0") == Data("RIFF".utf8))  // clips too
+    }
+
+    /// A decision is never sent twice by itself; it fails in short Chinese and can be retried by tap.
+    @Test func aTimedOutDecisionIsNotResentButCanBeRetried() async throws {
+        let queue = VoiceReviewQueue(speakers: try speakers())
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, Self.first)]
+        VoicesHubStub.routes["POST /v1/speakers/review/s.a.1"] = [(-1, ""), (200, #"{"undo_token":"t"}"#)]
+        await queue.load()
+        #expect(await queue.decide(.reject) == false)
+        #expect(sent("POST", "/review/s.a.1").count == 1)
+        #expect(queue.error == NetworkTrouble.slow.message && queue.canRetry)
+        await queue.retry()
+        #expect(queue.current?.id == "s.b.1" && queue.undoable?.decision == .reject && queue.error == nil && !queue.canRetry)
+        let bodies = sent("POST", "/review/s.a.1").map { $0.body["request_id"] as? String }
+        #expect(bodies.count == 2 && bodies[0] == bodies[1])  // the same request id: the server dedupes it
+    }
+
+    @Test func networkErrorsReadAsShortChinese() {
+        #expect(NetworkTrouble(URLError(.timedOut)) == .slow)
+        #expect(NetworkTrouble(URLError(.notConnectedToInternet)) == .unreachable)
+        #expect(NetworkTrouble(URLError(.networkConnectionLost)) == .unreachable)
+        #expect(NetworkTrouble(URLError(.cannotConnectToHost)) == .unreachable)
+        #expect(NetworkTrouble(URLError(.badURL)) == nil)
+        #expect(NetworkTrouble.slow.message == "网络有点慢，点这里重试" && NetworkTrouble.unreachable.message == "连不上服务器")
+        #expect(SpeakersModel.describe(NetworkTrouble.slow) == "网络有点慢，点这里重试")
+    }
+
+    /// "这是谁？": choosing the person the item proposed confirms it; anyone else moves it to them.
+    @Test func choosingAPersonConfirmsOrMoves() async throws {
+        let queue = VoiceReviewQueue(speakers: try speakers())
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, Self.first)]
+        VoicesHubStub.routes["POST /v1/speakers/review/s.a.1"] = [(200, #"{"undo_token":"t1"}"#)]
+        VoicesHubStub.routes["POST /v1/speakers/review/s.b.1"] = [(200, #"{"undo_token":"t2"}"#)]
+        await queue.load()
+        #expect(await queue.choose("p-alan"))
+        #expect(sent("POST", "/review/s.a.1").first?.body["decision"] as? String == "confirm")
+        #expect(await queue.choose("p-gigi"))
+        let body = try #require(sent("POST", "/review/s.b.1").first?.body)
+        #expect(body["decision"] as? String == "move" && body["person_id"] as? String == "p-gigi")
     }
 
     // MARK: Capabilities

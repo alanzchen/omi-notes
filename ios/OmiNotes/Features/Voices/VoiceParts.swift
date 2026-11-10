@@ -126,10 +126,10 @@ struct PersonConsentFlow: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .alert("\(person?.name ?? "TA") 知道吗？", isPresented: .init(get: { person != nil && acknowledged }, set: { if !$0 { done() } }),
+            .alert(person.map { "\($0.name) 知道吗？" } ?? "对方知道吗？", isPresented: .init(get: { person != nil && acknowledged }, set: { if !$0 { done() } }),
                    presenting: person) { p in
                 Button("取消", role: .cancel) {}
-                Button("TA 知道") {
+                Button("\(p.name) 知道") {
                     Task {
                         if await !model.speakers.attest(p) {
                             failed = model.speakers.error ?? "请稍后再试"
@@ -137,7 +137,7 @@ struct PersonConsentFlow: ViewModifier {
                     }
                 }
             } message: { p in
-                Text("确认 \(p.name) 知道 Omi Notes 会识别 TA 的声音，然后再试一次。")
+                Text("确认 \(p.name) 知道 Omi Notes 会识别 \(p.name) 的声音，然后再试一次。")
             }
             .alert("没能保存", isPresented: .init(get: { failed != nil }, set: { if !$0 { failed = nil } }), presenting: failed) { _ in
                 Button("好") {}
@@ -153,6 +153,18 @@ struct PersonConsentFlow: ViewModifier {
 extension View {
     func personConsent(_ model: AppModel, personId: String?, done: @escaping () -> Void) -> some View {
         modifier(PersonConsentFlow(model: model, personId: personId, done: done))
+    }
+}
+
+/// An error the owner can tap to try again ("网络有点慢，点这里重试").
+struct RetryLine: View {
+    let text: String
+
+    var body: some View {
+        Label(text, systemImage: "arrow.clockwise")
+            .font(.footnote).foregroundStyle(.orange).multilineTextAlignment(.center)
+            .contentShape(Rectangle())
+            .accessibilityHint("重试")
     }
 }
 

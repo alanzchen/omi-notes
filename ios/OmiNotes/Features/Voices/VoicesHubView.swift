@@ -32,7 +32,9 @@ struct VoicesHubView: View {
                     NavigationLink(value: Route.unknownVoices) { unknownCard }.buttonStyle(.plain).padding(.top, 4)
                 }
                 if let error = speakers.error {
-                    Text(error).font(.footnote).foregroundStyle(.red).padding(.horizontal, 4)
+                    // tap to try again (what loaded stays: one failing call never empties the cards)
+                    Button { Task { await speakers.refresh() } } label: { RetryLine(text: error) }
+                        .buttonStyle(.plain).frame(maxWidth: .infinity).padding(.horizontal, 4)
                 }
             }
             .padding(.horizontal, 16).padding(.bottom, 24)

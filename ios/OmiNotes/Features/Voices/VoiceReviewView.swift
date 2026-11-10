@@ -10,6 +10,7 @@ struct VoiceReviewView: View {
     @State private var queue: VoiceReviewQueue
     @State private var player = VoicePlayer()
     @State private var drag: CGSize = .zero
+    @State private var newPerson: ConversationSpeakersView.NamingRun?
     @Environment(\.dismiss) private var dismiss
 
     init(model: AppModel, queue: VoiceReviewQueue? = nil) {
@@ -58,6 +59,9 @@ struct VoiceReviewView: View {
         .onChange(of: queue.generation) { player.invalidate() }
         .onDisappear { player.stop() }
         .personConsent(model, personId: queue.consentNeeded) { queue.clearConsentNeeded() }
+        .fullScreenCover(item: $newPerson, onDismiss: { Task { await speakers.refresh(); await queue.load() } }) { r in
+            NameVoiceView(model: model, items: r.items)
+        }
     }
 
     // MARK: Top
@@ -89,30 +93,79 @@ struct VoiceReviewView: View {
 
     // MARK: One clip
 
-    private func name(_ item: ReviewItem) -> String {
-        item.personId.flatMap { pid in speakers.people.first { $0.id == pid }?.name } ?? "TA"
+    /// The item's own name first, then the people list; nobody to name is "这是谁？", never a placeholder.
+    private func question(_ item: ReviewItem) -> VoicesHub.ReviewQuestion {
+        VoicesHub.reviewQuestion(item, people: speakers.people)
     }
 
     private func card(_ item: ReviewItem) -> some View {
-        VStack(spacing: 18) {
+        let q = question(item)
+        return VStack(spacing: 18) {
             Spacer(minLength: 0)
-            Text("是 \(name(item)) 吗？").font(.largeTitle.bold()).lineLimit(1).minimumScaleFactor(0.6)
-            listenCard(item)
-                .offset(x: drag.width)
-                .rotationEffect(.degrees(Double(drag.width) / 22))
-                .overlay { stamp }
-                .gesture(DragGesture()
-                    .onChanged { drag = $0.translation }
-                    .onEnded { g in
-                        if g.translation.width > 110 { answer(.confirm) } else if g.translation.width < -110 { answer(.reject) }
-                        withAnimation(.snappy) { drag = .zero }
-                    })
+            Group {
+                switch q {
+                case .isThis(_, let name): Text("是 \(name) 吗？")
+                case .whoIsThis: Text("这是谁？")
+                }
+            }
+            .font(.largeTitle.bold()).lineLimit(1).minimumScaleFactor(0.6)
+            if case .isThis = q {
+                listenCard(item)
+                    .offset(x: drag.width)
+                    .rotationEffect(.degrees(Double(drag.width) / 22))
+                    .overlay { stamp }
+                    .gesture(DragGesture()
+                        .onChanged { drag = $0.translation }
+                        .onEnded { g in
+                            if g.translation.width > 110 { answer(.confirm) } else if g.translation.width < -110 { answer(.reject) }
+                            withAnimation(.snappy) { drag = .zero }
+                        })
+            } else {
+                listenCard(item)
+            }
             errorLine
             Spacer(minLength: 0)
-            answers(item)
+            switch q {
+            case .isThis(_, let name): answers(item, name: name)
+            case .whoIsThis: whoAnswers(item)
+            }
             bottomLine.frame(height: 50).padding(.bottom, 8)
         }
         .padding(.horizontal, 20)
+    }
+
+    /// "这是谁？": someone you know (picked), a new person (the naming flow, which asks consent), or
+    /// 不认识 (skipped here; the voice stays unnamed).
+    private func whoAnswers(_ item: ReviewItem) -> some View {
+        HStack(spacing: 12) {
+            Menu {
+                ForEach(VoicesHub.cards(speakers.people)) { p in
+                    Button(p.name) { player.stop(); Task { await queue.choose(p.id) } }
+                }
+            } label: {
+                bigLabel("选择", symbol: "person.crop.circle", color: .accentColor)
+            }
+            .disabled(speakers.people.isEmpty)
+            if let naming = Self.namingItem(item) {
+                Button { player.stop(); newPerson = .init(items: [naming]) } label: {
+                    bigLabel("新的人", symbol: "person.badge.plus", color: .indigo)
+                }
+                .buttonStyle(.plain)
+            }
+            Button { withAnimation(.snappy) { queue.skip() } } label: {
+                bigLabel("不认识", symbol: "questionmark", color: .gray)
+            }
+            .buttonStyle(.plain)
+        }
+        .disabled(queue.busy)
+    }
+
+    /// A conversation's speaker, for the naming flow (it adds a person and asks consent).
+    static func namingItem(_ item: ReviewItem) -> VoiceItem? {
+        guard item.kind == "label", let label = item.label, let conv = item.conversation else { return nil }
+        let clip = item.clip.map { SpeakerClip(id: $0.id, seconds: $0.seconds, startedAt: $0.startedAt, text: item.text, conversationId: conv.id) }
+        return VoiceItem(target: .label(conversationId: conv.id, label: label), question: .whoIsThis, context: conv,
+                         clips: clip.map { [$0] } ?? [], scope: [conv])
     }
 
     private func listenCard(_ item: ReviewItem) -> some View {
@@ -159,12 +212,14 @@ struct VoiceReviewView: View {
         .shadow(color: .black.opacity(0.06), radius: 12, y: 6)
     }
 
+    /// When, then the conversation's title small and grey on its own line: the person question stays primary.
     private func contextLine(_ c: ConversationContext?) -> some View {
-        HStack(spacing: 4) {
-            Text(c?.title ?? "对话").fontWeight(.semibold).lineLimit(1)
-            if let when = VoicesHub.shortTime(c?.startedAt) { Text("· \(when)").foregroundStyle(.secondary).lineLimit(1).fixedSize() }
+        VStack(alignment: .leading, spacing: 2) {
+            Text(VoicesHub.shortTime(c?.startedAt) ?? "对话").font(.subheadline.weight(.semibold)).lineLimit(1)
+            if let title = c?.title, !title.isEmpty {
+                Text(title).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+            }
         }
-        .font(.subheadline)
         .accessibilityElement(children: .combine)
     }
 
@@ -187,7 +242,7 @@ struct VoiceReviewView: View {
         }
     }
 
-    private func answers(_ item: ReviewItem) -> some View {
+    private func answers(_ item: ReviewItem, name: String) -> some View {
         let others = speakers.people.filter { $0.id != item.personId }
         return HStack(spacing: 12) {
             bigButton("不是", symbol: "xmark", color: .red) { answer(.reject) }
@@ -207,22 +262,24 @@ struct VoiceReviewView: View {
                 .background(Color(.tertiarySystemFill), in: .rect(cornerRadius: 20))
             }
             .buttonStyle(.plain)
-            bigButton("是 \(name(item))", symbol: "checkmark", color: .green) { answer(.confirm) }
+            bigButton("是 \(name)", symbol: "checkmark", color: .green) { answer(.confirm) }
         }
         .disabled(queue.busy)
     }
 
     private func bigButton(_ title: String, symbol: String, color: Color, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 4) {
-                Image(systemName: symbol).font(.title2.weight(.bold))
-                Text(title).font(.headline).lineLimit(1).minimumScaleFactor(0.7)
-            }
-            .foregroundStyle(.white)
-            .frame(maxWidth: .infinity).frame(height: 76)
-            .background(color.gradient, in: .rect(cornerRadius: 20))
+        Button(action: action) { bigLabel(title, symbol: symbol, color: color) }
+            .buttonStyle(.plain)
+    }
+
+    private func bigLabel(_ title: String, symbol: String, color: Color) -> some View {
+        VStack(spacing: 4) {
+            Image(systemName: symbol).font(.title2.weight(.bold))
+            Text(title).font(.headline).lineLimit(1).minimumScaleFactor(0.7)
         }
-        .buttonStyle(.plain)
+        .foregroundStyle(.white)
+        .frame(maxWidth: .infinity).frame(height: 76)
+        .background(color.gradient, in: .rect(cornerRadius: 20))
     }
 
     private func answer(_ d: VoiceReviewQueue.Decision, personId: String? = nil) {
@@ -243,11 +300,14 @@ struct VoiceReviewView: View {
     }
 
     private func undoToast(_ d: VoiceReviewQueue.Done) -> some View {
-        let who = d.personId.flatMap { pid in speakers.people.first { $0.id == pid }?.name } ?? name(d.item)
+        // the person it went to (a move), else the one asked about; without a name, no name
+        let moved = d.personId.flatMap { pid in speakers.people.first { $0.id == pid }?.name }
+        let asked: String? = if case .isThis(_, let name) = question(d.item) { name } else { nil }
+        let who = (d.decision == .move ? moved : asked).map { " \($0)" } ?? ""
         let (symbol, tint, text): (String, Color, String) = switch d.decision {
-        case .confirm: ("checkmark.circle.fill", .green, "已确认是 \(who)")
-        case .reject: ("xmark.circle.fill", .orange, "已标记不是 \(who)")
-        case .move: ("arrow.right.circle.fill", .indigo, "已移给 \(who)")
+        case .confirm: ("checkmark.circle.fill", .green, who.isEmpty ? "已确认" : "已确认是\(who)")
+        case .reject: ("xmark.circle.fill", .orange, who.isEmpty ? "已标记不是" : "已标记不是\(who)")
+        case .move: ("arrow.right.circle.fill", .indigo, who.isEmpty ? "已移走" : "已移给\(who)")
         }
         return VoiceToast(symbol: symbol, tint: tint, text: text, action: "撤销") { Task { await queue.undo() } }
     }
@@ -264,8 +324,14 @@ struct VoiceReviewView: View {
 
     /// The queue's own error (with an undo's reasons), or the speakers model's (a failed attestation).
     @ViewBuilder private var errorLine: some View {
-        if let error = queue.error ?? speakers.error {
-            Text(error).font(.footnote).foregroundStyle(.orange).multilineTextAlignment(.center)
+        if let error = queue.error {
+            if queue.canRetry {
+                Button { Task { await queue.retry() } } label: { RetryLine(text: error) }.buttonStyle(.plain)
+            } else {
+                Text(error).font(.footnote).foregroundStyle(.orange).multilineTextAlignment(.center)
+            }
+        } else if let error = speakers.error {
+            Button { Task { await speakers.refresh() } } label: { RetryLine(text: error) }.buttonStyle(.plain)
         }
     }
 

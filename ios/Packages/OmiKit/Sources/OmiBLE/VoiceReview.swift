@@ -124,13 +124,46 @@ public final class VoiceReviewQueue {
         }
     }
 
+    /// A decision that failed for a reason other than a conflict (the network), to send again by tap
+    /// with the same request id (the server dedupes it).
+    private var failedAttempt: (itemId: String, decision: Decision, personId: String?, requestId: String)?
+
+    /// The error can be retried ("点这里重试"): a failed decision, or a failed fetch.
+    public var canRetry: Bool {
+        if failedAttempt != nil { return true }
+        if case .failed = phase { return true }
+        return false
+    }
+
+    /// "点这里重试": sends the failed decision again, or fetches the queue again.
+    public func retry() async {
+        if let f = failedAttempt, f.itemId == current?.id {
+            _ = await decide(f.decision, personId: f.personId, requestId: f.requestId)
+        } else {
+            failedAttempt = nil
+            error = nil
+            await load()
+        }
+    }
+
+    /// "这是谁？": the person the item proposed confirms it; anyone else takes it (a move).
+    @discardableResult
+    public func choose(_ personId: String) async -> Bool {
+        guard let item = current else { return false }
+        return item.personId == personId ? await decide(.confirm) : await decide(.move, personId: personId)
+    }
+
     /// Answers the current item; false (and the item stays) if the server didn't take it.
     @discardableResult
     public func decide(_ decision: Decision, personId: String? = nil) async -> Bool {
+        await decide(decision, personId: personId, requestId: UUID().uuidString.lowercased())
+    }
+
+    private func decide(_ decision: Decision, personId: String?, requestId: String) async -> Bool {
         guard let item = current, !busy else { return false }
         busy = true
         defer { busy = false }
-        let requestId = UUID().uuidString.lowercased()
+        failedAttempt = nil
         let answer: ReviewDecisionAnswer
         do {
             answer = try await speakers.decideReview(item.id, decision: decision.rawValue, personId: personId, requestId: requestId)
@@ -144,8 +177,13 @@ public final class VoiceReviewQueue {
                 await load()
             }
             return false
+        } catch let trouble as NetworkTrouble {
+            error = trouble.message
+            failedAttempt = (item.id, decision, personId, requestId)
+            return false
         } catch {
             self.error = "没能保存：\(SpeakersModel.describe(error))"
+            failedAttempt = (item.id, decision, personId, requestId)
             return false
         }
         error = nil
@@ -161,6 +199,7 @@ public final class VoiceReviewQueue {
     /// Not sure: on to the next one; it isn't sent anywhere.
     public func skip() {
         guard let item = current else { return }
+        failedAttempt = nil
         skipped.insert(item.id)
         error = nil
         advance()

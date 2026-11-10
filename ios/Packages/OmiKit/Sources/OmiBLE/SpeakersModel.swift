@@ -159,23 +159,43 @@ public final class SpeakersModel {
         serverSupportsNameVoice = status?.supportsNameVoice == true
         serverSupportsVoiceReview = status?.supportsVoiceReview == true
         serverSupportsVoiceCalibration = status?.supportsVoiceCalibration == true
-        do {
-            async let p = api.people()
-            async let s = api.speakerSettings()
-            let (newPeople, newSettings) = try await (p, s)
-            let newSuggestions = newSettings.unknownVoicesEnabled == true ? (try await api.speakerSuggestions()) : []
-            // the queue's size, for the hub (one item is enough to learn it); unknown is not an error
-            let total = serverSupportsVoiceReview ? (try? await api.reviewItems(limit: 1))?.total : nil
-            guard current() else { return }  // answered for a server (or vault) no longer shown
-            reviewTotal = total
-            people = newPeople
-            settings = newSettings
-            suggestions = newSuggestions
-            loadedFor = config
-            error = nil
-        } catch {
-            if current() { self.error = Self.describe(error) }
+        // This server's answers may be shown from here on (a failed call below keeps what it had).
+        loadedFor = config
+        // Each part on its own: one slow or failing call (suggestions, the queue total) never leaves
+        // the people list empty, and a failed people call keeps the last good list.
+        async let peopleAnswer = Self.attempt { try await api.people() }
+        async let settingsAnswer = Self.attempt { try await api.speakerSettings() }
+        let (p, s) = await (peopleAnswer, settingsAnswer)
+        guard current() else { return }  // answered for a server (or vault) no longer shown
+        var problems: [Error] = []
+        switch p {
+        case .success(let newPeople): people = newPeople
+        case .failure(let e): problems.append(e)
         }
+        switch s {
+        case .success(let newSettings):
+            settings = newSettings
+            if newSettings.unknownVoicesEnabled {
+                let answer = await Self.attempt { try await api.speakerSuggestions() }
+                guard current() else { return }
+                switch answer {
+                case .success(let newSuggestions): suggestions = newSuggestions
+                case .failure(let e): problems.append(e)
+                }
+            } else {
+                suggestions = []
+            }
+        case .failure(let e): problems.append(e)
+        }
+        // the queue's size, for the hub (one item is enough to learn it); unknown is not an error
+        let total = serverSupportsVoiceReview ? (try? await api.reviewItems(limit: 1))?.total : nil
+        guard current() else { return }
+        reviewTotal = total
+        error = problems.first.map(Self.describe)
+    }
+
+    private static func attempt<T: Sendable>(_ call: @Sendable () async throws -> T) async -> Result<T, Error> {
+        do { return .success(try await call()) } catch { return .failure(error) }
     }
 
     // MARK: Settings

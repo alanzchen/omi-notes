@@ -149,6 +149,21 @@ extension APIClient {
         do { return try Self.snakeDecoder.decode(T.self, from: data) } catch { throw APIError.decoding("\(error)") }
     }
 
+    /// The voices calls answer in tens of milliseconds; this only bounds a stuck connection.
+    static let voicesTimeout: TimeInterval = 20
+
+    /// A GET (idempotent) that hit a network problem is tried once more before failing; anything else
+    /// is sent once (a decision is retried only by the owner, with the same request id).
+    private static func send(_ req: URLRequest, session: URLSession) async throws -> (Data, URLResponse) {
+        do {
+            return try await session.data(for: req)
+        } catch {
+            guard let trouble = NetworkTrouble(error) else { throw error }
+            guard req.httpMethod == "GET" else { throw trouble }
+            do { return try await session.data(for: req) } catch { throw NetworkTrouble(error) ?? error }
+        }
+    }
+
     private func raw(_ method: String, _ path: String, query: String? = nil, body: Data? = nil, accept: String = "application/json") async throws -> Data {
         guard let url = endpoint.url(path, query: query) else { throw APIError.notConfigured }
         var req = URLRequest(url: url)
@@ -159,10 +174,13 @@ extension APIClient {
             req.httpBody = body
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
+        req.timeoutInterval = Self.voicesTimeout
         let data: Data
         let resp: URLResponse
         do {
-            (data, resp) = try await session.data(for: req)
+            (data, resp) = try await Self.send(req, session: session)
+        } catch let trouble as NetworkTrouble {
+            throw trouble
         } catch {
             throw APIError.transport((error as NSError).localizedDescription)
         }
@@ -173,4 +191,33 @@ extension APIClient {
         }
         return data
     }
+}
+
+/// A network problem in words the owner can act on (never "The request timed out.").
+public enum NetworkTrouble: Error, Equatable, Sendable, LocalizedError {
+    /// The request timed out.
+    case slow
+    /// No connection, or the server couldn't be reached.
+    case unreachable
+
+    public init?(_ error: Error) {
+        if let trouble = error as? NetworkTrouble { self = trouble; return }
+        guard let url = error as? URLError else { return nil }
+        switch url.code {
+        case .timedOut: self = .slow
+        case .notConnectedToInternet, .networkConnectionLost, .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
+             .dataNotAllowed, .internationalRoamingOff, .secureConnectionFailed:
+            self = .unreachable
+        default: return nil
+        }
+    }
+
+    public var message: String {
+        switch self {
+        case .slow: return "网络有点慢，点这里重试"
+        case .unreachable: return "连不上服务器"
+        }
+    }
+
+    public var errorDescription: String? { message }
 }
