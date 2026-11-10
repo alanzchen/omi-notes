@@ -45,6 +45,20 @@ def _uncovered_speech(pcm: np.ndarray, a: float, b: float, covered: list[tuple[f
     return float((loud & ~hit).sum()) * frame / plan.SR, float(loud.sum()) * frame / plan.SR
 
 
+def _check_truncated_tail(pcm: np.ndarray, capped: list[tuple[float, float]], lines: list[dict], start: float) -> None:
+    """Past the last line of a MOSS answer cut off by its cap, only Qwen has words: speech there in a span Qwen
+    failed on would vanish, so none of it is allowed (no share for noise, unlike `_check_fallback`)."""
+    last = max((line["end"] for line in lines), default=start)
+    for a, b in capped:
+        if b <= last + SLACK:
+            continue
+        missing, _ = _uncovered_speech(pcm, max(a, last + SLACK), b, [])
+        if missing >= 0.2:
+            raise IncompleteTranscription(
+                f"MOSS stopped at its cap at {last:.1f} s and Qwen failed on {a:.1f}-{b:.1f} s: {missing:.1f} s of speech has no words"
+            )
+
+
 QWEN_SPLITS = 6  # a capped chunk is halved, and each capped piece again, until 20 s or less (this only bounds it)
 
 
@@ -131,7 +145,7 @@ class Engine:
             mx.reset_peak_memory()
             t0 = time.perf_counter()
             duration = len(pcm) / plan.SR
-            stats = {"windows": 0, "resplits": 0, "truncated_unresolved": 0, "unlabeled_windows": 0, "qwen_chunks": 0,
+            stats = {"windows": 0, "resplits": 0, "truncated_unresolved": 0, "moss_retries": 0, "unlabeled_windows": 0, "qwen_chunks": 0,
                      "qwen_split": 0, "qwen_without_context": 0, "qwen_capped": 0, "qwen_unaligned": 0, "units": 0, "units_outside_lines": 0, "lines_with_moss_text": 0}  # fmt: skip
             lines: list[dict] = []
             languages: list[str] = []
@@ -169,6 +183,15 @@ class Engine:
         r = moss.generate(mx.array(window), max_tokens=cap)
         stats["windows"] += 1
         relative = moss_lines(r.segments)
+        retry = plan.moss_retry_tokens(seconds)
+        if relative and retry > cap and int(r.generation_tokens) >= cap:
+            # lines, then the short cap: dense speech, not a loop (a loop gives no lines and fails at the short cap)
+            stats["moss_retries"] += 1
+            log.warning("MOSS hit its short cap on %.0f s (tokens %d/%d): trying it with %d", seconds, r.generation_tokens, cap, retry)
+            cap = retry
+            r = moss.generate(mx.array(window), max_tokens=cap)
+            stats["windows"] += 1
+            relative = moss_lines(r.segments)
         if plan.is_truncated(relative, int(r.generation_tokens), cap, plan.speech_end(window)):
             if depth < MAX_RESPLIT_DEPTH and seconds > 120:
                 cut = a + plan.middle_cut(window, 0.0, seconds)
@@ -244,6 +267,8 @@ class Engine:
             units.extend(self._qwen(qwen, aligner, pcm, start + a, start + b, context, stats, languages, capped))
         lines = [dict(line) for line in lines]
         _check_fallback(pcm, capped, lines)
+        if truncated:
+            _check_truncated_tail(pcm, capped, lines, start)
         if not lines:
             if not units:
                 return []

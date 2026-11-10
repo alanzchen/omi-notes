@@ -29,17 +29,29 @@ QWEN_TOKENS_PER_SECOND = 12
 _FRAME = SR // 50  # 20 ms
 
 
-MOSS_SHORT_TOKENS_PER_SECOND = 40  # real windows run 5-10 per audio second; a repetition loop runs thousands
+MOSS_SHORT_TOKENS_PER_SECOND = 40  # real windows mostly run 5-10 per audio second; a repetition loop runs thousands
 MOSS_SHORT_FLOOR = 1024
+MOSS_RETRY_TOKENS_PER_SECOND = 160  # dense back-and-forth reaches ~55 (timestamps tokenize per digit)
+MOSS_RETRY_FLOOR = 4096
+
+
+def _moss_long_tokens(seconds: float) -> int:
+    prompt = math.ceil(MOSS_PROMPT_TOKENS_PER_SECOND * seconds)
+    return max(256, min(MOSS_CONTEXT - prompt - 256, max(16_384, math.ceil(20 * seconds))))
 
 
 def moss_max_tokens(seconds: float) -> int:
     """At least 16k, 20 per audio second, within what the context leaves after the audio prompt; for a window
     short enough that 40 per second is under that, 40 per second (at least 1024). A loop on a 7 s window ran
-    to the 16k floor (97 s of GPU) before the request failed honestly; it now stops after ~1k tokens."""
-    prompt = math.ceil(MOSS_PROMPT_TOKENS_PER_SECOND * seconds)
-    long = max(256, min(MOSS_CONTEXT - prompt - 256, max(16_384, math.ceil(20 * seconds))))
-    return min(long, max(MOSS_SHORT_FLOOR, math.ceil(MOSS_SHORT_TOKENS_PER_SECOND * seconds)))
+    to the 16k floor (97 s of GPU) before the request failed honestly; it now stops after ~1k tokens. A dense
+    window can need more than 40 per second: see `moss_retry_tokens`."""
+    return min(_moss_long_tokens(seconds), max(MOSS_SHORT_FLOOR, math.ceil(MOSS_SHORT_TOKENS_PER_SECOND * seconds)))
+
+
+def moss_retry_tokens(seconds: float) -> int:
+    """The cap for a second try of a window that hit `moss_max_tokens` while making progress: 160 per second
+    (at least 4096), never more than the long budget. Equal to the first cap where that was already the long one."""
+    return min(_moss_long_tokens(seconds), max(MOSS_RETRY_FLOOR, math.ceil(MOSS_RETRY_TOKENS_PER_SECOND * seconds)))
 
 
 def qwen_max_tokens(seconds: float) -> int:

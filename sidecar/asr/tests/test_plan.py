@@ -77,3 +77,11 @@ def test_a_short_window_s_moss_cap_scales_with_its_length_but_long_windows_keep_
         old = max(256, min(plan.MOSS_CONTEXT - math.ceil(plan.MOSS_PROMPT_TOKENS_PER_SECOND * seconds) - 256,
                            max(16_384, math.ceil(20 * seconds))))
         assert plan.moss_max_tokens(seconds) == old
+
+
+def test_the_retry_cap_after_a_short_cap_hit_is_4x_but_never_past_the_long_budget():
+    assert plan.moss_retry_tokens(7.3) == 4096 and plan.moss_max_tokens(7.3) == 1024
+    assert plan.moss_retry_tokens(30) == 4800 and plan.moss_max_tokens(30) == 1200
+    assert plan.moss_retry_tokens(120) == 16_384  # the long budget: 160/s would be 19,200
+    for seconds in (410, 600, 1200):
+        assert plan.moss_retry_tokens(seconds) == plan.moss_max_tokens(seconds), "long windows get no second try"

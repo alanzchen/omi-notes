@@ -343,3 +343,73 @@ def test_a_moss_loop_on_a_short_window_stops_at_its_small_cap_and_still_fails_ho
     with pytest.raises(IncompleteTranscription):
         e.transcribe(speech(7.3), [])
     assert moss.caps and max(moss.caps) <= 1024
+
+
+class DenseMoss(FakeMoss):
+    """Two speakers trading a reply every `step` s over the window, each reply costing `cost` tokens (the real
+    tokenizer gives ~18 for "[0.40][S02]Yes.[0.80]": timestamps go digit by digit). Stops at the cap with only
+    the replies it finished, as a capped generation does."""
+
+    def __init__(self, step=0.4, cost=18):
+        super().__init__([])
+        self.step, self.cost, self.caps = step, cost, []
+
+    def generate(self, audio, max_tokens=0, **_):
+        self.caps.append(max_tokens)
+        n = round(audio.shape[0] / SR / self.step)
+        done = min(n, max_tokens // self.cost)
+        lines = [{"start": round(i * self.step, 2), "end": round((i + 1) * self.step, 2), "speaker_id": f"S0{i % 2 + 1}",
+                  "text": f"[{i * self.step:.2f}][S0{i % 2 + 1}] r{i}"} for i in range(done)]  # fmt: skip
+        return SimpleNamespace(segments=lines, generation_tokens=min(n * self.cost, max_tokens))
+
+
+def test_a_dense_short_window_that_hits_the_short_cap_is_tried_again_and_keeps_every_reply():
+    # nightly review 2026-11-10 (IT1-01): 75 replies in 30 s are ~1,345 real tokens, over the 1,200 short cap;
+    # with Qwen also capped, MOSS's prefix passed fallback and 67 of 75 replies came back as a 200
+    moss = DenseMoss()
+    e = Engine()
+    e.models = (moss, CappingQwen(limit=0), FakeAligner())
+    out = e.transcribe(speech(30), [])
+    assert moss.caps == [1200, 4800]
+    assert out["omi_asr"]["moss_retries"] == 1 and out["omi_asr"]["truncated_unresolved"] == 0
+    assert [s["text"] for s in out["segments"]] == [f"r{i}" for i in range(75)]
+
+
+def test_a_window_still_capped_after_its_retry_with_qwen_failing_on_the_tail_is_incomplete_not_shortened():
+    from omi_asr.engine import IncompleteTranscription
+
+    moss = DenseMoss(cost=70)  # 75 replies need 5,250 tokens: past the 4,800 retry too; MOSS stops at 68 (27.2 s)
+    e = Engine()
+    e.models = (moss, CappingQwen(limit=0), FakeAligner())
+    with pytest.raises(IncompleteTranscription):
+        e.transcribe(speech(30), [])
+    assert moss.caps == [1200, 4800]
+
+
+def test_a_window_still_capped_after_its_retry_keeps_qwen_s_tail_when_qwen_manages():
+    e = Engine()
+    e.models = (DenseMoss(cost=70), FakeQwen(), FakeAligner())
+    out = e.transcribe(speech(30), [])
+    assert out["omi_asr"]["truncated_unresolved"] == 1
+    assert any(s["speaker_id"] == "UNKNOWN" and s["end"] >= 29 for s in out["segments"])
+
+
+def test_the_dense_window_over_http_is_complete_or_422_and_health_stays_up():
+    import io
+
+    import soundfile as sf
+    from fastapi.testclient import TestClient
+
+    from omi_asr import server
+
+    buf = io.BytesIO()
+    sf.write(buf, speech(30), SR, format="FLAC", subtype="PCM_16")
+    for cost, status in ((18, 200), (70, 422)):
+        e = Engine()
+        e.models = (DenseMoss(cost=cost), CappingQwen(limit=0), FakeAligner())
+        client = TestClient(server.create_app(e, exit=lambda _: pytest.fail("unexpected watchdog exit")))
+        r = client.post("/v1/audio/transcriptions", files={"file": ("a.flac", buf.getvalue(), "audio/flac")})
+        assert r.status_code == status
+        if status == 200:
+            assert len(r.json()["segments"]) == 75
+        assert client.get("/health").status_code == 200
