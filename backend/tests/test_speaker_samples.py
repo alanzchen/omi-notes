@@ -927,3 +927,29 @@ def test_every_review_item_names_the_person_it_asks_about(env):
     flag_one(worker, me, ids[0])
     items = review(client, limit=50)
     assert items and all(i.get("person_name") == "Alan" for i in items if i["person_id"] == me)
+
+
+def test_the_evidence_key_changes_when_a_vector_is_replaced_under_the_same_row(env):
+    # Astra: deleting and reinserting the newest conversation's voices can reuse SQLite row ids, so an
+    # aggregate over row ids kept serving the old GA
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    store = worker.pipeline.speakers
+    emb = worker.providers.embedder
+    before = store.evidence_key(emb.model, emb.model_sha)
+    r = worker.db.one("SELECT rowid, conversation_id, label, vector FROM voices WHERE vector IS NOT NULL ORDER BY rowid DESC LIMIT 1")
+    other = bytes(reversed(r["vector"]))
+    worker.db.execute("UPDATE voices SET vector=? WHERE rowid=?", (other, r["rowid"]))
+    assert store.evidence_key(emb.model, emb.model_sha) != before
+
+
+def test_the_evidence_key_changes_while_a_forget_is_unfinished(env):
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    store = worker.pipeline.speakers
+    emb = worker.providers.embedder
+    before = store.evidence_key(emb.model, emb.model_sha)
+    plan = store.forgetting_path(me)
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    plan.write_text("{}")
+    assert store.evidence_key(emb.model, emb.model_sha) != before, "an unfinished forget is evidence too"

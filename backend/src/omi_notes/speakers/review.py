@@ -189,8 +189,9 @@ class Review:
             if key is not None and self._cache is not None and self._cache[0] == key:
                 return self._cache[1]
         built = self._entries(now)
-        with self._cache_lock:
-            self._cache = (key, built) if key is not None else None
+        if key is not None and self.store.evidence_key(embedder.model, embedder.model_sha) == key:  # unchanged meanwhile
+            with self._cache_lock:
+                self._cache = (key, built)
         return built
 
     def _entries(self, now: float) -> list[tuple]:

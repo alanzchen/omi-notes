@@ -276,19 +276,34 @@ class SpeakerStore:
                 population.append((s.session, raw))
         return population
 
-    def evidence_key(self, model: str, model_sha: str) -> tuple:
-        """A cheap digest (a few aggregate queries) of everything the voice space and the review queue depend on:
-        samples and their states, stored vectors, label states, consent and the wearer, the speaker settings.
-        Any change to those changes it, so a value cached under it is never stale."""
-        samples = tuple(self.db.one("SELECT count(*), coalesce(sum(revision), 0), coalesce(max(created_at), 0), "
-                                    "coalesce(sum(length(state)), 0) FROM samples"))  # fmt: skip
-        voices = tuple(self.db.one("SELECT count(*), coalesce(sum(rowid), 0), coalesce(max(rowid), 0) FROM voices "
-                                   "WHERE vector IS NOT NULL AND model=? AND model_sha=?", (model, model_sha)))  # fmt: skip
-        labels = tuple(self.db.one("SELECT count(*), coalesce(sum(speakers_revision), 0) FROM conversations"))
-        raw_gone = self.db.one("SELECT count(*) FROM chunks WHERE raw_deleted=1")[0]  # unknown voices need raw audio
-        people = tuple((r["id"], r["me"], r["attested_at"]) for r in self.people())
-        return (model, model_sha, samples, voices, labels, raw_gone, people,
-                json.dumps(self.settings(), sort_keys=True, default=str))
+    def evidence_key(self, model: str, model_sha: str) -> str:
+        """A content digest of everything the voice space and the review queue depend on: every stored vector of
+        this model, every sample (state, revision, flag, vector), every label state, the recent conversations
+        the queue lists (status, transcript, speakers revision), raw availability, people and consent, the speaker
+        settings file as stored (forgotten voices included) and any unfinished forget or journaled operation.
+        Hashing the rows themselves (milliseconds) rather than counting them: a replaced vector or a recovery
+        that reuses row ids must change it, so a value cached under it is never stale."""
+        h = hashlib.blake2b(digest_size=16)
+
+        def add(rows) -> None:
+            for row in rows:
+                h.update(repr(tuple(row)).encode())
+            h.update(b"|")
+
+        add(self.db.query("SELECT conversation_id, label, file, vector FROM voices WHERE vector IS NOT NULL AND model=? "
+                          "AND model_sha=? ORDER BY conversation_id, label", (model, model_sha)))  # fmt: skip
+        add(self.db.query("SELECT id, person_id, state, revision, flag_json, vector, model_sha FROM samples ORDER BY id"))
+        add(self.db.query("SELECT * FROM speaker_labels ORDER BY conversation_id, label"))
+        add(self.db.query("SELECT id, status, transcript_sha, speakers_revision, start FROM conversations ORDER BY start DESC "
+                          "LIMIT 200"))  # fmt: skip (the queue's recent conversations, with margin)
+        add([(self.db.one("SELECT count(*) FROM chunks WHERE raw_deleted=1")[0],)])
+        add(self.db.query("SELECT id, me, attested_at, name FROM people ORDER BY id"))
+        settings = self.settings_path.read_bytes() if self.settings_path.exists() else b""
+        h.update(settings + b"|")
+        for folder in (self.vault.speakers / "forgetting", self.vault.speakers / "journal"):
+            names = sorted(p.name for p in folder.glob("*.json")) if folder.exists() else []
+            h.update(repr(names).encode() + b"|")
+        return f"{model}:{model_sha[:12]}:{h.hexdigest()}"
 
     def rm_space(self, model: str, model_sha: str):
         """GA (`ga_population`) and people's GA-centred centroids (`speakers.space`), in memory only; None without
@@ -299,8 +314,9 @@ class SpeakerStore:
             if self._space_cache is not None and self._space_cache[0] == key:
                 return self._space_cache[1]
         space = self._rm_space(model, model_sha)
-        with self._space_cache_lock:
-            self._space_cache = (key, space)
+        if self.evidence_key(model, model_sha) == key:  # nothing changed while it was built: safe to keep
+            with self._space_cache_lock:
+                self._space_cache = (key, space)
         return space
 
     def _rm_space(self, model: str, model_sha: str):
