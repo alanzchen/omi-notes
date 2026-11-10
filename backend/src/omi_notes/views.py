@@ -687,6 +687,8 @@ def stats(db, tz, days: int, now: float) -> dict:
 
 def last_note_at(db) -> str | None:
     """When the newest useful note was first written (discarded and enrollment rows excluded)."""
-    r = db.one(f"SELECT MAX(done_at) AS t FROM conversations WHERE note_path IS NOT NULL "
-               f"AND status IN ('done','failed') AND {LISTED}")  # fmt: skip
+    from .db import LAST_NOTE
+
+    # the newest entry of a partial index over useful notes, not a scan of every conversation
+    r = db.one(f"SELECT done_at AS t FROM conversations WHERE {LAST_NOTE} ORDER BY done_at DESC LIMIT 1")
     return iso_utc_epoch(r["t"]) if r and r["t"] else None

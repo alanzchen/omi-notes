@@ -1989,8 +1989,15 @@ def queue_counts(db: Database) -> dict:
             "SELECT COUNT(*) AS n FROM conversations WHERE status IN ('closed','transcribing','summarizing') "
             "AND error IS NOT NULL AND next_attempt_at IS NOT NULL"
         ),
-        "notes_conflicted": count("SELECT COUNT(*) AS n FROM conversations WHERE edited=1 AND frozen=0 AND note_path IS NOT NULL"),
+        "notes_conflicted": notes_conflicted(db),
     }
+
+
+def notes_conflicted(db: Database) -> int:
+    """Notes changed outside My Notes that the server stopped updating: a count over a partial index of just them."""
+    from ..db import CONFLICTED
+
+    return db.one(f"SELECT COUNT(*) AS n FROM conversations WHERE {CONFLICTED}")["n"]
 
 
 def ring_seen_check(db: Database, device_id: str, capture_id: str, chunk_sequence: int):

@@ -29,6 +29,9 @@ SCHEMA_VERSION = 11
 # a query that includes it walks only listed rows.
 LISTED = ("enrollment_id IS NULL AND COALESCE(waiting_for, '') <> 'voice enrollment' "
           "AND COALESCE(relevance, '') <> 'too_short'")
+# a note changed outside My Notes that the server stopped updating; a useful note (for "the newest note")
+CONFLICTED = "edited = 1 AND frozen = 0 AND note_path IS NOT NULL"
+LAST_NOTE = f"note_path IS NOT NULL AND status IN ('done','failed') AND done_at IS NOT NULL AND {LISTED}"
 # a failure the owner dismissed from the phone (that very failure; a later one shows again)
 NOT_DISMISSED = ("NOT (COALESCE(json_extract(resolution, '$.kind'), '') = 'dismissed' "
                  "AND json_extract(resolution, '$.failure.id') IS failure_id)")
@@ -291,6 +294,9 @@ CREATE INDEX IF NOT EXISTS conversations_listed_kind ON conversations(kind, star
 CREATE INDEX IF NOT EXISTS conversations_listed_day ON conversations(day, start, id) WHERE @LISTED@;
 CREATE INDEX IF NOT EXISTS conversations_listed_day_short ON conversations(day, short, start, id) WHERE @LISTED@;
 CREATE INDEX IF NOT EXISTS conversations_listed_short ON conversations(short, start, id) WHERE @LISTED@;
+-- the status card: notes changed outside My Notes, and the newest note (`queue_counts`, `views.last_note_at`)
+CREATE INDEX IF NOT EXISTS conversations_conflicted ON conversations(id) WHERE @CONFLICTED@;
+CREATE INDEX IF NOT EXISTS conversations_last_note ON conversations(done_at) WHERE @LAST_NOTE@;
 
 -- Per local day, over its listed short sessions: how many, how many wait deferred, how many were asked for and
 -- aren't done, how many need a look. Kept by these triggers in the same statement (so the same transaction) as
@@ -413,7 +419,7 @@ CREATE VIEW IF NOT EXISTS event_times AS
     FROM events e LEFT JOIN captures k ON k.capture_id = e.capture_id;
 """
 SCHEMA = (SCHEMA.replace("@LISTED@", LISTED).replace("@WAITING@", WAITING).replace("@REQUESTED@", REQUESTED)
-          .replace("@ISSUE@", ISSUE))
+          .replace("@ISSUE@", ISSUE).replace("@CONFLICTED@", CONFLICTED).replace("@LAST_NOTE@", LAST_NOTE))
 
 _SEAL = "raw/<dev>/<cap>/seal.json"
 _HEADER = "chunk envelope header (or <seq>.gone tombstone header)"
