@@ -316,6 +316,16 @@ struct ShortClipsGroup: View {
     let totals: ShortDay
     @State private var open = false
 
+    /// Simulator automation only (debug builds): `-OmiNotesDebugOpenShortDay YYYY-MM-DD` starts with that day's
+    /// fold open (a headless simulator can't tap).
+    private static var debugOpenDay: String? {
+        #if DEBUG
+        return UserDefaults.standard.string(forKey: "OmiNotesDebugOpenShortDay")
+        #else
+        return nil
+        #endif
+    }
+
     private var shown: [ConversationSummary] { model.shortDayRows[day] ?? rows }
 
     var body: some View {
@@ -334,6 +344,7 @@ struct ShortClipsGroup: View {
         .onChange(of: open) { _, isOpen in
             if isOpen { Task { await model.loadShortSessions(day: day) } }
         }
+        .onAppear { if Self.debugOpenDay == day { open = true } }
     }
 }
 

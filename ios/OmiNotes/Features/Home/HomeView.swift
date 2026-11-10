@@ -14,7 +14,16 @@ struct HomeView: View {
     @State private var query = HomeView.debugSearch
     @State private var naming: ConversationSpeakersView.NamingRun?
     /// The kind the main list shows: conversations by default (with anything not yet known).
-    @State private var kindFilter: HomeFilter = .talk
+    @State private var kindFilter: HomeFilter = HomeView.debugFilter
+
+    /// Simulator automation only (debug builds): `-OmiNotesDebugHomeFilter talk|me|background` starts on that filter.
+    private static var debugFilter: HomeFilter {
+        #if DEBUG
+        return UserDefaults.standard.string(forKey: "OmiNotesDebugHomeFilter").flatMap(HomeFilter.init(rawValue:)) ?? .talk
+        #else
+        return .talk
+        #endif
+    }
 
     /// Simulator automation only (debug builds): `-OmiNotesDebugOpenConversation YES` opens the
     /// newest conversation once it has loaded (a headless simulator can't tap).
