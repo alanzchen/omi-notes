@@ -44,7 +44,18 @@ struct HomeView: View {
         #endif
     }
 
+    /// Simulator automation only (debug builds): the day whose fold `-OmiNotesDebugOpenShortDay` opens; Home scrolls
+    /// to it once the day's sessions have loaded (a headless simulator can't scroll).
+    private static var debugFoldDay: String? {
+        #if DEBUG
+        return UserDefaults.standard.string(forKey: "OmiNotesDebugOpenShortDay")
+        #else
+        return nil
+        #endif
+    }
+
     var body: some View {
+        ScrollViewReader { proxy in
         List {
             if query.trimmingCharacters(in: .whitespaces).isEmpty {
                 Section {
@@ -65,6 +76,10 @@ struct HomeView: View {
         .task { await model.speakers.refresh() }
         .onChange(of: model.recent.first?.id) { _, id in
             if Self.debugOpenFirst, debugOpened == nil, id != nil { debugOpened = model.recent.first }
+        }
+        .onChange(of: Self.debugFoldDay.flatMap { model.shortDayRows[$0]?.count }) { _, count in
+            if let day = Self.debugFoldDay, count != nil { proxy.scrollTo("fold-\(day)", anchor: .top) }
+        }
         }
         .navigationDestination(item: $debugOpened) { c in ConversationDetailView(model: model, summary: c) }
         .fullScreenCover(item: $naming, onDismiss: { Task { await model.speakers.refresh() } }) { r in
@@ -154,6 +169,7 @@ struct HomeView: View {
                     // totals even when none of them is loaded; the owner's "less useful" into another
                     if section.showsFold {
                         ShortClipsGroup(model: model, day: section.day, rows: section.home.shortClips, totals: section.totals)
+                            .id("fold-\(section.day)")
                     }
                     if !section.home.lessUseful.isEmpty { LessUsefulGroup(model: model, rows: section.home.lessUseful) }
                 }
