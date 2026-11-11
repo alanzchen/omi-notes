@@ -2,7 +2,7 @@ import CoreBluetooth
 import Foundation
 import Testing
 @testable import OmiBLE
-import OmiCapture
+@testable import OmiCapture
 import OmiProtocol
 
 final class TestClock: CaptureClock, @unchecked Sendable {
@@ -225,6 +225,25 @@ struct SessionHarness {
         #expect(h.delegate.disconnectRequests.isEmpty)
         if case .refused = h.session.phase { Issue.record("refused: \(h.session.phase)") }
         #expect(FileIO.contents(of: h.dirs.journalQuarantine).isEmpty)
+    }
+
+    /// ASTRA-20261111-IT1-01: a pendant that reported codec 1 is refused and its audio quarantined; with the reason
+    /// file gone (as build 49 wrote none) recovery must not send those bytes labelled as the remembered Opus codec.
+    @Test func aRefusedCodecsAudioIsNeverRecoveredAsTheRememberedCodec() throws {
+        let h = SessionHarness()
+        h.transport.unansweredReads = [.audioCodec]
+        h.connectFully()
+        h.transport.audio(Data([0, 0, 0, 0x11, 0x22, 0x33]))
+        h.transport.delegate?.transport(h.transport, didUpdateValue: Data([1]), for: .audioCodec, error: nil)
+        #expect(h.delegate.disconnectRequests.count == 1)
+        let dir = try #require(FileIO.contents(of: h.dirs.journalQuarantine).first)
+        let reason = dir.appendingPathComponent(CaptureRecovery.reasonFileName)
+        #expect(try String(contentsOf: reason, encoding: .utf8).hasPrefix("unsupported audio codec 1"))
+        let env = CaptureEnvironment(dirs: h.dirs, outbox: h.outbox, clock: h.clock, appVersion: "t", timezone: "UTC")
+        #expect(CaptureRecovery.run(env: env, codecFallback: { _ in 21 }).restored.isEmpty)
+        try FileManager.default.removeItem(at: reason)
+        #expect(CaptureRecovery.run(env: env, codecFallback: { _ in 21 }).restored.isEmpty)
+        #expect(!h.outbox.pending().contains { $0.kind.isChunk })
     }
 
     /// Field log, build 49 (2026-11-11 01:01:20–24Z): connected, the link dropped during the codec read, and

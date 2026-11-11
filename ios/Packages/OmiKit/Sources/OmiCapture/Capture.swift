@@ -830,24 +830,24 @@ public enum CaptureRecovery {
         FileIO.contents(of: dir).filter { $0.pathExtension == "journal" }.allSatisfy { FileIO.fileSize($0) == 0 }
     }
 
-    /// Written beside a quarantined capture's journals: why it is there (absent before build 52).
+    /// Written beside a quarantined capture's journals, durably, before the move: why it is there. Build 49 and
+    /// earlier wrote none, and a reasonless capture stays where it is (its codec may have been read and refused).
     static let reasonFileName = "quarantine-reason.txt"
+    /// The one reason recovery may undo: recovery itself found no codec for the capture (`finalizeRecovered`).
+    static let codecUnknownReason = "codec unknown"
 
-    /// Captures in quarantine only because their codec was never read go back to their journal folder once a
-    /// codec is remembered for their pendant, and `run` then recovers them like any capture whose link dropped
-    /// before the codec read: rebuilt with that codec, sealed `app_recovered`, uploaded. Build 49 quarantined
-    /// such a capture as "unsupported codec" when the link dropped during the codec read (field log 2026-11-11
-    /// 01:01Z). Moved, never rewritten: the journal bytes stay as they are. Stays in quarantine: a manifest that
-    /// can't be read, a capture with a codec, a pendant with no remembered codec (a pendant only ever refused
-    /// has none), and any recorded reason other than an unknown codec (a refusal, unaccounted journals).
+    /// Captures recovery quarantined only because no codec was known for their pendant go back to their journal
+    /// folder once one is remembered, and `run` then recovers them like any capture whose link dropped before the
+    /// codec read: rebuilt with that codec, sealed `app_recovered`, uploaded. Moved, never rewritten: the journal
+    /// bytes stay as they are. Everything else stays in quarantine: no reason file (build 49 and earlier, where an
+    /// unsupported codec the pendant reported looks the same on disk), a refusal, a manifest that can't be read, a
+    /// capture with a codec, a pendant with no remembered codec.
     static func restoreCodecUnread(env: CaptureEnvironment, codecFallback: (String) -> Int?, report: inout Report) {
         for dir in FileIO.contents(of: env.dirs.journalQuarantine) where dir.hasDirectoryPath {
-            guard case .ok(let m) = loadManifest(dir.appendingPathComponent(CaptureManifest.fileName)),
+            guard let why = try? String(contentsOf: dir.appendingPathComponent(reasonFileName), encoding: .utf8),
+                  why.hasPrefix(codecUnknownReason),
+                  case .ok(let m) = loadManifest(dir.appendingPathComponent(CaptureManifest.fileName)),
                   m.codecId == nil, codecFallback(m.deviceId) != nil else { continue }
-            let reasonURL = dir.appendingPathComponent(reasonFileName)
-            if FileIO.exists(reasonURL) {
-                guard let why = try? String(contentsOf: reasonURL, encoding: .utf8), why.hasPrefix("codec unknown") else { continue }
-            }
             let root = m.source == .deviceRing ? env.dirs.journalRing : env.dirs.journalLive
             let dest = root.appendingPathComponent(m.captureId, isDirectory: true)
             guard !FileIO.exists(dest) else {
@@ -874,8 +874,11 @@ public enum CaptureRecovery {
         }
         do {
             try FileIO.ensureDirectory(env.dirs.journalQuarantine)
+            // the reason first, durably: a capture moved without one stays quarantined (fails closed)
+            do { try FileIO.atomicWrite(Data(why.utf8), to: dir.appendingPathComponent(reasonFileName)) } catch {
+                log(.error, "recovery", "could not record why \(dir.lastPathComponent) is quarantined (\(error)); it stays there")
+            }
             try FileManager.default.moveItem(at: dir, to: dest)
-            try? Data(why.utf8).write(to: dest.appendingPathComponent(reasonFileName), options: .atomic)
             report.quarantined.append(dir.lastPathComponent)
             log(.error, "recovery", "kept \(dir.lastPathComponent) in journal/quarantine: \(why)")
         } catch {
@@ -953,7 +956,7 @@ public enum CaptureRecovery {
                     m.openChunkSequence = seq + 1
                 }
             } catch RecoveryError.codecUnknown {
-                quarantine(dir, env: env, why: "codec unknown for \(m.captureId)", report: &report)
+                quarantine(dir, env: env, why: "\(codecUnknownReason) for \(m.captureId)", report: &report)
                 return false
             } catch {
                 log(.error, "recovery", "could not rebuild chunk \(seq) of \(m.captureId): \(error)")

@@ -184,10 +184,9 @@ import OmiProtocol
         #expect(FileIO.fileSize(kept) > 0)
     }
 
-    /// Build 49 quarantined a live capture as "unsupported codec" when the link dropped during the codec read
-    /// (no reason file then). Once the pendant's codec is remembered, recovery takes it back and sends it,
-    /// the journal bytes unchanged; without a remembered codec it stays where it is.
-    @Test func aCaptureQuarantinedBecauseItsCodecWasNeverReadIsRecoveredOnceTheCodecIsKnown() throws {
+    /// Build 49 quarantined a capture whose codec read failed and one whose pendant reported an unsupported codec
+    /// the same way, without a reason (ASTRA-20261111-IT1-01): nothing proves which, so it stays, bytes intact.
+    @Test func aReasonlessLegacyQuarantinedCaptureStaysQuarantined() throws {
         let t = TestEnv()
         let (r, id) = try recorder(t, codec: nil)
         for i in 0..<3 { r.append(notification(seq: UInt16(i))) }
@@ -195,17 +194,32 @@ import OmiProtocol
         let kept = t.dirs.journalQuarantine.appendingPathComponent(id)
         try FileManager.default.removeItem(at: kept.appendingPathComponent(CaptureRecovery.reasonFileName))  // as build 49 left it
         let journal = try Data(contentsOf: kept.appendingPathComponent("chunk-000000.journal"))
+        let report = CaptureRecovery.run(env: t.env, codecFallback: { _ in 21 })
+        #expect(report.restored.isEmpty && report.liveRecovered.isEmpty)
+        #expect(t.outbox.pending().isEmpty)
+        #expect(try Data(contentsOf: kept.appendingPathComponent("chunk-000000.journal")) == journal)
+    }
 
-        let unknown = CaptureRecovery.run(env: t.env)
-        #expect(unknown.restored.isEmpty && FileIO.exists(kept), "no remembered codec: stays in quarantine")
+    /// Recovery's own "codec unknown" quarantine (the reason written before the move) comes back once the pendant's
+    /// codec is remembered, bytes unchanged; a second launch finds nothing more to do.
+    @Test func aCaptureRecoveryQuarantinedForAnUnknownCodecIsRecoveredOnceTheCodecIsKnown() throws {
+        let t = TestEnv()
+        let (r, id) = try recorder(t, codec: nil)
+        for i in 0..<3 { r.append(notification(seq: UInt16(i))) }
+        r.syncNow()
+        let journal = try Data(contentsOf: t.dirs.journalLive.appendingPathComponent(id).appendingPathComponent("chunk-000000.journal"))
+        let first = CaptureRecovery.run(env: t.env)  // no codec known: quarantined, with its reason
+        #expect(first.quarantined == [id])
+        let kept = t.dirs.journalQuarantine.appendingPathComponent(id)
+        #expect(try String(contentsOf: kept.appendingPathComponent(CaptureRecovery.reasonFileName), encoding: .utf8).hasPrefix("codec unknown"))
 
         let report = CaptureRecovery.run(env: t.env, codecFallback: { $0 == "dev-1" ? 21 : nil })
         #expect(report.restored == [id] && report.liveRecovered == [id])
-        #expect(!FileIO.exists(kept))
         let chunk = try #require(t.pendingChunks().first)
-        #expect(chunk.1.codecId == 21 && chunk.1.recordCount == 3)
-        #expect(chunk.2 == journal, "the journal's own bytes, unchanged")
+        #expect(chunk.1.codecId == 21 && chunk.2 == journal, "the journal's own bytes, unchanged")
         #expect(t.seal(id)?.reason == .appRecovered)
+        let again = CaptureRecovery.run(env: t.env, codecFallback: { _ in 21 })
+        #expect(again.restored.isEmpty && again.liveRecovered.isEmpty && t.pendingChunks().count == 1)
     }
 
     /// A pendant refused for a codec it actually reported stays in quarantine, codec remembered or not.
