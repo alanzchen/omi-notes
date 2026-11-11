@@ -26,12 +26,22 @@ struct HomeView: View {
     }
 
     /// Simulator automation only (debug builds): `-OmiNotesDebugOpenConversation YES` opens the
-    /// newest conversation once it has loaded (a headless simulator can't tap).
+    /// newest conversation once it has loaded (a headless simulator can't tap); a conversation id opens
+    /// that one once it is in the list.
     private static var debugOpenFirst: Bool {
         #if DEBUG
-        return UserDefaults.standard.bool(forKey: "OmiNotesDebugOpenConversation")
+        return UserDefaults.standard.string(forKey: "OmiNotesDebugOpenConversation") != nil
         #else
         return false
+        #endif
+    }
+
+    private static func debugOpenTarget(_ recent: [ConversationSummary]) -> ConversationSummary? {
+        #if DEBUG
+        let value = UserDefaults.standard.string(forKey: "OmiNotesDebugOpenConversation") ?? ""
+        return ["YES", "1", "true"].contains(value) ? recent.first : recent.first { $0.id == value }
+        #else
+        return nil
         #endif
     }
 
@@ -74,8 +84,8 @@ struct HomeView: View {
         .navigationTitle("Omi Notes")
         .refreshable { await model.refreshServer() }
         .task { await model.speakers.refresh() }
-        .onChange(of: model.recent.first?.id) { _, id in
-            if Self.debugOpenFirst, debugOpened == nil, id != nil { debugOpened = model.recent.first }
+        .onChange(of: model.recent.map(\.id)) { _, _ in
+            if Self.debugOpenFirst, debugOpened == nil { debugOpened = Self.debugOpenTarget(model.recent) }
         }
         .onChange(of: Self.debugFoldDay.flatMap { model.shortDayRows[$0]?.count }) { _, count in
             if let day = Self.debugFoldDay, count != nil { proxy.scrollTo("fold-\(day)", anchor: .top) }
