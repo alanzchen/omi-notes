@@ -177,6 +177,12 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     private var scanning = false
     private var attention: [String] = []
     private var refusal: String?
+    /// Connections in a row (per pendant) whose codec couldn't be read on a live link; cleared when one reads it.
+    /// At `codecFailureLimit` the engine stops reconnecting (a new connection resets the session's own count, so
+    /// it would otherwise retry every 200 ms forever) until the owner taps Reconnect.
+    private var codecFailures: [String: Int] = [:]
+    static let codecFailureLimit = 3
+    private var codecStall: String?
     private var storageTripped = false
     private var freeBytes: Int64?
     private var outboxStats = OutboxStats()
@@ -403,7 +409,9 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             self.settings.rememberedDeviceName = name
             self.settings.userDisconnected = false
             self.refusal = nil
-            for r in [ReconnectSuppression.userDisconnected, .pairingLost, .unsupportedDevice] { self.central?.unsuppress(r) }
+            for r in [ReconnectSuppression.userDisconnected, .pairingLost, .unsupportedDevice, .codecUnreadable] { self.central?.unsuppress(r) }
+            self.codecFailures.removeAll()
+            self.codecStall = nil
             if id == SimulatedDevice.deviceIdentifier {
                 self.startSimulatedDevice()
             } else {
@@ -429,7 +437,9 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         queue.async {
             self.settings.userDisconnected = false
             self.refusal = nil
-            for r in [ReconnectSuppression.userDisconnected, .pairingLost, .unsupportedDevice] { self.central?.unsuppress(r) }
+            for r in [ReconnectSuppression.userDisconnected, .pairingLost, .unsupportedDevice, .codecUnreadable] { self.central?.unsuppress(r) }
+            self.codecFailures.removeAll()
+            self.codecStall = nil
             self.attention.removeAll { $0.contains("pairing") }
             if self.settings.rememberedDeviceId == SimulatedDevice.deviceIdentifier, self.settings.simulatedMode {
                 self.connectSimulated(after: 0.3)
@@ -450,7 +460,9 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             self.settings.rememberedDeviceName = nil
             self.settings.userDisconnected = false
             self.refusal = nil
-            for r in [ReconnectSuppression.userDisconnected, .pairingLost, .unsupportedDevice] { self.central?.unsuppress(r) }
+            for r in [ReconnectSuppression.userDisconnected, .pairingLost, .unsupportedDevice, .codecUnreadable] { self.central?.unsuppress(r) }
+            self.codecFailures.removeAll()
+            self.codecStall = nil
             self.scheduleSnapshot()
         }
     }
@@ -1049,7 +1061,10 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         s.delegate = self
         let memory = deviceMemory!
         let id = s.deviceId
-        s.onCodecLearned = { memory.remember(codec: $0.rawValue, for: id) }
+        s.onCodecLearned = { [weak self] in
+            memory.remember(codec: $0.rawValue, for: id)
+            self?.codecFailures[id] = nil
+        }
         s.onAudioNotification = { [weak self] in self?.noteAudio() }
         s.startPaused(settings.recordingPaused)
         s.autoCollect = settings.autoCollectPendantAudio
@@ -1229,9 +1244,26 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         writeHeartbeat(reason: "wake")
     }
 
+    public static let codecStallReason = "couldn't read the pendant's audio format"
+
     public func session(_ session: DeviceSession, requestsReconnect reason: String) {
-        addAttention("Reconnecting to the device: \(reason)")
         let transport = session.transport
+        if reason == DeviceSession.codecUnreadable, !transport.isSimulated {
+            let failures = (codecFailures[session.deviceId] ?? 0) + 1
+            codecFailures[session.deviceId] = failures
+            if failures >= Self.codecFailureLimit {
+                // the audio already received stays journaled (sealed with the remembered codec, or kept for recovery)
+                log(.error, "engine", "codec unreadable on \(failures) connections in a row; not reconnecting until asked")
+                codecStall = Self.codecStallReason
+                central?.suppress(.codecUnreadable)
+                addAttention("Not recording: the pendant's audio format couldn't be read \(failures) times in a row. Tap Reconnect to try again.")
+                pendingDisconnectReason = .bleDisconnected
+                endSession(reason: .bleDisconnected)
+                central?.disconnect()
+                return
+            }
+        }
+        addAttention("Reconnecting to the device: \(reason)")
         pendingDisconnectReason = .bleDisconnected
         endSession(reason: .bleDisconnected)
         if transport.isSimulated {
@@ -1546,6 +1578,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
 
     private func connectionPhase() -> ConnectionPhase {
         if let refusal { return .refused(refusal) }
+        if let codecStall { return .paused(codecStall) }
         if let sess = session {
             switch sess.phase {
             case .streaming: return .streaming

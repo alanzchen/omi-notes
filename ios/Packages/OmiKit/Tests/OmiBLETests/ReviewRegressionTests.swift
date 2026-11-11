@@ -346,4 +346,47 @@ final class MismatchCounter: @unchecked Sendable {
         #expect(engine.session != nil)
         #expect(engine.recorder.isActive)
     }
+
+    /// ASTRA-20261111-IT1-03: a codec that keeps failing to read on a live link made every fresh session ask for a
+    /// reconnect (the per-session budget resets), and the central reconnects 200 ms later: forever. Three
+    /// connections in a row now stop reconnecting, with a Reconnect state; Reconnect starts again.
+    @Test func aCodecThatNeverReadsStopsReconnectingAfterThreeConnections() throws {
+        let x = UUID(uuidString: "0000000A-0000-4000-8000-0000000000C3")!
+        let backend = FakeBackend()
+        let p = FakePeripheral(x, state: .connected)
+        p.configure = {
+            var values = FakeDeviceTransport.cv1Values()
+            values[.audioCodec] = nil  // every read fails (a timeout), the link stays up
+            $0.values = values
+            $0.cachedCharacteristics = Set(OmiCharacteristic.allCases)
+            $0.alreadyNotifying = [.audioData]
+        }
+        backend.known[x] = p
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-codec-\(UUID().uuidString)")
+        var config = EngineConfiguration(dirs: CaptureDirectories(root: root), appVersion: "t", useCoreBluetooth: false, tickInterval: 0.2)
+        let sink = Locked<CentralBackendEvents?>(nil)
+        config.testCentralBackend = { events in
+            sink.value = events
+            backend.state = .poweredOn
+            return backend
+        }
+        let engine = OmiEngine(config: config, settings: try makeSettings(remembered: x), uploadTransport: CountingUploadTransport())
+        let events = try #require(sink.value)
+        engine.queue.sync { events.backendDidUpdateState(.poweredOn) }
+        for _ in 0..<5 {
+            p.connectionState = .connected
+            p.resetTransport()
+            engine.queue.sync { events.backendDidConnect(p) }
+            engine.queue.sync { events.backendDidDisconnect(p, error: nil) }
+        }
+        #expect(p.transportsCreated == OmiEngine.codecFailureLimit, "three sessions, then connections are refused")
+        #expect(engine.snapshotNow().connection == .paused(OmiEngine.codecStallReason))
+        engine.reconnect()
+        engine.queue.sync {}
+        #expect(engine.snapshotNow().connection != .paused(OmiEngine.codecStallReason))
+        p.connectionState = .connected
+        p.resetTransport()
+        engine.queue.sync { events.backendDidConnect(p) }
+        #expect(p.transportsCreated == OmiEngine.codecFailureLimit + 1, "Reconnect lets it try again")
+    }
 }

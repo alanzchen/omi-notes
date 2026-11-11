@@ -129,6 +129,10 @@ public struct SystemHealth: Equatable, Sendable {
                 return step(.needsAction, "Pendant disconnected",
                             "You disconnected it. It may keep recording to its own storage; reconnect to collect that audio.", .reconnectDevice)
             }
+            if why == OmiEngine.codecStallReason {
+                return step(.needsAction, "Can't read the pendant's audio format", "Audio received so far is kept. Tap Reconnect to try again.",
+                            .reconnectDevice)
+            }
             return step(.needsAction, "Recording is paused", why, s.storageTripped ? nil : .reconnectDevice)
         case .settingUp:
             return step(.working, "Connecting to the pendant")

@@ -26,7 +26,7 @@ public struct ScanCandidate: Sendable, Identifiable, Equatable {
 
 /// Why connections are currently not accepted. Any suppression blocks every acceptance path.
 public enum ReconnectSuppression: String, Sendable, Hashable {
-    case userDisconnected, pairingLost, storageLow, unsupportedDevice, simulatedMode
+    case userDisconnected, pairingLost, storageLow, unsupportedDevice, simulatedMode, codecUnreadable
 }
 
 public protocol CentralControllerDelegate: AnyObject {

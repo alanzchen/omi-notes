@@ -547,6 +547,9 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
         readCodec()
     }
 
+    /// The reconnect reason when the codec can't be read on a live link (the engine counts these per pendant).
+    public static let codecUnreadable = "audio codec unreadable"
+
     private func readCodec() {
         codecAttempts += 1
         enqueue(.read(.audioCodec) { [weak self] data, error in
@@ -566,7 +569,7 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
                 // remembered for this pendant, or keeps its journal for recovery. Still connected: one more
                 // read, then a fresh connection (not suppressed, so it is tried again at once).
                 if self.phase == .ended { return }
-                if self.codecAttempts < 2 { self.readCodec() } else { self.requestReconnect("audio codec unreadable") }
+                if self.codecAttempts < 2 { self.readCodec() } else { self.requestReconnect(Self.codecUnreadable) }
             }
         })
     }
