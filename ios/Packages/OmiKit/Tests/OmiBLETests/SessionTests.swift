@@ -246,6 +246,31 @@ struct SessionHarness {
         #expect(!h.outbox.pending().contains { $0.kind.isChunk })
     }
 
+    /// ASTRA-20261111-IT2-01: the refusal's reason is written before the move; a crash between the two leaves the
+    /// journal in journal/live with that reason. Recovery finishes the quarantine and keeps the refusal, whether a
+    /// codec is remembered at once or only by a later launch (an earlier launch must not rewrite it "codec unknown").
+    @Test(arguments: [true, false]) func aRefusalInterruptedBeforeItsMoveStaysRefused(rememberedOnFirstLaunch: Bool) throws {
+        let h = SessionHarness()
+        h.transport.unansweredReads = [.audioCodec]
+        h.connectFully()
+        h.transport.audio(Data([0, 0, 0, 0x11, 0x22, 0x33]))
+        h.transport.delegate?.transport(h.transport, didUpdateValue: Data([1]), for: .audioCodec, error: nil)
+        let quarantined = try #require(FileIO.contents(of: h.dirs.journalQuarantine).first)
+        let journal = try Data(contentsOf: quarantined.appendingPathComponent("chunk-000000.journal"))
+        let live = h.dirs.journalLive.appendingPathComponent(quarantined.lastPathComponent)
+        try FileManager.default.moveItem(at: quarantined, to: live)  // the disk as it was before the move
+        let env = CaptureEnvironment(dirs: h.dirs, outbox: h.outbox, clock: h.clock, appVersion: "t", timezone: "UTC")
+        if !rememberedOnFirstLaunch { _ = CaptureRecovery.run(env: env) }
+        let report = CaptureRecovery.run(env: env, codecFallback: { _ in 21 })
+        #expect(report.liveRecovered.isEmpty && report.restored.isEmpty)
+        #expect(!h.outbox.pending().contains { $0.kind.isChunk })
+        let kept = try #require(FileIO.contents(of: h.dirs.journalQuarantine).first)
+        #expect(try String(contentsOf: kept.appendingPathComponent(CaptureRecovery.reasonFileName), encoding: .utf8)
+            .hasPrefix("unsupported audio codec 1"))
+        #expect(try Data(contentsOf: kept.appendingPathComponent("chunk-000000.journal")) == journal)
+        #expect(FileIO.contents(of: h.dirs.journalLive).isEmpty)
+    }
+
     /// Field log, build 49 (2026-11-11 01:01:20–24Z): connected, the link dropped during the codec read, and
     /// `end` failing that read counted as "unreadable" twice: "refusing to record: audio codec unreadable",
     /// the capture quarantined as "unsupported codec" and reconnection suppressed. Now the drop just ends

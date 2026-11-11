@@ -857,6 +857,9 @@ public enum CaptureRecovery {
             do {
                 try FileIO.ensureDirectory(root)
                 try FileManager.default.moveItem(at: dir, to: dest)
+                // the reason now names a quarantine that is over (left behind, the move would be finished again;
+                // a crash before this removal just quarantines it as "codec unknown" once more)
+                try? FileManager.default.removeItem(at: dest.appendingPathComponent(reasonFileName))
                 report.restored.append(m.captureId)
                 log(.warning, "recovery", "restored \(m.captureId) from journal/quarantine: its codec was never read; recovering it with the remembered one")
             } catch {
@@ -874,8 +877,11 @@ public enum CaptureRecovery {
         }
         do {
             try FileIO.ensureDirectory(env.dirs.journalQuarantine)
-            // the reason first, durably: a capture moved without one stays quarantined (fails closed)
-            do { try FileIO.atomicWrite(Data(why.utf8), to: dir.appendingPathComponent(reasonFileName)) } catch {
+            // the reason first, durably: a capture moved without one stays quarantined (fails closed). A reason
+            // already there that isn't "codec unknown" (a refusal) is never replaced by the one recovery may undo.
+            let existing = try? String(contentsOf: dir.appendingPathComponent(reasonFileName), encoding: .utf8)
+            let keep = existing.map { !$0.hasPrefix(codecUnknownReason) && why.hasPrefix(codecUnknownReason) } ?? false
+            do { if !keep { try FileIO.atomicWrite(Data(why.utf8), to: dir.appendingPathComponent(reasonFileName)) } } catch {
                 log(.error, "recovery", "could not record why \(dir.lastPathComponent) is quarantined (\(error)); it stays there")
             }
             try FileManager.default.moveItem(at: dir, to: dest)
@@ -888,6 +894,12 @@ public enum CaptureRecovery {
     }
 
     private static func recover(dir: URL, env: CaptureEnvironment, codecFallback: (String) -> Int?, report: inout Report) -> Bool {
+        // A reason here is a quarantine interrupted between writing it and the move (ASTRA-20261111-IT2-01): finish
+        // the move with that reason, before anything could finalize the journal or weaken a refusal.
+        if let why = try? String(contentsOf: dir.appendingPathComponent(reasonFileName), encoding: .utf8) {
+            quarantine(dir, env: env, why: why, report: &report)
+            return false
+        }
         var m: CaptureManifest
         switch loadManifest(dir.appendingPathComponent(CaptureManifest.fileName)) {
         case .ok(let loaded):
