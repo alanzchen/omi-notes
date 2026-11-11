@@ -188,3 +188,103 @@ def test_a_copy_with_extra_sound_past_the_shorter_end_is_not_the_same_audio():
 
 def test_the_server_advertises_that_it_takes_the_same_audio_sent_again(client):
     assert "same_audio_resend" in client.get("/v1/status", headers=AUTH).json()["features"]
+
+
+def _resend_setup(client, worker):
+    capture = str(uuid.uuid4())
+    pcm = np.concatenate([talk(20, 3), silence(10)])
+    as_pcm = pcm_envelopes(pcm, capture_id=capture, device_id=WATCH, started_at=STARTED, source="watch_mic")
+    as_aac = aac_envelopes(pcm, capture_id=capture, device_id=WATCH, started_at=STARTED)
+    assert put_chunk(client, capture, 0, as_pcm[0]).status_code == 201
+    return capture, as_aac[0]
+
+
+def test_comparing_a_resend_does_not_hold_up_other_uploads(client, worker, monkeypatch):
+    # 2026-11-10 17:28 CST: ~130 Watch parts sent again as other bytes, each compared (two ffmpeg decodes,
+    # 0.15-0.3 s for a 60 s part) inside the one ingest lock; every other upload waited, and the proxy dropped
+    # 418 of them unanswered. The comparison now runs outside the lock.
+    import threading
+
+    from omi_notes import ingest as ingest_module
+
+    capture, resend = _resend_setup(client, worker)
+    comparing, release = threading.Event(), threading.Event()
+    real = ingest_module.same_audio
+
+    def slow(a, b):
+        comparing.set()
+        assert release.wait(10)
+        return real(a, b)
+
+    monkeypatch.setattr(ingest_module, "same_audio", slow)
+    ingest = client.app.state.ingest
+    result = {}
+    t = threading.Thread(target=lambda: result.update(r=ingest.put_chunk(capture, 0, resend, hashlib.sha256(resend).hexdigest())))
+    t.start()
+    assert comparing.wait(10)
+    other = str(uuid.uuid4())
+    new = pcm_envelopes(talk(10, 5), capture_id=other, device_id=WATCH, started_at=STARTED, source="watch_mic")[0]
+    assert put_chunk(client, other, 0, new).status_code == 201, "a new upload is stored while the comparison runs"
+    release.set()
+    t.join(10)
+    assert result["r"][0] == 200 and result["r"][1]["duplicate"] is True
+
+
+def test_the_same_resend_again_is_not_decoded_again(client, worker, monkeypatch):
+    from omi_notes import ingest as ingest_module
+
+    capture, resend = _resend_setup(client, worker)
+    calls = []
+    real = ingest_module.same_audio
+    monkeypatch.setattr(ingest_module, "same_audio", lambda a, b: calls.append(1) or real(a, b))
+    for _ in range(3):
+        r = put_chunk(client, capture, 0, resend)
+        assert r.status_code == 200 and r.json()["duplicate"] is True
+    assert len(calls) == 1, "one comparison per stored identity and sent bytes; repeats are a lookup"
+    path = worker.db.one("SELECT path FROM chunks WHERE capture_id=? AND chunk_sequence=0", (capture,))["path"]
+    kept = list(((worker.pipeline.settings.vault_dir / path).parent / "alternates").glob("0-*.omnc"))
+    assert len(kept) == 1 and kept[0].read_bytes() == resend, "the second copy is still kept"
+
+
+def test_a_different_resend_stays_a_conflict_when_sent_again(client, worker, monkeypatch):
+    from omi_notes import ingest as ingest_module
+
+    capture = str(uuid.uuid4())
+    first = pcm_envelopes(np.concatenate([talk(20, 3), silence(10)]), capture_id=capture, device_id=WATCH,
+                          started_at=STARTED, source="watch_mic")  # fmt: skip
+    other = aac_envelopes(np.concatenate([silence(10), talk(20, 9)]), capture_id=capture, device_id=WATCH, started_at=STARTED)[0]
+    assert put_chunk(client, capture, 0, first[0]).status_code == 201
+    calls = []
+    real = ingest_module.same_audio
+    monkeypatch.setattr(ingest_module, "same_audio", lambda a, b: calls.append(1) or real(a, b))
+    assert [put_chunk(client, capture, 0, other).status_code for _ in range(2)] == [409, 409]
+    assert len(calls) == 1
+
+
+def test_a_new_aac_part_is_decoded_outside_the_ingest_lock(client, worker, monkeypatch):
+    import threading
+
+    from omi_notes import ingest as ingest_module
+
+    decoding, release = threading.Event(), threading.Event()
+    real = ingest_module.aac.decode
+
+    def slow(payload, expected, **kw):
+        decoding.set()
+        assert release.wait(10)
+        return real(payload, expected, **kw)
+
+    capture = str(uuid.uuid4())
+    body = aac_envelopes(np.concatenate([talk(20, 3), silence(10)]), capture_id=capture, device_id=WATCH, started_at=STARTED)[0]
+    monkeypatch.setattr(ingest_module.aac, "decode", slow)
+    ingest = client.app.state.ingest
+    result = {}
+    t = threading.Thread(target=lambda: result.update(r=ingest.put_chunk(capture, 0, body, hashlib.sha256(body).hexdigest())))
+    t.start()
+    assert decoding.wait(10)
+    other = str(uuid.uuid4())
+    new = pcm_envelopes(talk(10, 5), capture_id=other, device_id=WATCH, started_at=STARTED, source="watch_mic")[0]
+    assert put_chunk(client, other, 0, new).status_code == 201, "stored while the AAC part is checked"
+    release.set()
+    t.join(10)
+    assert result["r"][0] == 201

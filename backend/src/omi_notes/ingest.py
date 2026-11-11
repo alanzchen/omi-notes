@@ -37,6 +37,13 @@ log = logging.getLogger(__name__)
 
 MIN_FREE_BYTES = 256 * 1024 * 1024
 _lock = threading.Lock()
+# AAC decodes (ffmpeg runs) at once for checks outside `_lock`: a resend burst can't take every core
+_decodes = threading.BoundedSemaphore(4)
+SAME_AUDIO_VERDICTS = 10_000  # remembered (capture, seq, sha256) comparisons; a stored chunk never changes
+
+
+class _CompareFirst(Exception):
+    """Other bytes under a stored identity whose comparison isn't known yet: done outside `_lock`, then again."""
 
 
 @dataclass
@@ -343,6 +350,8 @@ class Ingest:
         # Captures / events with a durable file whose index commit failed in this process.
         self._dirty: set[tuple[str, str]] = set()
         self._pending_events: dict[str, tuple[str, float]] = {}
+        # (capture_id, seq, sha256 of other bytes) -> same audio as the stored chunk
+        self._verdicts: dict[tuple[str, int, str], bool] = {}
 
     def _writable(self) -> None:
         reason = self.read_only()
@@ -372,6 +381,35 @@ class Ingest:
             return status, {"capture_id": capture_id, "chunk_sequence": seq, "sha256": digest, "stored": True,
                             "duplicate": duplicate}  # fmt: skip
 
+        # Decoding is the slow part (ffmpeg, 0.15-0.3 s for a 60 s AAC part) and needs no lock: a new AAC part
+        # is checked before taking it, and other bytes under a stored identity are compared outside it.
+        decoded: bool | aac.AacError | None = None
+        if self.db.one("SELECT 1 FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq)) is None:
+            decoded = self._check_aac(capture_id, seq, body)
+        try:
+            return self._put_chunk_locked(capture_id, seq, body, digest, ok, decoded)
+        except _CompareFirst:
+            same = self._compare(capture_id, seq, body, digest)
+            return self._put_chunk_locked(capture_id, seq, body, digest, ok, decoded, same)
+
+    @staticmethod
+    def _check_aac(capture_id: str, seq: int, body: bytes) -> bool | aac.AacError | None:
+        """Whether a new AAC part decodes (True, or the error); None when it isn't one (or not an envelope)."""
+        try:
+            env = parse_envelope(body, capture_id=capture_id, chunk_sequence=seq)
+        except EnvelopeError:
+            return None
+        if env.header.payload_format != "aac_m4a_v1":
+            return None
+        try:
+            with _decodes:
+                aac.decode(env.payload, env.header.record_count)
+        except aac.AacError as exc:
+            return exc
+        return True
+
+    def _put_chunk_locked(self, capture_id: str, seq: int, body: bytes, digest: str, ok, decoded,
+                          same: bool | None = None) -> tuple[int, dict]:  # fmt: skip
         db, vault = self.db, self.vault
         with _lock:
             existing = db.one("SELECT sha256 FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq))
@@ -385,7 +423,7 @@ class Ingest:
             if existing is not None:
                 if existing["sha256"] == digest:
                     return ok(200, True)
-                return ok(200, True) if self._same_audio_again(capture_id, seq, body, digest) else self._conflict()
+                return ok(200, True) if self._same_audio_again(capture_id, seq, body, digest, same) else self._conflict()
 
             try:
                 env = parse_envelope(body, capture_id=capture_id, chunk_sequence=seq)
@@ -393,10 +431,13 @@ class Ingest:
                 raise ApiError(422, "invalid_envelope", str(exc)) from exc
             if env.header.payload_format == "aac_m4a_v1":
                 # refuse a file we can't decode before acknowledging it (the phone keeps refused ones)
-                try:
-                    aac.decode(env.payload, env.header.record_count)
-                except aac.AacError as exc:
-                    raise ApiError(422, "invalid_audio", str(exc)) from exc
+                if isinstance(decoded, aac.AacError):
+                    raise ApiError(422, "invalid_audio", str(decoded)) from decoded
+                if decoded is not True:  # stored under this identity meanwhile, then not: check it here
+                    try:
+                        aac.decode(env.payload, env.header.record_count)
+                    except aac.AacError as exc:
+                        raise ApiError(422, "invalid_audio", str(exc)) from exc
             header = env.header
             if (header.device_id, capture_id) in self._dirty:
                 self._recover(header.device_id, capture_id)
@@ -404,7 +445,7 @@ class Ingest:
                 if existing is not None:
                     if existing["sha256"] == digest:
                         return ok(200, True)
-                    return ok(200, True) if self._same_audio_again(capture_id, seq, body, digest) else self._conflict()
+                    return ok(200, True) if self._same_audio_again(capture_id, seq, body, digest, same) else self._conflict()
 
             capture = db.one("SELECT * FROM captures WHERE capture_id=?", (capture_id,))
             started = header.capture_started_at.timestamp()
@@ -445,7 +486,7 @@ class Ingest:
     def _conflict():
         raise ApiError(409, "chunk_conflict", "different content is already stored under this identity")
 
-    def _same_audio_again(self, capture_id: str, seq: int, body: bytes, digest: str) -> bool:
+    def _same_audio_again(self, capture_id: str, seq: int, body: bytes, digest: str, same: bool | None = None) -> bool:
         """Other bytes under a stored chunk's identity (caller holds the lock). They are always kept, beside the
         stored chunk in `alternates/` (vault first; nothing is overwritten or dropped). True when they are the
         same audio encoded another way, e.g. a Watch part stored as PCM by an old phone build and relayed
@@ -458,6 +499,11 @@ class Ingest:
             return False
         if row is None:
             return False
+        key = (capture_id, seq, digest)
+        if same is None:
+            same = self._verdicts.get(key)
+        if same is None and (self.vault.root / row["path"]).exists():
+            raise _CompareFirst  # nothing written yet: `put_chunk` compares outside the lock and comes back
         stored_path = self.vault.root / row["path"]
         alternate = stored_path.parent / "alternates" / f"{seq}-{digest[:16]}.omnc"
         if alternate.exists() and sha256_hex(alternate.read_bytes()) != digest:  # damaged: these bytes again, durably
@@ -472,14 +518,30 @@ class Ingest:
                                {"alternate_of_seq": seq, "sha256": digest, "received_at": self.clock()})  # fmt: skip
         if not stored_path.exists():  # audio deleted before 2026-11-08: nothing to compare with
             return False
+        return bool(same)
+
+    def _compare(self, capture_id: str, seq: int, body: bytes, digest: str) -> bool:
+        """Whether other bytes are the same audio as the chunk stored under their identity, compared without
+        `_lock` (that chunk is never overwritten). The verdict is remembered, so a resend of the same bytes is a
+        lookup however often it comes; a comparison that fails (unreadable file, decode error) answers "not the
+        same" for this request only, as before, and is tried again next time."""
+        row = self.db.one("SELECT path FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq))
+        if row is None:
+            return False
         try:
-            stored = parse_envelope(stored_path.read_bytes(), capture_id=capture_id, chunk_sequence=seq)
-            same = same_audio(stored, env)
+            env = parse_envelope(body, capture_id=capture_id, chunk_sequence=seq)
+            stored = parse_envelope((self.vault.root / row["path"]).read_bytes(), capture_id=capture_id, chunk_sequence=seq)
+            with _decodes:
+                same = same_audio(stored, env)
         except (EnvelopeError, OSError, aac.AacError, ValueError) as exc:
             log.warning("chunk %s/%d: could not compare a second copy with the stored one: %s", capture_id, seq, exc)
             return False
         log.warning("chunk %s/%d: other bytes under a stored identity (%s → %s): %s", capture_id, seq,
                     stored.header.payload_format, env.header.payload_format, "same audio" if same else "different audio")  # fmt: skip
+        with _lock:
+            if len(self._verdicts) >= SAME_AUDIO_VERDICTS:
+                self._verdicts.pop(next(iter(self._verdicts)))
+            self._verdicts[(capture_id, seq, digest)] = same
         return same
 
     def _adopt_orphan(self, env, digest: str, size: int, path, tomb_path) -> tuple[int, bool]:
