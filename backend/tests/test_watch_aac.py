@@ -475,6 +475,59 @@ def test_a_comparison_that_fails_now_is_retryable_not_a_conflict(client, monkeyp
     assert {f.read_bytes() for f in (path.parent / "alternates").glob("*.omnc")} == {aac_copy, other}
 
 
+@pytest.mark.parametrize("ending", ["success", "aac_error", "exception"])
+def test_a_comparison_every_upload_stopped_waiting_for_still_finishes_cleanly(client, monkeypatch, ending):
+    # ASTRA-20261111-IT3-02: all waiting uploads cancelled; the shared comparison finishes, leaves the map, and an
+    # unexpected exception is logged, not reported by asyncio as never retrieved; a later resend is answered
+    import asyncio
+    import gc
+    import inspect
+    import threading
+
+    from omi_notes import ingest as ingest_module
+
+    capture = str(uuid.uuid4())
+    pcm, aac_copy = _two_seconds(capture)
+    assert put_chunk(client, capture, 0, pcm).status_code == 201
+    real, entered, release = ingest_module.same_audio, threading.Event(), threading.Event()
+
+    def work(a, b):
+        entered.set()
+        assert release.wait(6)
+        if ending == "aac_error":
+            raise ingest_module.aac.AacError("temporary")
+        if ending == "exception":
+            raise RuntimeError("unexpected")
+        return real(a, b)
+
+    monkeypatch.setattr(ingest_module, "same_audio", work)
+    route = next(r for r in client.app.routes if getattr(r, "path", None) == "/v1/captures/{capture_id}/chunks/{chunk_sequence}")
+    comparing = inspect.getclosurevars(inspect.getclosurevars(route.endpoint).nonlocals["run_decode"]).nonlocals["comparing"]
+    unhandled = []
+
+    async def exercise():
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: unhandled.append(context.get("message")))
+        async with _asgi(client) as c:
+            jobs = [asyncio.create_task(_route_put(c, capture, aac_copy)) for _ in range(4)]
+            await _until(entered.is_set)
+            await asyncio.sleep(0.1)
+            for job in jobs:
+                job.cancel()
+            await asyncio.gather(*jobs, return_exceptions=True)
+            jobs.clear()
+            assert len(comparing) == 1
+            release.set()
+            await _until(lambda: not comparing)
+            gc.collect()
+            await asyncio.sleep(0.05)
+            monkeypatch.setattr(ingest_module, "same_audio", real)
+            return await asyncio.wait_for(_route_put(c, capture, aac_copy), 3)
+
+    retry = asyncio.run(exercise())
+    assert retry.status_code == 200 and not comparing
+    assert unhandled == []
+
+
 def test_a_cancelled_upload_leading_a_comparison_leaves_its_followers_off_the_shared_workers(client, monkeypatch):
     # ASTRA-20261111-IT2-02: four held decodes fill the decode pool; a comparison's first upload is cancelled before
     # it is admitted, and its 40 followers then compared on shared workers, blocking a PCM upload and /v1/status

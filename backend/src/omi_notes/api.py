@@ -229,6 +229,14 @@ def create_app(
         limiter = decodes.setdefault("aac", anyio.CapacityLimiter(UPLOAD_DECODES))
         return await anyio.to_thread.run_sync(work, limiter=limiter)
 
+    def comparison_done(key, task: asyncio.Task) -> None:
+        if comparing.get(key) is task:
+            comparing.pop(key)
+        # observed here, so a failure nobody waited for any more (every upload cancelled) is logged once, not
+        # reported by asyncio as never retrieved; uploads still waiting get it through their `shield`
+        if not task.cancelled() and task.exception() is not None:
+            log.error("comparing %s/%d failed: %r", key[0], key[1], task.exception())
+
     async def run_decode(plan) -> None:
         if plan.key is None:
             plan.decoded = await admitted(plan.work)
@@ -237,7 +245,7 @@ def create_app(
         if task is None:
             task = asyncio.ensure_future(admitted(plan.work))
             comparing[plan.key] = task
-            task.add_done_callback(lambda t, key=plan.key: comparing.pop(key, None) if comparing.get(key) is t else None)
+            task.add_done_callback(lambda t, key=plan.key: comparison_done(key, t))
         plan.same = await asyncio.shield(task)
 
     @app.put("/v1/captures/{capture_id}/chunks/{chunk_sequence}")
