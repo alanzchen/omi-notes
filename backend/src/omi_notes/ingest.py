@@ -50,10 +50,15 @@ class ChunkPlan:
     bounded pool so decode-bound uploads never hold the shared request workers. `key` names a comparison, so
     simultaneous identical resends share one."""
 
-    work: Callable[[], None] | None = None
+    work: Callable[[], object] | None = None  # returns `decoded` (no key) or `same` (a comparison, keyed)
     key: tuple[str, int, str] | None = None
     decoded: bool | aac.AacError | None = None
     same: bool | None = None
+
+
+class NeedsComparison(Exception):
+    """`put_chunk` with a plan found other bytes under the identity that the plan didn't compare (a writer stored
+    them after planning): plan again and admit that comparison, rather than decode on a shared request worker."""
 
 
 class _CompareFirst(Exception):
@@ -395,15 +400,9 @@ class Ingest:
             except EnvelopeError:
                 return plan
             if aac_part:
-                def check() -> None:
-                    plan.decoded = self._check_aac(capture_id, seq, body)
-
-                plan.work = check
+                plan.work = lambda: self._check_aac(capture_id, seq, body)
         elif row["sha256"] != digest and (capture_id, seq, digest) not in self._verdicts:
-            def compare() -> None:
-                plan.same = self._compare(capture_id, seq, body, digest)
-
-            plan.work, plan.key = compare, (capture_id, seq, digest)
+            plan.work, plan.key = (lambda: self._compare(capture_id, seq, body, digest)), (capture_id, seq, digest)
         return plan
 
     def put_chunk(self, capture_id: str, seq: int, body: bytes, sha_header: str | None,
@@ -430,6 +429,8 @@ class Ingest:
         try:
             return self._put_chunk_locked(capture_id, seq, body, digest, ok, decoded, plan.same if plan is not None else None)
         except _CompareFirst:
+            if plan is not None:
+                raise NeedsComparison from None
             same = self._compare(capture_id, seq, body, digest)
             return self._put_chunk_locked(capture_id, seq, body, digest, ok, decoded, same)
 

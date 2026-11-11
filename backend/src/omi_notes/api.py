@@ -23,7 +23,7 @@ from starlette.requests import ClientDisconnect
 from . import PROTOCOL_VERSION, __version__, home, operations, phone_log, priority, recording, search, views, watch_perf
 from .audio import aac
 from .envelope import MAX_BODY_BYTES
-from .ingest import UPLOAD_DECODES, ApiError, Ingest, capture_status
+from .ingest import UPLOAD_DECODES, ApiError, Ingest, NeedsComparison, capture_status
 from .lock import api_lock
 from .pipeline.conversations import ConversationPipeline, Providers, queue_counts
 from .pipeline.worker import Worker, read_only_reason
@@ -221,32 +221,39 @@ def create_app(
     # AAC decodes for uploads (ffmpeg, ~0.2 s for a 60 s part) run in their own small pool: a burst of them waits
     # here, in the event loop, never on the shared request workers that every other request needs
     decodes: dict[str, anyio.CapacityLimiter] = {}
-    comparing: dict[tuple[str, int, str], asyncio.Event] = {}
+    # one comparison per (capture, seq, sha256) at a time: a task of its own (a cancelled request doesn't cancel it),
+    # whose result, a failed comparison's "not the same" included, every upload of those bytes takes
+    comparing: dict[tuple[str, int, str], asyncio.Task] = {}
+
+    async def admitted(work):
+        limiter = decodes.setdefault("aac", anyio.CapacityLimiter(UPLOAD_DECODES))
+        return await anyio.to_thread.run_sync(work, limiter=limiter)
 
     async def run_decode(plan) -> None:
-        if plan.key is not None and plan.key in comparing:  # the same bytes already being compared: wait for it
-            await comparing[plan.key].wait()
+        if plan.key is None:
+            plan.decoded = await admitted(plan.work)
             return
-        done = asyncio.Event()
-        if plan.key is not None:
-            comparing[plan.key] = done
-        try:
-            limiter = decodes.setdefault("aac", anyio.CapacityLimiter(UPLOAD_DECODES))
-            await anyio.to_thread.run_sync(plan.work, limiter=limiter)
-        finally:
-            if plan.key is not None:
-                comparing.pop(plan.key, None)
-            done.set()
+        task = comparing.get(plan.key)
+        if task is None:
+            task = asyncio.ensure_future(admitted(plan.work))
+            comparing[plan.key] = task
+            task.add_done_callback(lambda t, key=plan.key: comparing.pop(key, None) if comparing.get(key) is t else None)
+        plan.same = await asyncio.shield(task)
 
     @app.put("/v1/captures/{capture_id}/chunks/{chunk_sequence}")
     async def upload_chunk(capture_id: str, chunk_sequence: int, request: Request) -> JSONResponse:
         body = await read_body(request, MAX_BODY_BYTES)
         sha = request.headers.get("x-content-sha256")
-        plan = await run_in_threadpool(ingest.plan_chunk, capture_id, chunk_sequence, body, sha)
-        if plan.work is not None:
-            await run_decode(plan)
-        status_code, payload = await run_in_threadpool(ingest.put_chunk, capture_id, chunk_sequence, body, sha, plan)
-        return JSONResponse(payload, status_code=status_code)
+        for _ in range(3):  # again only when another writer stored this identity between planning and commit
+            plan = await run_in_threadpool(ingest.plan_chunk, capture_id, chunk_sequence, body, sha)
+            if plan.work is not None:
+                await run_decode(plan)
+            try:
+                status_code, payload = await run_in_threadpool(ingest.put_chunk, capture_id, chunk_sequence, body, sha, plan)
+            except NeedsComparison:
+                continue
+            return JSONResponse(payload, status_code=status_code)
+        raise ApiError(503, "busy", "this chunk's identity kept changing while it was checked; send it again")
 
     @app.put("/v1/captures/{capture_id}/seal")
     async def seal(capture_id: str, request: Request) -> JSONResponse:

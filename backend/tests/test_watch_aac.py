@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from omi_notes.audio import aac
 from omi_notes.audio.timeline import CaptureTimeline
@@ -379,3 +380,176 @@ def test_identical_resends_arriving_together_are_compared_once(client, worker, m
     assert codes == [200] * 4 and len(calls) == 1
     path = worker.db.one("SELECT path FROM chunks WHERE capture_id=? AND chunk_sequence=0", (capture,))["path"]
     assert len(list(((worker.pipeline.settings.vault_dir / path).parent / "alternates").glob("0-*.omnc"))) == 1
+
+
+def _route_put(c, ident, body):
+    return c.put(f"/v1/captures/{ident}/chunks/0", content=body, headers=AUTH | {"X-Content-SHA256": hashlib.sha256(body).hexdigest()})
+
+
+async def _until(check, timeout=5.0):
+    import asyncio
+    import time
+
+    end = time.monotonic() + timeout
+    while not check() and time.monotonic() < end:
+        await asyncio.sleep(0.01)
+    assert check(), "test coordination deadline"
+
+
+def _two_seconds(capture):
+    samples = talk(2, 3)
+    return (pcm_envelopes(samples, capture_id=capture, device_id=WATCH, started_at=STARTED, source="watch_mic")[0],
+            aac_envelopes(samples, capture_id=capture, device_id=WATCH, started_at=STARTED)[0])  # fmt: skip
+
+
+def test_a_failed_comparison_answers_every_waiting_resend_without_shared_workers(client, monkeypatch):
+    # ASTRA-20261111-IT2-02: the first comparison of 41 identical resends failed (AacError, not remembered); the 40
+    # waiters woke without its result and each compared again on a shared worker: a PCM upload and /v1/status
+    # waited. They now take the failed comparison's answer (409, as before), and nothing decodes on shared workers.
+    import asyncio
+    import threading
+
+    from omi_notes import ingest as ingest_module
+
+    capture, probe_id = str(uuid.uuid4()), str(uuid.uuid4())
+    pcm, aac_copy = _two_seconds(capture)
+    probe_pcm, _ = _two_seconds(probe_id)
+    assert put_chunk(client, capture, 0, pcm).status_code == 201
+    calls, guard, release = [0], threading.Lock(), threading.Event()
+
+    def failing(a, b):
+        with guard:
+            calls[0] += 1
+        assert release.wait(10)
+        raise ingest_module.aac.AacError("decoder unavailable for this attempt")
+
+    monkeypatch.setattr(ingest_module, "same_audio", failing)
+
+    async def exercise():
+        async with _asgi(client) as c:
+            jobs = [asyncio.create_task(_route_put(c, capture, aac_copy)) for _ in range(41)]
+            await _until(lambda: calls[0] == 1)
+            await asyncio.sleep(0.2)
+            release.set()
+            answers = await asyncio.gather(*jobs)
+            probe = await asyncio.wait_for(_route_put(c, probe_id, probe_pcm), 2)
+            status = await asyncio.wait_for(c.get("/v1/status", headers=AUTH), 2)
+            return answers, probe, status
+
+    answers, probe, status = asyncio.run(exercise())
+    assert [r.status_code for r in answers] == [409] * 41 and calls[0] == 1
+    assert probe.status_code == 201 and status.status_code == 200
+    row = client.app.state.db.one("SELECT path FROM chunks WHERE capture_id=?", (capture,))
+    path = client.app.state.vault.root / row["path"]
+    alternates = list((path.parent / "alternates").glob("*.omnc"))
+    assert path.read_bytes() == pcm and len(alternates) == 1 and alternates[0].read_bytes() == aac_copy
+    # not remembered: the next resend compares again (a decode failure is transient)
+    monkeypatch.setattr(ingest_module, "same_audio", lambda a, b: True)
+    assert put_chunk(client, capture, 0, aac_copy).status_code == 200
+
+
+def test_a_cancelled_upload_leading_a_comparison_leaves_its_followers_off_the_shared_workers(client, monkeypatch):
+    # ASTRA-20261111-IT2-02: four held decodes fill the decode pool; a comparison's first upload is cancelled before
+    # it is admitted, and its 40 followers then compared on shared workers, blocking a PCM upload and /v1/status
+    import asyncio
+    import json as _json
+    import threading
+
+    import anyio.to_thread
+
+    from omi_notes import ingest as ingest_module
+    from omi_notes.devtools import build_envelope
+
+    capture, probe_id = str(uuid.uuid4()), str(uuid.uuid4())
+    pcm, aac_copy = _two_seconds(capture)
+    probe_pcm, _ = _two_seconds(probe_id)
+    assert put_chunk(client, capture, 0, pcm).status_code == 201
+    env = parse_envelope(aac_copy)
+    holders = []
+    for _ in range(4):
+        ident = str(uuid.uuid4())
+        holders.append((ident, build_envelope(_json.loads(env.header.model_dump_json()) | {"capture_id": ident}, env.payload)))
+    decoding, guard, release = [0], threading.Lock(), threading.Event()
+    real = ingest_module.aac.decode
+
+    def held(payload, expected, **kw):
+        with guard:
+            decoding[0] += 1
+        assert release.wait(10)
+        return real(payload, expected, **kw)
+
+    monkeypatch.setattr(ingest_module.aac, "decode", held)
+
+    async def exercise():
+        async with _asgi(client) as c:
+            held_jobs = [asyncio.create_task(_route_put(c, i, b)) for i, b in holders]
+            try:
+                await _until(lambda: decoding[0] == 4)
+                leader = asyncio.create_task(_route_put(c, capture, aac_copy))
+                await asyncio.sleep(0.2)
+                followers = [asyncio.create_task(_route_put(c, capture, aac_copy)) for _ in range(40)]
+                await asyncio.sleep(0.2)
+                leader.cancel()
+                await asyncio.gather(leader, return_exceptions=True)
+                await asyncio.sleep(0.1)
+                assert anyio.to_thread.current_default_thread_limiter().borrowed_tokens == 0
+                probe = await asyncio.wait_for(_route_put(c, probe_id, probe_pcm), 2)
+                status = await asyncio.wait_for(c.get("/v1/status", headers=AUTH), 2)
+            finally:
+                release.set()
+            return await asyncio.gather(*held_jobs), await asyncio.gather(*followers), probe, status
+
+    held_answers, answers, probe, status = asyncio.run(exercise())
+    assert probe.status_code == 201 and status.status_code == 200
+    assert [r.status_code for r in held_answers] == [201] * 4 and [r.status_code for r in answers] == [200] * 40
+    row = client.app.state.db.one("SELECT path FROM chunks WHERE capture_id=?", (capture,))
+    path = client.app.state.vault.root / row["path"]
+    alternates = list((path.parent / "alternates").glob("*.omnc"))
+    assert path.read_bytes() == pcm and len(alternates) == 1 and alternates[0].read_bytes() == aac_copy
+
+
+def test_a_resend_stored_by_another_writer_after_planning_is_compared_in_the_decode_pool(client, monkeypatch):
+    # put_chunk with a plan never decodes on a shared worker: other bytes the plan didn't compare (stored by another
+    # writer after planning) go back to the route, which plans again and compares in its decode pool
+    import pytest as _pytest
+
+    from omi_notes.ingest import ChunkPlan, NeedsComparison
+
+    capture = str(uuid.uuid4())
+    pcm, aac_copy = _two_seconds(capture)
+    ingest = client.app.state.ingest
+    assert ingest.put_chunk(capture, 0, pcm, hashlib.sha256(pcm).hexdigest())[0] == 201
+    with _pytest.raises(NeedsComparison):
+        ingest.put_chunk(capture, 0, aac_copy, hashlib.sha256(aac_copy).hexdigest(), ChunkPlan())
+    r = put_chunk(client, capture, 0, aac_copy)
+    assert r.status_code == 200 and r.json()["duplicate"] is True
+
+
+@pytest.mark.parametrize("kind", ["identical", "equivalent", "different"])
+def test_two_first_writers_through_the_route_keep_the_original_and_one_alternate(client, monkeypatch, kind):
+    # both plan before either commits; the second then finds the first's bytes, plans again and compares in the
+    # decode pool (ASTRA-20261111-IT2-02's replanning path), never on a shared worker
+    import asyncio
+    import threading
+
+    cid = str(uuid.uuid4())
+    p, a = _two_seconds(cid)
+    b = a if kind == "identical" else p if kind == "equivalent" else aac_envelopes(talk(2, 19), capture_id=cid, device_id=WATCH, started_at=STARTED)[0]
+    barrier = threading.Barrier(2); real = client.app.state.ingest.plan_chunk; n = [0]; lock = threading.Lock()
+    def plan(*args):
+        r = real(*args)
+        with lock:
+            n[0] += 1; first_two = n[0] <= 2
+        if first_two: barrier.wait(timeout=5)
+        return r
+    monkeypatch.setattr(client.app.state.ingest, "plan_chunk", plan)
+    async def go():
+        async with _asgi(client) as c:
+            return await asyncio.gather(*[c.put(f"/v1/captures/{cid}/chunks/0", content=x, headers=AUTH | {"X-Content-SHA256": hashlib.sha256(x).hexdigest()}) for x in (a, b)])
+    codes = sorted(r.status_code for r in asyncio.run(go()))
+    row = client.app.state.db.one("SELECT path, sha256 FROM chunks WHERE capture_id=?", (cid,))
+    path = client.app.state.vault.root / row["path"]; kept = path.read_bytes()
+    alts = list((path.parent / "alternates").glob("*.omnc"))
+    assert codes == ([201, 409] if kind == "different" else [200, 201]), (codes, n)
+    assert hashlib.sha256(kept).hexdigest() == row["sha256"] and len(alts) == (0 if kind == "identical" else 1)
+    if alts: assert {kept, alts[0].read_bytes()} == {a, b}
