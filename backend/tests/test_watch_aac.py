@@ -402,10 +402,12 @@ def _two_seconds(capture):
             aac_envelopes(samples, capture_id=capture, device_id=WATCH, started_at=STARTED)[0])  # fmt: skip
 
 
-def test_a_failed_comparison_answers_every_waiting_resend_without_shared_workers(client, monkeypatch):
+def test_a_comparison_that_fails_now_answers_every_waiting_resend_503_without_shared_workers(client, monkeypatch):
     # ASTRA-20261111-IT2-02: the first comparison of 41 identical resends failed (AacError, not remembered); the 40
     # waiters woke without its result and each compared again on a shared worker: a PCM upload and /v1/status
-    # waited. They now take the failed comparison's answer (409, as before), and nothing decodes on shared workers.
+    # waited. ASTRA-20261111-IT3-01: that failure answered 409, which the phone quarantines. Now every waiter takes
+    # the failed comparison's answer, a retryable 503, nothing decodes on shared workers, and a later resend is
+    # compared again and acknowledged.
     import asyncio
     import threading
 
@@ -416,12 +418,13 @@ def test_a_failed_comparison_answers_every_waiting_resend_without_shared_workers
     probe_pcm, _ = _two_seconds(probe_id)
     assert put_chunk(client, capture, 0, pcm).status_code == 201
     calls, guard, release = [0], threading.Lock(), threading.Event()
+    real = ingest_module.same_audio
 
     def failing(a, b):
         with guard:
             calls[0] += 1
         assert release.wait(10)
-        raise ingest_module.aac.AacError("decoder unavailable for this attempt")
+        raise ingest_module.aac.AacError("AAC decode took longer than 30 s")
 
     monkeypatch.setattr(ingest_module, "same_audio", failing)
 
@@ -430,22 +433,46 @@ def test_a_failed_comparison_answers_every_waiting_resend_without_shared_workers
             jobs = [asyncio.create_task(_route_put(c, capture, aac_copy)) for _ in range(41)]
             await _until(lambda: calls[0] == 1)
             await asyncio.sleep(0.2)
-            release.set()
-            answers = await asyncio.gather(*jobs)
             probe = await asyncio.wait_for(_route_put(c, probe_id, probe_pcm), 2)
             status = await asyncio.wait_for(c.get("/v1/status", headers=AUTH), 2)
-            return answers, probe, status
+            release.set()
+            return await asyncio.gather(*jobs), probe, status
 
     answers, probe, status = asyncio.run(exercise())
-    assert [r.status_code for r in answers] == [409] * 41 and calls[0] == 1
+    assert [r.status_code for r in answers] == [503] * 41 and calls[0] == 1
+    assert {r.json()["error"] for r in answers} == {"comparison_unavailable"}
     assert probe.status_code == 201 and status.status_code == 200
     row = client.app.state.db.one("SELECT path FROM chunks WHERE capture_id=?", (capture,))
     path = client.app.state.vault.root / row["path"]
     alternates = list((path.parent / "alternates").glob("*.omnc"))
     assert path.read_bytes() == pcm and len(alternates) == 1 and alternates[0].read_bytes() == aac_copy
-    # not remembered: the next resend compares again (a decode failure is transient)
-    monkeypatch.setattr(ingest_module, "same_audio", lambda a, b: True)
+    monkeypatch.setattr(ingest_module, "same_audio", real)  # not remembered: compared again, and the same audio
     assert put_chunk(client, capture, 0, aac_copy).status_code == 200
+
+
+def test_a_comparison_that_fails_now_is_retryable_not_a_conflict(client, monkeypatch):
+    # ASTRA-20261111-IT3-01, one resend (no coalescing): 503, both copies kept, then 200 once a comparison is made;
+    # different audio is still a conflict (409) with both copies kept
+    from omi_notes import ingest as ingest_module
+
+    capture = str(uuid.uuid4())
+    pcm, aac_copy = _two_seconds(capture)
+    assert put_chunk(client, capture, 0, pcm).status_code == 201
+    real = ingest_module.same_audio
+
+    def timeout(a, b):
+        raise ingest_module.aac.AacError("AAC decode took longer than 30 s")
+
+    monkeypatch.setattr(ingest_module, "same_audio", timeout)
+    r = put_chunk(client, capture, 0, aac_copy)
+    assert r.status_code == 503 and r.json()["error"] == "comparison_unavailable"
+    monkeypatch.setattr(ingest_module, "same_audio", real)
+    assert put_chunk(client, capture, 0, aac_copy).status_code == 200
+    other = aac_envelopes(np.concatenate([silence(1), talk(1, 9)]), capture_id=capture, device_id=WATCH, started_at=STARTED)[0]
+    assert put_chunk(client, capture, 0, other).status_code == 409
+    path = client.app.state.vault.root / client.app.state.db.one("SELECT path FROM chunks WHERE capture_id=?", (capture,))["path"]
+    assert path.read_bytes() == pcm
+    assert {f.read_bytes() for f in (path.parent / "alternates").glob("*.omnc")} == {aac_copy, other}
 
 
 def test_a_cancelled_upload_leading_a_comparison_leaves_its_followers_off_the_shared_workers(client, monkeypatch):

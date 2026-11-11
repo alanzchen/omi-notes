@@ -53,7 +53,18 @@ class ChunkPlan:
     work: Callable[[], object] | None = None  # returns `decoded` (no key) or `same` (a comparison, keyed)
     key: tuple[str, int, str] | None = None
     decoded: bool | aac.AacError | None = None
-    same: bool | None = None
+    same: bool | _Unavailable | None = None
+
+
+class _Unavailable:
+    """A comparison that couldn't be made right now (a decode timed out, a file couldn't be read): neither the same
+    nor different. Answered 503, never remembered (ASTRA-20261111-IT3-01: a 409 makes the phone quarantine it)."""
+
+    def __repr__(self) -> str:
+        return "COMPARISON_UNAVAILABLE"
+
+
+COMPARISON_UNAVAILABLE = _Unavailable()
 
 
 class NeedsComparison(Exception):
@@ -451,7 +462,7 @@ class Ingest:
         return True
 
     def _put_chunk_locked(self, capture_id: str, seq: int, body: bytes, digest: str, ok, decoded,
-                          same: bool | None = None) -> tuple[int, dict]:  # fmt: skip
+                          same: bool | _Unavailable | None = None) -> tuple[int, dict]:  # fmt: skip
         db, vault = self.db, self.vault
         with _lock:
             existing = db.one("SELECT sha256 FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq))
@@ -528,7 +539,8 @@ class Ingest:
     def _conflict():
         raise ApiError(409, "chunk_conflict", "different content is already stored under this identity")
 
-    def _same_audio_again(self, capture_id: str, seq: int, body: bytes, digest: str, same: bool | None = None) -> bool:
+    def _same_audio_again(self, capture_id: str, seq: int, body: bytes, digest: str,
+                          same: bool | _Unavailable | None = None) -> bool:  # fmt: skip
         """Other bytes under a stored chunk's identity (caller holds the lock). They are always kept, beside the
         stored chunk in `alternates/` (vault first; nothing is overwritten or dropped). True when they are the
         same audio encoded another way, e.g. a Watch part stored as PCM by an old phone build and relayed
@@ -560,13 +572,17 @@ class Ingest:
                                {"alternate_of_seq": seq, "sha256": digest, "received_at": self.clock()})  # fmt: skip
         if not stored_path.exists():  # audio deleted before 2026-11-08: nothing to compare with
             return False
+        if same is COMPARISON_UNAVAILABLE:  # the copy is kept above; the phone keeps its own and sends it again
+            raise ApiError(503, "comparison_unavailable",
+                           "the server couldn't compare this copy with the stored one right now; send it again")
         return bool(same)
 
-    def _compare(self, capture_id: str, seq: int, body: bytes, digest: str) -> bool:
+    def _compare(self, capture_id: str, seq: int, body: bytes, digest: str) -> bool | _Unavailable:
         """Whether other bytes are the same audio as the chunk stored under their identity, compared without
         `_lock` (that chunk is never overwritten). The verdict is remembered, so a resend of the same bytes is a
-        lookup however often it comes; a comparison that fails (unreadable file, decode error) answers "not the
-        same" for this request only, as before, and is tried again next time."""
+        lookup however often it comes. A comparison that couldn't be made right now (a decode error or timeout, an
+        unreadable file) is `COMPARISON_UNAVAILABLE`: a 503, not remembered, tried again next time. Bytes that
+        can't be compared at all (not an envelope, no comparison for their format) are "not the same"."""
         row = self.db.one("SELECT path FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq))
         if row is None:
             return False
@@ -575,8 +591,11 @@ class Ingest:
             stored = parse_envelope((self.vault.root / row["path"]).read_bytes(), capture_id=capture_id, chunk_sequence=seq)
             with _decodes:
                 same = same_audio(stored, env)
-        except (EnvelopeError, OSError, aac.AacError, ValueError) as exc:
-            log.warning("chunk %s/%d: could not compare a second copy with the stored one: %s", capture_id, seq, exc)
+        except (OSError, aac.AacError) as exc:
+            log.warning("chunk %s/%d: could not compare a second copy with the stored one now: %s", capture_id, seq, exc)
+            return COMPARISON_UNAVAILABLE
+        except (EnvelopeError, ValueError) as exc:
+            log.warning("chunk %s/%d: a second copy can't be compared with the stored one: %s", capture_id, seq, exc)
             return False
         log.warning("chunk %s/%d: other bytes under a stored identity (%s → %s): %s", capture_id, seq,
                     stored.header.payload_format, env.header.payload_format, "same audio" if same else "different audio")  # fmt: skip
