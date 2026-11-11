@@ -334,6 +334,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             }
         }
         if recoveredCaptures > 0 { log(.warning, "engine", "recovered \(recoveredCaptures) unsealed capture(s) from a previous run") }
+        if !report.restored.isEmpty { log(.warning, "engine", "\(report.restored.count) capture(s) whose codec was never read came back from quarantine") }
         if !report.quarantined.isEmpty {
             addAttention("\(report.quarantined.count) capture journal(s) could not be recovered automatically and were kept in journal/quarantine (nothing was deleted).")
         }

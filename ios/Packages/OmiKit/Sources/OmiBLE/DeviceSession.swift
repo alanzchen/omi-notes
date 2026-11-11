@@ -561,7 +561,12 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
             case .unsupported(let id):
                 self.refuse("unsupported audio codec \(id) — only Opus 20/21 are supported")
             case .unreadable:
-                if self.codecAttempts < 2 { self.readCodec() } else { self.refuse("audio codec unreadable") }
+                // No value is not an unsupported codec. A read failed by `end` (the link dropped mid-read,
+                // build 49 field log 2026-11-11 01:01Z) needs nothing: `end` seals the capture with the codec
+                // remembered for this pendant, or keeps its journal for recovery. Still connected: one more
+                // read, then a fresh connection (not suppressed, so it is tried again at once).
+                if self.phase == .ended { return }
+                if self.codecAttempts < 2 { self.readCodec() } else { self.requestReconnect("audio codec unreadable") }
             }
         })
     }
@@ -826,9 +831,10 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
 
     private func refuse(_ reason: String) {
         if case .refused = phase { return }
+        guard phase != .ended else { return }  // the link is gone: `end` already settled the capture
         phase = .refused(reason)
         log(.error, "ble", "refusing to record: \(reason)")
-        recorder.abort()
+        recorder.abort(reason: reason)
         ring.stop(reason: reason)
         delegate?.session(self, requestsDisconnect: reason, suppressReconnect: true)
         delegate?.sessionDidChange(self)

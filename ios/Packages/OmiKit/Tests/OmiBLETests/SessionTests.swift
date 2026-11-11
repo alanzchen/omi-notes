@@ -44,8 +44,12 @@ final class FakeDeviceTransport: DeviceTransport {
     /// Reads that fail although the pendant has a value.
     var failReads: Set<OmiCharacteristic> = []
 
+    /// Reads that are never answered (the op stays outstanding, e.g. until the link drops).
+    var unansweredReads: Set<OmiCharacteristic> = []
+
     func read(_ c: OmiCharacteristic) {
         calls.append("read \(c.rawValue)")
+        if unansweredReads.contains(c) { return }
         let value = failReads.contains(c) ? nil : values[c]
         delegate?.transport(self, didUpdateValue: value, for: c, error: value == nil ? SessionError.timeout : nil)
     }
@@ -209,13 +213,48 @@ struct SessionHarness {
         #expect(!h.transport.calls.contains("read storageStatus"))
     }
 
-    @Test func unreadableCodecIsRetriedThenRefused() {
+    /// A codec read that fails on a live link is not an unsupported codec: read again, then a fresh
+    /// connection (not suppressed). Only a codec value actually read and unknown refuses the pendant.
+    @Test func unreadableCodecIsRetriedThenReconnectedNotRefused() {
         var values = FakeDeviceTransport.cv1Values()
         values[.audioCodec] = nil
         let h = SessionHarness(values: values)
         h.connectFully()
         #expect(h.transport.calls.filter { $0 == "read audioCodec" }.count == 2)
-        #expect(h.session.phase == .refused("audio codec unreadable"))
+        #expect(h.delegate.reconnectRequests == ["audio codec unreadable"])
+        #expect(h.delegate.disconnectRequests.isEmpty)
+        if case .refused = h.session.phase { Issue.record("refused: \(h.session.phase)") }
+        #expect(FileIO.contents(of: h.dirs.journalQuarantine).isEmpty)
+    }
+
+    /// Field log, build 49 (2026-11-11 01:01:20–24Z): connected, the link dropped during the codec read, and
+    /// `end` failing that read counted as "unreadable" twice: "refusing to record: audio codec unreadable",
+    /// the capture quarantined as "unsupported codec" and reconnection suppressed. Now the drop just ends
+    /// the session; the audio already received waits in the journal and the next launch's recovery sends it
+    /// with the codec remembered for the pendant.
+    @Test func aLinkLostDuringTheCodecReadKeepsTheAudioAndDoesNotRefuseThePendant() throws {
+        let h = SessionHarness()
+        h.transport.unansweredReads = [.audioCodec]
+        h.connectFully()
+        #expect(h.transport.calls.last == "read audioCodec")
+        for i in 0..<4 {
+            h.transport.audio(Data([UInt8(i), 0, 0, 0xB8, 1, 2, 3]))
+            h.clock.advance(0.02)
+        }
+        h.session.end(reason: .bleDisconnected)
+        #expect(h.session.phase == .ended)
+        #expect(h.delegate.disconnectRequests.isEmpty, "no refusal, so nothing suppresses the reconnect")
+        #expect(FileIO.contents(of: h.dirs.journalQuarantine).isEmpty)
+        let kept = try #require(FileIO.contents(of: h.dirs.journalLive).first)
+        let id = kept.lastPathComponent
+        // reconnect → launch recovery knows the pendant's codec (21) from earlier connections
+        let env = CaptureEnvironment(dirs: h.dirs, outbox: h.outbox, clock: h.clock, appVersion: "t", timezone: "UTC")
+        let report = CaptureRecovery.run(env: env, codecFallback: { _ in 21 })
+        #expect(report.liveRecovered == [id])
+        let chunk = try #require(h.outbox.pending().first { $0.kind == .chunk(captureId: id, sequence: 0) })
+        let parsed = try Envelope.parse(Data(contentsOf: chunk.url))
+        #expect(parsed.header.codecId == 21 && parsed.header.recordCount == 4)
+        #expect(h.outbox.contains(.seal(captureId: id)))
     }
 
     @Test func audioIsJournaledAndSealedOnDisconnect() throws {

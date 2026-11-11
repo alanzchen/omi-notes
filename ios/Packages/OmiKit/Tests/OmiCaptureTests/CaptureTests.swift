@@ -184,6 +184,42 @@ import OmiProtocol
         #expect(FileIO.fileSize(kept) > 0)
     }
 
+    /// Build 49 quarantined a live capture as "unsupported codec" when the link dropped during the codec read
+    /// (no reason file then). Once the pendant's codec is remembered, recovery takes it back and sends it,
+    /// the journal bytes unchanged; without a remembered codec it stays where it is.
+    @Test func aCaptureQuarantinedBecauseItsCodecWasNeverReadIsRecoveredOnceTheCodecIsKnown() throws {
+        let t = TestEnv()
+        let (r, id) = try recorder(t, codec: nil)
+        for i in 0..<3 { r.append(notification(seq: UInt16(i))) }
+        r.abort()
+        let kept = t.dirs.journalQuarantine.appendingPathComponent(id)
+        try FileManager.default.removeItem(at: kept.appendingPathComponent(CaptureRecovery.reasonFileName))  // as build 49 left it
+        let journal = try Data(contentsOf: kept.appendingPathComponent("chunk-000000.journal"))
+
+        let unknown = CaptureRecovery.run(env: t.env)
+        #expect(unknown.restored.isEmpty && FileIO.exists(kept), "no remembered codec: stays in quarantine")
+
+        let report = CaptureRecovery.run(env: t.env, codecFallback: { $0 == "dev-1" ? 21 : nil })
+        #expect(report.restored == [id] && report.liveRecovered == [id])
+        #expect(!FileIO.exists(kept))
+        let chunk = try #require(t.pendingChunks().first)
+        #expect(chunk.1.codecId == 21 && chunk.1.recordCount == 3)
+        #expect(chunk.2 == journal, "the journal's own bytes, unchanged")
+        #expect(t.seal(id)?.reason == .appRecovered)
+    }
+
+    /// A pendant refused for a codec it actually reported stays in quarantine, codec remembered or not.
+    @Test func aRefusedCaptureStaysInQuarantine() throws {
+        let t = TestEnv()
+        let (r, id) = try recorder(t, codec: nil)
+        r.append(notification(seq: 1))
+        r.abort(reason: "unsupported audio codec 1 — only Opus 20/21 are supported")
+        let report = CaptureRecovery.run(env: t.env, codecFallback: { _ in 21 })
+        #expect(report.restored.isEmpty)
+        #expect(FileIO.fileSize(t.dirs.journalQuarantine.appendingPathComponent(id).appendingPathComponent("chunk-000000.journal")) > 0)
+        #expect(t.outbox.pending().isEmpty)
+    }
+
     @Test func abortWithoutAudioLeavesNothing() throws {
         let t = TestEnv()
         let (r, _) = try recorder(t, codec: nil)

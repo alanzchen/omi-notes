@@ -406,8 +406,9 @@ public final class LiveCaptureRecorder {
     }
 
     /// Stops the capture without uploading anything (unsupported codec: the server can't decode it).
-    /// The journal is quarantined, not deleted: unacknowledged audio is never thrown away.
-    public func abort() {
+    /// The journal is quarantined, not deleted: unacknowledged audio is never thrown away. `reason` is kept
+    /// beside it, so recovery can tell a refused pendant from a codec that was never read.
+    public func abort(reason: String = "unsupported codec") {
         guard let m = manifest else { return }
         if let journal { try? env.sync(journal, full: true) }
         journal?.close()
@@ -416,10 +417,10 @@ public final class LiveCaptureRecorder {
                 try? FileManager.default.removeItem(at: dir)
             } else {
                 var report = CaptureRecovery.Report()
-                CaptureRecovery.quarantine(dir, env: env, why: "unsupported codec", report: &report)
+                CaptureRecovery.quarantine(dir, env: env, why: reason, report: &report)
             }
         }
-        log(.warning, "capture", "live capture \(m.captureId) stopped without upload (unsupported codec)")
+        log(.warning, "capture", "live capture \(m.captureId) stopped without upload (\(reason))")
         reset()
     }
 
@@ -780,6 +781,8 @@ public enum CaptureRecovery {
         /// Highest durable ring sequence per (device, generation), to advance the dedupe cursor.
         public var ringDurable: [RingDurableMark] = []
         public var quarantined: [String] = []
+        /// Moved back out of quarantine: kept there only because their codec was never read.
+        public var restored: [String] = []
         public var skipped: [String] = []
         public init() {}
     }
@@ -799,6 +802,7 @@ public enum CaptureRecovery {
 
     public static func run(env: CaptureEnvironment, codecFallback: (String) -> Int? = { _ in nil }) -> Report {
         var report = Report()
+        restoreCodecUnread(env: env, codecFallback: codecFallback, report: &report)
         for dir in FileIO.contents(of: env.dirs.journalLive) where dir.hasDirectoryPath {
             if recover(dir: dir, env: env, codecFallback: codecFallback, report: &report) {
                 report.liveRecovered.append(dir.lastPathComponent)
@@ -826,6 +830,41 @@ public enum CaptureRecovery {
         FileIO.contents(of: dir).filter { $0.pathExtension == "journal" }.allSatisfy { FileIO.fileSize($0) == 0 }
     }
 
+    /// Written beside a quarantined capture's journals: why it is there (absent before build 52).
+    static let reasonFileName = "quarantine-reason.txt"
+
+    /// Captures in quarantine only because their codec was never read go back to their journal folder once a
+    /// codec is remembered for their pendant, and `run` then recovers them like any capture whose link dropped
+    /// before the codec read: rebuilt with that codec, sealed `app_recovered`, uploaded. Build 49 quarantined
+    /// such a capture as "unsupported codec" when the link dropped during the codec read (field log 2026-11-11
+    /// 01:01Z). Moved, never rewritten: the journal bytes stay as they are. Stays in quarantine: a manifest that
+    /// can't be read, a capture with a codec, a pendant with no remembered codec (a pendant only ever refused
+    /// has none), and any recorded reason other than an unknown codec (a refusal, unaccounted journals).
+    static func restoreCodecUnread(env: CaptureEnvironment, codecFallback: (String) -> Int?, report: inout Report) {
+        for dir in FileIO.contents(of: env.dirs.journalQuarantine) where dir.hasDirectoryPath {
+            guard case .ok(let m) = loadManifest(dir.appendingPathComponent(CaptureManifest.fileName)),
+                  m.codecId == nil, codecFallback(m.deviceId) != nil else { continue }
+            let reasonURL = dir.appendingPathComponent(reasonFileName)
+            if FileIO.exists(reasonURL) {
+                guard let why = try? String(contentsOf: reasonURL, encoding: .utf8), why.hasPrefix("codec unknown") else { continue }
+            }
+            let root = m.source == .deviceRing ? env.dirs.journalRing : env.dirs.journalLive
+            let dest = root.appendingPathComponent(m.captureId, isDirectory: true)
+            guard !FileIO.exists(dest) else {
+                log(.warning, "recovery", "\(dir.lastPathComponent) not restored from quarantine: \(m.captureId) already in the journal")
+                continue
+            }
+            do {
+                try FileIO.ensureDirectory(root)
+                try FileManager.default.moveItem(at: dir, to: dest)
+                report.restored.append(m.captureId)
+                log(.warning, "recovery", "restored \(m.captureId) from journal/quarantine: its codec was never read; recovering it with the remembered one")
+            } catch {
+                log(.error, "recovery", "could not restore \(dir.lastPathComponent) from quarantine (\(error)); left there")
+            }
+        }
+    }
+
     static func quarantine(_ dir: URL, env: CaptureEnvironment, why: String, report: inout Report) {
         var dest = env.dirs.journalQuarantine.appendingPathComponent(dir.lastPathComponent, isDirectory: true)
         var n = 1
@@ -836,6 +875,7 @@ public enum CaptureRecovery {
         do {
             try FileIO.ensureDirectory(env.dirs.journalQuarantine)
             try FileManager.default.moveItem(at: dir, to: dest)
+            try? Data(why.utf8).write(to: dest.appendingPathComponent(reasonFileName), options: .atomic)
             report.quarantined.append(dir.lastPathComponent)
             log(.error, "recovery", "kept \(dir.lastPathComponent) in journal/quarantine: \(why)")
         } catch {
