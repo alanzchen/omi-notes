@@ -269,6 +269,24 @@ final class UploaderHarness: @unchecked Sendable {
         #expect(h.task(for: item.name)?.earliest == h.now.addingTimeInterval(60))
     }
 
+    /// ASTRA-20261111-IT3-01: a resend whose server comparison couldn't be made now is answered 503
+    /// comparison_unavailable. After its one automatic 409 requeue is used, that reply still keeps the audio pending
+    /// and retried, never quarantined (409 stays a quarantine).
+    @Test func aComparisonTheServerCantMakeNowStaysPendingAfterTheConflictRequeue() throws {
+        let h = UploaderHarness()
+        let item = try h.writeChunk(seq: 0)
+        let bytes = try Data(contentsOf: item.url)
+        h.reconcile()
+        h.complete(item.name, status: 409, body: #"{"error":"chunk_conflict","detail":"different content"}"#)
+        #expect(try h.t.outbox.requeueConflicts() == [item.name])
+        h.reconcile()
+        h.complete(item.name, status: 503, body: #"{"error":"comparison_unavailable","detail":"send it again"}"#)
+        #expect(h.t.outbox.quarantined().isEmpty)
+        #expect(h.t.outbox.pending().map(\.name) == [item.name])
+        #expect(try Data(contentsOf: h.t.outbox.pending()[0].url) == bytes)
+        #expect(h.task(for: item.name)?.earliest == h.now.addingTimeInterval(30))
+    }
+
     @Test func conflictAndInvalidAreQuarantinedNotRetried() throws {
         let h = UploaderHarness()
         let a = try h.writeChunk(seq: 0)
