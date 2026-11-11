@@ -288,3 +288,94 @@ def test_a_new_aac_part_is_decoded_outside_the_ingest_lock(client, worker, monke
     release.set()
     t.join(10)
     assert result["r"][0] == 201
+
+
+def _asgi(client):
+    import httpx
+
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app), base_url="http://test")
+
+
+def test_decode_bound_uploads_never_hold_the_shared_workers_others_need(client, monkeypatch):
+    # ASTRA-20261111-IT1-02: 40 AAC uploads borrowed all 40 shared AnyIO workers (4 decoding, 36 waiting on the
+    # decode semaphore), so a PCM upload and every other threaded request waited for the decoder
+    import asyncio
+    import json as _json
+    import threading
+    import time
+
+    import anyio.to_thread
+
+    from omi_notes import ingest as ingest_module
+    from omi_notes.devtools import build_envelope
+
+    capture = str(uuid.uuid4())
+    samples = talk(2, 3)
+    pcm = pcm_envelopes(samples, capture_id=capture, device_id=WATCH, started_at=STARTED, source="watch_mic")[0]
+    env = parse_envelope(aac_envelopes(samples, capture_id=capture, device_id=WATCH, started_at=STARTED)[0])
+    inputs = []
+    for _ in range(40):
+        ident = str(uuid.uuid4())
+        header = _json.loads(env.header.model_dump_json()) | {"capture_id": ident}
+        inputs.append((ident, build_envelope(header, env.payload)))
+    entered, guard, release = [0], threading.Lock(), threading.Event()
+
+    def held(payload, expected, **kw):
+        with guard:
+            entered[0] += 1
+        assert release.wait(10)
+        return np.zeros(expected, dtype=np.int16)
+
+    monkeypatch.setattr(ingest_module.aac, "decode", held)
+
+    async def exercise():
+        async with _asgi(client) as ac:
+            async def put(ident, body):
+                return await ac.put(f"/v1/captures/{ident}/chunks/0", content=body,
+                                    headers=AUTH | {"X-Content-SHA256": hashlib.sha256(body).hexdigest()})  # fmt: skip
+
+            jobs = [asyncio.create_task(put(i, b)) for i, b in inputs]
+            try:
+                end = time.monotonic() + 5
+                while entered[0] < 4 and time.monotonic() < end:
+                    await asyncio.sleep(0.01)
+                await asyncio.sleep(0.2)
+                assert entered[0] == 4, "four decodes at once, the rest wait"
+                assert anyio.to_thread.current_default_thread_limiter().borrowed_tokens == 0
+                probe = await asyncio.wait_for(put(capture, pcm), 2)
+                status = await asyncio.wait_for(ac.get("/v1/status", headers=AUTH), 2)
+                assert probe.status_code == 201 and status.status_code == 200
+            finally:
+                release.set()
+            assert all(r.status_code == 201 for r in await asyncio.gather(*jobs))
+
+    asyncio.run(exercise())
+
+
+def test_identical_resends_arriving_together_are_compared_once(client, worker, monkeypatch):
+    import asyncio
+
+    from omi_notes import ingest as ingest_module
+
+    capture, resend = _resend_setup(client, worker)
+    calls = []
+    real = ingest_module.same_audio
+
+    def slow(a, b):
+        calls.append(1)
+        import time
+
+        time.sleep(0.3)
+        return real(a, b)
+
+    monkeypatch.setattr(ingest_module, "same_audio", slow)
+
+    async def exercise():
+        async with _asgi(client) as ac:
+            headers = AUTH | {"X-Content-SHA256": hashlib.sha256(resend).hexdigest()}
+            return await asyncio.gather(*[ac.put(f"/v1/captures/{capture}/chunks/0", content=resend, headers=headers) for _ in range(4)])
+
+    codes = [r.status_code for r in asyncio.run(exercise())]
+    assert codes == [200] * 4 and len(calls) == 1
+    path = worker.db.one("SELECT path FROM chunks WHERE capture_id=? AND chunk_sequence=0", (capture,))["path"]
+    assert len(list(((worker.pipeline.settings.vault_dir / path).parent / "alternates").glob("0-*.omnc"))) == 1

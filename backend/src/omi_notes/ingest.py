@@ -20,6 +20,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from collections.abc import Callable
 from typing import Annotated, Any, Literal
 
 import numpy as np
@@ -38,8 +39,21 @@ log = logging.getLogger(__name__)
 MIN_FREE_BYTES = 256 * 1024 * 1024
 _lock = threading.Lock()
 # AAC decodes (ffmpeg runs) at once for checks outside `_lock`: a resend burst can't take every core
-_decodes = threading.BoundedSemaphore(4)
+UPLOAD_DECODES = 4
+_decodes = threading.BoundedSemaphore(UPLOAD_DECODES)
 SAME_AUDIO_VERDICTS = 10_000  # remembered (capture, seq, sha256) comparisons; a stored chunk never changes
+
+
+@dataclass
+class ChunkPlan:
+    """The decode one chunk upload needs before its locked commit (`Ingest.plan_chunk`), done by the API in its own
+    bounded pool so decode-bound uploads never hold the shared request workers. `key` names a comparison, so
+    simultaneous identical resends share one."""
+
+    work: Callable[[], None] | None = None
+    key: tuple[str, int, str] | None = None
+    decoded: bool | aac.AacError | None = None
+    same: bool | None = None
 
 
 class _CompareFirst(Exception):
@@ -367,7 +381,33 @@ class Ingest:
 
     # -- chunks ----------------------------------------------------------------------------------
 
-    def put_chunk(self, capture_id: str, seq: int, body: bytes, sha_header: str | None) -> tuple[int, dict]:
+    def plan_chunk(self, capture_id: str, seq: int, body: bytes, sha_header: str | None) -> ChunkPlan:
+        """Cheap (one indexed lookup, an envelope parse): which decode `put_chunk` will need, as work to run first.
+        Nothing for a request `put_chunk` will refuse anyway, an identical resend or a remembered comparison."""
+        digest = sha256_hex(body)
+        if not sha_header or digest != sha_header.lower() or seq < 0 or not UUID_RE.fullmatch(capture_id):
+            return ChunkPlan()
+        row = self.db.one("SELECT sha256 FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq))
+        plan = ChunkPlan()
+        if row is None:
+            try:
+                aac_part = parse_envelope(body, capture_id=capture_id, chunk_sequence=seq).header.payload_format == "aac_m4a_v1"
+            except EnvelopeError:
+                return plan
+            if aac_part:
+                def check() -> None:
+                    plan.decoded = self._check_aac(capture_id, seq, body)
+
+                plan.work = check
+        elif row["sha256"] != digest and (capture_id, seq, digest) not in self._verdicts:
+            def compare() -> None:
+                plan.same = self._compare(capture_id, seq, body, digest)
+
+            plan.work, plan.key = compare, (capture_id, seq, digest)
+        return plan
+
+    def put_chunk(self, capture_id: str, seq: int, body: bytes, sha_header: str | None,
+                  plan: ChunkPlan | None = None) -> tuple[int, dict]:  # fmt: skip
         _check_uuid(capture_id, "capture_id")
         if seq < 0:
             raise ApiError(422, "invalid_chunk_sequence", "chunk_sequence must be >= 0")
@@ -383,11 +423,12 @@ class Ingest:
 
         # Decoding is the slow part (ffmpeg, 0.15-0.3 s for a 60 s AAC part) and needs no lock: a new AAC part
         # is checked before taking it, and other bytes under a stored identity are compared outside it.
-        decoded: bool | aac.AacError | None = None
-        if self.db.one("SELECT 1 FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq)) is None:
+        # With a `plan`, the API already ran that decode in its own pool; otherwise (direct callers) it runs here.
+        decoded: bool | aac.AacError | None = plan.decoded if plan is not None else None
+        if plan is None and self.db.one("SELECT 1 FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq)) is None:
             decoded = self._check_aac(capture_id, seq, body)
         try:
-            return self._put_chunk_locked(capture_id, seq, body, digest, ok, decoded)
+            return self._put_chunk_locked(capture_id, seq, body, digest, ok, decoded, plan.same if plan is not None else None)
         except _CompareFirst:
             same = self._compare(capture_id, seq, body, digest)
             return self._put_chunk_locked(capture_id, seq, body, digest, ok, decoded, same)

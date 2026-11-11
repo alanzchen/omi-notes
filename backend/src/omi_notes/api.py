@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import logging
@@ -12,6 +13,8 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from datetime import time as dt_time
 
+import anyio
+import anyio.to_thread
 from fastapi import FastAPI, Request, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -20,7 +23,7 @@ from starlette.requests import ClientDisconnect
 from . import PROTOCOL_VERSION, __version__, home, operations, phone_log, priority, recording, search, views, watch_perf
 from .audio import aac
 from .envelope import MAX_BODY_BYTES
-from .ingest import ApiError, Ingest, capture_status
+from .ingest import UPLOAD_DECODES, ApiError, Ingest, capture_status
 from .lock import api_lock
 from .pipeline.conversations import ConversationPipeline, Providers, queue_counts
 from .pipeline.worker import Worker, read_only_reason
@@ -215,12 +218,34 @@ def create_app(
             "vault_id": vault.vault_id,
         }
 
+    # AAC decodes for uploads (ffmpeg, ~0.2 s for a 60 s part) run in their own small pool: a burst of them waits
+    # here, in the event loop, never on the shared request workers that every other request needs
+    decodes: dict[str, anyio.CapacityLimiter] = {}
+    comparing: dict[tuple[str, int, str], asyncio.Event] = {}
+
+    async def run_decode(plan) -> None:
+        if plan.key is not None and plan.key in comparing:  # the same bytes already being compared: wait for it
+            await comparing[plan.key].wait()
+            return
+        done = asyncio.Event()
+        if plan.key is not None:
+            comparing[plan.key] = done
+        try:
+            limiter = decodes.setdefault("aac", anyio.CapacityLimiter(UPLOAD_DECODES))
+            await anyio.to_thread.run_sync(plan.work, limiter=limiter)
+        finally:
+            if plan.key is not None:
+                comparing.pop(plan.key, None)
+            done.set()
+
     @app.put("/v1/captures/{capture_id}/chunks/{chunk_sequence}")
     async def upload_chunk(capture_id: str, chunk_sequence: int, request: Request) -> JSONResponse:
         body = await read_body(request, MAX_BODY_BYTES)
-        status_code, payload = await run_in_threadpool(
-            ingest.put_chunk, capture_id, chunk_sequence, body, request.headers.get("x-content-sha256")
-        )
+        sha = request.headers.get("x-content-sha256")
+        plan = await run_in_threadpool(ingest.plan_chunk, capture_id, chunk_sequence, body, sha)
+        if plan.work is not None:
+            await run_decode(plan)
+        status_code, payload = await run_in_threadpool(ingest.put_chunk, capture_id, chunk_sequence, body, sha, plan)
         return JSONResponse(payload, status_code=status_code)
 
     @app.put("/v1/captures/{capture_id}/seal")
