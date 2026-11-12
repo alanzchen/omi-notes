@@ -472,4 +472,40 @@ final class MismatchCounter: @unchecked Sendable {
         #expect(engine.queue.sync { backend.connects } == [x])
         #expect(engine.session == nil)
     }
+
+    /// The end of a streaming connection is kept (across launches, in settings) for the "last connected" line.
+    @Test func theEndOfAStreamingConnectionIsRemembered() throws {
+        let x = UUID(uuidString: "0000000A-0000-4000-8000-0000000000C6")!
+        let backend = FakeBackend()
+        let p = FakePeripheral(x, state: .connected)
+        p.configure = {
+            $0.values = FakeDeviceTransport.cv1Values()
+            $0.cachedCharacteristics = Set(OmiCharacteristic.allCases)
+            $0.alreadyNotifying = [.audioData]
+        }
+        backend.known[x] = p
+        let clock = TestClock()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-last-\(UUID().uuidString)")
+        var config = EngineConfiguration(dirs: CaptureDirectories(root: root), clock: clock, appVersion: "t", useCoreBluetooth: false, tickInterval: 10)
+        let sink = Locked<CentralBackendEvents?>(nil)
+        config.testCentralBackend = { events in
+            sink.value = events
+            backend.state = .poweredOn
+            return backend
+        }
+        let settings = try makeSettings(remembered: x)
+        let engine = OmiEngine(config: config, settings: settings, uploadTransport: CountingUploadTransport())
+        let events = try #require(sink.value)
+        engine.queue.sync { events.backendDidUpdateState(.poweredOn) }
+        engine.queue.sync { events.backendDidConnect(p) }
+        #expect(engine.snapshotNow().connection == .streaming)
+        #expect(engine.snapshotNow().pendantLastConnectedAt == nil)
+        clock.advance(120)
+        let ended = clock.wallNow()
+        engine.queue.sync { events.backendDidDisconnect(p, error: nil) }
+        #expect(engine.snapshotNow().pendantLastConnectedAt == ended && settings.pendantLastConnectedAt == ended)
+        engine.forgetDevice()
+        engine.queue.sync {}
+        #expect(engine.snapshotNow().pendantLastConnectedAt == nil)
+    }
 }

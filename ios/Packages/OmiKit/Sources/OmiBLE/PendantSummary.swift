@@ -246,7 +246,10 @@ public struct PendantSummary: Equatable, Sendable {
             }
             return "Connected · no audio yet"
         case .settingUp: return "Connecting…"
-        case .waitingForDevice: return "Not connected · may still record on its own"
+        case .waitingForDevice:
+            // after a while "may still record" reassures more than it tells: say when it was last here
+            if let at = s.pendantLastConnectedAt { return "Not connected · last connected \(SystemHealth.relative(at, now))" }
+            return "Not connected · may still record on its own"
         case .noDevice: return "No pendant paired"
         case .bluetoothUnavailable(let why): return SystemHealth.bluetoothTitle(why)
         case .refused: return "This pendant can't be used"

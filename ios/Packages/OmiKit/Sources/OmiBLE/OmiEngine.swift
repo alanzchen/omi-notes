@@ -65,6 +65,8 @@ public struct EngineSnapshot: Equatable, Sendable {
     public var simulated = false
     public var rememberedDeviceId: String?
     public var rememberedDeviceName: String?
+    /// When the pendant's last streaming connection ended (nil: not since it was paired, or never recorded).
+    public var pendantLastConnectedAt: Date?
     public var device: DeviceSession.Info?
     public var live: LiveSnapshot?
     public var offline: RingSyncState = .idle
@@ -410,6 +412,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         queue.async {
             self.scanning = false
             self.central?.stopScan()
+            if self.settings.rememberedDeviceId != id { self.settings.pendantLastConnectedAt = nil }  // another pendant
             self.settings.rememberedDeviceId = id
             self.settings.rememberedDeviceName = name
             self.settings.userDisconnected = false
@@ -465,6 +468,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             self.simulated = nil
             self.settings.rememberedDeviceId = nil
             self.settings.rememberedDeviceName = nil
+            self.settings.pendantLastConnectedAt = nil
             self.settings.userDisconnected = false
             self.refusal = nil
             for r in [ReconnectSuppression.userDisconnected, .pairingLost, .unsupportedDevice, .codecUnreadable] { self.central?.unsuppress(r) }
@@ -1092,6 +1096,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         let r = pendingDisconnectReason ?? reason
         pendingDisconnectReason = nil
         if let updater = firmwareUpdater, updater.session === s { updater.linkDropped() }
+        if s.phase == .streaming, !s.transport.isSimulated { settings.pendantLastConnectedAt = config.clock.wallNow() }
         session = nil
         withBackgroundTask("seal") { s.end(reason: r) }
         refreshOutboxStats()
@@ -1545,6 +1550,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         s.simulated = settings.simulatedMode
         s.rememberedDeviceId = settings.rememberedDeviceId?.uuidString.lowercased()
         s.rememberedDeviceName = settings.rememberedDeviceName
+        s.pendantLastConnectedAt = settings.pendantLastConnectedAt
         s.device = session?.info
         if let sess = session {
             var l = LiveSnapshot()

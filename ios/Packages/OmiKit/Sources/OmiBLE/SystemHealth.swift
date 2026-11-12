@@ -138,8 +138,11 @@ public struct SystemHealth: Equatable, Sendable {
             return step(.working, "Connecting to the pendant")
         case .waitingForDevice:
             let name = s.rememberedDeviceName ?? "The pendant"
+            let last = s.pendantLastConnectedAt.map {
+                "Last connected \(DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .short)). "
+            } ?? ""
             return step(.unknown, "\(name) isn't connected",
-                        "If its firmware supports offline recording, it keeps audio and the phone collects it when it's back in range.")
+                        last + "If its firmware supports offline recording, it keeps audio and the phone collects it when it's back in range.")
         case .streaming:
             let d = s.device
             if d?.rtcValid == false {

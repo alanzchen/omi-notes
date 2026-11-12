@@ -93,6 +93,7 @@ public final class SettingsStore: @unchecked Sendable {
         static let rememberedDevice = "omi.rememberedPeripheral"
         static let rememberedName = "omi.rememberedPeripheralName"
         static let userDisconnected = "omi.userDisconnected"
+        static let pendantLastConnectedAt = "omi.pendantLastConnectedAt"
         static let simulated = "omi.simulatedDevice"
         static let onboarded = "omi.onboarded"
         static let buttonActionsOff = "omi.buttonActionsOff"
@@ -181,6 +182,12 @@ public final class SettingsStore: @unchecked Sendable {
     public var rememberedDeviceName: String? {
         get { defaults.string(forKey: Key.rememberedName) }
         set { defaults.set(newValue, forKey: Key.rememberedName) }
+    }
+
+    /// When the remembered pendant's last streaming connection ended (kept across launches).
+    public var pendantLastConnectedAt: Date? {
+        get { (defaults.object(forKey: Key.pendantLastConnectedAt) as? Double).map(Date.init(timeIntervalSince1970:)) }
+        set { defaults.set(newValue?.timeIntervalSince1970, forKey: Key.pendantLastConnectedAt) }
     }
 
     public var userDisconnected: Bool {

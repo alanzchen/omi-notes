@@ -187,6 +187,20 @@ import Testing
         #expect(summary(away, reachable, nil).stateLine.hasPrefix("Not connected"))
     }
 
+    /// Nightly 2026-11-12: 29 hours without a connection still read "Not connected · may still record on its own".
+    /// With a last connection on record it says when (no Reconnect: a pending connect already waits for it).
+    @Test func aPendantAwayForLongSaysWhenItWasLastConnected() {
+        var away = streaming()
+        away.connection = .waitingForDevice
+        away.pendantLastConnectedAt = now.addingTimeInterval(-29 * 3600)
+        let line = summary(away, reachable, nil).stateLine
+        #expect(line.hasPrefix("Not connected · last connected") && !line.contains("may still record"))
+        let step = SystemHealth.pendant(away)
+        #expect(step.detail?.hasPrefix("Last connected ") == true && step.fix == nil)
+        away.pendantLastConnectedAt = nil  // nothing on record: as before
+        #expect(summary(away, reachable, nil).stateLine == "Not connected · may still record on its own")
+    }
+
     @Test func pendantStorageIsOnlyClaimedFromThisSessionsSync() {
         var s = streaming()
         #expect(summary(s, reachable, nil).storage == nil)  // never synced: say nothing

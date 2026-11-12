@@ -202,7 +202,7 @@ private struct PendantCardView: View {
     var body: some View {
         Card {
             DeviceCardShell(name: summary.name, state: state, stateColor: summary.connected ? Pendant.indicatorOn : nil,
-                            detail: battery, detailColor: lowBattery ? Pendant.lowText : Pendant.secondary,
+                            detail: battery ?? lastConnected, detailColor: lowBattery ? Pendant.lowText : Pendant.secondary,
                             art: { MiniPendant(on: summary.connected) }, action: open)
             // a problem shows here, on its device; everything else is on the pendant's page
             if let issue = summary.rows.first(where: \.attention) {
@@ -214,6 +214,14 @@ private struct PendantCardView: View {
     private var state: String {
         // the state line before its "·" detail: "Recording", "Not connected", "Connected"
         summary.stateLine.components(separatedBy: " · ").first ?? summary.stateLine
+    }
+
+    /// Away from the phone: when it was last connected (the state line's "last connected …"), in the slot the
+    /// battery uses while connected.
+    private var lastConnected: String? {
+        guard !summary.connected, let part = summary.stateLine.components(separatedBy: " · ").dropFirst().first,
+              part.hasPrefix("last connected") else { return nil }
+        return part.prefix(1).uppercased() + part.dropFirst()
     }
 
     private var lowBattery: Bool {
