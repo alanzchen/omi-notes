@@ -75,6 +75,8 @@ def decode_upload(filename: str, payload: bytes) -> np.ndarray:
     if lower.endswith((".m4a", ".mp4", ".aac")):
         try:
             return aac.decode(payload, None, max_samples=MAX_SECONDS * SR)
+        except aac.AacUnavailable as exc:  # nothing learned about the file: try again, not "undecodable"
+            raise ApiError(503, "decoder_unavailable", str(exc)) from exc
         except aac.AacError as exc:
             raise ApiError(422, "undecodable_audio", str(exc)) from exc
     try:
@@ -84,6 +86,8 @@ def decode_upload(filename: str, payload: bytes) -> np.ndarray:
     if rate != SR:  # a band-limited resampler (ffmpeg's), never interpolation that aliases
         try:
             return aac.resample(payload, ".wav", MAX_SECONDS * SR)
+        except aac.AacUnavailable as exc:
+            raise ApiError(503, "decoder_unavailable", str(exc)) from exc
         except aac.AacError as exc:
             raise ApiError(422, "undecodable_audio", str(exc)) from exc
     pcm = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0].astype(np.float64)

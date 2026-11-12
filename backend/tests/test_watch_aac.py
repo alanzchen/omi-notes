@@ -633,3 +633,49 @@ def test_two_first_writers_through_the_route_keep_the_original_and_one_alternate
     assert codes == ([201, 409] if kind == "different" else [200, 201]), (codes, n)
     assert hashlib.sha256(kept).hexdigest() == row["sha256"] and len(alts) == (0 if kind == "identical" else 1)
     if alts: assert {kept, alts[0].read_bytes()} == {a, b}
+
+
+@pytest.mark.parametrize("fault", ["timeout", "no_ffmpeg", "cannot_start"])
+def test_a_new_aac_part_the_decoder_cant_check_now_is_503_then_stored(client, worker, monkeypatch, fault):
+    # ASTRA-20261111-IT4-01: a decoder timeout or a missing ffmpeg answered 422 invalid_audio, which the phone
+    # quarantines: valid audio stranded. Nothing was learned about the audio, so it is a 503 (the phone keeps the
+    # part and sends it again), nothing is stored, and once the decoder works the same part is stored (201).
+    import subprocess
+
+    from omi_notes.audio import aac as aac_module
+
+    capture = str(uuid.uuid4())
+    body = aac_envelopes(np.concatenate([talk(20, 3), silence(10)]), capture_id=capture, device_id=WATCH, started_at=STARTED)[0]
+    real_run, real_which = aac_module.subprocess.run, aac_module.ffmpeg
+    if fault == "timeout":
+        def slow(*a, **kw):
+            raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=aac_module.TIMEOUT_S)
+
+        monkeypatch.setattr(aac_module.subprocess, "run", slow)
+    elif fault == "no_ffmpeg":
+        monkeypatch.setattr(aac_module, "ffmpeg", lambda: None)
+    else:
+        def missing(*a, **kw):
+            raise FileNotFoundError(2, "No such file or directory", "ffmpeg")
+
+        monkeypatch.setattr(aac_module.subprocess, "run", missing)
+    r = put_chunk(client, capture, 0, body)
+    assert r.status_code == 503 and r.json()["error"] == "decoder_unavailable", r.text
+    assert worker.db.one("SELECT COUNT(*) AS n FROM chunks WHERE capture_id=?", (capture,))["n"] == 0
+    monkeypatch.setattr(aac_module.subprocess, "run", real_run)
+    monkeypatch.setattr(aac_module, "ffmpeg", real_which)
+    assert put_chunk(client, capture, 0, body).status_code == 201
+    assert stored_payload(worker, capture, 0) == parse_envelope(body).payload
+
+
+def test_a_new_aac_part_the_decoder_rejects_is_still_invalid_audio(client, worker):
+    # ffmpeg ran and failed on these bytes: genuinely damaged, 422 (the phone quarantines it, keeping it)
+    capture = str(uuid.uuid4())
+    good = parse_envelope(aac_envelopes(talk(10, 3), capture_id=capture, device_id=WATCH, started_at=STARTED)[0])
+    import json as _json
+
+    from omi_notes.devtools import build_envelope
+
+    damaged = build_envelope(_json.loads(good.header.model_dump_json()), good.payload[:40] + b"\x00" * (len(good.payload) - 40))
+    r = put_chunk(client, capture, 0, damaged)
+    assert r.status_code == 422 and r.json()["error"] == "invalid_audio", r.text

@@ -484,13 +484,18 @@ class Ingest:
                 raise ApiError(422, "invalid_envelope", str(exc)) from exc
             if env.header.payload_format == "aac_m4a_v1":
                 # refuse a file we can't decode before acknowledging it (the phone keeps refused ones)
-                if isinstance(decoded, aac.AacError):
-                    raise ApiError(422, "invalid_audio", str(decoded)) from decoded
-                if decoded is not True:  # stored under this identity meanwhile, then not: check it here
+                if decoded is not True and not isinstance(decoded, aac.AacError):  # not checked before the lock
                     try:
                         aac.decode(env.payload, env.header.record_count)
+                        decoded = True
                     except aac.AacError as exc:
-                        raise ApiError(422, "invalid_audio", str(exc)) from exc
+                        decoded = exc
+                # a decoder that couldn't run says nothing about the audio: send it again (the phone retries a 503;
+                # it quarantines a 422), never "invalid"
+                if isinstance(decoded, aac.AacUnavailable):
+                    raise ApiError(503, "decoder_unavailable", f"the server couldn't check this audio right now ({decoded}); send it again") from decoded
+                if isinstance(decoded, aac.AacError):
+                    raise ApiError(422, "invalid_audio", str(decoded)) from decoded
             header = env.header
             if (header.device_id, capture_id) in self._dirty:
                 self._recover(header.device_id, capture_id)

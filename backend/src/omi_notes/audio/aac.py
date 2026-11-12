@@ -26,6 +26,11 @@ class AacError(ValueError):
     pass
 
 
+class AacUnavailable(AacError):
+    """The decoder couldn't run or finish (ffmpeg missing, a timeout, an OS error starting it): nothing was learned
+    about the audio. Upload paths answer it 503 (send again), never as invalid audio."""
+
+
 def ffmpeg() -> str | None:
     return shutil.which("ffmpeg")
 
@@ -39,14 +44,20 @@ def decode(payload: bytes, expected_samples: int | None, *, max_samples: int | N
     length nothing vouches for), whatever it holds up to `max_samples`."""
     exe = ffmpeg()
     if exe is None:
-        raise AacError("ffmpeg is not installed: this server can't decode AAC")
+        raise AacUnavailable("ffmpeg is not installed: this server can't decode AAC")
     if not payload:
         raise AacError("empty AAC payload")
     # mp4 needs a seekable input (its index may be at the end): a private temporary file
-    fd, path = tempfile.mkstemp(suffix=".m4a")
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(payload)
+        fd, path = tempfile.mkstemp(suffix=".m4a")
+    except OSError as exc:
+        raise AacUnavailable(f"no room to decode AAC: {exc}") from exc
+    try:
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(payload)
+        except OSError as exc:
+            raise AacUnavailable(f"no room to decode AAC: {exc}") from exc
         limit = ((expected_samples if expected_samples is not None else max_samples or 0) + 2 * SAMPLE_RATE) * 2
         try:
             run = subprocess.run(
@@ -54,7 +65,9 @@ def decode(payload: bytes, expected_samples: int | None, *, max_samples: int | N
                 capture_output=True, timeout=TIMEOUT_S, check=False,
             )  # fmt: skip
         except subprocess.TimeoutExpired as exc:
-            raise AacError(f"AAC decode took longer than {TIMEOUT_S:.0f} s") from exc
+            raise AacUnavailable(f"AAC decode took longer than {TIMEOUT_S:.0f} s") from exc
+        except OSError as exc:  # ffmpeg vanished or couldn't start
+            raise AacUnavailable(f"ffmpeg couldn't run: {exc}") from exc
         if run.returncode != 0:
             raise AacError(f"AAC decode failed: {run.stderr.decode(errors='replace').strip()[:300]}")
         if len(run.stdout) > limit:
@@ -76,7 +89,7 @@ def resample(payload: bytes, suffix: str, max_samples: int) -> np.ndarray:
     through ffmpeg's band-limited resampler: nothing above 8 kHz folds into the speech band."""
     exe = ffmpeg()
     if exe is None:
-        raise AacError("ffmpeg is not installed: this server can only read 16 kHz WAV uploads")
+        raise AacUnavailable("ffmpeg is not installed: this server can only read 16 kHz WAV uploads")
     fd, path = tempfile.mkstemp(suffix=suffix)
     try:
         with os.fdopen(fd, "wb") as f:
@@ -85,7 +98,9 @@ def resample(payload: bytes, suffix: str, max_samples: int) -> np.ndarray:
             run = subprocess.run([exe, "-nostdin", "-v", "error", "-i", path, "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE), "pipe:1"],
                                  capture_output=True, timeout=TIMEOUT_S * 4, check=False)  # fmt: skip
         except subprocess.TimeoutExpired as exc:
-            raise AacError("decoding the upload took too long") from exc
+            raise AacUnavailable("decoding the upload took too long") from exc
+        except OSError as exc:
+            raise AacUnavailable(f"ffmpeg couldn't run: {exc}") from exc
         if run.returncode != 0:
             raise AacError(f"decode failed: {run.stderr.decode(errors='replace').strip()[:300]}")
         if len(run.stdout) > (max_samples + 2 * SAMPLE_RATE) * 2:
