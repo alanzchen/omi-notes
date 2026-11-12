@@ -73,7 +73,7 @@ struct WatchDetailView: View {
                             }
                             ForEach(Array(performance.sessions.prefix(3).enumerated()), id: \.element.id) { index, session in
                                 if index > 0 { Divider().padding(.leading, 50) }
-                                place("battery.75percent", Self.when(session, now: context.date), Self.battery(session))
+                                place("battery.75percent", Self.when(session), Self.battery(session, now: context.date))
                             }
                         }
                         note("The whole Watch's battery, other apps included. Charging time and gaps are left out.")
@@ -128,19 +128,27 @@ struct WatchDetailView: View {
         }
     }
 
-    static func when(_ s: WatchPerformance.Session, now: Date = Date()) -> String {
+    static func when(_ s: WatchPerformance.Session) -> String {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         guard let start = s.startedAt.flatMap(iso.date(from:)) else { return "A recording" }
         let end = s.lastAt.flatMap(iso.date(from:))
         let day = Calendar.current.isDateInToday(start) ? "Today" : start.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
         let range = "\(start.formatted(date: .omitted, time: .shortened))–\(end?.formatted(date: .omitted, time: .shortened) ?? "?")"
-        return "\(day), \(range)\(WatchSummary.sessionEnd(complete: s.complete, lastAt: end, now: now))"
+        return "\(day), \(range)"
     }
 
-    static func battery(_ s: WatchPerformance.Session) -> String {
+    /// The secondary line: how it ended when that's not known ("not finished yet", "no final reading"), then battery.
+    static func battery(_ s: WatchPerformance.Session, now: Date = Date()) -> String {
         let span = Duration.seconds(s.measuredS).formatted(.units(allowed: [.hours, .minutes], width: .abbreviated))
         var parts: [String] = []
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let end = WatchSummary.sessionEnd(complete: s.complete, lastAt: s.lastAt.flatMap(iso.date(from:)), now: now)
+        if !end.isEmpty {  // " · no final reading" → "No final reading"
+            let text = end.dropFirst(3)
+            parts.append(text.prefix(1).uppercased() + text.dropFirst())
+        }
         if let a = s.batteryStart, let b = s.batteryEnd { parts.append("\(Int((a * 100).rounded()))% → \(Int((b * 100).rounded()))%") }
         switch (s.rateQuality, s.ratePerHour) {
         case ("ok", let r?): parts.append(String(format: "%.1f points an hour over %@ on battery", r, span))
