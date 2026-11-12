@@ -368,6 +368,7 @@ extension PendantSummary {
         case "disconnected":
             s.connection = .waitingForDevice
             s.upload.lastSuccessAt = now.addingTimeInterval(-24 * 60)
+            s.pendantLastConnectedAt = now.addingTimeInterval(-29 * 3600)  // the 2026-11-11/12 field state
         case "unpaired":
             s = EngineSnapshot()
             s.ready = true
