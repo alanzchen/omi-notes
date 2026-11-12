@@ -100,18 +100,11 @@ public struct WatchSummary: Equatable, Sendable {
         return age >= 0 && age <= fresh
     }
 
-    /// How a Watch recording on its page ended, when the server's samples don't say: nil for one that finished, or the
-    /// one a current report says is still recording (ASTRA-20261112-IT2-03: an old battery sample is not an ending);
-    /// otherwise what the samples show, without inferring that it stopped: "Not finished yet" up to 12 h after the last
-    /// reading, then "Last reading 13 hours ago"; "No end reading" / "Reading time unclear" without a usable time.
-    public static func sessionEnd(complete: Bool, startedAt: Date?, lastAt: Date?, report: WatchReport?, now: Date) -> String? {
-        if complete { return nil }
-        if let r = report, r.state == .recording, isCurrent(r, now: now), let since = r.since, let startedAt,
-           abs(since.timeIntervalSince(startedAt)) <= 120 { return nil }
-        guard let lastAt else { return "No end reading" }
-        let age = now.timeIntervalSince(lastAt)
-        if age < 0 { return "Reading time unclear" }
-        return age <= 12 * 3600 ? "Not finished yet" : "Last reading \(SystemHealth.relative(lastAt, now))"
+    /// A Watch recording on its page without a final sample says so, neutrally: "No end reading", whatever the age of
+    /// its last sample (ASTRA-20261112-IT4-02: incomplete telemetry says neither that it is still going nor that it
+    /// stopped; and no recording ID ties it to the Watch's current report). Nil for one that finished.
+    public static func sessionEnd(complete: Bool) -> String? {
+        complete ? nil : "No end reading"
     }
 
     /// The Watch page's "Upload to your server" line: the iPhone → server hop only. Watch audio this iPhone set aside

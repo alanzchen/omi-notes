@@ -79,7 +79,7 @@ struct WatchDetailView: View {
                             }
                             ForEach(Array(performance.sessions.prefix(3).enumerated()), id: \.element.id) { index, session in
                                 if index > 0 { Divider().padding(.leading, 50) }
-                                place("battery.75percent", Self.when(session), Self.battery(session, report: flow.report, now: context.date))
+                                place("battery.75percent", Self.when(session), Self.battery(session))
                             }
                         }
                         note("The whole Watch's battery, other apps included. Charging time and gaps are left out.")
@@ -144,23 +144,19 @@ struct WatchDetailView: View {
         return "\(day), \(range)"
     }
 
-    /// The secondary line: how it ended when that's not known ("not finished yet", "no final reading"), then battery.
-    static func battery(_ s: WatchPerformance.Session, report: WatchReport? = nil, now: Date = Date()) -> String {
-        let span = Duration.seconds(s.measuredS).formatted(.units(allowed: [.hours, .minutes], width: .abbreviated))
+    /// The secondary line, at most two lines: the battery change, the rate (or why there is none) over the time on
+    /// battery, gaps, and one qualifier when the recording has no final sample.
+    static func battery(_ s: WatchPerformance.Session) -> String {
+        let span = Duration.seconds(s.measuredS).formatted(.units(allowed: [.hours, .minutes], width: .narrow))
         var parts: [String] = []
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let end = WatchSummary.sessionEnd(complete: s.complete, startedAt: s.startedAt.flatMap(iso.date(from:)),
-                                              lastAt: s.lastAt.flatMap(iso.date(from:)), report: report, now: now) {
-            parts.append(end)
-        }
         if let a = s.batteryStart, let b = s.batteryEnd { parts.append("\(Int((a * 100).rounded()))% → \(Int((b * 100).rounded()))%") }
         switch (s.rateQuality, s.ratePerHour) {
-        case ("ok", let r?): parts.append(String(format: "%.1f points an hour over %@ on battery", r, span))
-        case ("coarse", _): parts.append("too small a change over \(span) to give a rate")
-        default: parts.append("not enough time on battery to estimate (\(span))")
+        case ("ok", let r?): parts.append(String(format: "%.1f pts/hr over %@", r, span))
+        case ("coarse", _): parts.append("change too small to rate (\(span))")
+        default: parts.append("too short to rate (\(span))")
         }
         if s.gaps > 0 { parts.append("\(s.gaps) gap\(s.gaps == 1 ? "" : "s")") }
+        if let end = WatchSummary.sessionEnd(complete: s.complete) { parts.append(end.lowercased()) }
         return parts.joined(separator: " · ")
     }
 

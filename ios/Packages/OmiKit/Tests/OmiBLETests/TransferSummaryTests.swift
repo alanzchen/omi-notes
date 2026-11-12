@@ -307,26 +307,12 @@ import OmiWatchKit
         #expect(WatchSummary.evaluate(installed: true, report: recording, lastReceivedAt: now, now: now).cardDetail == nil)
     }
 
-    /// Nightly 2026-11-12 round 2 / ASTRA-20261112-IT2-03: a recording with no final sample was "not finished yet"
-    /// for good, and then (90e5c2e) "no final reading" after 12 h even while a current report said the same recording
-    /// was still going. Sample age never says a recording ended.
-    @Test func aWatchRecordingsEndIsNeverInferredFromAnOldSample() {
-        let started = now.addingTimeInterval(-14 * 3600)
-        func end(_ complete: Bool, _ last: Date?, _ r: WatchReport? = nil) -> String? {
-            WatchSummary.sessionEnd(complete: complete, startedAt: started, lastAt: last, report: r, now: now)
-        }
-        #expect(end(true, now.addingTimeInterval(-90 * 86_400)) == nil)
-        #expect(end(false, now.addingTimeInterval(-3600)) == "Not finished yet")
-        #expect(end(false, now.addingTimeInterval(-12 * 3600)) == "Not finished yet", "exactly 12 h")
-        #expect(end(false, now.addingTimeInterval(-13 * 3600))?.hasPrefix("Last reading 13 hours ago") == true)
-        #expect(end(false, now.addingTimeInterval(3600)) == "Reading time unclear", "a future sample")
-        #expect(end(false, nil) == "No end reading")
-        let recording = WatchReport(state: .recording, since: started.addingTimeInterval(30), waitingParts: 0, at: now.addingTimeInterval(-60))
-        #expect(end(false, now.addingTimeInterval(-13 * 3600), recording) == nil, "the current report says it is still recording")
-        let other = WatchReport(state: .recording, since: now.addingTimeInterval(-600), waitingParts: 0, at: now.addingTimeInterval(-60))
-        #expect(end(false, now.addingTimeInterval(-13 * 3600), other)?.hasPrefix("Last reading") == true, "another recording")
-        let future = WatchReport(state: .recording, since: started, waitingParts: 0, at: now.addingTimeInterval(3600))
-        #expect(end(false, now.addingTimeInterval(-13 * 3600), future)?.hasPrefix("Last reading") == true, "not a current report")
+    /// ASTRA-20261112-IT2-03 / IT4-02: an incomplete recording said "not finished yet" (claiming it ongoing) or, after
+    /// 12 h, implied it ended; and a start-time match with the current report suppressed a different recording. Every
+    /// incomplete recording says "No end reading", whatever the age of its last sample.
+    @Test func anIncompleteWatchRecordingIsDescribedNeutrally() {
+        #expect(WatchSummary.sessionEnd(complete: true) == nil)
+        #expect(WatchSummary.sessionEnd(complete: false) == "No end reading")
     }
 
     /// ASTRA-20261112-IT2-02: a future-dated report (Watch clock ahead) made the card say "2 min waiting on the Watch"
