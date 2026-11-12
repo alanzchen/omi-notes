@@ -995,9 +995,10 @@ def test_an_enrollment_upload_reads_only_its_own_person(env, monkeypatch, popula
     assert len(reads) == 1, f"{len(reads)} People notes read with {population} people"
 
 
-def test_an_enrollment_import_refuses_a_person_whose_note_changed_outside_the_app(env, monkeypatch):
-    # the per-person refresh fails closed: a renamed (or removed) People note is not this person until the full
-    # reconciliation (People list, the worker's sweep) has seen it; the consent check stays as strict
+def test_an_enrollment_import_follows_a_note_renamed_outside_the_app(env, monkeypatch):
+    # a rename changes the People folder: the import resolves everyone once (as the People list would), refuses that
+    # changed person this time, then knows it by its new name only (ASTRA-20261112-IT3-01: one resolver for
+    # authorization and the index)
     settings, client, worker = env
     me = new_person(client, "Alan", me=True)
     files = {"file": ("reading.wav", wav_bytes(monologue()), "audio/wav")}
@@ -1005,8 +1006,10 @@ def test_an_enrollment_import_refuses_a_person_whose_note_changed_outside_the_ap
     note.rename(note.with_name("Alan B.md"))
     r = client.post(f"/v1/people/{me}/enrollments/import", data={"confirm_person": "true", "person_name": "Alan"},
                     files=files, headers=AUTH)  # fmt: skip
-    assert r.status_code == 404, r.text
-    assert client.get("/v1/people", headers=AUTH).status_code == 200  # the full scan learns the new name
+    assert r.status_code == 404, r.text  # changed: refused once, while everyone is resolved again
+    r = client.post(f"/v1/people/{me}/enrollments/import", data={"confirm_person": "true", "person_name": "Alan"},
+                    files=files, headers=AUTH)  # fmt: skip
+    assert r.status_code == 422 and r.json()["error"] == "person_name_mismatch", r.text
     r = client.post(f"/v1/people/{me}/enrollments/import", data={"confirm_person": "true", "person_name": "Alan B"},
                     files=files, headers=AUTH)  # fmt: skip
     assert r.status_code == 201, r.text
@@ -1039,3 +1042,60 @@ def test_an_enrollment_upload_the_decoder_cant_handle_now_is_503(env, monkeypatc
     r = client.post(f"/v1/people/{me}/enrollments/import", data={"confirm_person": "true", "person_name": "Alan"},
                     files={"file": ("reading.wav", buf.getvalue(), "audio/wav")}, headers=AUTH)  # fmt: skip
     assert r.status_code == 503 and r.json()["error"] == "decoder_unavailable", r.text
+
+
+def _import(client, pid, name):
+    return client.post(f"/v1/people/{pid}/enrollments/import", data={"confirm_person": "true", "person_name": name},
+                       files={"file": ("reading.wav", wav_bytes(monologue()), "audio/wav")}, headers=AUTH)  # fmt: skip
+
+
+@pytest.mark.parametrize("where", ["same_folder_other_name", "subfolder_same_name"])
+def test_a_second_people_note_claiming_the_wearer_is_refused_without_writes(env, where):
+    # ASTRA-20261112-IT3-01: the per-person refresh authorized from the cached wearer note while the full resolver
+    # (sorted, first wins) picked a duplicate that isn't the wearer: 201 and a kept sample where base refused
+    settings, client, worker = env
+    store = worker.pipeline.speakers
+    pid = new_person(client, "Zulu original", me=True)
+    path = Vault.open(settings).root / store.person(pid)["note_path"]
+    dup = path.with_name("AAA duplicate.md") if where == "same_folder_other_name" else path.parent / "AAA" / path.name
+    dup.parent.mkdir(exist_ok=True)
+    dup.write_text(path.read_text().replace("omi_me: true", "omi_me: false"))
+    r = _import(client, pid, "Zulu original")
+    assert r.status_code in (409, 422), r.text
+    if where == "subfolder_same_name":
+        assert r.json()["error"] == "consent_required", r.text  # as base: the resolver's note isn't the wearer
+    assert not list(store.person_dir(pid).glob("samples/*.json")) and not list(store.person_dir(pid).glob("enrollment/*"))
+    assert store.people_conflicted(pid)
+
+
+def test_a_conflicted_person_that_would_be_authorized_is_still_refused(env):
+    # both notes say the wearer: consent passes, the conflict alone refuses
+    settings, client, worker = env
+    store = worker.pipeline.speakers
+    pid = new_person(client, "Zulu original", me=True)
+    path = Vault.open(settings).root / store.person(pid)["note_path"]
+    (path.parent / "AAA").mkdir()
+    (path.parent / "AAA" / path.name).write_text(path.read_text())
+    r = _import(client, pid, "Zulu original")
+    assert r.status_code == 409 and r.json()["error"] == "person_conflict", r.text
+    assert not list(store.person_dir(pid).glob("samples/*.json"))
+
+
+def test_a_rename_while_the_import_is_judged_is_refused(env, monkeypatch):
+    settings, client, worker = env
+    store = worker.pipeline.speakers
+    pid = new_person(client, "Alan", me=True)
+    real = worker.providers.embedder.embed
+    done = []
+
+    def embed(pcm):
+        if not done:
+            done.append(1)
+            path = Vault.open(settings).root / store.person(pid)["note_path"]
+            path.rename(path.with_name("Alan B.md"))
+        return real(pcm)
+
+    monkeypatch.setattr(worker.providers.embedder, "embed", embed)
+    r = _import(client, pid, "Alan")
+    assert done and r.status_code in (404, 409), r.text
+    assert not list(store.person_dir(pid).glob("samples/*.json"))

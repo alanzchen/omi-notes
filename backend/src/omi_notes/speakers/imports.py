@@ -139,6 +139,8 @@ class Importer:
             raise ApiError(422, "person_name_mismatch", f"person_name must be this person's name ({person['name']})")
         if not authorized(consent):
             raise ApiError(409, "consent_required", "this person's voice can't be kept without the acknowledgment and their attestation")
+        if self.store.people_conflicted(person_id):
+            raise ApiError(409, "person_conflict", "two People notes claim this person; keep one of them, then try again")
         embedder = self.pipeline.providers.embedder
         if embedder is None:
             raise ApiError(409, "no_speaker_model", "the speaker model isn't installed (`omi-notes fetch-models --speakers`)")
@@ -152,7 +154,9 @@ class Importer:
         person = self.store.refresh_person(person_id)
         if person is None:
             return None
-        return (bool(person["me"]), person["attested_at"], self.store.settings()["acknowledged_at"], self.store.forget_count(person_id))
+        # the name too: a rename while the import is judged is a different confirmation than the one made
+        return (bool(person["me"]), person["attested_at"], self.store.settings()["acknowledged_at"], self.store.forget_count(person_id),
+                person["name"])
 
     def _range(self, fields: dict, total: float | None) -> tuple[float, float]:
         try:
@@ -265,6 +269,8 @@ class Importer:
                 raise ApiError(404, "not_found", "the person's voice was forgotten while the import was judged")
             if current != consent or not authorized(current):
                 raise ApiError(409, "consent_required", "the person's consent changed while the import was judged; try again")
+            if self.store.people_conflicted(person_id):
+                raise ApiError(409, "person_conflict", "two People notes claim this person; keep one of them, then try again")
             if {e["import_id"] for e in self._imports(person_id, sha) if e["start"] < end and e["end"] > start} != {
                     e["import_id"] for e in overlapping}:  # fmt: skip
                 raise ApiError(409, "import_conflict", "another import of this audio finished meanwhile; try again")

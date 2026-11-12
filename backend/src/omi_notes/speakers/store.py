@@ -188,7 +188,9 @@ class SpeakerStore:
         """Refresh the `people` cache from People notes and voice folders; True when anything
         that rendering depends on (names, me) changed."""
         found: dict[str, dict] = {}
+        conflicts: set[str] = set()
         people_root = self.vault.root / PEOPLE_DIR
+        signature = self._people_signature_now()  # before reading: a change during the scan is seen next time
         if people_root.exists():
             for path in sorted(people_root.rglob("*.md")):
                 try:
@@ -196,6 +198,8 @@ class SpeakerStore:
                 except (OSError, UnicodeDecodeError):
                     continue
                 pid = front.get("omi_person_id")
+                if isinstance(pid, str) and pid in found:
+                    conflicts.add(pid)  # two notes claim this person: the first (sorted) is used, and imports refuse it
                 if not isinstance(pid, str) or pid in found:
                     continue
                 aliases = front.get("aliases") if isinstance(front.get("aliases"), list) else []
@@ -221,13 +225,55 @@ class SpeakerStore:
         else:
             for p in found.values():
                 self.db.execute("UPDATE people SET attested_at=?, aliases_json=? WHERE id=?", (p["attested_at"], p["aliases_json"], p["id"]))
+        self.db.set_meta("people_conflicts", json.dumps(sorted(conflicts)))
+        self.db.set_meta("people_signature", json.dumps(signature))
         return before != after
+
+    def _people_signature_now(self, dirs: list[str] | None = None) -> dict[str, int]:
+        """Modification times of the People folder's directories (a note added, removed or renamed changes its
+        folder's): all of them during a full scan, the recorded ones on a request. Voice folders aren't in it: one
+        appears with a person's first sample, and a note-less person's own folder is checked by `refresh_person`."""
+        roots = [self.vault.root / PEOPLE_DIR]
+        if dirs is None:
+            dirs = [str(r) for r in roots if r.exists()]
+            people_root = roots[0]
+            if people_root.exists():
+                dirs += [str(d) for d in sorted(people_root.rglob("*")) if d.is_dir()]
+        out = {}
+        for d in dirs:
+            try:
+                out[d] = os.stat(d).st_mtime_ns
+            except OSError:
+                out[d] = -1
+        for r in roots:  # a root that appeared since
+            if str(r) not in out and r.exists():
+                out[str(r)] = os.stat(r).st_mtime_ns
+        return out
+
+    def people_conflicted(self, person_id: str) -> bool:
+        """Two People notes claim this person (as of the last full scan)."""
+        return person_id in json.loads(self.db.meta("people_conflicts") or "[]")
 
     def refresh_person(self, person_id: str):
         """`scan_people` for one person, for request paths (whose cost must not grow with the People folder): its
         indexed People note (its name, `me` flag and id, read again), its consent file and, without a note, its own
         samples' name. None when that isn't the person any more (the note gone, renamed or moved, or not this id):
-        the caller refuses, and the full reconciliation (People list, writes, the worker's sweep) catches up."""
+        the caller refuses, and the full reconciliation (People list, writes, the worker's sweep) catches up. When the
+        People folders changed since the last full scan (their modification times), that full scan runs first."""
+        recorded = json.loads(self.db.meta("people_signature") or "null")
+        if recorded is None or self._people_signature_now(list(recorded)) != recorded:
+            # a note was added, removed or renamed since the last full scan (a duplicate of this person, perhaps):
+            # resolve everyone once, as `scan_people` would (ASTRA-20261112-IT3-01). A person whose note, name or
+            # wearer flag changed by that is refused this time (as a changed note always is); two notes claiming it
+            # go to the caller's consent and conflict checks, which refuse it with their reasons
+            before = self.person(person_id)
+            self.scan_people()
+            after = self.person(person_id)
+            if after is not None and self.people_conflicted(person_id):
+                return after
+            if before is None or after is None or any(before[k] != after[k] for k in ("note_path", "name", "me")):
+                return None
+            return after
         row = self.person(person_id)
         if row is None:
             return None
