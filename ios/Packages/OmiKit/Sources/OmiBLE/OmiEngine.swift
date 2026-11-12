@@ -183,6 +183,11 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     private var codecFailures: [String: Int] = [:]
     static let codecFailureLimit = 3
     private var codecStall: String?
+    private var codecStallSinceMono: UInt64?
+    /// A codec-read stop is lifted after this long (on the engine's tick, whenever the app is awake) or when the app
+    /// comes to the foreground: another bounded run of `codecFailureLimit` connections. Without it, a suspended app
+    /// holding no pending connect would never wake for the pendant again until the owner tapped Reconnect.
+    static let codecRetryAfter: UInt64 = 900_000_000_000
     private var storageTripped = false
     private var freeBytes: Int64?
     private var outboxStats = OutboxStats()
@@ -412,6 +417,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             for r in [ReconnectSuppression.userDisconnected, .pairingLost, .unsupportedDevice, .codecUnreadable] { self.central?.unsuppress(r) }
             self.codecFailures.removeAll()
             self.codecStall = nil
+            self.codecStallSinceMono = nil
             if id == SimulatedDevice.deviceIdentifier {
                 self.startSimulatedDevice()
             } else {
@@ -440,6 +446,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             for r in [ReconnectSuppression.userDisconnected, .pairingLost, .unsupportedDevice, .codecUnreadable] { self.central?.unsuppress(r) }
             self.codecFailures.removeAll()
             self.codecStall = nil
+            self.codecStallSinceMono = nil
             self.attention.removeAll { $0.contains("pairing") }
             if self.settings.rememberedDeviceId == SimulatedDevice.deviceIdentifier, self.settings.simulatedMode {
                 self.connectSimulated(after: 0.3)
@@ -463,6 +470,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             for r in [ReconnectSuppression.userDisconnected, .pairingLost, .unsupportedDevice, .codecUnreadable] { self.central?.unsuppress(r) }
             self.codecFailures.removeAll()
             self.codecStall = nil
+            self.codecStallSinceMono = nil
             self.scheduleSnapshot()
         }
     }
@@ -992,6 +1000,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             self.refreshOutboxStats()
             self.writePhoneStatus(trigger: "foreground")
             self.endKeepAlive()
+            self.liftCodecStall(why: "the app was opened")
             self.central?.ensureConnected()  // re-kick a pending connect on foreground
             self.uploader.reconcile()
             if self.session?.phase == .streaming { self.writeHeartbeat(reason: "foreground") }
@@ -1255,6 +1264,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
                 // the audio already received stays journaled (sealed with the remembered codec, or kept for recovery)
                 log(.error, "engine", "codec unreadable on \(failures) connections in a row; not reconnecting until asked")
                 codecStall = Self.codecStallReason
+                codecStallSinceMono = config.clock.monotonicNanoseconds()
                 central?.suppress(.codecUnreadable)
                 addAttention("Not recording: the pendant's audio format couldn't be read \(failures) times in a row. Tap Reconnect to try again.")
                 pendingDisconnectReason = .bleDisconnected
@@ -1350,9 +1360,24 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
 
     // MARK: Tick
 
+    /// Ends a codec-read stop (see `codecRetryAfter`); the caller or the next `ensureConnected` connects again.
+    private func liftCodecStall(why: String) {
+        guard codecStall != nil else { return }
+        log(.info, "engine", "trying the pendant again after the codec-read pause: \(why)")
+        codecStall = nil
+        codecStallSinceMono = nil
+        codecFailures.removeAll()
+        central?.unsuppress(.codecUnreadable)
+        scheduleSnapshot()
+    }
+
     private func tick() {
         tickCount += 1
         let now = config.clock.monotonicNanoseconds()
+        if let since = codecStallSinceMono, now &- since >= Self.codecRetryAfter {
+            liftCodecStall(why: "\(Self.codecRetryAfter / 60_000_000_000) min passed")
+            central?.ensureConnected()
+        }
         session?.tick()
         if keepAliveTask != nil, now &- max(lastAudioMono, keepAliveSinceMono) >= Self.keepAliveAfterAudio {
             recorder.syncNow()

@@ -202,6 +202,7 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
         if p.connectionState == .connected {
             if deliveredId != p.identifier { deliver(p) }
         } else {
+            log(.info, "ble", "waiting to connect to the remembered pendant")
             backend.connect(p)
         }
     }
@@ -214,6 +215,7 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
                 if deliveredId != p.identifier { deliver(p) }
                 return
             }
+            if p.connectionState == .disconnected { log(.info, "ble", "waiting to connect to the remembered pendant") }
             backend.connect(p)  // re-kick even while .connecting
             return
         }

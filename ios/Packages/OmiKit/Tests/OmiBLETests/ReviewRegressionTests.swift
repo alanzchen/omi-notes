@@ -389,4 +389,87 @@ final class MismatchCounter: @unchecked Sendable {
         engine.queue.sync { events.backendDidConnect(p) }
         #expect(p.transportsCreated == OmiEngine.codecFailureLimit + 1, "Reconnect lets it try again")
     }
+
+    /// Nightly 2026-11-12: f8a34ef's stop after three codec-read failures held only until the owner tapped Reconnect.
+    /// A suspended app holding no pending connect never wakes for the pendant, so the stop could last for good. It now
+    /// lifts after `codecRetryAfter` (on the engine's tick) or when the app comes to the foreground: another bounded
+    /// run of three, never a tight loop.
+    @Test func aCodecReadStopIsLiftedAfterAPauseOrWhenTheAppIsOpened() throws {
+        let x = UUID(uuidString: "0000000A-0000-4000-8000-0000000000C4")!
+        let backend = FakeBackend()
+        let p = FakePeripheral(x, state: .disconnected)
+        p.configure = {
+            var values = FakeDeviceTransport.cv1Values()
+            values[.audioCodec] = nil
+            $0.values = values
+            $0.cachedCharacteristics = Set(OmiCharacteristic.allCases)
+            $0.alreadyNotifying = [.audioData]
+        }
+        backend.known[x] = p
+        let clock = TestClock()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-codec-retry-\(UUID().uuidString)")
+        var config = EngineConfiguration(dirs: CaptureDirectories(root: root), clock: clock, appVersion: "t", useCoreBluetooth: false, tickInterval: 0.02)
+        let sink = Locked<CentralBackendEvents?>(nil)
+        config.testCentralBackend = { events in
+            sink.value = events
+            backend.state = .poweredOn
+            return backend
+        }
+        let engine = OmiEngine(config: config, settings: try makeSettings(remembered: x), uploadTransport: CountingUploadTransport())
+        let events = try #require(sink.value)
+        engine.queue.sync { events.backendDidUpdateState(.poweredOn) }
+        func failedConnections(_ n: Int) {
+            for _ in 0..<n {
+                p.connectionState = .connected
+                p.resetTransport()
+                engine.queue.sync { events.backendDidConnect(p) }
+                engine.queue.sync { events.backendDidDisconnect(p, error: nil) }
+            }
+        }
+        failedConnections(4)
+        #expect(p.transportsCreated == 3)
+        let stalled = ConnectionPhase.paused(OmiEngine.codecStallReason)
+        #expect(engine.snapshotNow().connection == stalled)
+        let connectsWhileStopped = engine.queue.sync { backend.connects.count }
+        clock.advance(10 * 60)
+        Thread.sleep(forTimeInterval: 0.2)
+        #expect(engine.snapshotNow().connection == stalled, "not before the pause is over")
+        clock.advance(6 * 60)
+        Thread.sleep(forTimeInterval: 0.2)
+        #expect(engine.snapshotNow().connection != stalled)
+        #expect(engine.queue.sync { backend.connects.count } > connectsWhileStopped, "a pending connect again")
+        failedConnections(4)
+        #expect(p.transportsCreated == 6, "another run of three, then the stop again")
+        #expect(engine.snapshotNow().connection == stalled)
+        engine.appDidBecomeActive()
+        engine.queue.sync {}
+        #expect(engine.snapshotNow().connection != stalled, "opening the app tries again")
+        failedConnections(1)
+        #expect(p.transportsCreated == 7)
+    }
+
+    /// Nightly 2026-11-12 (phone log, build 49, Nov 11-12): background relaunches show "state restoration with 1
+    /// peripheral(s)" then "bluetooth poweredOn" and nothing else. A restored pendant that isn't connected gets a
+    /// pending connect (now logged), so iOS wakes the app when it comes back in range.
+    @Test func aRestoredPendantThatIsNotConnectedGetsAPendingConnectAfterARelaunch() throws {
+        let x = UUID(uuidString: "0000000A-0000-4000-8000-0000000000C5")!
+        let backend = FakeBackend()
+        let p = FakePeripheral(x, state: .disconnected)
+        backend.known[x] = p
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-restore-\(UUID().uuidString)")
+        var config = EngineConfiguration(dirs: CaptureDirectories(root: root), appVersion: "t", useCoreBluetooth: false, tickInterval: 10)
+        let sink = Locked<CentralBackendEvents?>(nil)
+        config.testCentralBackend = { events in
+            sink.value = events
+            return backend
+        }
+        let engine = OmiEngine(config: config, settings: try makeSettings(remembered: x), uploadTransport: CountingUploadTransport())
+        let events = try #require(sink.value)
+        engine.queue.sync { events.backendWillRestore([p]) }
+        #expect(backend.connects.isEmpty, "nothing before Bluetooth is on")
+        backend.state = .poweredOn
+        engine.queue.sync { events.backendDidUpdateState(.poweredOn) }
+        #expect(engine.queue.sync { backend.connects } == [x])
+        #expect(engine.session == nil)
+    }
 }
