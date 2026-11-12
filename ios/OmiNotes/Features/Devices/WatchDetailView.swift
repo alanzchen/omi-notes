@@ -33,11 +33,11 @@ struct WatchDetailView: View {
             let some = f.lastReceivedAt != nil
             // consistent with the fixture: an idle Watch's waiting audio is still on the Watch, so the iPhone has
             // nothing of it to upload (the last upload followed the last receipt)
-            let idle = ["idle", "set-aside", "future"].contains(name)
+            let idle = ["idle", "set-aside", "unknown-aside", "future"].contains(name)
             return (summary, Flow(report: f.report, receivedTotal: some ? 214 : 0, lastReceivedAt: f.lastReceivedAt, preparing: 0,
                                   waitingUpload: some && !idle ? 3 : 0, othersWaiting: name == "stale" ? 1_960 : 0,
                                   lastUploadedAt: idle ? f.lastReceivedAt?.addingTimeInterval(60) : some ? now.addingTimeInterval(-4 * 60) : nil,
-                                  setAside: name == "set-aside" ? 1 : 0))
+                                  setAside: name == "set-aside" ? 1 : 0, setAsideUnknown: name == "unknown-aside" ? 1 : 0))
         }
         #endif
         let s = model.snapshot
