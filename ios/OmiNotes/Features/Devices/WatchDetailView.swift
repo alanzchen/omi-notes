@@ -27,9 +27,12 @@ struct WatchDetailView: View {
         #if DEBUG
         if let name = UserDefaults.standard.string(forKey: "OmiNotesDebugWatchState"), let f = WatchSummary.debugFixture(name, now: now) {
             let some = f.lastReceivedAt != nil
+            // consistent with the fixture: an idle Watch's waiting audio is still on the Watch, so the iPhone has
+            // nothing of it to upload (the last upload followed the last receipt)
+            let idle = name == "idle"
             return (summary, Flow(report: f.report, receivedTotal: some ? 214 : 0, lastReceivedAt: f.lastReceivedAt, preparing: 0,
-                                  waitingUpload: some ? 3 : 0, othersWaiting: name == "stale" ? 1_960 : 0,
-                                  lastUploadedAt: some ? now.addingTimeInterval(-4 * 60) : nil))
+                                  waitingUpload: some && !idle ? 3 : 0, othersWaiting: name == "stale" ? 1_960 : 0,
+                                  lastUploadedAt: idle ? f.lastReceivedAt?.addingTimeInterval(60) : some ? now.addingTimeInterval(-4 * 60) : nil))
         }
         #endif
         let s = model.snapshot
@@ -70,7 +73,7 @@ struct WatchDetailView: View {
                             }
                             ForEach(Array(performance.sessions.prefix(3).enumerated()), id: \.element.id) { index, session in
                                 if index > 0 { Divider().padding(.leading, 50) }
-                                place("battery.75percent", Self.when(session), Self.battery(session))
+                                place("battery.75percent", Self.when(session, now: context.date), Self.battery(session))
                             }
                         }
                         note("The whole Watch's battery, other apps included. Charging time and gaps are left out.")
@@ -125,14 +128,14 @@ struct WatchDetailView: View {
         }
     }
 
-    static func when(_ s: WatchPerformance.Session) -> String {
+    static func when(_ s: WatchPerformance.Session, now: Date = Date()) -> String {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         guard let start = s.startedAt.flatMap(iso.date(from:)) else { return "A recording" }
         let end = s.lastAt.flatMap(iso.date(from:))
         let day = Calendar.current.isDateInToday(start) ? "Today" : start.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
         let range = "\(start.formatted(date: .omitted, time: .shortened))–\(end?.formatted(date: .omitted, time: .shortened) ?? "?")"
-        return "\(day), \(range)\(s.complete ? "" : " · not finished yet")"
+        return "\(day), \(range)\(WatchSummary.sessionEnd(complete: s.complete, lastAt: end, now: now))"
     }
 
     static func battery(_ s: WatchPerformance.Session) -> String {
@@ -158,7 +161,8 @@ struct WatchDetailView: View {
 
     @ViewBuilder private func places(_ f: Flow, _ now: Date) -> some View {
         place("applewatch", "On the Watch", f.report.map { WatchSummary.onWatchLine($0, lastReceivedAt: f.lastReceivedAt, now: now) }
-              ?? "Unknown until the Watch app reports")
+              ?? "Unknown until the Watch app reports",
+              hint: f.report.flatMap { WatchSummary.onWatchHint($0, lastReceivedAt: f.lastReceivedAt, now: now) })
         Divider().padding(.leading, 50)
         place("iphone", "On this iPhone", {
             guard let at = f.lastReceivedAt else { return "Nothing received yet" }
@@ -186,13 +190,16 @@ struct WatchDetailView: View {
             .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 4).padding(.top, 6)
     }
 
-    private func place(_ symbol: String, _ title: String, _ detail: String) -> some View {
+    private func place(_ symbol: String, _ title: String, _ detail: String, hint: String? = nil) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: symbol).font(.system(size: 13, weight: .semibold)).foregroundStyle(Pendant.iconForeground)
                 .frame(width: 26, height: 26).background(Pendant.iconBackground, in: .rect(cornerRadius: 8))
             VStack(alignment: .leading, spacing: 1) {
                 Text(title).font(.subheadline.weight(.semibold))
                 Text(detail).font(.footnote).foregroundStyle(Pendant.secondary).fixedSize(horizontal: false, vertical: true)
+                if let hint {
+                    Text(hint).font(.caption).foregroundStyle(Pendant.secondary).fixedSize(horizontal: false, vertical: true)
+                }
             }
             Spacer(minLength: 0)
         }

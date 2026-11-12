@@ -15,6 +15,9 @@ public struct WatchSummary: Equatable, Sendable {
     /// A problem shown on the Watch's card (one short line), and what fixes it.
     public var issue: String?
     public var issueFix: SystemHealth.Fix?
+    /// The Devices card's subtitle when it says more than `detail`: audio still on an idle Watch
+    /// ("2 min waiting on the Watch") rather than when it reported (the Watch page's header keeps that).
+    public var cardDetail: String?
 
     /// A report older than this says what the Watch was doing then, not now.
     public static let fresh: TimeInterval = 10 * 60
@@ -45,7 +48,12 @@ public struct WatchSummary: Equatable, Sendable {
                 case .paused:
                     return WatchSummary(configured: true, title: "Paused on the Watch", detail: "Tap Resume on the Watch · \(asOf)", tone: .attention)
                 case .idle:
-                    return WatchSummary(configured: true, title: "Not recording", detail: asOf, tone: .quiet)
+                    var summary = WatchSummary(configured: true, title: "Not recording", detail: asOf, tone: .quiet)
+                    if r.waitingParts > r.recheckParts {
+                        summary.cardDetail = (r.waitingSeconds ?? 0) > 0
+                            ? "\(WaitingAudio.text(r.waitingSeconds!)) waiting on the Watch" : "Audio waiting on the Watch"
+                    }
+                    return summary
                 }
             }
             let was = r.state == .recording ? "recording" : r.state == .paused ? "paused" : "not recording"
@@ -62,27 +70,36 @@ public struct WatchSummary: Equatable, Sendable {
         return WatchSummary(configured: false, title: "Set up Apple Watch", detail: nil, tone: .quiet)
     }
 
-    /// The Watch detail's "On the Watch" line, as of its report: the recorded length waiting (from the
-    /// Watch's own parts, never a count × 60 s), parts kept that can't be sent, and, when waiting audio
-    /// hasn't arrived for a while, what helps (about the sendable audio only). Re-checks are named but
-    /// still unacknowledged; unknown kept parts (older Watch apps) never allow "everything sent".
+    /// The Watch detail's "On the Watch" status, one line, as of its report (the page's header says when): the
+    /// recorded length waiting (from the Watch's own parts, never a count × 60 s) and parts kept that can't be sent.
+    /// Re-checks are named but still unacknowledged; unknown kept parts (older Watch apps) never allow "everything sent".
     public static func onWatchLine(_ r: WatchReport, lastReceivedAt: Date?, now: Date) -> String {
         let kept = r.keptParts ?? 0
         let newParts = max(0, r.waitingParts - r.recheckParts)
         let waiting: String? = r.waitingParts == 0 ? nil
-            : newParts == 0 ? "Re-checking \(r.recheckParts) older part\(r.recheckParts == 1 ? "" : "s") with this iPhone"
-            : (r.waitingSeconds ?? 0) > 0 ? "\(Self.capitalizedFirst(WaitingAudio.text(r.waitingSeconds!))) of audio not on this iPhone yet"
-            : "Some audio not on this iPhone yet"
-        let keptText = kept > 0 ? "\(kept) part\(kept == 1 ? "" : "s") kept on the Watch, can't be sent" : nil
+            : newParts == 0 ? "Re-checking \(r.recheckParts) older part\(r.recheckParts == 1 ? "" : "s")"
+            : (r.waitingSeconds ?? 0) > 0 ? "\(WaitingAudio.text(r.waitingSeconds!)) waiting"
+            : "Some audio waiting"
+        let keptText = kept > 0 ? "\(kept) part\(kept == 1 ? "" : "s") kept, can't be sent" : nil
         let parts = [waiting, keptText].compactMap { $0 }.joined(separator: " · ")
-        let what = !parts.isEmpty ? parts
-            : r.keptParts == nil ? "Nothing waiting; kept parts not reported"
-            : "Everything sent to this iPhone"
-        // waiting, and nothing has arrived for a while: what helps
-        let stuck = r.waitingParts > 0 && (lastReceivedAt.map { now.timeIntervalSince($0) > 15 * 60 } ?? true)
-        let advice = !stuck ? "" : kept > 0 ? ". The waiting audio moves when both are nearby with Omi Notes open."
-            : ". They move when both are nearby with Omi Notes open."
-        return "\(what) · reported \(SystemHealth.relative(r.at, now))" + advice
+        return !parts.isEmpty ? parts : r.keptParts == nil ? "Nothing waiting; kept parts not reported" : "Everything sent to this iPhone"
+    }
+
+    /// The one short line under it when waiting audio hasn't arrived for a while: what helps (about the sendable
+    /// audio only; nothing for kept parts alone).
+    public static func onWatchHint(_ r: WatchReport, lastReceivedAt: Date?, now: Date) -> String? {
+        guard r.waitingParts > 0, lastReceivedAt.map({ now.timeIntervalSince($0) > 15 * 60 }) ?? true else { return nil }
+        return (r.keptParts ?? 0) > 0 ? "The waiting audio moves when both are nearby with Omi Notes open"
+            : "Moves when both are nearby with Omi Notes open"
+    }
+
+    /// After a Watch recording's time range on its page: a recording with no final sample is "not finished yet"
+    /// while it may still be going, and "no final reading" once its last sample is older than 12 hours (a Watch
+    /// app that was closed or ran out of battery never sends one).
+    public static func sessionEnd(complete: Bool, lastAt: Date?, now: Date) -> String {
+        if complete { return "" }
+        guard let lastAt, now.timeIntervalSince(lastAt) <= 12 * 3600 else { return " · no final reading" }
+        return " · not finished yet"
     }
 
     static func capitalizedFirst(_ s: String) -> String { s.prefix(1).uppercased() + s.dropFirst() }
@@ -101,7 +118,7 @@ public struct WatchSummary: Equatable, Sendable {
         case "recording": (report, received, installed) = (WatchReport(state: .recording, since: now.addingTimeInterval(-3 * 3600), waitingParts: 2, waitingSeconds: 95, at: now.addingTimeInterval(-60)), now.addingTimeInterval(-90), true)
         case "paused": (report, received, installed) = (WatchReport(state: .paused, since: now.addingTimeInterval(-3600), waitingParts: 0, at: now.addingTimeInterval(-120)), now.addingTimeInterval(-150), true)
         case "stale": (report, received, installed) = (WatchReport(state: .recording, since: now.addingTimeInterval(-6 * 3600), waitingParts: 5, waitingSeconds: 290, at: now.addingTimeInterval(-2 * 3600)), now.addingTimeInterval(-2 * 3600), true)
-        case "idle": (report, received, installed) = (WatchReport(state: .idle, since: now.addingTimeInterval(-5 * 3600), waitingParts: 3, waitingSeconds: 140, at: now.addingTimeInterval(-90)), now.addingTimeInterval(-4 * 3600), true)
+        case "idle": (report, received, installed) = (WatchReport(state: .idle, since: now.addingTimeInterval(-5 * 3600), waitingParts: 3, waitingSeconds: 140, at: now.addingTimeInterval(-90), stats: ["orphan_parts": 0]), now.addingTimeInterval(-4 * 3600), true)
         case "received": (report, received, installed) = (nil, now.addingTimeInterval(-40 * 60), true)
         case "installed": (report, received, installed) = (nil, nil, true)
         case "none": (report, received, installed) = (nil, nil, false)

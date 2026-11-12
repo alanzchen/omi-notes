@@ -274,7 +274,7 @@ private struct WatchCardView: View {
 
     var body: some View {
         Card {
-            DeviceCardShell(name: "Apple Watch", state: summary.title, stateColor: dot, detail: summary.detail,
+            DeviceCardShell(name: "Apple Watch", state: summary.title, stateColor: dot, detail: summary.cardDetail ?? summary.detail,
                             art: { MiniWatch(recording: summary.tone == .recording) }, action: open)
             if let issue = summary.issue { DeviceIssueRow(title: issue, fix: summary.issueFix, onFix: onFix) }
         }

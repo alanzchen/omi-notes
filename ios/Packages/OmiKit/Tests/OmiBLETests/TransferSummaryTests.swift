@@ -282,14 +282,38 @@ import OmiWatchKit
     @Test func aMixedBacklogNamesBothAndAdvisesOnlyAboutSendableAudio() {
         let mixed = WatchReport(state: .recording, since: now, waitingParts: 3, waitingSeconds: 180, at: now, stats: ["orphan_parts": 2])
         let line = WatchSummary.onWatchLine(mixed, lastReceivedAt: nil, now: now)
-        #expect(line.contains("3 min") && line.contains("2 parts kept"), "\(line)")
-        #expect(!line.contains("They move"), "\(line)")
-        #expect(line.contains("The waiting audio moves when both are nearby"), "\(line)")
+        #expect(line == "3 min waiting · 2 parts kept, can't be sent", "\(line)")
+        #expect(WatchSummary.onWatchHint(mixed, lastReceivedAt: nil, now: now) == "The waiting audio moves when both are nearby with Omi Notes open")
         let keptOnly = WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now, stats: ["orphan_parts": 2])
-        let k = WatchSummary.onWatchLine(keptOnly, lastReceivedAt: nil, now: now)
-        #expect(k.hasPrefix("2 parts kept on the Watch, can't be sent") && !k.contains("moves"), "\(k)")
+        #expect(WatchSummary.onWatchLine(keptOnly, lastReceivedAt: nil, now: now) == "2 parts kept, can't be sent")
+        #expect(WatchSummary.onWatchHint(keptOnly, lastReceivedAt: nil, now: now) == nil)
         let waiting = WatchReport(state: .recording, since: now, waitingParts: 3, waitingSeconds: 180, at: now, stats: ["orphan_parts": 0])
-        #expect(WatchSummary.onWatchLine(waiting, lastReceivedAt: nil, now: now).hasSuffix("They move when both are nearby with Omi Notes open."))
+        #expect(WatchSummary.onWatchHint(waiting, lastReceivedAt: nil, now: now) == "Moves when both are nearby with Omi Notes open")
+        #expect(WatchSummary.onWatchHint(waiting, lastReceivedAt: now.addingTimeInterval(-60), now: now) == nil, "arriving: no advice")
+    }
+
+    /// Nightly 2026-11-12 round 2: the Watch page's "On the Watch" row was three lines ("2 min of audio not on this
+    /// iPhone yet · reported 1 minute ago. They move when …"). One status line, no repeated report time (the header
+    /// has it); the advice is a separate short line. The Devices card of an idle Watch says what is waiting on it.
+    @Test func theWatchRowIsOneStatusLineAndTheCardSaysWhatIsWaiting() {
+        let idle = WatchReport(state: .idle, since: nil, waitingParts: 3, waitingSeconds: 140, at: now.addingTimeInterval(-60), stats: ["orphan_parts": 0])
+        let line = WatchSummary.onWatchLine(idle, lastReceivedAt: now.addingTimeInterval(-4 * 3600), now: now)
+        #expect(line == "2 min waiting" && !line.contains("reported"))
+        let s = WatchSummary.evaluate(installed: true, report: idle, lastReceivedAt: now.addingTimeInterval(-4 * 3600), now: now)
+        #expect(s.cardDetail == "2 min waiting on the Watch" && s.detail?.hasPrefix("reported") == true)
+        let empty = WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now, stats: ["orphan_parts": 0])
+        #expect(WatchSummary.evaluate(installed: true, report: empty, lastReceivedAt: now, now: now).cardDetail == nil)
+        let recording = WatchReport(state: .recording, since: now, waitingParts: 3, waitingSeconds: 140, at: now)
+        #expect(WatchSummary.evaluate(installed: true, report: recording, lastReceivedAt: now, now: now).cardDetail == nil)
+    }
+
+    /// Nightly 2026-11-12 round 2: a Watch recording with no final sample (the app closed, the battery ran out) was
+    /// "not finished yet" for good; after 12 hours without a reading it is "no final reading".
+    @Test func aWatchRecordingWithoutAFinalSampleIsNotUnfinishedForever() {
+        #expect(WatchSummary.sessionEnd(complete: true, lastAt: now.addingTimeInterval(-90 * 86_400), now: now) == "")
+        #expect(WatchSummary.sessionEnd(complete: false, lastAt: now.addingTimeInterval(-3600), now: now) == " · not finished yet")
+        #expect(WatchSummary.sessionEnd(complete: false, lastAt: now.addingTimeInterval(-28 * 86_400), now: now) == " · no final reading")
+        #expect(WatchSummary.sessionEnd(complete: false, lastAt: nil, now: now) == " · no final reading")
     }
 
     // TRANSFERS-50 (Alan, 2026-11-09/10: "uploading 卡片很多余"; "都有进度条了我为什么要知道文件数量"): no
