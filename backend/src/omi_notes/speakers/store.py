@@ -188,9 +188,7 @@ class SpeakerStore:
         """Refresh the `people` cache from People notes and voice folders; True when anything
         that rendering depends on (names, me) changed."""
         found: dict[str, dict] = {}
-        conflicts: set[str] = set()
         people_root = self.vault.root / PEOPLE_DIR
-        signature = self._people_signature_now()  # before reading: a change during the scan is seen next time
         if people_root.exists():
             for path in sorted(people_root.rglob("*.md")):
                 try:
@@ -198,8 +196,6 @@ class SpeakerStore:
                 except (OSError, UnicodeDecodeError):
                     continue
                 pid = front.get("omi_person_id")
-                if isinstance(pid, str) and pid in found:
-                    conflicts.add(pid)  # two notes claim this person: the first (sorted) is used, and imports refuse it
                 if not isinstance(pid, str) or pid in found:
                     continue
                 aliases = front.get("aliases") if isinstance(front.get("aliases"), list) else []
@@ -225,79 +221,7 @@ class SpeakerStore:
         else:
             for p in found.values():
                 self.db.execute("UPDATE people SET attested_at=?, aliases_json=? WHERE id=?", (p["attested_at"], p["aliases_json"], p["id"]))
-        self.db.set_meta("people_conflicts", json.dumps(sorted(conflicts)))
-        self.db.set_meta("people_signature", json.dumps(signature))
         return before != after
-
-    def _people_signature_now(self, dirs: list[str] | None = None) -> dict[str, int]:
-        """Modification times of the People folder's directories (a note added, removed or renamed changes its
-        folder's): all of them during a full scan, the recorded ones on a request. Voice folders aren't in it: one
-        appears with a person's first sample, and a note-less person's own folder is checked by `refresh_person`."""
-        roots = [self.vault.root / PEOPLE_DIR]
-        if dirs is None:
-            dirs = [str(r) for r in roots if r.exists()]
-            people_root = roots[0]
-            if people_root.exists():
-                dirs += [str(d) for d in sorted(people_root.rglob("*")) if d.is_dir()]
-        out = {}
-        for d in dirs:
-            try:
-                out[d] = os.stat(d).st_mtime_ns
-            except OSError:
-                out[d] = -1
-        for r in roots:  # a root that appeared since
-            if str(r) not in out and r.exists():
-                out[str(r)] = os.stat(r).st_mtime_ns
-        return out
-
-    def people_conflicted(self, person_id: str) -> bool:
-        """Two People notes claim this person (as of the last full scan)."""
-        return person_id in json.loads(self.db.meta("people_conflicts") or "[]")
-
-    def refresh_person(self, person_id: str):
-        """`scan_people` for one person, for request paths (whose cost must not grow with the People folder): its
-        indexed People note (its name, `me` flag and id, read again), its consent file and, without a note, its own
-        samples' name. None when that isn't the person any more (the note gone, renamed or moved, or not this id):
-        the caller refuses, and the full reconciliation (People list, writes, the worker's sweep) catches up. When the
-        People folders changed since the last full scan (their modification times), that full scan runs first."""
-        recorded = json.loads(self.db.meta("people_signature") or "null")
-        if recorded is None or self._people_signature_now(list(recorded)) != recorded:
-            # a note was added, removed or renamed since the last full scan (a duplicate of this person, perhaps):
-            # resolve everyone once, as `scan_people` would (ASTRA-20261112-IT3-01). A person whose note, name or
-            # wearer flag changed by that is refused this time (as a changed note always is); two notes claiming it
-            # go to the caller's consent and conflict checks, which refuse it with their reasons
-            before = self.person(person_id)
-            self.scan_people()
-            after = self.person(person_id)
-            if after is not None and self.people_conflicted(person_id):
-                return after
-            if before is None or after is None or any(before[k] != after[k] for k in ("note_path", "name", "me")):
-                return None
-            return after
-        row = self.person(person_id)
-        if row is None:
-            return None
-        name, me, aliases = row["name"], row["me"], row["aliases_json"]
-        if row["note_path"]:
-            path = self.vault.root / row["note_path"]
-            try:
-                front = read_frontmatter(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError):
-                return None
-            if front.get("omi_person_id") != person_id:
-                return None
-            name, me = path.stem, int(front.get("omi_me") is True)
-            listed = front.get("aliases") if isinstance(front.get("aliases"), list) else []
-            aliases = json.dumps([str(a) for a in listed])
-        elif not self.person_dir(person_id).is_dir():
-            return None
-        else:
-            name = self._name_from_samples(self.person_dir(person_id)) or "Unnamed person"
-        attested = (Vault.read_json(self.person_dir(person_id) / "consent.json") or {}).get("attested_at")
-        if (name, me, aliases, attested) != (row["name"], row["me"], row["aliases_json"], row["attested_at"]):
-            self.db.execute("UPDATE people SET name=?, me=?, aliases_json=?, attested_at=? WHERE id=?",
-                            (name, me, aliases, attested, person_id))  # fmt: skip
-        return self.person(person_id)
 
     def _name_from_samples(self, folder: Path) -> str | None:
         names = []
@@ -734,34 +658,13 @@ class SpeakerStore:
         return self.update_sample(person_id, sample_id, {"state": state} | (extra or {}), action=action, by=by,
                                   request_id=request_id, now=now, record={"from": before, "to": state} | (record or {}))  # fmt: skip
 
-    def reconcile(self, person_id: str | None = None) -> None:
+    def reconcile(self) -> None:
         """Before anything uses the samples: unfinished journaled operations finish (`speakers.journal`), and the
-        index catches up with the sample files: everyone's, or with `person_id` only this person's (a request about
-        one person, whose cost must not grow with everyone's samples; an interrupted index write anywhere still
-        reloads everything)."""
+        index catches up with the sample files."""
         from . import journal
 
         journal.reconcile(self)
-        if person_id is None:
-            self.sync_samples()
-        else:
-            self.sync_person_samples(person_id)
-
-    def sync_person_samples(self, person_id: str) -> bool:
-        """`sync_samples` for one person: their sample files against their index rows (call under the speaker lock)."""
-        if self.db.one("SELECT 1 FROM meta WHERE key LIKE 'samples_dirty:%' LIMIT 1") is not None:
-            return self.sync_samples()  # an interrupted write somewhere: the full reload, as before
-        folder = self.person_dir(person_id) / "samples"
-        files = {p.stem: p for p in folder.glob("*.json")} if folder.exists() else {}
-        indexed = {r["id"] for r in self.db.query("SELECT id FROM samples WHERE person_id=?", (person_id,))}
-        if set(files) == indexed:
-            return False
-        self.db.execute("DELETE FROM samples WHERE person_id=?", (person_id,))
-        for path in sorted(files.values()):
-            data = Vault.read_json(path)
-            if data and data.get("vector_b64"):
-                self._index_sample(data)
-        return True
+        self.sync_samples()
 
     def samples_changed(self, now: float | None = None) -> None:
         """People's voice evidence changed (a sample, a state, consent): recalibrate (debounced, `calibration`)."""

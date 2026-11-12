@@ -139,8 +139,6 @@ class Importer:
             raise ApiError(422, "person_name_mismatch", f"person_name must be this person's name ({person['name']})")
         if not authorized(consent):
             raise ApiError(409, "consent_required", "this person's voice can't be kept without the acknowledgment and their attestation")
-        if self.store.people_conflicted(person_id):
-            raise ApiError(409, "person_conflict", "two People notes claim this person; keep one of them, then try again")
         embedder = self.pipeline.providers.embedder
         if embedder is None:
             raise ApiError(409, "no_speaker_model", "the speaker model isn't installed (`omi-notes fetch-models --speakers`)")
@@ -148,15 +146,12 @@ class Importer:
         return self._enroll(person_id, consent, source, pcm, day, embedder, whole)
 
     def _consent(self, person_id: str) -> tuple | None:
-        """What the import was allowed by (None: the person is gone or no longer this note): rechecked before anything
-        is written. Only this person's note and consent are read again (ASTRA-20261112-IT1-01: a full People scan here
-        made every upload's cost grow with the People folder)."""
-        person = self.store.refresh_person(person_id)
+        """What the import was allowed by (None: the person is gone): rechecked before anything is written."""
+        self.store.scan_people()
+        person = self.store.person(person_id)
         if person is None:
             return None
-        # the name too: a rename while the import is judged is a different confirmation than the one made
-        return (bool(person["me"]), person["attested_at"], self.store.settings()["acknowledged_at"], self.store.forget_count(person_id),
-                person["name"])
+        return (bool(person["me"]), person["attested_at"], self.store.settings()["acknowledged_at"], self.store.forget_count(person_id))
 
     def _range(self, fields: dict, total: float | None) -> tuple[float, float]:
         try:
@@ -230,7 +225,7 @@ class Importer:
         sha, start, end = source["sha256"], source["start"], source["end"]
         iid = import_id(person_id, sha, start, end)
         with self.store.lock:
-            self.store.reconcile(person_id)  # an interrupted import finishes before it is answered
+            self.store.reconcile()  # an interrupted import finishes before it is answered
             journal.blocking(self.store, {person_id})  # never answered over one recovery couldn't finish
             done = self._answer(person_id, iid)
             if done is not None:
@@ -257,7 +252,7 @@ class Importer:
         vector, enroll_pcm = verdict.pop("vector"), verdict.pop("enroll_pcm")
         now = time.time()
         with self.store.lock:
-            self.store.reconcile(person_id)
+            self.store.reconcile()
             journal.blocking(self.store, {person_id})
             done = self._answer(person_id, iid)
             if done is not None:
@@ -269,8 +264,6 @@ class Importer:
                 raise ApiError(404, "not_found", "the person's voice was forgotten while the import was judged")
             if current != consent or not authorized(current):
                 raise ApiError(409, "consent_required", "the person's consent changed while the import was judged; try again")
-            if self.store.people_conflicted(person_id):
-                raise ApiError(409, "person_conflict", "two People notes claim this person; keep one of them, then try again")
             if {e["import_id"] for e in self._imports(person_id, sha) if e["start"] < end and e["end"] > start} != {
                     e["import_id"] for e in overlapping}:  # fmt: skip
                 raise ApiError(409, "import_conflict", "another import of this audio finished meanwhile; try again")
@@ -294,7 +287,6 @@ class Importer:
             atomic_write_bytes(self.store.person_dir(person_id) / "enrollment" / f"{iid}.omiaudio", enroll.flac_bytes(enroll_pcm))
             journal.run(self.store, {"kind": "merge", "person": person_id, "import_id": iid, "request_id": request,
                                      "sample": sample, "replaced": replaced, "result": result})  # fmt: skip
-            # the worker re-runs the assignment (it relabels whenever this is set): never here, where it would read
-            # every People note and conversation before answering (ASTRA-20261112-IT3-02)
             self.db.set_meta("relabel_pending", "1")
+        self.service._relabel()
         return 201, self._answer(person_id, iid)
