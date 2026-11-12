@@ -68,6 +68,8 @@ def decode(payload: bytes, expected_samples: int | None, *, max_samples: int | N
             raise AacUnavailable(f"AAC decode took longer than {TIMEOUT_S:.0f} s") from exc
         except OSError as exc:  # ffmpeg vanished or couldn't start
             raise AacUnavailable(f"ffmpeg couldn't run: {exc}") from exc
+        if run.returncode < 0:  # killed by a signal (out of memory, the system stopping it): nothing learned about the audio
+            raise AacUnavailable(f"ffmpeg was stopped (signal {-run.returncode})")
         if run.returncode != 0:
             raise AacError(f"AAC decode failed: {run.stderr.decode(errors='replace').strip()[:300]}")
         if len(run.stdout) > limit:
@@ -90,10 +92,16 @@ def resample(payload: bytes, suffix: str, max_samples: int) -> np.ndarray:
     exe = ffmpeg()
     if exe is None:
         raise AacUnavailable("ffmpeg is not installed: this server can only read 16 kHz WAV uploads")
-    fd, path = tempfile.mkstemp(suffix=suffix)
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(payload)
+        fd, path = tempfile.mkstemp(suffix=suffix)
+    except OSError as exc:
+        raise AacUnavailable(f"no room to decode the upload: {exc}") from exc
+    try:
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(payload)
+        except OSError as exc:
+            raise AacUnavailable(f"no room to decode the upload: {exc}") from exc
         try:
             run = subprocess.run([exe, "-nostdin", "-v", "error", "-i", path, "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE), "pipe:1"],
                                  capture_output=True, timeout=TIMEOUT_S * 4, check=False)  # fmt: skip
@@ -101,6 +109,8 @@ def resample(payload: bytes, suffix: str, max_samples: int) -> np.ndarray:
             raise AacUnavailable("decoding the upload took too long") from exc
         except OSError as exc:
             raise AacUnavailable(f"ffmpeg couldn't run: {exc}") from exc
+        if run.returncode < 0:
+            raise AacUnavailable(f"ffmpeg was stopped (signal {-run.returncode})")
         if run.returncode != 0:
             raise AacError(f"decode failed: {run.stderr.decode(errors='replace').strip()[:300]}")
         if len(run.stdout) > (max_samples + 2 * SAMPLE_RATE) * 2:

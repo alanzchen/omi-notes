@@ -1010,3 +1010,32 @@ def test_an_enrollment_import_refuses_a_person_whose_note_changed_outside_the_ap
     r = client.post(f"/v1/people/{me}/enrollments/import", data={"confirm_person": "true", "person_name": "Alan B"},
                     files=files, headers=AUTH)  # fmt: skip
     assert r.status_code == 201, r.text
+
+
+@pytest.mark.parametrize("fault", ["killed", "no_room"])
+def test_an_enrollment_upload_the_decoder_cant_handle_now_is_503(env, monkeypatch, fault):
+    # ASTRA-20261112-IT1-02: ffmpeg stopped by a signal was 422 undecodable_audio, and the WAV resampler's temp-file
+    # error a 500; neither says anything about the file. A 44.1 kHz WAV goes through the resampler.
+    import subprocess
+    import tempfile
+
+    from omi_notes.audio import aac
+
+    settings, client, worker = env
+    me = new_person(client, "Alan", me=True)
+    if fault == "killed":
+        monkeypatch.setattr(aac.subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess("ffmpeg", -9, b"", b""))
+    else:
+        def full(*a, **kw):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(tempfile, "mkstemp", full)
+    import io
+
+    import soundfile as sf
+
+    buf = io.BytesIO()
+    sf.write(buf, np.zeros(44_100 * 5, np.int16), 44_100, format="WAV", subtype="PCM_16")
+    r = client.post(f"/v1/people/{me}/enrollments/import", data={"confirm_person": "true", "person_name": "Alan"},
+                    files={"file": ("reading.wav", buf.getvalue(), "audio/wav")}, headers=AUTH)  # fmt: skip
+    assert r.status_code == 503 and r.json()["error"] == "decoder_unavailable", r.text

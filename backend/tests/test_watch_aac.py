@@ -635,7 +635,7 @@ def test_two_first_writers_through_the_route_keep_the_original_and_one_alternate
     if alts: assert {kept, alts[0].read_bytes()} == {a, b}
 
 
-@pytest.mark.parametrize("fault", ["timeout", "no_ffmpeg", "cannot_start"])
+@pytest.mark.parametrize("fault", ["timeout", "no_ffmpeg", "cannot_start", "killed"])
 def test_a_new_aac_part_the_decoder_cant_check_now_is_503_then_stored(client, worker, monkeypatch, fault):
     # ASTRA-20261111-IT4-01: a decoder timeout or a missing ffmpeg answered 422 invalid_audio, which the phone
     # quarantines: valid audio stranded. Nothing was learned about the audio, so it is a 503 (the phone keeps the
@@ -654,6 +654,11 @@ def test_a_new_aac_part_the_decoder_cant_check_now_is_503_then_stored(client, wo
         monkeypatch.setattr(aac_module.subprocess, "run", slow)
     elif fault == "no_ffmpeg":
         monkeypatch.setattr(aac_module, "ffmpeg", lambda: None)
+    elif fault == "killed":  # ASTRA-20261112-IT1-02: ffmpeg stopped by a signal (e.g. SIGKILL under memory pressure)
+        def killed(*a, **kw):
+            return subprocess.CompletedProcess(a[0] if a else "ffmpeg", -9, b"", b"")
+
+        monkeypatch.setattr(aac_module.subprocess, "run", killed)
     else:
         def missing(*a, **kw):
             raise FileNotFoundError(2, "No such file or directory", "ffmpeg")
