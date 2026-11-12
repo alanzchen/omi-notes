@@ -1096,7 +1096,11 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         let r = pendingDisconnectReason ?? reason
         pendingDisconnectReason = nil
         if let updater = firmwareUpdater, updater.session === s { updater.linkDropped() }
-        if s.phase == .streaming, !s.transport.isSimulated { settings.pendantLastConnectedAt = config.clock.wallNow() }
+        // only for the remembered pendant: a late disconnect of a pendant replaced by pairing another (which has never
+        // connected) must not give that one a "last connected" time (ASTRA-20261112-IT1-03)
+        if s.phase == .streaming, !s.transport.isSimulated, s.transport.identifier == settings.rememberedDeviceId {
+            settings.pendantLastConnectedAt = config.clock.wallNow()
+        }
         session = nil
         withBackgroundTask("seal") { s.end(reason: r) }
         refreshOutboxStats()

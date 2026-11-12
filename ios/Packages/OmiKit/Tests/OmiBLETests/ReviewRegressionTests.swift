@@ -508,4 +508,39 @@ final class MismatchCounter: @unchecked Sendable {
         engine.queue.sync {}
         #expect(engine.snapshotNow().pendantLastConnectedAt == nil)
     }
+
+    /// ASTRA-20261112-IT1-03: pendant A streaming, pendant B paired (never connected), A's disconnect arrives late:
+    /// B showed "last connected just now". Only the remembered pendant's own connection sets the time.
+    @Test func aReplacedPendantsLateDisconnectGivesTheNewOneNoLastConnectedTime() throws {
+        let a = UUID(uuidString: "0000000A-0000-4000-8000-0000000000C7")!
+        let b = UUID(uuidString: "0000000A-0000-4000-8000-0000000000C8")!
+        let backend = FakeBackend()
+        let pa = FakePeripheral(a, state: .connected)
+        pa.configure = {
+            $0.values = FakeDeviceTransport.cv1Values()
+            $0.cachedCharacteristics = Set(OmiCharacteristic.allCases)
+            $0.alreadyNotifying = [.audioData]
+        }
+        backend.known[a] = pa
+        backend.known[b] = FakePeripheral(b, state: .disconnected)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-swap-\(UUID().uuidString)")
+        var config = EngineConfiguration(dirs: CaptureDirectories(root: root), clock: TestClock(), appVersion: "t", useCoreBluetooth: false, tickInterval: 10)
+        let sink = Locked<CentralBackendEvents?>(nil)
+        config.testCentralBackend = { events in
+            sink.value = events
+            backend.state = .poweredOn
+            return backend
+        }
+        let settings = try makeSettings(remembered: a)
+        let engine = OmiEngine(config: config, settings: settings, uploadTransport: CountingUploadTransport())
+        let events = try #require(sink.value)
+        engine.queue.sync { events.backendDidUpdateState(.poweredOn) }
+        engine.queue.sync { events.backendDidConnect(pa) }
+        #expect(engine.snapshotNow().connection == .streaming)
+        engine.pair(id: b, name: "Omi B")
+        engine.queue.sync {}
+        engine.queue.sync { events.backendDidDisconnect(pa, error: nil) }
+        #expect(engine.snapshotNow().rememberedDeviceId == b.uuidString || settings.rememberedDeviceId == b)
+        #expect(engine.snapshotNow().pendantLastConnectedAt == nil && settings.pendantLastConnectedAt == nil)
+    }
 }
