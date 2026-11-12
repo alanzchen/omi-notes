@@ -201,7 +201,8 @@ public struct PendantSummary: Equatable, Sendable {
 
     /// What the button does, as set on this phone.
     static func gesturesRow(_ s: EngineSnapshot) -> Row? {
-        guard s.rememberedDeviceId != nil else { return nil }
+        // taps reach the phone only over a live link: no hint while the pendant is away
+        guard s.rememberedDeviceId != nil, s.connection == .streaming else { return nil }
         guard s.buttonActionsEnabled else { return Row(kind: .gestures, title: "Button actions are off", detail: "Taps on the pendant are ignored") }
         let double: String
         switch s.doubleTapAction {

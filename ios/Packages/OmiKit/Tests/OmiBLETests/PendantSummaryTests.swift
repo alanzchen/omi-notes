@@ -201,6 +201,16 @@ import Testing
         #expect(summary(away, reachable, nil).stateLine == "Not connected · may still record on its own")
     }
 
+    /// Nightly 2026-11-12 round 2: "Tap once to bookmark" showed while the pendant was away, when taps can't reach
+    /// the phone. The gesture hint is shown only while connected.
+    @Test func theGestureHintShowsOnlyWhileConnected() {
+        #expect(PendantSummary.gesturesRow(streaming())?.title == "Tap once to bookmark")
+        var away = streaming()
+        away.connection = .waitingForDevice
+        #expect(PendantSummary.gesturesRow(away) == nil)
+        #expect(!summary(away, reachable, nil).rows.contains { $0.kind == .gestures })
+    }
+
     @Test func pendantStorageIsOnlyClaimedFromThisSessionsSync() {
         var s = streaming()
         #expect(summary(s, reachable, nil).storage == nil)  // never synced: say nothing
