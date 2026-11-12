@@ -734,13 +734,34 @@ class SpeakerStore:
         return self.update_sample(person_id, sample_id, {"state": state} | (extra or {}), action=action, by=by,
                                   request_id=request_id, now=now, record={"from": before, "to": state} | (record or {}))  # fmt: skip
 
-    def reconcile(self) -> None:
+    def reconcile(self, person_id: str | None = None) -> None:
         """Before anything uses the samples: unfinished journaled operations finish (`speakers.journal`), and the
-        index catches up with the sample files."""
+        index catches up with the sample files: everyone's, or with `person_id` only this person's (a request about
+        one person, whose cost must not grow with everyone's samples; an interrupted index write anywhere still
+        reloads everything)."""
         from . import journal
 
         journal.reconcile(self)
-        self.sync_samples()
+        if person_id is None:
+            self.sync_samples()
+        else:
+            self.sync_person_samples(person_id)
+
+    def sync_person_samples(self, person_id: str) -> bool:
+        """`sync_samples` for one person: their sample files against their index rows (call under the speaker lock)."""
+        if self.db.one("SELECT 1 FROM meta WHERE key LIKE 'samples_dirty:%' LIMIT 1") is not None:
+            return self.sync_samples()  # an interrupted write somewhere: the full reload, as before
+        folder = self.person_dir(person_id) / "samples"
+        files = {p.stem: p for p in folder.glob("*.json")} if folder.exists() else {}
+        indexed = {r["id"] for r in self.db.query("SELECT id FROM samples WHERE person_id=?", (person_id,))}
+        if set(files) == indexed:
+            return False
+        self.db.execute("DELETE FROM samples WHERE person_id=?", (person_id,))
+        for path in sorted(files.values()):
+            data = Vault.read_json(path)
+            if data and data.get("vector_b64"):
+                self._index_sample(data)
+        return True
 
     def samples_changed(self, now: float | None = None) -> None:
         """People's voice evidence changed (a sample, a state, consent): recalibrate (debounced, `calibration`)."""

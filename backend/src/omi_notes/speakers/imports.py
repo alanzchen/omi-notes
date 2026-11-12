@@ -230,7 +230,7 @@ class Importer:
         sha, start, end = source["sha256"], source["start"], source["end"]
         iid = import_id(person_id, sha, start, end)
         with self.store.lock:
-            self.store.reconcile()  # an interrupted import finishes before it is answered
+            self.store.reconcile(person_id)  # an interrupted import finishes before it is answered
             journal.blocking(self.store, {person_id})  # never answered over one recovery couldn't finish
             done = self._answer(person_id, iid)
             if done is not None:
@@ -257,7 +257,7 @@ class Importer:
         vector, enroll_pcm = verdict.pop("vector"), verdict.pop("enroll_pcm")
         now = time.time()
         with self.store.lock:
-            self.store.reconcile()
+            self.store.reconcile(person_id)
             journal.blocking(self.store, {person_id})
             done = self._answer(person_id, iid)
             if done is not None:
@@ -294,6 +294,7 @@ class Importer:
             atomic_write_bytes(self.store.person_dir(person_id) / "enrollment" / f"{iid}.omiaudio", enroll.flac_bytes(enroll_pcm))
             journal.run(self.store, {"kind": "merge", "person": person_id, "import_id": iid, "request_id": request,
                                      "sample": sample, "replaced": replaced, "result": result})  # fmt: skip
+            # the worker re-runs the assignment (it relabels whenever this is set): never here, where it would read
+            # every People note and conversation before answering (ASTRA-20261112-IT3-02)
             self.db.set_meta("relabel_pending", "1")
-        self.service._relabel()
         return 201, self._answer(person_id, iid)

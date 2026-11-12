@@ -1099,3 +1099,36 @@ def test_a_rename_while_the_import_is_judged_is_refused(env, monkeypatch):
     r = _import(client, pid, "Alan")
     assert done and r.status_code in (404, 409), r.text
     assert not list(store.person_dir(pid).glob("samples/*.json"))
+
+
+@pytest.mark.parametrize("population", [1, 100])
+def test_a_successful_import_and_its_replay_cost_the_same_with_more_people(env, monkeypatch, population):
+    # ASTRA-20261112-IT3-02: a successful import parsed every People note (the relabel it ran before answering) and a
+    # replay enumerated every sample file (reconcile → sync_samples). Both are about this person only now; the
+    # worker relabels afterwards.
+    from omi_notes.speakers import store as store_module
+
+    settings, client, worker = env
+    store = worker.pipeline.speakers
+    me = new_person(client, "Alan", me=True)
+    for n in range(population - 1):
+        new_person(client, f"Someone {n}", attest_knows=True)
+    client.put("/v1/speakers/settings", json={"acknowledged_at": "2026-11-01T10:00:00Z"}, headers=AUTH)
+    for n in range(population - 1):  # other people's sample files
+        folder = store.person_dir(store.db.query("SELECT id FROM people WHERE me=0")[n]["id"]) / "samples"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{n:04d}-unrelated.json").write_text("{}")
+    store.scan_people()
+    reads, globs = [], []
+    real_read = store_module.read_frontmatter
+    monkeypatch.setattr(store_module, "read_frontmatter", lambda t: reads.append(1) or real_read(t))
+    real_samples = store.sync_samples
+    monkeypatch.setattr(store, "sync_samples", lambda: globs.append(1) or real_samples())
+    first = _import(client, me, "Alan")
+    assert first.status_code == 201, first.text
+    again = _import(client, me, "Alan")
+    assert again.status_code == 200 and again.json()["import_id"] == first.json()["import_id"]
+    assert len(reads) == 3 and globs == [], (len(reads), len(globs))  # this person's note per consent check: import, pre-commit, replay
+    assert worker.db.meta("relabel_pending") == "1", "the relabel is left to the worker"
+    worker.pipeline.relabel(T0 + 10)
+    assert worker.db.meta("relabel_pending") is None
