@@ -22,6 +22,7 @@ struct WatchDetailView: View {
         var lastUploadedAt: Date?
         /// Watch audio this iPhone set aside (couldn't upload), and whether its outbox could be read at all.
         var setAside = 0
+        var setAsideUnknown = 0
         var inventoryReadable = true
     }
 
@@ -43,7 +44,7 @@ struct WatchDetailView: View {
         return (summary, Flow(report: report, receivedTotal: s.watchReceived, lastReceivedAt: s.watchLastReceivedAt, preparing: s.watchPending,
                               waitingUpload: s.watchWaitingUpload, othersWaiting: max(0, s.outbox.pendingChunks - s.watchWaitingUpload),
                               lastUploadedAt: s.watchLastUploadedAt, setAside: s.outbox.quarantineWatchCount,
-                              inventoryReadable: s.outbox.inventoryReadable))
+                              setAsideUnknown: s.outbox.quarantineSourceUnknownCount, inventoryReadable: s.outbox.inventoryReadable))
     }
 
     var body: some View {
@@ -186,7 +187,7 @@ struct WatchDetailView: View {
         place("arrow.up", "Upload to your server",
               WatchSummary.uploadLine(waiting: f.waitingUpload, othersWaiting: f.othersWaiting, setAside: f.setAside,
                                       inventoryReadable: f.inventoryReadable, lastUploadedAt: f.lastUploadedAt,
-                                      received: f.receivedTotal, now: now))
+                                      received: f.receivedTotal, now: now, setAsideUnknown: f.setAsideUnknown))
     }
 
     private func heading(_ text: String) -> some View {

@@ -117,14 +117,15 @@ public struct WatchSummary: Equatable, Sendable {
     /// The Watch page's "Upload to your server" line: the iPhone → server hop only. Watch audio this iPhone set aside
     /// (couldn't upload) is named, and an unreadable outbox is unknown, never "Nothing waiting" (ASTRA-20261112-IT2-01).
     public static func uploadLine(waiting: Int, othersWaiting: Int, setAside: Int, inventoryReadable: Bool,
-                                  lastUploadedAt: Date?, received: Int, now: Date) -> String {
+                                  lastUploadedAt: Date?, received: Int, now: Date, setAsideUnknown: Int = 0) -> String {
         let aside = setAside > 0 ? "\(setAside) part\(setAside == 1 ? "" : "s") set aside" : nil
         if waiting > 0 {
             let line = othersWaiting > 50 ? "Watch audio waiting, in turn after other recordings on this iPhone" : "Watch audio waiting to upload"
             return [line, aside].compactMap { $0 }.joined(separator: " · ")
         }
         if let aside { return aside }
-        if !inventoryReadable { return "Unknown right now" }
+        // a kept-aside file whose source can't be read may be the Watch's: not "Nothing waiting" (ASTRA-20261112-IT4-01)
+        if !inventoryReadable || setAsideUnknown > 0 { return "Unknown right now" }
         if let at = lastUploadedAt { return "Nothing waiting · last uploaded \(SystemHealth.relative(at, now))" }
         return received > 0 ? "Nothing waiting" : "Nothing to upload yet"
     }

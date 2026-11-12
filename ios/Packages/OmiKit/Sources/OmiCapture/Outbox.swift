@@ -94,6 +94,9 @@ public struct OutboxStats: Sendable, Equatable {
     /// Of those, the Apple Watch's (chunks and seals with source `watch_mic`): the Devices screen shows
     /// each problem on the device it concerns.
     public var quarantineWatchCount = 0
+    /// Kept-aside files whose source couldn't be read (an unreadable file or header): maybe the Watch's, never
+    /// counted as known non-Watch.
+    public var quarantineSourceUnknownCount = 0
     /// The waiting and kept-aside folders could be listed (false: counts are unknown, not zero).
     public var inventoryReadable = true
     public init() {}
@@ -382,23 +385,31 @@ public final class Outbox: @unchecked Sendable {
             s.sentBytes += item.size
         }
         s.quarantineCount = quarantineList?.count ?? 0
-        s.quarantineWatchCount = (quarantineList ?? []).filter { isFromWatch($0.name) }.count
+        let sources = (quarantineList ?? []).map { quarantineSource($0.name) }
+        s.quarantineWatchCount = sources.filter { $0 == true }.count
+        s.quarantineSourceUnknownCount = sources.filter { $0 == nil }.count
         s.inventoryReadable = pendingList != nil && quarantineList != nil  // the inventory these counts came from
         return s
     }
 
-    private func isFromWatch(_ name: String) -> Bool {
+    /// Whether a kept-aside file is the Watch's: true/false once its source is read (cached), nil while it can't be
+    /// (an unreadable file or header: asked again next time, never taken as "not the Watch's"). Only read, never
+    /// moved or rewritten. Events carry no recording source: not the Watch's audio.
+    private func quarantineSource(_ name: String) -> Bool? {
         if let known = lock.withLock({ quarantineFromWatch[name] }) { return known }
         struct Source: Decodable { var source: CaptureSource }
-        let data = try? Data(contentsOf: dirs.outboxQuarantine.appendingPathComponent(name))
+        let kind = OutboxKind.parse(name)
+        if case .event = kind { return false }
+        guard let data = try? Data(contentsOf: dirs.outboxQuarantine.appendingPathComponent(name)) else { return nil }
         let source: CaptureSource?
-        switch OutboxKind.parse(name) {
-        case .chunk: source = data.flatMap { try? Envelope.parse($0).header.source }
-        case .seal: source = data.flatMap { try? JSONDecoder().decode(Source.self, from: $0).source }
+        switch kind {
+        case .chunk: source = try? Envelope.parse(data).header.source
+        case .seal: source = try? JSONDecoder().decode(Source.self, from: data).source
         case .event, nil: source = nil
         }
+        guard let source else { return nil }
         let watch = source == .watchMic
-        if data != nil { lock.withLock { quarantineFromWatch[name] = watch } }  // unreadable: asked again next time
+        lock.withLock { quarantineFromWatch[name] = watch }
         return watch
     }
 

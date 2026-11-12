@@ -349,6 +349,8 @@ import OmiWatchKit
         #expect(line(aside: 1) == "1 part set aside")
         #expect(line(waiting: 2, aside: 2) == "Watch audio waiting to upload · 2 parts set aside")
         #expect(line(readable: false) == "Unknown right now")
+        #expect(WatchSummary.uploadLine(waiting: 0, othersWaiting: 0, setAside: 0, inventoryReadable: true, lastUploadedAt: nil,
+                                        received: 10, now: now, setAsideUnknown: 1) == "Unknown right now", "a kept file of unknown source")
         #expect(line().hasPrefix("Nothing waiting · last uploaded"))
     }
 

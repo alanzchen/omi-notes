@@ -50,6 +50,31 @@ import OmiProtocol
         #expect(s.quarantineCount == 4 && s.quarantineWatchCount == 2, "the Watch's chunk and seal; the pendant's chunk and an event aren't")
     }
 
+    /// ASTRA-20261112-IT4-01: a kept-aside file whose header couldn't be read counted (and stayed cached) as not the
+    /// Watch's, so the Watch page said "Nothing waiting". Its source is unknown until it can be read; the file is only
+    /// read, never moved or rewritten.
+    @Test func aKeptAsideFileWhoseSourceCantBeReadIsUnknownNotNonWatch() throws {
+        let t = TestEnv()
+        let item = try t.outbox.write(Data(repeating: 0xEE, count: 40), kind: .chunk(captureId: "unknown-rec", sequence: 0))
+        try t.outbox.quarantine(item.name, reason: "409: x")
+        let kept = t.dirs.outboxQuarantine.appendingPathComponent(item.name)
+        let bytes = try Data(contentsOf: kept)
+        let first = t.outbox.stats()
+        #expect(first.quarantineCount == 1 && first.quarantineWatchCount == 0 && first.quarantineSourceUnknownCount == 1)
+        #expect(t.outbox.stats().quarantineSourceUnknownCount == 1, "not cached as known non-Watch")
+        #expect(try Data(contentsOf: kept) == bytes, "only read")
+        // once it reads as the Watch's (a repaired header), it counts as the Watch's: the failure was never cached
+        let payload = Data(repeating: 0, count: 64)
+        let h = EnvelopeHeader(
+            captureId: "unknown-rec", chunkSequence: 0, deviceId: "dev", deviceName: nil, modelNumber: nil, firmwareRevision: nil,
+            hardwareRevision: nil, source: .watchMic, payloadFormat: .pcm16leV1, codecId: 0,
+            captureStartedAt: "2026-11-08T19:32:05.123Z", chunkStartOffsetUs: 0, chunkEndOffsetUs: 2000, clockQuality: .unknown,
+            timezone: nil, recordCount: 32, payloadBytes: payload.count, offlineStorage: nil, ring: nil, appVersion: nil)
+        try Envelope.build(header: h, payload: payload).write(to: kept)
+        let later = t.outbox.stats()
+        #expect(later.quarantineWatchCount == 1 && later.quarantineSourceUnknownCount == 0)
+    }
+
     @Test func theReasonIsKeptInTheLedger() throws {
         let t = TestEnv()
         let name = try quarantined(t, seq: 3, reason: "409: x")
