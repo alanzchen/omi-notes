@@ -20,6 +20,9 @@ struct WatchDetailView: View {
         var waitingUpload = 0
         var othersWaiting = 0
         var lastUploadedAt: Date?
+        /// Watch audio this iPhone set aside (couldn't upload), and whether its outbox could be read at all.
+        var setAside = 0
+        var inventoryReadable = true
     }
 
     private func current(_ now: Date) -> (WatchSummary, Flow) {
@@ -29,16 +32,18 @@ struct WatchDetailView: View {
             let some = f.lastReceivedAt != nil
             // consistent with the fixture: an idle Watch's waiting audio is still on the Watch, so the iPhone has
             // nothing of it to upload (the last upload followed the last receipt)
-            let idle = name == "idle"
+            let idle = ["idle", "set-aside", "future"].contains(name)
             return (summary, Flow(report: f.report, receivedTotal: some ? 214 : 0, lastReceivedAt: f.lastReceivedAt, preparing: 0,
                                   waitingUpload: some && !idle ? 3 : 0, othersWaiting: name == "stale" ? 1_960 : 0,
-                                  lastUploadedAt: idle ? f.lastReceivedAt?.addingTimeInterval(60) : some ? now.addingTimeInterval(-4 * 60) : nil))
+                                  lastUploadedAt: idle ? f.lastReceivedAt?.addingTimeInterval(60) : some ? now.addingTimeInterval(-4 * 60) : nil,
+                                  setAside: name == "set-aside" ? 1 : 0))
         }
         #endif
         let s = model.snapshot
         return (summary, Flow(report: report, receivedTotal: s.watchReceived, lastReceivedAt: s.watchLastReceivedAt, preparing: s.watchPending,
                               waitingUpload: s.watchWaitingUpload, othersWaiting: max(0, s.outbox.pendingChunks - s.watchWaitingUpload),
-                              lastUploadedAt: s.watchLastUploadedAt))
+                              lastUploadedAt: s.watchLastUploadedAt, setAside: s.outbox.quarantineWatchCount,
+                              inventoryReadable: s.outbox.inventoryReadable))
     }
 
     var body: some View {
@@ -73,7 +78,7 @@ struct WatchDetailView: View {
                             }
                             ForEach(Array(performance.sessions.prefix(3).enumerated()), id: \.element.id) { index, session in
                                 if index > 0 { Divider().padding(.leading, 50) }
-                                place("battery.75percent", Self.when(session), Self.battery(session, now: context.date))
+                                place("battery.75percent", Self.when(session), Self.battery(session, report: flow.report, now: context.date))
                             }
                         }
                         note("The whole Watch's battery, other apps included. Charging time and gaps are left out.")
@@ -139,15 +144,14 @@ struct WatchDetailView: View {
     }
 
     /// The secondary line: how it ended when that's not known ("not finished yet", "no final reading"), then battery.
-    static func battery(_ s: WatchPerformance.Session, now: Date = Date()) -> String {
+    static func battery(_ s: WatchPerformance.Session, report: WatchReport? = nil, now: Date = Date()) -> String {
         let span = Duration.seconds(s.measuredS).formatted(.units(allowed: [.hours, .minutes], width: .abbreviated))
         var parts: [String] = []
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let end = WatchSummary.sessionEnd(complete: s.complete, lastAt: s.lastAt.flatMap(iso.date(from:)), now: now)
-        if !end.isEmpty {  // " · no final reading" → "No final reading"
-            let text = end.dropFirst(3)
-            parts.append(text.prefix(1).uppercased() + text.dropFirst())
+        if let end = WatchSummary.sessionEnd(complete: s.complete, startedAt: s.startedAt.flatMap(iso.date(from:)),
+                                              lastAt: s.lastAt.flatMap(iso.date(from:)), report: report, now: now) {
+            parts.append(end)
         }
         if let a = s.batteryStart, let b = s.batteryEnd { parts.append("\(Int((a * 100).rounded()))% → \(Int((b * 100).rounded()))%") }
         switch (s.rateQuality, s.ratePerHour) {
@@ -179,13 +183,10 @@ struct WatchDetailView: View {
             return s
         }())
         Divider().padding(.leading, 50)
-        place("arrow.up", "Upload to your server", {
-            if f.waitingUpload > 0 {
-                return f.othersWaiting > 50 ? "Watch audio waiting, in turn after other recordings on this iPhone" : "Watch audio waiting to upload"
-            }
-            if let at = f.lastUploadedAt { return "Nothing waiting · last uploaded \(SystemHealth.relative(at, now))" }
-            return f.receivedTotal > 0 ? "Nothing waiting" : "Nothing to upload yet"
-        }())
+        place("arrow.up", "Upload to your server",
+              WatchSummary.uploadLine(waiting: f.waitingUpload, othersWaiting: f.othersWaiting, setAside: f.setAside,
+                                      inventoryReadable: f.inventoryReadable, lastUploadedAt: f.lastUploadedAt,
+                                      received: f.receivedTotal, now: now))
     }
 
     private func heading(_ text: String) -> some View {

@@ -49,7 +49,8 @@ public struct WatchSummary: Equatable, Sendable {
                     return WatchSummary(configured: true, title: "Paused on the Watch", detail: "Tap Resume on the Watch · \(asOf)", tone: .attention)
                 case .idle:
                     var summary = WatchSummary(configured: true, title: "Not recording", detail: asOf, tone: .quiet)
-                    if r.waitingParts > r.recheckParts {
+                    // only from a report as of now: a future-dated one keeps "reported in …" (ASTRA-20261112-IT2-02)
+                    if Self.isCurrent(r, now: now), r.waitingParts > r.recheckParts {
                         summary.cardDetail = (r.waitingSeconds ?? 0) > 0
                             ? "\(WaitingAudio.text(r.waitingSeconds!)) waiting on the Watch" : "Audio waiting on the Watch"
                     }
@@ -93,13 +94,39 @@ public struct WatchSummary: Equatable, Sendable {
             : "Moves when both are nearby with Omi Notes open"
     }
 
-    /// After a Watch recording's time range on its page: a recording with no final sample is "not finished yet"
-    /// while it may still be going, and "no final reading" once its last sample is older than 12 hours (a Watch
-    /// app that was closed or ran out of battery never sends one).
-    public static func sessionEnd(complete: Bool, lastAt: Date?, now: Date) -> String {
-        if complete { return "" }
-        guard let lastAt, now.timeIntervalSince(lastAt) <= 12 * 3600 else { return " · no final reading" }
-        return " · not finished yet"
+    /// A report that is about now: not older than `fresh` and not from the future (a Watch clock ahead of the iPhone).
+    public static func isCurrent(_ r: WatchReport, now: Date) -> Bool {
+        let age = now.timeIntervalSince(r.at)
+        return age >= 0 && age <= fresh
+    }
+
+    /// How a Watch recording on its page ended, when the server's samples don't say: nil for one that finished, or the
+    /// one a current report says is still recording (ASTRA-20261112-IT2-03: an old battery sample is not an ending);
+    /// otherwise what the samples show, without inferring that it stopped: "Not finished yet" up to 12 h after the last
+    /// reading, then "Last reading 13 hours ago"; "No end reading" / "Reading time unclear" without a usable time.
+    public static func sessionEnd(complete: Bool, startedAt: Date?, lastAt: Date?, report: WatchReport?, now: Date) -> String? {
+        if complete { return nil }
+        if let r = report, r.state == .recording, isCurrent(r, now: now), let since = r.since, let startedAt,
+           abs(since.timeIntervalSince(startedAt)) <= 120 { return nil }
+        guard let lastAt else { return "No end reading" }
+        let age = now.timeIntervalSince(lastAt)
+        if age < 0 { return "Reading time unclear" }
+        return age <= 12 * 3600 ? "Not finished yet" : "Last reading \(SystemHealth.relative(lastAt, now))"
+    }
+
+    /// The Watch page's "Upload to your server" line: the iPhone → server hop only. Watch audio this iPhone set aside
+    /// (couldn't upload) is named, and an unreadable outbox is unknown, never "Nothing waiting" (ASTRA-20261112-IT2-01).
+    public static func uploadLine(waiting: Int, othersWaiting: Int, setAside: Int, inventoryReadable: Bool,
+                                  lastUploadedAt: Date?, received: Int, now: Date) -> String {
+        let aside = setAside > 0 ? "\(setAside) part\(setAside == 1 ? "" : "s") set aside" : nil
+        if waiting > 0 {
+            let line = othersWaiting > 50 ? "Watch audio waiting, in turn after other recordings on this iPhone" : "Watch audio waiting to upload"
+            return [line, aside].compactMap { $0 }.joined(separator: " · ")
+        }
+        if let aside { return aside }
+        if !inventoryReadable { return "Unknown right now" }
+        if let at = lastUploadedAt { return "Nothing waiting · last uploaded \(SystemHealth.relative(at, now))" }
+        return received > 0 ? "Nothing waiting" : "Nothing to upload yet"
     }
 
     static func capitalizedFirst(_ s: String) -> String { s.prefix(1).uppercased() + s.dropFirst() }
@@ -111,7 +138,7 @@ public struct WatchSummary: Equatable, Sendable {
     }
 
     #if DEBUG
-    /// Simulator screenshots only: `-OmiNotesDebugWatchState recording|paused|stale|idle|received|installed|none`.
+    /// Simulator screenshots only: `-OmiNotesDebugWatchState recording|paused|stale|idle|set-aside|future|received|installed|none`.
     public static func debugFixture(_ name: String, now: Date = Date()) -> (summary: WatchSummary, report: WatchReport?, lastReceivedAt: Date?)? {
         let report: WatchReport?, received: Date?, installed: Bool
         switch name {
@@ -119,12 +146,15 @@ public struct WatchSummary: Equatable, Sendable {
         case "paused": (report, received, installed) = (WatchReport(state: .paused, since: now.addingTimeInterval(-3600), waitingParts: 0, at: now.addingTimeInterval(-120)), now.addingTimeInterval(-150), true)
         case "stale": (report, received, installed) = (WatchReport(state: .recording, since: now.addingTimeInterval(-6 * 3600), waitingParts: 5, waitingSeconds: 290, at: now.addingTimeInterval(-2 * 3600)), now.addingTimeInterval(-2 * 3600), true)
         case "idle": (report, received, installed) = (WatchReport(state: .idle, since: now.addingTimeInterval(-5 * 3600), waitingParts: 3, waitingSeconds: 140, at: now.addingTimeInterval(-90), stats: ["orphan_parts": 0]), now.addingTimeInterval(-4 * 3600), true)
+        case "set-aside": (report, received, installed) = (WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now.addingTimeInterval(-90), stats: ["orphan_parts": 0]), now.addingTimeInterval(-4 * 3600), true)
+        case "future": (report, received, installed) = (WatchReport(state: .idle, since: nil, waitingParts: 3, waitingSeconds: 140, at: now.addingTimeInterval(3600), stats: ["orphan_parts": 0]), now.addingTimeInterval(-4 * 3600), true)
         case "received": (report, received, installed) = (nil, now.addingTimeInterval(-40 * 60), true)
         case "installed": (report, received, installed) = (nil, nil, true)
         case "none": (report, received, installed) = (nil, nil, false)
         default: return nil
         }
-        return (evaluate(installed: installed, report: report, lastReceivedAt: received, now: now), report, received)
+        return (evaluate(installed: installed, report: report, lastReceivedAt: received, now: now, quarantined: name == "set-aside" ? 1 : 0),
+                report, received)
     }
     #endif
 }

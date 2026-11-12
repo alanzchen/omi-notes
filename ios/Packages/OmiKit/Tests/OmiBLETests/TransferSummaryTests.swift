@@ -307,13 +307,49 @@ import OmiWatchKit
         #expect(WatchSummary.evaluate(installed: true, report: recording, lastReceivedAt: now, now: now).cardDetail == nil)
     }
 
-    /// Nightly 2026-11-12 round 2: a Watch recording with no final sample (the app closed, the battery ran out) was
-    /// "not finished yet" for good; after 12 hours without a reading it is "no final reading".
-    @Test func aWatchRecordingWithoutAFinalSampleIsNotUnfinishedForever() {
-        #expect(WatchSummary.sessionEnd(complete: true, lastAt: now.addingTimeInterval(-90 * 86_400), now: now) == "")
-        #expect(WatchSummary.sessionEnd(complete: false, lastAt: now.addingTimeInterval(-3600), now: now) == " · not finished yet")
-        #expect(WatchSummary.sessionEnd(complete: false, lastAt: now.addingTimeInterval(-28 * 86_400), now: now) == " · no final reading")
-        #expect(WatchSummary.sessionEnd(complete: false, lastAt: nil, now: now) == " · no final reading")
+    /// Nightly 2026-11-12 round 2 / ASTRA-20261112-IT2-03: a recording with no final sample was "not finished yet"
+    /// for good, and then (90e5c2e) "no final reading" after 12 h even while a current report said the same recording
+    /// was still going. Sample age never says a recording ended.
+    @Test func aWatchRecordingsEndIsNeverInferredFromAnOldSample() {
+        let started = now.addingTimeInterval(-14 * 3600)
+        func end(_ complete: Bool, _ last: Date?, _ r: WatchReport? = nil) -> String? {
+            WatchSummary.sessionEnd(complete: complete, startedAt: started, lastAt: last, report: r, now: now)
+        }
+        #expect(end(true, now.addingTimeInterval(-90 * 86_400)) == nil)
+        #expect(end(false, now.addingTimeInterval(-3600)) == "Not finished yet")
+        #expect(end(false, now.addingTimeInterval(-12 * 3600)) == "Not finished yet", "exactly 12 h")
+        #expect(end(false, now.addingTimeInterval(-13 * 3600))?.hasPrefix("Last reading 13 hours ago") == true)
+        #expect(end(false, now.addingTimeInterval(3600)) == "Reading time unclear", "a future sample")
+        #expect(end(false, nil) == "No end reading")
+        let recording = WatchReport(state: .recording, since: started.addingTimeInterval(30), waitingParts: 0, at: now.addingTimeInterval(-60))
+        #expect(end(false, now.addingTimeInterval(-13 * 3600), recording) == nil, "the current report says it is still recording")
+        let other = WatchReport(state: .recording, since: now.addingTimeInterval(-600), waitingParts: 0, at: now.addingTimeInterval(-60))
+        #expect(end(false, now.addingTimeInterval(-13 * 3600), other)?.hasPrefix("Last reading") == true, "another recording")
+        let future = WatchReport(state: .recording, since: started, waitingParts: 0, at: now.addingTimeInterval(3600))
+        #expect(end(false, now.addingTimeInterval(-13 * 3600), future)?.hasPrefix("Last reading") == true, "not a current report")
+    }
+
+    /// ASTRA-20261112-IT2-02: a future-dated report (Watch clock ahead) made the card say "2 min waiting on the Watch"
+    /// as current, dropping "reported in 1 hour". Only a report as of now gives that subtitle.
+    @Test func aFutureReportGivesNoCurrentWaitingSubtitle() {
+        let ahead = WatchReport(state: .idle, since: nil, waitingParts: 3, waitingSeconds: 140, at: now.addingTimeInterval(3600))
+        let s = WatchSummary.evaluate(installed: true, report: ahead, lastReceivedAt: nil, now: now)
+        #expect(s.cardDetail == nil && (s.cardDetail ?? s.detail ?? "").contains("in 1 hour"), "\(String(describing: s.detail))")
+        #expect(!WatchSummary.isCurrent(ahead, now: now))
+        #expect(WatchSummary.isCurrent(WatchReport(state: .idle, since: nil, waitingParts: 0, at: now.addingTimeInterval(-600)), now: now))
+    }
+
+    /// ASTRA-20261112-IT2-01: "Upload to your server" said "Nothing waiting" while this iPhone held a Watch part it set
+    /// aside; an unreadable outbox is unknown. Only a readable, empty outbox is "Nothing waiting".
+    @Test func theWatchUploadLineNamesSetAsideAudioAndAnUnknownOutbox() {
+        func line(waiting: Int = 0, aside: Int = 0, readable: Bool = true) -> String {
+            WatchSummary.uploadLine(waiting: waiting, othersWaiting: 0, setAside: aside, inventoryReadable: readable,
+                                    lastUploadedAt: now.addingTimeInterval(-3600), received: 10, now: now)
+        }
+        #expect(line(aside: 1) == "1 part set aside")
+        #expect(line(waiting: 2, aside: 2) == "Watch audio waiting to upload · 2 parts set aside")
+        #expect(line(readable: false) == "Unknown right now")
+        #expect(line().hasPrefix("Nothing waiting · last uploaded"))
     }
 
     // TRANSFERS-50 (Alan, 2026-11-09/10: "uploading 卡片很多余"; "都有进度条了我为什么要知道文件数量"): no
