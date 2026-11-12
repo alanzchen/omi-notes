@@ -972,3 +972,41 @@ def test_the_evidence_key_covers_every_conversation_the_queue_can_list(env):
     before = store.evidence_key(emb.model, emb.model_sha)
     worker.db.execute("UPDATE conversations SET speakers_revision = speakers_revision + 1 WHERE id=?", (rows[0]["id"],))
     assert store.evidence_key(emb.model, emb.model_sha) != before
+
+
+@pytest.mark.parametrize("population", [1, 100])
+def test_an_enrollment_upload_reads_only_its_own_person(env, monkeypatch, population):
+    # ASTRA-20261112-IT1-01: every import scanned all People notes under the speaker lock before decoding, so its cost
+    # grew with the People folder (1 / 25 / 100 notes read). It reads only its own person's note now.
+    from omi_notes.audio import aac
+    from omi_notes.speakers import store as store_module
+
+    settings, client, worker = env
+    me = new_person(client, "Alan", me=True)
+    for n in range(population - 1):
+        new_person(client, f"Someone {n}")
+    reads = []
+    real = store_module.read_frontmatter
+    monkeypatch.setattr(store_module, "read_frontmatter", lambda text: reads.append(1) or real(text))
+    monkeypatch.setattr(aac, "ffmpeg", lambda: None)  # the import then ends 503 at the decode: its cost before that counts
+    r = client.post(f"/v1/people/{me}/enrollments/import", data={"confirm_person": "true", "person_name": "Alan"},
+                    files={"file": ("reading.m4a", b"not really aac", "audio/mp4")}, headers=AUTH)  # fmt: skip
+    assert r.status_code == 503 and r.json()["error"] == "decoder_unavailable", r.text
+    assert len(reads) == 1, f"{len(reads)} People notes read with {population} people"
+
+
+def test_an_enrollment_import_refuses_a_person_whose_note_changed_outside_the_app(env, monkeypatch):
+    # the per-person refresh fails closed: a renamed (or removed) People note is not this person until the full
+    # reconciliation (People list, the worker's sweep) has seen it; the consent check stays as strict
+    settings, client, worker = env
+    me = new_person(client, "Alan", me=True)
+    files = {"file": ("reading.wav", wav_bytes(monologue()), "audio/wav")}
+    note = Vault.open(settings).root / worker.db.one("SELECT note_path FROM people WHERE id=?", (me,))["note_path"]
+    note.rename(note.with_name("Alan B.md"))
+    r = client.post(f"/v1/people/{me}/enrollments/import", data={"confirm_person": "true", "person_name": "Alan"},
+                    files=files, headers=AUTH)  # fmt: skip
+    assert r.status_code == 404, r.text
+    assert client.get("/v1/people", headers=AUTH).status_code == 200  # the full scan learns the new name
+    r = client.post(f"/v1/people/{me}/enrollments/import", data={"confirm_person": "true", "person_name": "Alan B"},
+                    files=files, headers=AUTH)  # fmt: skip
+    assert r.status_code == 201, r.text

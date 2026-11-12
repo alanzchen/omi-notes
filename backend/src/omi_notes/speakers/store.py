@@ -223,6 +223,36 @@ class SpeakerStore:
                 self.db.execute("UPDATE people SET attested_at=?, aliases_json=? WHERE id=?", (p["attested_at"], p["aliases_json"], p["id"]))
         return before != after
 
+    def refresh_person(self, person_id: str):
+        """`scan_people` for one person, for request paths (whose cost must not grow with the People folder): its
+        indexed People note (its name, `me` flag and id, read again), its consent file and, without a note, its own
+        samples' name. None when that isn't the person any more (the note gone, renamed or moved, or not this id):
+        the caller refuses, and the full reconciliation (People list, writes, the worker's sweep) catches up."""
+        row = self.person(person_id)
+        if row is None:
+            return None
+        name, me, aliases = row["name"], row["me"], row["aliases_json"]
+        if row["note_path"]:
+            path = self.vault.root / row["note_path"]
+            try:
+                front = read_frontmatter(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError):
+                return None
+            if front.get("omi_person_id") != person_id:
+                return None
+            name, me = path.stem, int(front.get("omi_me") is True)
+            listed = front.get("aliases") if isinstance(front.get("aliases"), list) else []
+            aliases = json.dumps([str(a) for a in listed])
+        elif not self.person_dir(person_id).is_dir():
+            return None
+        else:
+            name = self._name_from_samples(self.person_dir(person_id)) or "Unnamed person"
+        attested = (Vault.read_json(self.person_dir(person_id) / "consent.json") or {}).get("attested_at")
+        if (name, me, aliases, attested) != (row["name"], row["me"], row["aliases_json"], row["attested_at"]):
+            self.db.execute("UPDATE people SET name=?, me=?, aliases_json=?, attested_at=? WHERE id=?",
+                            (name, me, aliases, attested, person_id))  # fmt: skip
+        return self.person(person_id)
+
     def _name_from_samples(self, folder: Path) -> str | None:
         names = []
         for path in sorted((folder / "samples").glob("*.json")) if (folder / "samples").exists() else []:

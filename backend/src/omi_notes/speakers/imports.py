@@ -146,9 +146,10 @@ class Importer:
         return self._enroll(person_id, consent, source, pcm, day, embedder, whole)
 
     def _consent(self, person_id: str) -> tuple | None:
-        """What the import was allowed by (None: the person is gone): rechecked before anything is written."""
-        self.store.scan_people()
-        person = self.store.person(person_id)
+        """What the import was allowed by (None: the person is gone or no longer this note): rechecked before anything
+        is written. Only this person's note and consent are read again (ASTRA-20261112-IT1-01: a full People scan here
+        made every upload's cost grow with the People folder)."""
+        person = self.store.refresh_person(person_id)
         if person is None:
             return None
         return (bool(person["me"]), person["attested_at"], self.store.settings()["acknowledged_at"], self.store.forget_count(person_id))
