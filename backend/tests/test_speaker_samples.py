@@ -622,12 +622,16 @@ def test_a_label_review_item_names_or_rules_out_through_the_naming_path(env):
     assert decide(client, item["id"], "reject", "lab-2").json()["error"] == "stale_review"
 
 
-def test_a_review_item_without_raw_audio_keeps_its_caption_and_is_not_playable(env):
+def test_a_sample_without_raw_audio_is_not_asked_about_but_stays_listed(env):
+    # TestFlight 2026-11-12 (build 53): "我都无法试听我怎么选？" — the queue never asks about audio the server can't cut;
+    # the sample is still listed for its person (caption, not playable) and its clip is still 410
     settings, client, worker = env
     me, rows, ids = me_with_samples(client, worker, days=(6,))
     worker.db.execute("UPDATE chunks SET raw_deleted=1")  # an older vault's audio, deleted before raw was kept for good
-    (item,) = [i for i in review(client) if i.get("sample_id") == ids[0]]
-    assert item["playable"] is False and "clip" not in item and item["text"]
+    assert not [i for i in review(client) if i.get("sample_id") == ids[0]]
+    listed = client.get(f"/v1/people/{me}/samples", headers=AUTH).json()["samples"]
+    (view,) = [v for v in listed if v["id"] == ids[0]]
+    assert view["playable"] is False and "clip" not in view and view["text"] and view["state"] == "active"
     assert client.get(f"/v1/clips/sample.{ids[0]}.0", headers=AUTH).status_code == 410
 
 
@@ -1001,3 +1005,67 @@ def test_an_enrollment_upload_the_decoder_cant_handle_now_is_503(env, monkeypatc
     r = client.post(f"/v1/people/{me}/enrollments/import", data={"confirm_person": "true", "person_name": "Alan"},
                     files={"file": ("reading.wav", buf.getvalue(), "audio/wav")}, headers=AUTH)  # fmt: skip
     assert r.status_code == 503 and r.json()["error"] == "decoder_unavailable", r.text
+
+
+def _no_audio(worker, row):
+    # this conversation's raw audio deleted (as before 2026-11-08, when raw wasn't kept for good)
+    current = worker.db.one("SELECT blocks_json, device_id FROM conversations WHERE id=?", (row["id"],))
+    blocks = json.loads(current["blocks_json"])
+    lo, hi = min(b[0] for b in blocks), max(b[1] for b in blocks)
+    worker.db.execute("UPDATE chunks SET raw_deleted=1 WHERE device_id=? AND audio_start <= ? AND audio_end >= ?",
+                      (current["device_id"], hi + 1, lo - 1))  # fmt: skip
+
+
+def test_a_flagged_sample_nobody_can_listen_to_is_set_aside_and_can_be_restored(env):
+    # TestFlight 2026-11-12 (build 53): 348 of 353 sample items in Alan's queue couldn't be played; "这些以后就舍弃吧".
+    # A flagged one is set aside (soft, kept, out of the model and the queue), restorable; its label is untouched.
+    settings, client, worker = env
+    store = worker.pipeline.speakers
+    me, rows, ids = me_with_samples(client, worker)
+    flag_one(worker, me, ids[0])
+    label_before = store.labels(rows[0]["id"])["S1"]
+    _no_audio(worker, rows[0])
+    service = client.app.state.speakers
+    service.warm()
+    data = sample_file(settings, me, ids[0])
+    assert data.get("state") == "removed" and data["set_aside"] == "no_audio" and data["vector_b64"]
+    assert data["history"][-1]["action"] == "set_aside" and data["history"][-1]["by"] == "system"
+    assert not [i for i in review(client) if i.get("sample_id") == ids[0]]
+    assert store.labels(rows[0]["id"])["S1"]["person_id"] == label_before["person_id"] == me, "the owner's name stays"
+    assert sample_file(settings, me, ids[1]).get("state", "active") == "active", "playable samples are untouched"
+    r = client.post(f"/v1/samples/{ids[0]}/restore", json={"request_id": "back-1"}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    store.update_settings(auto_assign=store.settings()["auto_assign"])  # any later change: warm runs again
+    service.warm()
+    assert sample_file(settings, me, ids[0]).get("state", "active") == "active", "the owner restored it: never set aside again"
+
+
+def test_an_unflagged_sample_or_a_suggestion_without_audio_is_left_out_of_the_queue(env):
+    settings, client, worker = env
+    store = worker.pipeline.speakers
+    me, rows, ids = me_with_samples(client, worker)
+    fresh = talk(client, worker, dialogue(ALAN, PRIYA, seed=40), day=1)
+    assert store.labels(fresh["id"])["S1"]["source"] == "auto"
+    assert any(i["kind"] == "label" for i in review(client, limit=50))
+    _no_audio(worker, rows[0])
+    _no_audio(worker, fresh)  # the suggestion's audio gone
+    store.update_settings(auto_assign=store.settings()["auto_assign"])
+    items = review(client, limit=50)
+    assert not [i for i in items if i["kind"] == "label" and i["conversation"]["id"] == fresh["id"]]
+    assert not [i for i in items if i.get("sample_id") == ids[0]]
+    assert sample_file(settings, me, ids[0]).get("state", "active") == "active", "not flagged: only left out, not set aside"
+    assert all(i["playable"] for i in items)
+    assert store.labels(fresh["id"])["S1"]["source"] == "auto", "the suggestion itself is unchanged"
+
+
+def test_a_review_page_does_no_playability_work_once_the_queue_is_built(env, monkeypatch):
+    # request cost: playability is decided when the queue is built (the worker warms it); a page slices it
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker)
+    service = client.app.state.speakers
+    service.warm()
+    calls = []
+    real = type(service.review).playable
+    monkeypatch.setattr(type(service.review), "playable", lambda self, *a, **k: calls.append(1) or real(self, *a, **k))
+    assert review(client, limit=2)
+    assert calls == []

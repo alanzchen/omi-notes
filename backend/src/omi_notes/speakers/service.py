@@ -53,6 +53,7 @@ class SpeakerService:
         self.db = pipeline.db
         self.vault = pipeline.vault
         self.review = Review(self)
+        self._set_aside_key = None
 
     # -- people ----------------------------------------------------------------------------------
 
@@ -105,7 +106,12 @@ class SpeakerService:
     def warm(self) -> None:
         """Rebuild what changed since the last request (the review queue's order and, through it, the voice
         space) so requests only slice cached results; a no-op when nothing changed. Called by the worker."""
-        if self.pipeline.providers.embedder is not None:
+        embedder = self.pipeline.providers.embedder
+        if embedder is not None:
+            key = self.store.evidence_key(embedder.model, embedder.model_sha)
+            if key != self._set_aside_key:  # flagged samples nobody can listen to leave the queue (once per change)
+                self.review.set_aside_unplayable()
+                self._set_aside_key = self.store.evidence_key(embedder.model, embedder.model_sha)
             self.review.entries()
 
     def review_items(self, limit: int, offset: int = 0) -> dict:

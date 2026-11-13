@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import threading
 import time
 import uuid
@@ -31,9 +32,13 @@ import soundfile as sf
 
 from ..ingest import ApiError
 from ..util import UUID_RE, iso_utc_epoch
+from ..vault import Vault
 from . import f0 as sample_f0
 from . import journal
 from .store import ACTIVE, MOVED, REMOVED, consent_ok, flag_open, sample_eligible
+from .voices import cosine_distance, decode_vector
+
+log = logging.getLogger(__name__)
 
 RECENT_CONVERSATIONS = 60  # how far back label items reach (newest conversations)
 MAX_CLIP_SECONDS = 10.0
@@ -66,11 +71,12 @@ class Review:
 
     # -- views -----------------------------------------------------------------------------------
 
-    def _audio(self, data: dict) -> tuple[list, object] | None:
-        """(clip bounds, conversation row) when the sample's audio can be cut from raw audio now."""
+    def _audio(self, data: dict, voices: dict | None = None) -> tuple[list, object] | None:
+        """(clip bounds, conversation row) when the sample's audio can be cut from raw audio now. `voices` caches
+        each conversation's voices files across a queue build (one read per conversation, not per sample)."""
         conv_id = data.get("conversation_id")
         row = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,)) if conv_id else None
-        found = sample_f0.sample_spans(self.store, data) if row is not None else None
+        found = (self._spans(data, voices) if voices is not None else sample_f0.sample_spans(self.store, data)) if row is not None else None
         if row is None or found is None or not self.store.raw_available(row):
             return None
         spans, voices_file = found
@@ -78,6 +84,57 @@ class Review:
         if expected and (row["audio_sha"] or "")[:16] != expected:
             return None  # the bounds belong to another assembly of the audio
         return spans, row
+
+    def _spans(self, data: dict, voices: dict) -> tuple[list, str | None] | None:
+        """`f0.sample_spans` with the conversation's voices files read once per build."""
+        if data.get("clips") or not data.get("conversation_id") or not data.get("vector_b64"):
+            return sample_f0.sample_spans(self.store, data)
+        conv_id = data["conversation_id"]
+        if conv_id not in voices:
+            entries = []
+            for path in sorted(self.store.conv_dir(conv_id).glob("voices-*.json")):
+                for entry in ((Vault.read_json(path) or {}).get("labels") or {}).values():
+                    if entry.get("vector_b64") and entry.get("clips"):
+                        entries.append((decode_vector(entry["vector_b64"]), entry["clips"], path.name))
+            voices[conv_id] = entries
+        vector = decode_vector(data["vector_b64"])
+        for v, clips, name in voices[conv_id]:
+            if cosine_distance(v, vector) < 1e-6:
+                return [[float(a), float(b)] for a, b in clips], name
+        return None
+
+    def playable(self, data: dict, voices: dict | None = None) -> bool:
+        """The server can play this sample: its clip can be cut from raw audio now, or it is an enrollment with
+        its audio kept."""
+        return self._audio(data, voices) is not None or self._enrollment_audio(data) is not None
+
+    def set_aside_unplayable(self, now: float | None = None) -> int:
+        """Flagged samples whose audio can't be played any more (no clip bounds in the current voices files, or
+        raw audio gone) are set aside: soft-removed (state `removed`, action `set_aside`, reason `no_audio`),
+        kept with their vector and record, out of the voice model and the review queue, and restorable from the
+        person's sample list like any removed sample. One the owner restored is never set aside again; labels
+        aren't touched, so names the owner gave stay. Called by the worker; how many were set aside."""
+        n = 0
+        voices: dict = {}
+        with self.store.lock:
+            for r in self.db.query("SELECT * FROM samples ORDER BY created_at DESC, id"):
+                if not sample_eligible(r):
+                    continue
+                data = self.store.read_sample(r["person_id"], r["id"])
+                if data is None or not flag_open(data.get("flag")):
+                    continue
+                if any(h.get("action") == "restore" for h in data.get("history") or []):
+                    continue
+                if self.playable(data, voices):
+                    continue
+                rev = int(data.get("revision") or 0)
+                self.store.set_sample_state(r["person_id"], r["id"], REMOVED, action="set_aside", by="system",
+                                            request_id=f"set_aside:{r['id']}:{rev}", now=now,
+                                            extra={"set_aside": "no_audio"}, record={"reason": "no_audio"})  # fmt: skip
+                n += 1
+        if n:
+            log.info("set aside %d flagged voice sample(s) whose audio can't be played", n)
+        return n
 
     def _enrollment_audio(self, data: dict):
         if data.get("source") != "enrollment" or not data.get("enrollment_id"):
@@ -195,12 +252,16 @@ class Review:
         return built
 
     def _entries(self, now: float) -> list[tuple]:
+        """Only items the owner can listen to: a sample or a label whose clip the server can't cut never asks to be
+        judged (the worker sets flagged ones aside, `set_aside_unplayable`; a suggested name without audio is
+        dropped, the voice stays unnamed)."""
         flagged, rest = [], []
+        voices: dict = {}
         for r in self.db.query("SELECT * FROM samples ORDER BY created_at DESC, id"):
             if not sample_eligible(r):
                 continue
             data = self.store.read_sample(r["person_id"], r["id"])
-            if data is None:
+            if data is None or not self.playable(data, voices):
                 continue
             if flag_open(data.get("flag")):
                 flagged.append((-len(data["flag"].get("reasons") or []), -(data.get("created_at") or 0), data))
@@ -236,13 +297,31 @@ class Review:
                 if space is None and embedder is not None:
                     space = self.pipeline.voice_space(embedder) or False
                 hints = self._hint_people(row, space) if space else {}
+            heard = None  # labels of this conversation with a clip the server can cut (computed when needed)
             for label in sorted(set(states) | set(hints)):
                 state = states.get(label) or {}
                 if state.get("source") == "auto" and state.get("person_id") in people:
-                    keys.append((row, label, state["person_id"], ["auto"]))
+                    key = (row, label, state["person_id"], ["auto"])
                 elif label in hints and hints[label] in people and not state.get("person_id"):
-                    keys.append((row, label, hints[label], ["possible"]))
+                    key = (row, label, hints[label], ["possible"])
+                else:
+                    continue
+                if heard is None:
+                    heard = self._playable_labels(row)
+                if label in heard:
+                    keys.append(key)
         return keys
+
+    def _playable_labels(self, row) -> set[str]:
+        """The labels of a conversation whose clip `_label_item` could cut (its transcript, clip bounds, raw audio)."""
+        if not self.store.raw_available(row):
+            return set()
+        try:
+            transcript = self.service._transcript(row["id"])
+        except ApiError:
+            return set()
+        return {label for label, spans in self.service._clips(row["id"], transcript).items()
+                if self.service._clip_list(row["id"], transcript, label, spans)}  # fmt: skip
 
     def _hint_people(self, row, space=None) -> dict:
         """label → the person a "possibly X" hint names (the rule of `possible_voice_names`)."""
