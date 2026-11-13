@@ -68,6 +68,8 @@ class Review:
         self.pipeline = service.pipeline
         self._cache: tuple | None = None  # (evidence_key, entries): the worker's last build
         self._snapshot: dict | None = None  # what requests read: {"entries", "evidence"} (None before the first build)
+        self._reopened: list[tuple[int, dict]] = []  # (sequence, sample) reopened since the last publication
+        self._reopen_seq = 0
         self._cache_lock = threading.Lock()
 
     # -- views -----------------------------------------------------------------------------------
@@ -303,8 +305,9 @@ class Review:
             snapshot = self._snapshot
             if snapshot is None:
                 return
-            kept = [e for e in snapshot["entries"] if not (e[0] == "sample" and e[1].get("sample_id") == sample_id)]
-            self._snapshot = snapshot | {"entries": [("sample", data)] + kept}
+            self._reopen_seq += 1
+            self._reopened.append((self._reopen_seq, data))  # a build already running re-applies it (`entries`)
+            self._snapshot = snapshot | {"entries": _front(snapshot["entries"], [data])}
 
     def _label_still_open(self, value) -> tuple | None:
         """A label entry as it is now (its conversation's row and labels), or None when it was decided since the queue
@@ -329,6 +332,7 @@ class Review:
         key = self.store.evidence_key(embedder.model, embedder.model_sha) if embedder else None
         with self._cache_lock:
             cached = self._cache
+            seen = self._reopen_seq  # reopens up to here are in the sample files this build reads
         if cached is not None and key is not None and cached[0] == key:
             return cached[1]
         built = self._entries(now)
@@ -336,7 +340,9 @@ class Review:
         if key is not None and self.store.evidence_key(embedder.model, embedder.model_sha) == key:  # unchanged meanwhile
             with self._cache_lock:
                 self._cache = (key, built)
-                self._snapshot = {"entries": list(built), "evidence": evidence}
+                # an undo or restore that landed while this build ran stays at the front (ASTRA-20261113-IT3-01)
+                self._reopened = [(n, d) for n, d in self._reopened if n > seen]
+                self._snapshot = {"entries": _front(built, [d for _, d in self._reopened]), "evidence": evidence}
         return built
 
     def _entries(self, now: float) -> list[tuple]:
@@ -742,6 +748,8 @@ class Review:
                 return why
             journal.run(self.store, {"kind": "unmove", "request_id": undo_id, "undo_of": key, "from": a, "to": b, "pairs": pairs,
                                      "label": {"conversation_id": conv_id, "label": label}, "label_before": rec.get("before") or {}})  # fmt: skip
+            for src, _ in pairs:
+                self.reopen_sample(a, src)
             return ""
         rejected = rec["rejected"]
         x = rejected["person_id"]
@@ -757,6 +765,8 @@ class Review:
             return why
         journal.run(self.store, {"kind": "unreject", "request_id": undo_id, "undo_of": key, "person": x, "samples": rejected["samples"],
                                  "label": {"conversation_id": conv_id, "label": label}, "label_before": rec.get("before") or {}})  # fmt: skip
+        for sid in rejected["samples"]:  # back in the queue now, like a sample undo (ASTRA-20261113-IT3-01)
+            self.reopen_sample(x, sid)
         return ""
 
     # -- clips -----------------------------------------------------------------------------------
@@ -829,6 +839,18 @@ def status_line(model, active_samples: int, auto_assign: bool) -> str:
     if active_samples and "leave-one-out" in (model.why_inactive if model else ""):
         return "停用：样本不一致"
     return "需要更多样本"
+
+
+def _front(entries: list[tuple], samples: list[dict]) -> list[tuple]:
+    """`entries` with these samples first (the last reopened at the very front), each listed once."""
+    ids = {d["sample_id"] for d in samples}
+    kept = [e for e in entries if not (e[0] == "sample" and e[1].get("sample_id") in ids)]
+    firsts, seen = [], set()
+    for d in reversed(samples):
+        if d["sample_id"] not in seen:
+            seen.add(d["sample_id"])
+            firsts.append(("sample", d))
+    return firsts + kept
 
 
 def _later(history: list[dict], index: int) -> bool:

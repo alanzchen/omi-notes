@@ -1220,3 +1220,73 @@ def test_an_undo_or_restore_is_asked_again_after_the_worker_rebuilt_the_queue(en
     assert r.status_code == 200, r.text
     assert [i["sample_id"] for i in review(client, warm=False)] == [ids[0]], "back without waiting for the worker"
     assert [i["sample_id"] for i in review(client)] == [ids[0]]
+
+
+@pytest.mark.parametrize("action", ["undo", "restore"])
+def test_a_worker_build_running_during_an_undo_or_restore_keeps_it_in_the_queue(env, monkeypatch, action):
+    # ASTRA-20261113-IT3-01: a build that had read the sample files before the undo/restore published afterwards and
+    # replaced the queue the undo had just put the sample back into, until the next build.
+    import threading
+
+    settings, client, worker = env
+    me, rows, ids, store, service = populated(client, worker, 1)
+    sid = ids[0]
+    flag_one(worker, me, sid)
+    (item,) = review(client)
+    if action == "undo":
+        r = decide(client, item["id"], "confirm", "race-original")
+    else:
+        r = client.post(f"/v1/samples/{sid}/remove", json={"request_id": "race-original"}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    reached, release, real = threading.Event(), threading.Event(), threading.Lock()
+
+    class Gate:  # holds the build just before it publishes (its second use of the lock)
+        uses = 0
+
+        def __enter__(self):
+            if threading.current_thread().name == "build":
+                Gate.uses += 1
+                if Gate.uses == 2:
+                    reached.set()
+                    assert release.wait(5)
+            real.acquire()
+
+        def __exit__(self, *a):
+            real.release()
+
+    monkeypatch.setattr(service.review, "_cache_lock", Gate())
+    build = threading.Thread(target=service.review.entries, name="build")
+    build.start()
+    try:
+        assert reached.wait(5)
+        if action == "undo":
+            r = client.post("/v1/speakers/undo", json={"request_id": "race-original", "undo_request_id": "race-back"}, headers=AUTH)
+        else:
+            r = client.post(f"/v1/samples/{sid}/restore", json={"request_id": "race-back"}, headers=AUTH)
+        assert r.status_code == 200, r.text
+    finally:
+        release.set()
+        build.join(5)
+    assert not build.is_alive()
+    assert store.read_sample(me, sid).get("state", "active") == "active"
+    assert [i["sample_id"] for i in review(client, warm=False)] == [sid], "the build's older queue replaced it"
+
+
+def test_undoing_a_reject_with_its_label_puts_the_sample_back_in_the_queue(env):
+    # ASTRA-20261113-IT3-01: a reject that also changed the conversation's label is undone with the label
+    # (`undo_label_op`), which never put the sample back in the queue.
+    settings, client, worker = env
+    me, rows, ids, store, service = populated(client, worker, 1)
+    sid = ids[0]
+    flag_one(worker, me, sid)
+    (item,) = review(client)
+    vector = store.read_sample(me, sid)["vector_b64"]
+    assert decide(client, item["id"], "reject", "edge-reject").status_code == 200
+    assert store.read_sample(me, sid)["state"] == "removed"
+    assert review(client) == []
+    r = client.post("/v1/speakers/undo", json={"request_id": "edge-reject", "undo_request_id": "edge-undo"}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    data = store.read_sample(me, sid)
+    assert data["state"] == "active" and data["vector_b64"] == vector
+    assert store.labels(rows[0]["id"])["S1"]["person_id"] == me
+    assert [i["sample_id"] for i in review(client, warm=False)] == [sid]
