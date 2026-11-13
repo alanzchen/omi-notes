@@ -131,6 +131,8 @@ public final class Outbox: @unchecked Sendable {
     private var listings: [URL: Listing] = [:]
     /// Whether each quarantined file is the Watch's, read once from its header (the folder is small).
     private var quarantineFromWatch: [String: Bool] = [:]
+    /// Kept-aside files whose source couldn't be read, by their size and modification time when last tried.
+    private var quarantineUnknownStamp: [String: String] = [:]
 
     public init(dirs: CaptureDirectories) { self.dirs = dirs }
 
@@ -400,16 +402,27 @@ public final class Outbox: @unchecked Sendable {
         struct Source: Decodable { var source: CaptureSource }
         let kind = OutboxKind.parse(name)
         if case .event = kind { return false }
-        guard let data = try? Data(contentsOf: dirs.outboxQuarantine.appendingPathComponent(name)) else { return nil }
+        let url = dirs.outboxQuarantine.appendingPathComponent(name)
+        // an unknown one is read again only once the file changed (ASTRA-20261112-IT6-01: not on every refresh)
+        let stamp = (try? FileManager.default.attributesOfItem(atPath: url.path)).map {
+            "\(($0[.size] as? NSNumber)?.int64Value ?? -1):\(($0[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1)"
+        }
+        if let stamp, lock.withLock({ quarantineUnknownStamp[name] }) == stamp { return nil }
         let source: CaptureSource?
         switch kind {
-        case .chunk: source = try? Envelope.parse(data).header.source
-        case .seal: source = try? JSONDecoder().decode(Source.self, from: data).source
+        case .chunk: source = Envelope.header(at: url)?.source  // the header only, never the payload
+        case .seal: source = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(Source.self, from: $0).source }
         case .event, nil: source = nil
         }
-        guard let source else { return nil }
+        guard let source else {
+            lock.withLock { quarantineUnknownStamp[name] = stamp }
+            return nil
+        }
         let watch = source == .watchMic
-        lock.withLock { quarantineFromWatch[name] = watch }
+        lock.withLock {
+            quarantineFromWatch[name] = watch
+            quarantineUnknownStamp[name] = nil
+        }
         return watch
     }
 

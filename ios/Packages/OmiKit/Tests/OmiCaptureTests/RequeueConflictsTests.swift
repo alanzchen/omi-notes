@@ -75,6 +75,34 @@ import OmiProtocol
         #expect(later.quarantineWatchCount == 1 && later.quarantineSourceUnknownCount == 0)
     }
 
+    /// ASTRA-20261112-IT6-01: an unknown-source kept-aside file was read in full on every stats refresh. Only its
+    /// header is read, and only again once the file changed (size or modification time).
+    @Test func anUnknownKeptAsideFileIsNotReadAgainUntilItChanges() throws {
+        let t = TestEnv()
+        let item = try t.outbox.write(Data(repeating: 0xEE, count: 600), kind: .chunk(captureId: "unknown-rec", sequence: 0))
+        try t.outbox.quarantine(item.name, reason: "409: x")
+        let kept = t.dirs.outboxQuarantine.appendingPathComponent(item.name)
+        let when = Date(timeIntervalSince1970: 1_790_000_000)  // a whole second: restored exactly below
+        try FileManager.default.setAttributes([.modificationDate: when], ofItemAtPath: kept.path)
+        #expect(t.outbox.stats().quarantineSourceUnknownCount == 1)
+        // a readable Watch header, padded to the same size and given back the same modification time: not read again
+        let payload = Data(repeating: 0, count: 64)
+        let h = EnvelopeHeader(
+            captureId: "unknown-rec", chunkSequence: 0, deviceId: "dev", deviceName: nil, modelNumber: nil, firmwareRevision: nil,
+            hardwareRevision: nil, source: .watchMic, payloadFormat: .pcm16leV1, codecId: 0,
+            captureStartedAt: "2026-11-08T19:32:05.123Z", chunkStartOffsetUs: 0, chunkEndOffsetUs: 2000, clockQuality: .unknown,
+            timezone: nil, recordCount: 32, payloadBytes: payload.count, offlineStorage: nil, ring: nil, appVersion: nil)
+        var bytes = try Envelope.build(header: h, payload: payload)
+        #expect(bytes.count <= 600)
+        bytes.append(Data(repeating: 0, count: 600 - bytes.count))
+        try bytes.write(to: kept)
+        try FileManager.default.setAttributes([.modificationDate: when], ofItemAtPath: kept.path)
+        #expect(t.outbox.stats().quarantineSourceUnknownCount == 1, "same size and time: not read again")
+        try FileManager.default.setAttributes([.modificationDate: when.addingTimeInterval(5)], ofItemAtPath: kept.path)
+        let later = t.outbox.stats()
+        #expect(later.quarantineWatchCount == 1 && later.quarantineSourceUnknownCount == 0, "changed: its header is read")
+    }
+
     @Test func theReasonIsKeptInTheLedger() throws {
         let t = TestEnv()
         let name = try quarantined(t, seq: 3, reason: "409: x")
