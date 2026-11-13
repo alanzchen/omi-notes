@@ -99,6 +99,50 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
         #expect(queue.phase == .ready && queue.current?.isSuspicious == true)
     }
 
+    @Test func aPageWithoutReadyIsReady() async throws {
+        // an older server never sends `ready`: its empty page is the finished state, as before
+        let page = try APIClient.snakeDecoder.decode(ReviewItemsResponse.self, from: Data(#"{"items":[],"total":0,"next_offset":null}"#.utf8))
+        #expect(page.ready == nil && page.isReady)
+        let queue = VoiceReviewQueue(speakers: try speakers())
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, #"{"items":[],"total":0,"next_offset":null}"#)]
+        queue.setVisible(true)
+        await queue.load()
+        #expect(queue.phase == .empty && !queue.preparingGaveUp)
+    }
+
+    @Test func aServerStillPreparingIsAskedAgainAFewTimesThenLeftToATap() async throws {
+        // OMI-NIGHTLY-2026-11-13-R5: right after a restart the server answers `ready: false`; build 53 showed
+        // "没有待确认的了" and a hub count of 0 as if the queue were done
+        let speakers = try speakers()
+        let queue = VoiceReviewQueue(speakers: speakers)
+        queue.preparingWaits = [.milliseconds(10), .milliseconds(20), .milliseconds(30)]
+        let cold = #"{"items":[],"total":0,"next_offset":null,"ready":false}"#
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, cold)]
+        queue.setVisible(true)
+        await queue.load()
+        #expect(queue.phase == .preparing && !queue.phase.isOver && queue.total == nil)
+        for _ in 0..<200 where !queue.preparingGaveUp { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(queue.preparingGaveUp && queue.phase == .preparing)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(sent("GET", "/v1/speakers/review").count == 4, "the first fetch and three more, then no more")
+        #expect(VoicesHub.reviewBadge(total: 0, flagged: 0, preparing: true) == "准备中")
+        // a tap asks again; a ready server's queue then shows
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, Self.first)]
+        await queue.refreshPreparing()
+        #expect(queue.phase == .ready && queue.items.count == 3)
+    }
+
+    @Test func aPreparingServerIsNotAskedWhileTheScreenIsClosed() async throws {
+        let queue = VoiceReviewQueue(speakers: try speakers())
+        queue.preparingWaits = [.milliseconds(20), .milliseconds(20), .milliseconds(20)]
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, #"{"items":[],"total":0,"ready":false}"#)]
+        queue.setVisible(true)
+        await queue.load()
+        queue.setVisible(false)
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(sent("GET", "/v1/speakers/review").count == 1 && queue.phase == .preparing)
+    }
+
     @Test func confirmSendsTheDecisionAndKeepsItsUndoToken() async throws {
         let queue = VoiceReviewQueue(speakers: try speakers())
         VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, Self.first)]

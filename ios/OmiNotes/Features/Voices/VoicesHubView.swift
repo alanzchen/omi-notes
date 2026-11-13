@@ -97,7 +97,7 @@ struct VoicesHubView: View {
                 Text("待确认").font(.title3.bold())
                 Spacer(minLength: 0)
                 // the queue's total when the server pages it; otherwise flagged samples, labelled 可疑
-                if let badge = VoicesHub.reviewBadge(total: speakers.reviewTotal, flagged: pending) {
+                if let badge = VoicesHub.reviewBadge(total: speakers.reviewTotal, flagged: pending, preparing: speakers.reviewPreparing) {
                     Text(badge).font(.title2.bold().monospacedDigit())
                         .padding(.horizontal, 12).padding(.vertical, 4)
                         .background(.white.opacity(0.22), in: .capsule)
@@ -110,7 +110,7 @@ struct VoicesHubView: View {
                         in: .rect(cornerRadius: 22))
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(VoicesHub.reviewBadge(total: speakers.reviewTotal, flagged: pending).map { "待确认 \($0)" } ?? "待确认")
+        .accessibilityLabel(VoicesHub.reviewBadge(total: speakers.reviewTotal, flagged: pending, preparing: speakers.reviewPreparing).map { "待确认 \($0)" } ?? "待确认")
     }
 
     /// No wearer yet: teaching your voice comes first.

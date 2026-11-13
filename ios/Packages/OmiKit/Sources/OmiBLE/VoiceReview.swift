@@ -44,6 +44,9 @@ public final class VoiceReviewQueue {
         case onlySkipped
         /// The server has nothing to review.
         case empty
+        /// The server is still building its queue (`ready: false`, just after it starts): not "nothing to review".
+        /// Fetched again a few times while the screen shows (`preparingWaits`), then left to a tap.
+        case preparing
         case failed(String)
 
         public var isOver: Bool { self == .batchDone || self == .onlySkipped || self == .empty }
@@ -97,6 +100,12 @@ public final class VoiceReviewQueue {
     /// Pages read in one fetch at most (a server that never ends its pages can't keep it busy).
     static let maxPages = 40
     private var undoTimer: Task<Void, Never>?
+    /// While the server prepares: fetched again after each of these waits, only while the screen shows.
+    public var preparingWaits: [Duration] = [.seconds(2), .seconds(5), .seconds(10)]
+    /// Fetches made since the server first answered "preparing".
+    public private(set) var preparingTries = 0
+    private var visible = false
+    private var preparingTask: Task<Void, Never>?
 
     public init(speakers: SpeakersModel) {
         self.speakers = speakers
@@ -108,9 +117,38 @@ public final class VoiceReviewQueue {
     /// speakers revision and the evidence digest, so a re-transcribed `conv.S1.0` is another clip.
     public static func clipVersion(_ item: ReviewItem) -> String { item.id }
 
+    /// The automatic fetches while the server prepares have all been made: the screen offers a refresh.
+    public var preparingGaveUp: Bool { phase == .preparing && preparingTries >= preparingWaits.count }
+
+    /// The screen shows (or stopped showing) the queue: a server that is still preparing is only asked again while it
+    /// does.
+    public func setVisible(_ shown: Bool) {
+        visible = shown
+        if shown { schedulePreparingFetch() } else { preparingTask?.cancel(); preparingTask = nil }
+    }
+
+    /// "刷新" after the automatic fetches: asks again, with a fresh round of them.
+    public func refreshPreparing() async {
+        preparingTries = 0
+        await load()
+    }
+
+    private func schedulePreparingFetch() {
+        guard visible, phase == .preparing, preparingTask == nil, preparingTries < preparingWaits.count else { return }
+        let wait = preparingWaits[preparingTries]
+        preparingTask = Task { [weak self] in
+            do { try await Task.sleep(for: wait) } catch { return }
+            guard let self else { return }
+            self.preparingTask = nil
+            guard self.visible, self.phase == .preparing else { return }
+            self.preparingTries += 1
+            await self.load()
+        }
+    }
+
     /// Fetches the window again and takes the next batch from it.
     public func load() async {
-        phase = .loading
+        if phase != .preparing { phase = .loading }  // while preparing, a fetch again doesn't flash a spinner
         generation += 1
         do {
             var fetched: [ReviewItem] = []
@@ -121,6 +159,14 @@ public final class VoiceReviewQueue {
             repeat {
                 let page = try await speakers.reviewItems(limit: ReviewBatch.window, offset: offset)
                 pages += 1
+                if !page.isReady, page.items.isEmpty, offset == 0 {
+                    items = []
+                    index = 0
+                    total = nil
+                    phase = .preparing
+                    schedulePreparingFetch()
+                    return
+                }
                 fetched += page.items
                 open = ReviewBatch.make(fetched, excluding: skipped, limit: fetched.count)
                 total = page.total
@@ -138,6 +184,7 @@ public final class VoiceReviewQueue {
             remaining = open.count - items.count
             moreOnServer = more
             index = 0
+            preparingTries = 0
             phase = items.isEmpty ? (fetched.isEmpty ? .empty : .onlySkipped) : .ready
         } catch {
             phase = .failed(SpeakersModel.describe(error))

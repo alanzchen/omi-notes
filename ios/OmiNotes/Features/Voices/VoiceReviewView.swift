@@ -28,6 +28,8 @@ struct VoiceReviewView: View {
                 switch queue.phase {
                 case .loading where queue.current == nil:
                     Spacer(); ProgressView(); Spacer()
+                case .preparing:
+                    preparing
                 case .failed(let why):
                     Spacer()
                     VStack(spacing: 12) {
@@ -69,7 +71,8 @@ struct VoiceReviewView: View {
         }
         // a fetched queue may name the same clip id after a re-transcription: no old audio is reused
         .onChange(of: queue.generation) { player.invalidate() }
-        .onDisappear { player.stop() }
+        .onAppear { queue.setVisible(true) }
+        .onDisappear { player.stop(); queue.setVisible(false) }
         .personConsent(model, personId: queue.consentNeeded) { queue.clearConsentNeeded() }
         .fullScreenCover(item: $newPerson, onDismiss: { Task { await speakers.refresh(); await queue.load() } }) { r in
             NameVoiceView(model: model, items: r.items)
@@ -362,6 +365,28 @@ struct VoiceReviewView: View {
         case .onlySkipped: return "剩下的都跳过了"
         default: return "没有待确认的了"
         }
+    }
+
+    /// The server is still building its queue (just after it starts): not "nothing to confirm".
+    private var preparing: some View {
+        VStack(spacing: 14) {
+            Spacer()
+            if queue.preparingGaveUp {
+                Image(systemName: "hourglass").font(.system(size: 44)).foregroundStyle(.secondary)
+            } else {
+                ProgressView().controlSize(.large)
+            }
+            Text("正在准备…").font(.title3.bold())
+            Text(queue.preparingGaveUp ? "服务器还在整理待确认的录音，稍后再看" : "服务器刚启动，正在整理待确认的录音")
+                .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            if queue.preparingGaveUp {
+                Button("刷新") { Task { await queue.refreshPreparing() } }.buttonStyle(.bordered)
+            }
+            Spacer()
+            Button("完成") { dismiss() }.font(.headline)
+            bottomLine.frame(height: 50).padding(.bottom, 8)
+        }
+        .padding(.horizontal, 32)
     }
 
     private var finished: some View {

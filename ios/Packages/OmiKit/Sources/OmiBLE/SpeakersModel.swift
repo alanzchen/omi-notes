@@ -68,6 +68,8 @@ public final class SpeakersModel {
     public private(set) var serverSupportsVoiceCalibration = false
     /// The review queue's size, from a server that pages it (nil: unknown, count flagged samples).
     public private(set) var reviewTotal: Int?
+    /// The server is still building its review queue (`ready: false`): its total isn't known yet.
+    public private(set) var reviewPreparing = false
     public var enrollment: Enrollment = .idle
 
     private let engine: OmiEngine
@@ -132,6 +134,7 @@ public final class SpeakersModel {
         serverSupportsVoiceReview = false
         serverSupportsVoiceCalibration = false
         reviewTotal = nil
+        reviewPreparing = false
         switch enrollment {
         case .idle: break
         case .checking, .reading: cancelEnrollment()
@@ -198,9 +201,10 @@ public final class SpeakersModel {
         case .failure(let e): problems.append(e)
         }
         // the queue's size, for the hub (one item is enough to learn it); unknown is not an error
-        let total = serverSupportsVoiceReview ? (try? await api.reviewItems(limit: 1))?.total : nil
+        let page = serverSupportsVoiceReview ? try? await api.reviewItems(limit: 1) : nil
         guard current() else { return }
-        reviewTotal = total
+        reviewPreparing = page?.isReady == false
+        reviewTotal = reviewPreparing ? nil : page?.total
         error = problems.first.map(Self.describe)
     }
 

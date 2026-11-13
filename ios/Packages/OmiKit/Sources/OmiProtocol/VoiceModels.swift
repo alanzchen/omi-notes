@@ -173,16 +173,22 @@ public struct ReviewItem: Decodable, Identifiable, Equatable, Hashable, Sendable
 
 /// One page of the review queue. A server with paging (`offset`) adds where the next page starts
 /// (`next_offset`, null at the end) and the queue's size (`total`); an older one sends items only.
+/// `ready: false` means the server hasn't built its queue yet (just after it starts): the empty page
+/// says nothing about what is waiting. Without the field (an older server), the page is ready.
 public struct ReviewItemsResponse: Decodable, Sendable {
     public var items: [ReviewItem]
     public var nextOffset: Int?
     public var total: Int?
+    public var ready: Bool?
 
-    public init(items: [ReviewItem], nextOffset: Int? = nil, total: Int? = nil) {
+    public init(items: [ReviewItem], nextOffset: Int? = nil, total: Int? = nil, ready: Bool? = nil) {
         self.items = items
         self.nextOffset = nextOffset
         self.total = total
+        self.ready = ready
     }
+
+    public var isReady: Bool { ready ?? true }
 
     /// The server pages (so a null `next_offset` means the end, not "unknown").
     public var paginated: Bool { total != nil || nextOffset != nil }
@@ -259,7 +265,8 @@ public enum VoicesHub {
 
     /// The review card's count: the server's queue total (under the card's 待确认) when it sends one;
     /// otherwise only flagged samples are known, and the badge says so (可疑).
-    public static func reviewBadge(total: Int?, flagged: Int) -> String? {
+    public static func reviewBadge(total: Int?, flagged: Int, preparing: Bool = false) -> String? {
+        if preparing { return "准备中" }  // the server is still building its queue: no count yet, not zero
         if let total { return total > 0 ? "\(total)" : nil }
         return flagged > 0 ? "可疑 \(flagged)" : nil
     }
