@@ -103,6 +103,9 @@ public final class ClipPlayback {
     private func begin(_ id: String) -> Int {
         stop()
         loading = id
+        // a new clip or a retry: the last one's failure isn't this one's (ASTRA-20261113-IT1-03)
+        message = nil
+        failure = nil
         return generation
     }
 

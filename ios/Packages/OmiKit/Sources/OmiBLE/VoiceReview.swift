@@ -12,12 +12,13 @@ public enum ReviewClipState: Equatable, Sendable {
 
     public static func of(_ item: ReviewItem, loading: Bool, failure: ClipFailure?) -> ReviewClipState {
         guard item.canPlay else { return .noAudio }
+        if loading { return .loading }  // a load in progress is about this clip, whatever failed before
         switch failure {
         case .noAudio?: return .noAudio
         case .network(.slow)?: return .retry("网络有点慢，点播放重试")
         case .network(.unreachable)?: return .retry("连不上服务器，点播放重试")
         case .other?: return .retry("没能加载这段录音，点播放重试")
-        case nil: return loading ? .loading : .ready
+        case nil: return .ready
         }
     }
 }
