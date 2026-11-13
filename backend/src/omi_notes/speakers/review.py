@@ -125,7 +125,7 @@ class Review:
                     continue
                 if any(h.get("action") == "restore" for h in data.get("history") or []):
                     continue
-                if self.playable(data, voices):
+                if self.playable(data, voices) or not self._stably_unplayable(data):
                     continue
                 rev = int(data.get("revision") or 0)
                 self.store.set_sample_state(r["person_id"], r["id"], REMOVED, action="set_aside", by="system",
@@ -135,6 +135,27 @@ class Review:
         if n:
             log.info("set aside %d flagged voice sample(s) whose audio can't be played", n)
         return n
+
+    SETTLED = ("done", "discarded", "failed")
+
+    def _stably_unplayable(self, data: dict) -> bool:
+        """The sample's audio is unavailable for good, not for now (ASTRA-20261113-IT1-02): its conversation is gone,
+        or settled (not being processed or recovered) with its raw audio deleted, or with its voices files present
+        (including the one the sample names) and none of them holding its clip. A conversation still being worked on,
+        or a voices file missing, only keeps it out of the queue until the next look."""
+        conv_id = data.get("conversation_id")
+        row = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,)) if conv_id else None
+        if row is None:
+            return conv_id is not None
+        if row["status"] not in self.SETTLED:
+            return False
+        if not self.store.raw_available(row):
+            return True
+        folder = self.store.conv_dir(conv_id)
+        if not any(folder.glob("voices-*.json")):
+            return False
+        named = data.get("voices_file")
+        return not (named and not (folder / named).exists())
 
     def _enrollment_audio(self, data: dict):
         if data.get("source") != "enrollment" or not data.get("enrollment_id"):

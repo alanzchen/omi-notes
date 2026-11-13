@@ -1100,3 +1100,32 @@ def test_a_review_get_after_an_answer_does_no_playability_work(env, monkeypatch,
     assert page.json()["items"][0]["sample_id"] != ids[0], "the answered sample is passed over on the page"
     assert calls == []
 
+
+def test_a_temporarily_missing_voices_file_does_not_set_a_sample_aside(env):
+    # ASTRA-20261113-IT1-02: while its conversation was being reprocessed, a legacy sample's voices file was briefly
+    # absent; one warm set the sample aside for good. Only a settled conversation's missing audio does that now.
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker, days=(6,))
+    store = worker.pipeline.speakers
+    service = client.app.state.speakers
+    data = store.read_sample(me, ids[0])
+    data.pop("clips", None)
+    data.pop("voices_file", None)
+    Vault.write_json(store.sample_path(me, ids[0]), data)
+    store._index_sample(data)
+    flag_one(worker, me, ids[0])
+    assert service.review.sample_view(store.read_sample(me, ids[0]))["playable"]
+    paths = list(store.conv_dir(rows[0]["id"]).glob("voices-*.json"))
+    worker.db.execute("UPDATE conversations SET status='transcribing' WHERE id=?", (rows[0]["id"],))
+    for p in paths:
+        p.rename(p.with_suffix(".held"))
+    service.warm()
+    assert store.read_sample(me, ids[0]).get("state", "active") == "active"
+    worker.db.execute("UPDATE conversations SET status='done' WHERE id=?", (rows[0]["id"],))
+    service.warm()  # settled, but no voices file at all: still not proof the audio is gone
+    assert store.read_sample(me, ids[0]).get("state", "active") == "active"
+    for p in paths:
+        p.with_suffix(".held").rename(p)
+    service.warm()
+    assert store.read_sample(me, ids[0]).get("state", "active") == "active"
+    assert service.review.sample_view(store.read_sample(me, ids[0]))["playable"]
