@@ -351,11 +351,12 @@ public enum ReviewBatch {
     /// asks for the whole window and pages it in batches of `size`.
     public static let window = 50
 
-    /// The server's order (it puts suspicious items first), without repeats or what was skipped.
+    /// The server's order (it puts suspicious items first), without repeats, what was skipped, or anything the server
+    /// can't play (an older server's queue, a cached page): nobody is asked to judge a clip they can't hear.
     public static func make(_ items: [ReviewItem], excluding skipped: Set<String>, limit: Int = size) -> [ReviewItem] {
         var seen = skipped
         var out: [ReviewItem] = []
-        for item in items where out.count < limit && seen.insert(item.id).inserted {
+        for item in items where out.count < limit && item.canPlay && seen.insert(item.id).inserted {
             out.append(item)
         }
         return out

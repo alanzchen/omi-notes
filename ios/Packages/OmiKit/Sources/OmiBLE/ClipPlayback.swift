@@ -25,6 +25,8 @@ public final class ClipPlayback {
     public private(set) var loading: String?
     public private(set) var loadedId: String?
     public private(set) var message: String?
+    /// Why the last load failed, by kind (a screen words it in its own language): nil while nothing failed.
+    public private(set) var failure: ClipFailure?
     /// The prepared clip's bytes (for a waveform).
     public private(set) var data: Data?
     public private(set) var audio: ClipAudio?
@@ -186,6 +188,7 @@ public final class ClipPlayback {
         data = bytes
         loadedId = id
         message = nil
+        failure = nil
     }
 
     private func start() {
@@ -201,10 +204,30 @@ public final class ClipPlayback {
         loadedId = nil  // a tap on play tries again
         audio = nil
         data = nil
+        failure = ClipFailure(error)
         if case APIError.http(410, _) = error {
             message = "This audio has expired on the server, so it can't be played."
         } else {
             message = "Couldn't load the audio (\(error)). Tap play to try again."
+        }
+    }
+}
+
+
+/// Why a clip couldn't be loaded. Only a network problem is worth "try again"; a clip the server says it doesn't have
+/// (410 expired, 404 gone) won't come back by retrying.
+public enum ClipFailure: Equatable, Sendable {
+    case noAudio
+    case network(NetworkTrouble)
+    case other
+
+    public init(_ error: Error) {
+        if case APIError.http(let code, _) = error, code == 404 || code == 410 {
+            self = .noAudio
+        } else if let trouble = NetworkTrouble(error) {
+            self = .network(trouble)
+        } else {
+            self = .other
         }
     }
 }

@@ -508,7 +508,7 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
         await queue.load()
         #expect(await queue.decide(.reject) == false)
         #expect(sent("POST", "/review/s.a.1").count == 1)
-        #expect(queue.error == NetworkTrouble.slow.message && queue.canRetry)
+        #expect(queue.error == "没保存上：" + NetworkTrouble.slow.message && queue.canRetry, "about the answer, not the clip")
         await queue.retry()
         #expect(queue.current?.id == "s.b.1" && queue.undoable?.decision == .reject && queue.error == nil && !queue.canRetry)
         let bodies = sent("POST", "/review/s.a.1").map { $0.body["request_id"] as? String }

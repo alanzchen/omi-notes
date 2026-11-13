@@ -193,7 +193,8 @@ struct VoiceReviewView: View {
                 Spacer(minLength: 0)
                 ReasonPills(reasons: item.reasons ?? [])
             }
-            if item.canPlay, let clip = item.clip {
+            let clipState = ReviewClipState.of(item, loading: player.loading, failure: player.failure)
+            if clipState != .noAudio, let clip = item.clip {
                 HStack(spacing: 14) {
                     Button { player.toggle(clip.id, version: VoiceReviewQueue.clipVersion(item), speakers: speakers) } label: {
                         ZStack {
@@ -213,11 +214,11 @@ struct VoiceReviewView: View {
                         .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     }
                 }
-                if let unavailable = player.unavailable {
-                    Text(unavailable).font(.footnote).foregroundStyle(.secondary)
+                if case .retry(let why) = clipState {  // a network failure loading a clip the server has
+                    Text(why).font(.footnote).foregroundStyle(.secondary)
                 }
             } else {
-                // the server can't cut this clip any more: the words only, never made-up audio
+                // the server can't cut this clip (or no longer has it): the words only, never made-up audio or "try again"
                 Label("无法试听", systemImage: "speaker.slash.fill")
                     .font(.headline).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 72)

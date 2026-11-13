@@ -538,6 +538,7 @@ final class VoicePlayer {
     var currentId: String? { core.loadedId }
     var loading: Bool { core.loading != nil }
     var unavailable: String? { core.message }
+    var failure: ClipFailure? { core.failure }
     var progress: Double { duration.map { $0 > 0 ? elapsed / $0 : 0 } ?? 0 }
 
     /// `version`: the generation the clip was listed in (`ClipPlayback.key`); the same id from another is another clip.

@@ -183,7 +183,7 @@ import Testing
 
     @Test func aBatchKeepsTheServerOrderDropsRepeatsAndWhatWasSkipped() throws {
         let ids = ["s.a.1", "s.b.1", "l.c.S1.2.p.x", "s.a.1", "s.d.1"]
-        let items = ids.map { ReviewItem(id: $0) }
+        let items = ids.map { ReviewItem(id: $0, playable: true, clip: SpeakerClip(id: "clip.\($0)")) }
         let batch = ReviewBatch.make(items, excluding: ["s.b.1"], limit: 10)
         #expect(batch.map(\.id) == ["s.a.1", "l.c.S1.2.p.x", "s.d.1"])
         #expect(ReviewBatch.make(items, excluding: [], limit: 2).map(\.id) == ["s.a.1", "s.b.1"])

@@ -3,6 +3,25 @@ import Observation
 import OmiCapture
 import OmiProtocol
 
+
+/// What a review card's clip area says. "网络有点慢" only for a real network failure while loading a clip the server
+/// has; a clip the server doesn't have (not playable, or 404/410 on load) is "无法试听", never "try again".
+public enum ReviewClipState: Equatable, Sendable {
+    case ready, loading, noAudio
+    case retry(String)
+
+    public static func of(_ item: ReviewItem, loading: Bool, failure: ClipFailure?) -> ReviewClipState {
+        guard item.canPlay else { return .noAudio }
+        switch failure {
+        case .noAudio?: return .noAudio
+        case .network(.slow)?: return .retry("网络有点慢，点播放重试")
+        case .network(.unreachable)?: return .retry("连不上服务器，点播放重试")
+        case .other?: return .retry("没能加载这段录音，点播放重试")
+        case nil: return loading ? .loading : .ready
+        }
+    }
+}
+
 /// The 声纹 review queue: one clip at a time, in batches of ten in the server's order (suspicious
 /// first). Every answer goes to the server at once and can be undone for a few seconds through its
 /// undo token; "Skip" only moves on in this session. A changed item (`409 stale_review`) is never
@@ -178,7 +197,8 @@ public final class VoiceReviewQueue {
             }
             return false
         } catch let trouble as NetworkTrouble {
-            error = trouble.message
+            // about the answer, not the clip: it didn't reach the server
+            error = "没保存上：" + trouble.message
             failedAttempt = (item.id, decision, personId, requestId)
             return false
         } catch {
