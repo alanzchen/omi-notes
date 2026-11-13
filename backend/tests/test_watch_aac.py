@@ -684,3 +684,21 @@ def test_a_new_aac_part_the_decoder_rejects_is_still_invalid_audio(client, worke
     damaged = build_envelope(_json.loads(good.header.model_dump_json()), good.payload[:40] + b"\x00" * (len(good.payload) - 40))
     r = put_chunk(client, capture, 0, damaged)
     assert r.status_code == 422 and r.json()["error"] == "invalid_audio", r.text
+
+
+def test_a_temp_file_that_cant_be_removed_does_not_fail_the_upload(client, worker, monkeypatch):
+    # ASTRA OBS-03 (nightly 2026-11-12 IT3): the decoder's final unlink raising OSError turned a valid AAC part into a
+    # generic 500; it is logged, and the part is stored
+    from omi_notes.audio import aac as aac_module
+
+    real = aac_module.os.unlink
+
+    def stuck(path, *a, **kw):
+        real(path, *a, **kw)
+        raise PermissionError(1, "Operation not permitted", path)
+
+    monkeypatch.setattr(aac_module.os, "unlink", stuck)
+    capture = str(uuid.uuid4())
+    body = aac_envelopes(np.concatenate([talk(20, 3), silence(10)]), capture_id=capture, device_id=WATCH, started_at=STARTED)[0]
+    r = put_chunk(client, capture, 0, body)
+    assert r.status_code == 201, r.text

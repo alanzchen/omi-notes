@@ -10,12 +10,15 @@ is padded or trimmed to keep the timeline exact, anything larger is refused.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
 import tempfile
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16_000
 TIMEOUT_S = 30.0
@@ -29,6 +32,15 @@ class AacError(ValueError):
 class AacUnavailable(AacError):
     """The decoder couldn't run or finish (ffmpeg missing, a timeout, an OS error starting it): nothing was learned
     about the audio. Upload paths answer it 503 (send again), never as invalid audio."""
+
+
+def _remove_temp(path: str) -> None:
+    """The decoder's private temporary input, removed after use. Failing to remove it says nothing about the audio and
+    must not turn a decoded (or refused) file into a server error (ASTRA OBS-03): the OS clears its temp folder."""
+    try:
+        os.unlink(path)
+    except OSError as exc:
+        log.warning("could not remove the decoder's temporary file %s: %s", path, exc)
 
 
 def ffmpeg() -> str | None:
@@ -75,7 +87,7 @@ def decode(payload: bytes, expected_samples: int | None, *, max_samples: int | N
         if len(run.stdout) > limit:
             raise AacError(f"AAC decodes to more audio than its header says ({len(run.stdout) // 2} > {expected_samples} samples)")
     finally:
-        os.unlink(path)
+        _remove_temp(path)
     pcm = np.frombuffer(run.stdout[: len(run.stdout) // 2 * 2], dtype="<i2").astype(np.int16)
     if expected_samples is None:
         return pcm
@@ -116,5 +128,5 @@ def resample(payload: bytes, suffix: str, max_samples: int) -> np.ndarray:
         if len(run.stdout) > (max_samples + 2 * SAMPLE_RATE) * 2:
             raise AacError("the recording is too long")
     finally:
-        os.unlink(path)
+        _remove_temp(path)
     return np.frombuffer(run.stdout[: len(run.stdout) // 2 * 2], dtype="<i2").astype(np.int16)
