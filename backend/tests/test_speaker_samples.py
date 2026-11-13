@@ -467,7 +467,9 @@ def test_a_confirmed_flag_never_returns_on_unchanged_evidence_and_flags_never_ex
 # -- M5: the review queue and sample APIs ------------------------------------------------------------------
 
 
-def review(client, limit: int = 10) -> list[dict]:
+def review(client, limit: int = 10, *, warm: bool = True) -> list[dict]:
+    if warm:  # the worker builds the queue (requests only read its snapshot)
+        client.app.state.speakers.warm()
     r = client.get(f"/v1/speakers/review?limit={limit}", headers=AUTH)
     assert r.status_code == 200, r.text
     return r.json()["items"]
@@ -510,6 +512,7 @@ def test_the_review_queue_pages_past_items_skipped_on_the_phone(env):
     # Astra: the phone could only ever see the first 50 items; skipping them left item 51 unreachable
     settings, client, worker = env
     me, rows, ids = me_with_samples(client, worker)
+    client.app.state.speakers.warm()
     whole = client.get("/v1/speakers/review?limit=50", headers=AUTH).json()
     assert whole["total"] == len(whole["items"]) and whole["next_offset"] is None
     first = client.get("/v1/speakers/review?limit=1", headers=AUTH).json()
@@ -628,7 +631,8 @@ def test_a_sample_without_raw_audio_is_not_asked_about_but_stays_listed(env):
     settings, client, worker = env
     me, rows, ids = me_with_samples(client, worker, days=(6,))
     worker.db.execute("UPDATE chunks SET raw_deleted=1")  # an older vault's audio, deleted before raw was kept for good
-    client.app.state.speakers.warm()  # the worker builds the queue (requests only read it)
+    # before the worker's next build (a queue built while the audio was there): the page checks it again
+    assert not [i for i in review(client, warm=False) if i.get("sample_id") == ids[0] or not i["playable"]]
     assert not [i for i in review(client) if i.get("sample_id") == ids[0]]
     listed = client.get(f"/v1/people/{me}/samples", headers=AUTH).json()["samples"]
     (view,) = [v for v in listed if v["id"] == ids[0]]
@@ -918,6 +922,7 @@ def test_a_review_page_is_a_slice_of_a_queue_built_once_per_change(env, monkeypa
         return real(*a, **kw)
 
     monkeypatch.setattr(review_queue, "_entries", counted)
+    client.app.state.speakers.warm()  # the worker's one build; requests only read it
     whole = client.get("/v1/speakers/review?limit=50", headers=AUTH).json()
     for offset in range(whole["total"]):
         assert client.get(f"/v1/speakers/review?limit=1&offset={offset}", headers=AUTH).status_code == 200
@@ -1073,21 +1078,28 @@ def test_a_review_page_does_no_playability_work_once_the_queue_is_built(env, mon
     assert calls == []
 
 
+def populated(client, worker, n: int):
+    """Alan with `n` samples (copies of one conversation's), and a fresh speaker service: no queue built yet."""
+    import uuid as _uuid
+
+    me, rows, ids = me_with_samples(client, worker, days=(6,))
+    store = worker.pipeline.speakers
+    template = store.read_sample(me, ids[0])
+    for _ in range(n - 1):
+        d = dict(template, sample_id=str(_uuid.uuid4()), request_id=str(_uuid.uuid4()))
+        Vault.write_json(store.sample_path(me, d["sample_id"]), d)
+        store._index_sample(d)
+        ids.append(d["sample_id"])
+    client.app.state.speakers = SpeakerService(worker.pipeline)
+    return me, rows, ids, store, client.app.state.speakers
+
+
 @pytest.mark.parametrize("population", [12, 120])
 def test_a_review_get_after_an_answer_does_no_playability_work(env, monkeypatch, population):
     # ASTRA-20261113-IT1-01: an answer changes the evidence; the next GET (before the worker's next tick) rebuilt the
     # queue with a playability check per sample (12 for 12, 120 for 120). It reads the worker's last queue instead.
-    import uuid as _uuid
-
     settings, client, worker = env
-    me, rows, ids = me_with_samples(client, worker, days=(6,))
-    store = worker.pipeline.speakers
-    template = store.read_sample(me, ids[0])
-    for _ in range(population - 1):
-        d = dict(template, sample_id=str(_uuid.uuid4()), request_id=str(_uuid.uuid4()))
-        Vault.write_json(store.sample_path(me, d["sample_id"]), d)
-        store._index_sample(d)
-    service = client.app.state.speakers
+    me, rows, ids, store, service = populated(client, worker, population)
     service.warm()
     calls = []
     real = service.review.playable
@@ -1129,3 +1141,82 @@ def test_a_temporarily_missing_voices_file_does_not_set_a_sample_aside(env):
     service.warm()
     assert store.read_sample(me, ids[0]).get("state", "active") == "active"
     assert service.review.sample_view(store.read_sample(me, ids[0]))["playable"]
+
+
+@pytest.mark.parametrize("population", [12, 120])
+@pytest.mark.parametrize("mode", ["cold", "stale", "all_answered"])
+def test_a_review_get_reads_only_its_page(env, monkeypatch, mode, population):
+    # ASTRA-20261113-IT2-01: a GET still synced every sample, hashed the evidence and, before a build or with every
+    # cached entry answered, read every sample file. Now: the worker's snapshot, and at most the page's candidates.
+    settings, client, worker = env
+    me, rows, ids, store, service = populated(client, worker, population)
+    if mode != "cold":
+        service.warm()
+    if mode == "stale":
+        r = decide(client, f"s.{ids[0]}.0", "confirm", "page-confirm")
+        assert r.status_code == 200, r.text
+    if mode == "all_answered":
+        with store.lock:
+            for sid in ids:
+                store.resolve_flag(me, sid, "confirm", request_id="done-" + sid)
+    reads, scans = [], []
+    real_read, real_query = store.read_sample, store.db.query
+    monkeypatch.setattr(store, "read_sample", lambda *a: reads.append(a) or real_read(*a))
+
+    def query(sql, *a, **k):
+        result = real_query(sql, *a, **k)
+        if " from samples" in " ".join(sql.lower().split()) and " where " not in sql.lower():
+            scans.append(len(result))
+        return result
+
+    monkeypatch.setattr(store.db, "query", query)
+    for name in ("sync_samples", "evidence_key"):
+        monkeypatch.setattr(store, name, lambda *a, **k: pytest.fail("population-wide work on a review GET"))
+    page = client.get("/v1/speakers/review?limit=1", headers=AUTH).json()
+    assert len(reads) <= 1 and sum(scans) == 0, (reads, scans)
+    assert all(i["playable"] and i["clip"] for i in page["items"])
+    if mode == "cold":
+        assert page == {"items": [], "total": 0, "next_offset": None, "ready": False}
+    elif mode == "stale":
+        assert [i["sample_id"] for i in page["items"]] != [ids[0]] and len(page["items"]) == 1
+    else:
+        assert page["items"] == [] and page["next_offset"] == (21 if population > 21 else None)
+
+
+@pytest.mark.parametrize("mode", ["cold", "stale"])
+def test_no_review_page_carries_an_item_without_audio(env, mode):
+    # ASTRA-20261113-IT2-02: build 53 shows every item with answer buttons (it doesn't filter `playable`). Before
+    # the worker's first build the page is empty and not ready; a queue built while the audio was there is checked
+    # again for the page.
+    settings, client, worker = env
+    me, rows, ids, store, service = populated(client, worker, 1)
+    if mode == "stale":
+        service.warm()
+    _no_audio(worker, rows[0])
+    page = client.get("/v1/speakers/review?limit=10", headers=AUTH).json()
+    assert page["items"] == [] and page["ready"] is (mode == "stale")
+    service.warm()
+    assert review(client) == []
+
+
+@pytest.mark.parametrize("action", ["undo", "restore"])
+def test_an_undo_or_restore_is_asked_again_after_the_worker_rebuilt_the_queue(env, action):
+    # ASTRA-20261113-IT2-03: the worker rebuilt the queue without the answered (or removed) sample; its undo or
+    # restore left the page empty until the worker's next build.
+    settings, client, worker = env
+    me, rows, ids, store, service = populated(client, worker, 1)
+    flag_one(worker, me, ids[0])
+    (item,) = review(client)
+    if action == "undo":
+        r = decide(client, item["id"], "confirm", "yes-before-build")
+    else:
+        r = client.post(f"/v1/samples/{ids[0]}/remove", json={"request_id": "remove-before-build"}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert review(client) == []  # the worker's build, without it
+    if action == "undo":
+        r = client.post("/v1/speakers/undo", json={"request_id": "yes-before-build", "undo_request_id": "undo-1"}, headers=AUTH)
+    else:
+        r = client.post(f"/v1/samples/{ids[0]}/restore", json={"request_id": "restore-after-build"}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert [i["sample_id"] for i in review(client, warm=False)] == [ids[0]], "back without waiting for the worker"
+    assert [i["sample_id"] for i in review(client)] == [ids[0]]
