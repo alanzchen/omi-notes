@@ -628,6 +628,7 @@ def test_a_sample_without_raw_audio_is_not_asked_about_but_stays_listed(env):
     settings, client, worker = env
     me, rows, ids = me_with_samples(client, worker, days=(6,))
     worker.db.execute("UPDATE chunks SET raw_deleted=1")  # an older vault's audio, deleted before raw was kept for good
+    client.app.state.speakers.warm()  # the worker builds the queue (requests only read it)
     assert not [i for i in review(client) if i.get("sample_id") == ids[0]]
     listed = client.get(f"/v1/people/{me}/samples", headers=AUTH).json()["samples"]
     (view,) = [v for v in listed if v["id"] == ids[0]]
@@ -1050,6 +1051,7 @@ def test_an_unflagged_sample_or_a_suggestion_without_audio_is_left_out_of_the_qu
     _no_audio(worker, rows[0])
     _no_audio(worker, fresh)  # the suggestion's audio gone
     store.update_settings(auto_assign=store.settings()["auto_assign"])
+    client.app.state.speakers.warm()
     items = review(client, limit=50)
     assert not [i for i in items if i["kind"] == "label" and i["conversation"]["id"] == fresh["id"]]
     assert not [i for i in items if i.get("sample_id") == ids[0]]
@@ -1069,3 +1071,32 @@ def test_a_review_page_does_no_playability_work_once_the_queue_is_built(env, mon
     monkeypatch.setattr(type(service.review), "playable", lambda self, *a, **k: calls.append(1) or real(self, *a, **k))
     assert review(client, limit=2)
     assert calls == []
+
+
+@pytest.mark.parametrize("population", [12, 120])
+def test_a_review_get_after_an_answer_does_no_playability_work(env, monkeypatch, population):
+    # ASTRA-20261113-IT1-01: an answer changes the evidence; the next GET (before the worker's next tick) rebuilt the
+    # queue with a playability check per sample (12 for 12, 120 for 120). It reads the worker's last queue instead.
+    import uuid as _uuid
+
+    settings, client, worker = env
+    me, rows, ids = me_with_samples(client, worker, days=(6,))
+    store = worker.pipeline.speakers
+    template = store.read_sample(me, ids[0])
+    for _ in range(population - 1):
+        d = dict(template, sample_id=str(_uuid.uuid4()), request_id=str(_uuid.uuid4()))
+        Vault.write_json(store.sample_path(me, d["sample_id"]), d)
+        store._index_sample(d)
+    service = client.app.state.speakers
+    service.warm()
+    calls = []
+    real = service.review.playable
+    monkeypatch.setattr(service.review, "playable", lambda *a, **k: calls.append(1) or real(*a, **k))
+    r = client.post(f"/v1/speakers/review/s.{ids[0]}.0", json={"decision": "confirm", "request_id": "cost-confirm"}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    calls.clear()
+    page = client.get("/v1/speakers/review?limit=1", headers=AUTH)
+    assert page.status_code == 200 and len(page.json()["items"]) == 1
+    assert page.json()["items"][0]["sample_id"] != ids[0], "the answered sample is passed over on the page"
+    assert calls == []
+

@@ -66,7 +66,7 @@ class Review:
         self.store = service.store
         self.db = service.db
         self.pipeline = service.pipeline
-        self._cache: tuple | None = None  # (evidence_key, entries)
+        self._cache: tuple | None = None  # (evidence_key, entries, playability checked)
         self._cache_lock = threading.Lock()
 
     # -- views -----------------------------------------------------------------------------------
@@ -223,52 +223,83 @@ class Review:
     def page(self, limit: int, offset: int = 0, now: float | None = None) -> dict:
         """`limit` items from `offset` in the queue's order (flagged samples, then recent automatic names and hints,
         then unconfirmed samples), with the queue's `total` and the `next_offset` (None at the end), so a phone
-        that skips items can page past them. Only the page's items are built."""
+        that skips items can page past them. Only the page's items are built: the queue is the worker's last one
+        (`entries(for_request=True)`), and an item decided since is checked on the page and passed over."""
         now = time.time() if now is None else now
-        entries = self.entries(now)
+        entries = self.entries(now, for_request=True)
         offset = max(0, offset)
-        chosen = entries[offset:offset + limit]
+        chosen, end = [], offset
+        while end < len(entries) and len(chosen) < limit:
+            current = self._still_open(*entries[end])
+            end += 1
+            if current is not None:
+                chosen.append(current)
         evidence = self._evidence() if any(kind == "label" for kind, _ in chosen) else ""
         out = [self._sample_item(v) if kind == "sample" else self._label_item(*v, evidence=evidence) for kind, v in chosen]
         names = {p["id"]: p["name"] for p in self.store.people()}
         for item in out:  # the person each item asks about, by name (the phone never shows a placeholder)
             item["person_name"] = names.get(item.get("person_id"))
-        end = offset + len(chosen)
         return {"items": out, "total": len(entries), "next_offset": end if end < len(entries) else None}
 
-    def entries(self, now: float | None = None) -> list[tuple]:
-        """The queue's order, built once per `evidence_key` (a page is a slice of it); the worker warms it."""
+    def _still_open(self, kind: str, value) -> tuple | None:
+        """A queue entry as it is now (one sample file, or one conversation's labels), or None when it was decided
+        since the queue was built (the worker's next build drops it)."""
+        if kind == "sample":
+            data = self.store.read_sample(value["person_id"], value["sample_id"])
+            if data is None or not sample_eligible(data):
+                return None
+            if not flag_open(data.get("flag")) and any(h.get("action") == "confirm" for h in data.get("history") or []):
+                return None
+            return "sample", data
+        row, label, person_id, reasons = value
+        row = self.db.one("SELECT * FROM conversations WHERE id=?", (row["id"],))
+        if row is None:
+            return None
+        state = self.store.labels(row["id"]).get(label) or {}
+        if reasons == ["auto"] and not (state.get("source") == "auto" and state.get("person_id") == person_id):
+            return None
+        if reasons == ["possible"] and state.get("person_id"):
+            return None
+        return "label", (row, label, person_id, reasons)
+
+    def entries(self, now: float | None = None, *, for_request: bool = False) -> list[tuple]:
+        """The queue's order, built by the worker once per `evidence_key` (playability included: every item has a clip
+        the server can cut). A request never builds it (ASTRA-20261113-IT1-01: that is a scan of every sample): it
+        takes the worker's last build, stale or not (a page re-checks its own items, `_still_open`), and only a
+        process that has none yet gets an unfiltered order (no playability work; the phone skips unplayable items)."""
         now = time.time() if now is None else now
         self.store.sync_samples()
         embedder = self.pipeline.providers.embedder
         key = self.store.evidence_key(embedder.model, embedder.model_sha) if embedder else None
         with self._cache_lock:
-            if key is not None and self._cache is not None and self._cache[0] == key:
-                return self._cache[1]
-        built = self._entries(now)
+            cached = self._cache
+        if cached is not None and (for_request or (key is not None and cached[0] == key and cached[2])):
+            return cached[1]
+        built = self._entries(now, check=not for_request)
         if key is not None and self.store.evidence_key(embedder.model, embedder.model_sha) == key:  # unchanged meanwhile
             with self._cache_lock:
-                self._cache = (key, built)
+                if not for_request or self._cache is None:  # a request's unchecked order never replaces a build
+                    self._cache = (key, built, not for_request)
         return built
 
-    def _entries(self, now: float) -> list[tuple]:
-        """Only items the owner can listen to: a sample or a label whose clip the server can't cut never asks to be
-        judged (the worker sets flagged ones aside, `set_aside_unplayable`; a suggested name without audio is
-        dropped, the voice stays unnamed)."""
+    def _entries(self, now: float, check: bool = True) -> list[tuple]:
+        """Only items the owner can listen to (`check`): a sample or a label whose clip the server can't cut never
+        asks to be judged (the worker sets flagged ones aside, `set_aside_unplayable`; a suggested name without
+        audio is dropped, the voice stays unnamed). Without `check` (no build yet), every open item."""
         flagged, rest = [], []
         voices: dict = {}
         for r in self.db.query("SELECT * FROM samples ORDER BY created_at DESC, id"):
             if not sample_eligible(r):
                 continue
             data = self.store.read_sample(r["person_id"], r["id"])
-            if data is None or not self.playable(data, voices):
+            if data is None or (check and not self.playable(data, voices)):
                 continue
             if flag_open(data.get("flag")):
                 flagged.append((-len(data["flag"].get("reasons") or []), -(data.get("created_at") or 0), data))
             elif not any(h.get("action") == "confirm" for h in data.get("history") or []):
                 rest.append(data)
         entries = [("sample", d) for *_, d in sorted(flagged, key=lambda x: (x[0], x[1]))]
-        entries += [("label", key) for key in self._label_keys(now)]
+        entries += [("label", key) for key in self._label_keys(now, check=check)]
         entries += [("sample", d) for d in rest]
         return entries
 
@@ -278,7 +309,7 @@ class Review:
         evidence = self._evidence() if keys else ""
         return [self._label_item(*key, evidence=evidence) for key in keys]
 
-    def _label_keys(self, now: float) -> list[tuple]:
+    def _label_keys(self, now: float, check: bool = True) -> list[tuple]:
         """(row, label, person, reasons) of every label item, in queue order: cheap, so a page can count and
         skip them and build only its own (the voice space is computed once, not per conversation)."""
         people = {p["id"] for p in self.store.people()}
@@ -305,6 +336,9 @@ class Review:
                 elif label in hints and hints[label] in people and not state.get("person_id"):
                     key = (row, label, hints[label], ["possible"])
                 else:
+                    continue
+                if not check:
+                    keys.append(key)
                     continue
                 if heard is None:
                     heard = self._playable_labels(row)
