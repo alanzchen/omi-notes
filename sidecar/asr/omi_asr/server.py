@@ -40,26 +40,57 @@ LOAD_TIMEOUT = float(os.environ.get("OMI_ASR_LOAD_TIMEOUT", "180"))  # one model
 LOAD_RETRY_AFTER = 1800.0  # a load stuck this long: start over in a fresh process (a restart can't free it sooner)
 
 
+EXTERNAL_ROOTS = ("/Volumes", "/System/Volumes/Data/Volumes")  # other disks, by either name
+MAX_LINKS = 40
+
+
+def _external(path: str) -> bool:
+    return any(path == root or path.startswith(root + "/") for root in EXTERNAL_ROOTS)
+
+
 def cache_problem(env=os.environ) -> str | None:
-    """Why the Hugging Face cache can't be trusted from a launchd process, else None. Each component of the
-    cache path is checked with lstat and its link text read (never stat or open beyond a link): a link to an
-    external volume (/Volumes/...) can block every open() on a privacy check nobody can answer while the screen
-    is locked (2026-11-14: ~/.cache/huggingface/hub moved to an external SSD; every model load hung)."""
+    """Why the Hugging Face cache can't be trusted from a launchd process, else None. A cache on an external volume
+    (/Volumes/...) can block every open() on a privacy check nobody can answer while the screen is locked
+    (2026-11-14: ~/.cache/huggingface/hub moved to an external SSD; every model load hung), and so can any metadata
+    call there, this check's own included (ASTRA-20261114-IT1-01). So the path is resolved by hand, one component at
+    a time: ".." takes back an already resolved component, a link's text (os.readlink) is spliced in, and every path
+    is checked by name against the external roots before the one call that looks at it (os.path.islink, an lstat
+    whose parents are all resolved, internal directories). Nothing under an external root is ever looked at."""
     home = env.get("HF_HOME") or os.path.join(env.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "huggingface")
     hub = env.get("HF_HUB_CACHE") or os.path.join(home, "hub")
-    prefix = os.sep
-    for part in os.path.abspath(hub).split(os.sep)[1:]:
-        prefix = os.path.join(prefix, part)
+    if not os.path.isabs(hub):
+        hub = os.path.join(os.getcwd(), hub)
+
+    def refuse(where: str) -> str:
+        return f"the model cache {hub} is on an external volume ({where}): use a cache on the internal disk (OMI_ASR_HF_HOME)"
+
+    done: list[str] = []
+    rest = [p for p in hub.split("/") if p]
+    links = 0
+    while rest:
+        part = rest.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if done:
+                done.pop()
+            continue
+        candidate = "/" + "/".join(done + [part])
+        if _external(candidate):
+            return refuse("/".join([candidate] + rest))  # where it leads, by name only
         try:
-            if not os.path.islink(prefix):
+            if not os.path.islink(candidate):
+                done.append(part)
                 continue
-            target = os.readlink(prefix)
+            target = os.readlink(candidate)
         except OSError:
-            return None  # missing: the load reports it
-        if target.startswith("/Volumes/"):
-            return f"the model cache {prefix} links to {target} on an external volume: use a cache on the internal disk (OMI_ASR_HF_HOME)"
-        if os.path.isabs(target):
-            prefix = target  # an internal link: keep checking from where it points
+            return None  # missing or unreadable: the load reports it
+        links += 1
+        if links > MAX_LINKS:
+            return f"the model cache {hub} has too many links to follow ({MAX_LINKS})"
+        if target.startswith("/"):
+            done = []
+        rest = [p for p in target.split("/") if p] + rest
     return None
 
 
@@ -124,6 +155,8 @@ class Guard:
         return self.self_test_state
 
     def problem(self) -> str | None:
+        if self.cache_problem:  # known at startup, self-test or not (ASTRA-20261114-IT1-02)
+            return f"model cache unusable: {self.cache_problem}"
         if self.self_test_state.startswith("failed"):
             return f"startup self-test {self.self_test_state}"
         if self.failed:

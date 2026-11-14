@@ -239,3 +239,73 @@ def test_with_an_external_cache_the_self_test_fails_at_once_and_never_loads():
     r = TestClient(app).get("/health")
     assert calls == [] and r.status_code == 503 and "external volume" in r.json()["reason"]
     assert TestClient(app).post("/v1/audio/transcriptions", files={"file": ("a.flac", flac(), "audio/flac")}).status_code == 503
+
+
+# ASTRA-20261114-IT1-01: the check itself must never look at anything on an external volume. A virtual file system
+# (no real metadata call anywhere): every islink/readlink is resolved through its links, and one landing under
+# /Volumes fails the test.
+@pytest.mark.parametrize("mode", ["direct", "relative_parent", "chained_parent", "relative_leaf", "chained_leaf",
+                                  "direct_link", "system_volumes_name", "loop", "internal", "internal_relative"])  # fmt: skip
+def test_the_cache_check_refuses_external_paths_without_looking_at_them(monkeypatch, mode):
+    import posixpath
+
+    env, links = {"HF_HUB_CACHE": "/review/hub"}, {}
+    if mode == "direct":
+        env = {"HF_HUB_CACHE": "/Volumes/SSD/hub"}
+    elif mode == "relative_parent":
+        env, links = {"HF_HOME": "/review/hf"}, {"/review/hf": "../../Volumes/SSD/hf"}
+    elif mode == "chained_parent":
+        env, links = {"HF_HOME": "/review/hf"}, {"/review/hf": "/review/hop", "/review/hop": "/Volumes/SSD/hf"}
+    elif mode == "relative_leaf":
+        links = {"/review/hub": "../Volumes/SSD/hub"}
+    elif mode == "chained_leaf":
+        links = {"/review/hub": "/review/hop", "/review/hop": "/Volumes/SSD/hub"}
+    elif mode == "direct_link":
+        links = {"/review/hub": "/Volumes/SSD/hub"}
+    elif mode == "system_volumes_name":
+        links = {"/review/hub": "/System/Volumes/Data/Volumes/SSD/hub"}
+    elif mode == "loop":
+        links = {"/review/hub": "/review/a", "/review/a": "/review/hub"}
+    elif mode == "internal":
+        links = {"/review/hub": "/review/internal"}
+    elif mode == "internal_relative":
+        links = {"/review/hub": "../review/x/../internal"}
+
+    def resolve(path):
+        for _ in range(60):
+            pieces = path.strip("/").split("/")
+            for n in range(1, len(pieces) + 1):
+                prefix = "/" + "/".join(pieces[:n])
+                if prefix in links:
+                    path = posixpath.normpath(posixpath.join(posixpath.dirname(prefix), links[prefix], *pieces[n:]))
+                    break
+            else:
+                return path
+        return path
+
+    probes = []
+
+    def leaf(path):  # what a real lstat/readlink of `path` would look at
+        parent, name = posixpath.split(path)
+        actual = posixpath.join(resolve(parent), name)
+        probes.append(actual)
+        assert not actual.startswith(("/Volumes", "/System/Volumes/Data/Volumes")), f"looked at {actual}"
+        return actual
+
+    monkeypatch.setattr(server.os.path, "islink", lambda path: leaf(path) in links)
+    monkeypatch.setattr(server.os, "readlink", lambda path: links[leaf(path)])
+    result = server.cache_problem(env)
+    if mode.startswith("internal"):
+        assert result is None, result
+    elif mode == "loop":
+        assert result and "too many links" in result
+    else:
+        assert result and "external volume" in result, result
+
+
+def test_a_cache_refusal_fails_health_without_a_self_test():
+    # ASTRA-20261114-IT1-02: with OMI_ASR_SELF_TEST=0 a refused cache answered transcriptions 503 while /health said ok
+    app = server.create_app(FakeEngine(), exit=lambda code: None)
+    app.state.guard.cache_problem = "the model cache /x/hub is on an external volume (/Volumes/SSD)"
+    r = TestClient(app).get("/health")
+    assert r.status_code == 503 and r.json()["ok"] is False and "external volume" in r.json()["reason"]

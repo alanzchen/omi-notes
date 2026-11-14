@@ -17,7 +17,13 @@ HF="${OMI_ASR_HF_HOME:-$HOME/Library/Application Support/omi-notes-asr/hf}"
 case "${1:-status}" in
 install)
   [ -x "$HERE/.venv/bin/python" ] || { echo "run 'uv sync' in $HERE first" >&2; exit 1; }
-  [ -d "$HF/hub" ] && [ ! -L "$HF/hub" ] || { echo "no model cache at $HF/hub (copy the three models there first)" >&2; exit 1; }
+  # the sidecar's own check first (names and link text only, nothing on an external volume is looked at), and only then
+  # a test that follows the path (ASTRA-20261114-IT1-01)
+  if ! why=$(cd "$HERE" && HF_HOME="$HF" HF_HUB_CACHE="$HF/hub" .venv/bin/python -c \
+      'import sys; from omi_asr.server import cache_problem; p = cache_problem(); print(p or ""); sys.exit(1 if p else 0)'); then
+    echo "refusing: $why" >&2; exit 1
+  fi
+  [ -d "$HF/hub" ] || { echo "no model cache at $HF/hub (copy the three models there first)" >&2; exit 1; }
   mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
   tmp=$(mktemp)
   cat > "$tmp" <<PLIST
