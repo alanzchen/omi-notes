@@ -173,6 +173,33 @@ import OmiWatchKit
         #expect(health(streaming(), reachable(), try status()).level == .normal)
     }
 
+    @Test func aFreshRecoveredStatusClearsAnOutageIssueKeptFromBefore() throws {
+        // ASTRA-20261114-IT3-02: when the issue fetch fails, the phone keeps the previous issues; a kept
+        // local_transcription_unavailable overrode a fresh status saying the engine answers again
+        let outage = try JSONDecoder().decode(ServerIssue.self, from: Data(#"{"code":"local_transcription_unavailable","severity":"action","message":"Local transcription on the server has been unavailable for 25 min."}"#.utf8))
+        func engine(healthy: Bool?, available: Bool?) throws -> ServerStatus {
+            var body: [String: Any] = [
+                "ok": true, "llm": ["provider": "fake", "ready": true], "worker": ["present": true], "read_only": NSNull(),
+                "queue": ["chunks_pending": 0, "conversations_open": 0, "conversations_pending": 0, "failed": 0, "conversations_failed": 0,
+                          "chunks_failed": 0, "conversations_retrying": 0, "notes_conflicted": 0],
+                "last_note_at": "2026-09-21T12:00:00.000Z", "features": ["issues"],
+                "stt": ["provider": "local", "ready": true] as [String: Any],
+            ]
+            if let healthy { body["stt"] = ["provider": "local", "ready": true, "engine": ["name": "omi-asr sidecar", "healthy": healthy]] }
+            if let available { body["local_transcription"] = ["available": available] }
+            return try JSONDecoder().decode(ServerStatus.self, from: JSONSerialization.data(withJSONObject: body))
+        }
+        func level(_ st: ServerStatus, age: TimeInterval = 10) -> SystemHealth.Level {
+            step(SystemHealth.evaluate(snapshot: streaming(), server: reachable(), status: st, statusAt: now.addingTimeInterval(-age),
+                                       now: now, issues: [outage]), .server).level
+        }
+        #expect(level(try engine(healthy: true, available: true)) == .normal, "fresh recovery wins over the kept issue")
+        #expect(level(try engine(healthy: false, available: false)) == .delayed, "a real outage is still shown")
+        #expect(level(try engine(healthy: nil, available: nil)) == .delayed, "an older server: the issue is all there is")
+        #expect(level(try engine(healthy: true, available: nil)) == .delayed, "recovery not established by this status")
+        #expect(level(try engine(healthy: true, available: true), age: 600) == .unknown, "stale stays unknown")
+    }
+
     @Test func noNotesYetOnANewServer() throws {
         let json = #"{"queue":{"failed":0,"conversations_failed":0,"chunks_failed":0},"worker":{"present":true},"last_note_at":null,"features":["issues"]}"#
         let st = try JSONDecoder().decode(ServerStatus.self, from: Data(json.utf8))

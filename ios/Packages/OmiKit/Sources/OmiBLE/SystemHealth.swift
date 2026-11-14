@@ -263,8 +263,11 @@ public struct SystemHealth: Equatable, Sendable {
         // the server's own transcription engine is known to be down (configured, not answering), with nothing waiting
         // yet: still not "no problems" (ASTRA-20261114-IT2-01). A fresh answer only (the stale check above), and it
         // clears as soon as the engine answers again.
-        if status.stt?.engine?.healthy == false || status.localTranscription?.available == false
-            || issues.contains(where: { $0.code == "local_transcription_unavailable" }) {
+        // The issue list may be older than this status (kept when its own fetch failed): it counts only when this fresh
+        // status doesn't show the engine answering (ASTRA-20261114-IT3-02).
+        let engineDown = status.stt?.engine?.healthy == false || status.localTranscription?.available == false
+        let engineBack = status.stt?.engine?.healthy == true && status.localTranscription?.available == true
+        if engineDown || (!engineBack && issues.contains(where: { $0.code == "local_transcription_unavailable" })) {
             return step(.delayed, "Transcription on the server isn't answering",
                         "New conversations wait for it and are transcribed when it's back.", .openServer)
         }
