@@ -132,6 +132,41 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
         #expect(queue.phase == .ready && queue.items.count == 3)
     }
 
+    @Test func aSlowAutomaticFetchNeverReplacesWhatRefreshFound() async throws {
+        // ASTRA-20261113-IT4-01: an automatic fetch still waiting for a cold answer when "刷新" brought the queue
+        // used to land afterwards and put the screen back to "正在准备…"
+        let queue = VoiceReviewQueue(speakers: try speakers())
+        queue.preparingWaits = [.milliseconds(10)]
+        let cold = #"{"items":[],"total":0,"next_offset":null,"ready":false}"#
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, cold), (200, cold), (200, Self.first)]
+        queue.setVisible(true)
+        await queue.load()
+        queue.preparingWaits = [.seconds(30), .seconds(30), .seconds(30)]  // the first retry already waits 10 ms
+        VoicesHubStub.delays["GET /v1/speakers/review"] = 0.4  // the automatic fetch's cold answer comes late
+        for _ in 0..<100 where sent("GET", "/v1/speakers/review").count < 2 { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(sent("GET", "/v1/speakers/review").count == 2)
+        VoicesHubStub.delays = [:]
+        await queue.refreshPreparing()
+        #expect(queue.phase == .ready && queue.items.count == 3)
+        try await Task.sleep(for: .milliseconds(600))  // the late cold answer has arrived by now
+        #expect(queue.phase == .ready && queue.items.count == 3, "the older answer was dropped")
+        #expect(sent("GET", "/v1/speakers/review").count == 3)
+    }
+
+    @Test func closingTheScreenCancelsAnAutomaticFetchInFlight() async throws {
+        let queue = VoiceReviewQueue(speakers: try speakers())
+        queue.preparingWaits = [.milliseconds(10), .milliseconds(10), .milliseconds(10)]
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, #"{"items":[],"total":0,"ready":false}"#)]
+        queue.setVisible(true)
+        await queue.load()
+        VoicesHubStub.delays["GET /v1/speakers/review"] = 0.3
+        for _ in 0..<100 where sent("GET", "/v1/speakers/review").count < 2 { try await Task.sleep(for: .milliseconds(10)) }
+        queue.setVisible(false)
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(sent("GET", "/v1/speakers/review").count == 2, "no further fetch once the screen closed")
+        #expect(queue.phase == .preparing, "a cancelled fetch is not an error")
+    }
+
     @Test func aPreparingServerIsNotAskedWhileTheScreenIsClosed() async throws {
         let queue = VoiceReviewQueue(speakers: try speakers())
         queue.preparingWaits = [.milliseconds(20), .milliseconds(20), .milliseconds(20)]

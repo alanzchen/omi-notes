@@ -105,7 +105,11 @@ public final class VoiceReviewQueue {
     /// Fetches made since the server first answered "preparing".
     public private(set) var preparingTries = 0
     private var visible = false
+    /// The automatic fetch waiting or running now; owned until its fetch ends, so closing the screen or "刷新"
+    /// cancels it (ASTRA-20261113-IT4-01).
     private var preparingTask: Task<Void, Never>?
+    /// Bumped whenever the automatic round is cancelled: a fetch of an older round never schedules another.
+    private var preparingRound = 0
 
     public init(speakers: SpeakersModel) {
         self.speakers = speakers
@@ -124,25 +128,35 @@ public final class VoiceReviewQueue {
     /// does.
     public func setVisible(_ shown: Bool) {
         visible = shown
-        if shown { schedulePreparingFetch() } else { preparingTask?.cancel(); preparingTask = nil }
+        if shown { schedulePreparingFetch() } else { cancelPreparingFetch() }
     }
 
-    /// "刷新" after the automatic fetches: asks again, with a fresh round of them.
+    /// "刷新" after the automatic fetches: asks again, with a fresh round of them (an automatic fetch still running
+    /// is cancelled: its older answer never replaces this one).
     public func refreshPreparing() async {
+        cancelPreparingFetch()
         preparingTries = 0
         await load()
+    }
+
+    private func cancelPreparingFetch() {
+        preparingRound += 1
+        preparingTask?.cancel()
+        preparingTask = nil
     }
 
     private func schedulePreparingFetch() {
         guard visible, phase == .preparing, preparingTask == nil, preparingTries < preparingWaits.count else { return }
         let wait = preparingWaits[preparingTries]
+        let round = preparingRound
         preparingTask = Task { [weak self] in
             do { try await Task.sleep(for: wait) } catch { return }
-            guard let self else { return }
-            self.preparingTask = nil
-            guard self.visible, self.phase == .preparing else { return }
+            guard let self, round == self.preparingRound, self.visible, self.phase == .preparing else { return }
             self.preparingTries += 1
             await self.load()
+            guard round == self.preparingRound else { return }  // cancelled meanwhile: a newer round owns it
+            self.preparingTask = nil
+            self.schedulePreparingFetch()
         }
     }
 
@@ -150,6 +164,7 @@ public final class VoiceReviewQueue {
     public func load() async {
         if phase != .preparing { phase = .loading }  // while preparing, a fetch again doesn't flash a spinner
         generation += 1
+        let asked = generation  // a newer fetch (or a cancelled one) never applies an older answer
         do {
             var fetched: [ReviewItem] = []
             var open: [ReviewItem] = []
@@ -158,6 +173,7 @@ public final class VoiceReviewQueue {
             var more = false
             repeat {
                 let page = try await speakers.reviewItems(limit: ReviewBatch.window, offset: offset)
+                guard asked == generation, !Task.isCancelled else { return }
                 pages += 1
                 if !page.isReady, page.items.isEmpty, offset == 0 {
                     items = []
@@ -187,6 +203,7 @@ public final class VoiceReviewQueue {
             preparingTries = 0
             phase = items.isEmpty ? (fetched.isEmpty ? .empty : .onlySkipped) : .ready
         } catch {
+            guard asked == generation, !Task.isCancelled else { return }
             phase = .failed(SpeakersModel.describe(error))
         }
     }

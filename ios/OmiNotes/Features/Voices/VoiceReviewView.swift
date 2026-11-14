@@ -384,7 +384,7 @@ struct VoiceReviewView: View {
             }
             Spacer()
             Button("完成") { dismiss() }.font(.headline)
-            bottomLine.frame(height: 50).padding(.bottom, 8)
+            Color.clear.frame(height: 50).padding(.bottom, 8)  // no card: no swipe hint (keeps the layout of the others)
         }
         .padding(.horizontal, 32)
     }
