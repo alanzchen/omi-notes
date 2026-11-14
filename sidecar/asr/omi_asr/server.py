@@ -45,7 +45,10 @@ MAX_LINKS = 40
 
 
 def _external(path: str) -> bool:
-    return any(path == root or path.startswith(root + "/") for root in EXTERNAL_ROOTS)
+    """By name, without regard to case: on a case-insensitive disk /volumes/SSD is /Volumes/SSD
+    (ASTRA-20261114-IT3-01)."""
+    folded = path.casefold()
+    return any(folded == root.casefold() or folded.startswith(root.casefold() + "/") for root in EXTERNAL_ROOTS)
 
 
 def cache_problem(env=os.environ) -> str | None:

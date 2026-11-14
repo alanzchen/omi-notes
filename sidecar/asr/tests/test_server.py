@@ -309,3 +309,79 @@ def test_a_cache_refusal_fails_health_without_a_self_test():
     app.state.guard.cache_problem = "the model cache /x/hub is on an external volume (/Volumes/SSD)"
     r = TestClient(app).get("/health")
     assert r.status_code == 503 and r.json()["ok"] is False and "external volume" in r.json()["reason"]
+
+
+# ASTRA-20261114-IT3-01: the external names, without regard to case, and Astra's internal controls (virtual only)
+@pytest.mark.parametrize("case", ["lower_direct", "mixed_system", "relative_case_link", "symlink_dotdot_external",
+                                  "symlink_dotdot_internal", "internal_firmlink_name", "trailing_slash", "hub_precedence",
+                                  "empty_env", "empty_values", "relative_cwd", "loop"])  # fmt: skip
+def test_external_names_are_refused_whatever_their_case_and_internal_paths_pass(monkeypatch, case):
+    env, links, external = {"HF_HUB_CACHE": "/review/hub"}, {}, False
+    if case == "lower_direct":
+        env, external = {"HF_HUB_CACHE": "/volumes/SSD/hub"}, True
+    elif case == "mixed_system":
+        env, external = {"HF_HOME": "/system/volumes/data/VOLUMES/SSD"}, True
+    elif case == "relative_case_link":
+        links, external = {"/review/hub": "../vOlUmEs/SSD/hub"}, True
+    elif case == "symlink_dotdot_external":
+        env, links, external = {"HF_HUB_CACHE": "/review/link/../../Volumes/SSD/hub"}, {"/review/link": "/internal/deep"}, True
+    elif case == "symlink_dotdot_internal":
+        env, links = {"HF_HUB_CACHE": "/review/link/../hub"}, {"/review/link": "/internal/deep"}
+    elif case == "internal_firmlink_name":
+        env = {"HF_HOME": "/System/Volumes/Data/Users/synthetic/hf"}
+    elif case == "trailing_slash":
+        env = {"HF_HUB_CACHE": "/review/hub///"}
+    elif case == "hub_precedence":
+        env = {"HF_HOME": "/Volumes/SSD/unused", "HF_HUB_CACHE": "/review/hub"}
+    elif case == "empty_env":
+        env = {}
+    elif case == "empty_values":
+        env = {"HF_HOME": "", "HF_HUB_CACHE": "", "XDG_CACHE_HOME": ""}
+    elif case == "relative_cwd":
+        env = {"HF_HOME": "../review/hf"}
+    elif case == "loop":
+        links = {"/review/hub": "/review/a", "/review/a": "/review/hub"}
+    probes = []
+
+    def inspect(p):  # the resolver resolved every parent itself: the path given is the path looked at
+        probes.append(p)
+        assert not any(p.casefold().startswith(r + "/") for r in ("/volumes", "/system/volumes/data/volumes")), p
+        return p
+
+    monkeypatch.setattr(server.os.path, "islink", lambda p: inspect(p) in links)
+    monkeypatch.setattr(server.os, "readlink", lambda p: links[inspect(p)])
+    monkeypatch.setattr(server.os, "getcwd", lambda: "/review/work")
+    monkeypatch.setattr(server.os.path, "expanduser", lambda p: "/review/user/.cache")
+    result = server.cache_problem(env)
+    if external:
+        assert result and "external volume" in result
+    elif case == "loop":
+        assert result and "too many links" in result
+    else:
+        assert result is None, result
+    if case == "symlink_dotdot_internal":
+        assert "/internal/hub" in probes and "/review/hub" not in probes
+
+
+def _installer_check(caller, hf_home):
+    import os
+    import subprocess
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "launchagent.sh"
+    env = dict(os.environ, OMI_ASR_HF_HOME=hf_home, PWD=str(caller))
+    return subprocess.run(["sh", str(script), "check"], cwd=caller, env=env, capture_output=True, text=True, timeout=60)
+
+
+def test_the_installer_checks_a_relative_cache_where_it_uses_it(tmp_path):
+    # ASTRA-20261114-IT3-01: OMI_ASR_HF_HOME=cache was checked under the sidecar's folder but tested (-d) and written
+    # to the plist relative to the caller's: the installer now spells it once, absolute, and uses that spelling everywhere
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    (caller / "cache").symlink_to("/Volumes/No Such SSD/cache")  # only its text is read
+    r = _installer_check(caller, "cache")
+    assert r.returncode == 1 and "external volume" in r.stderr and f"{caller}/cache/hub" in r.stderr
+    good = tmp_path / "good"
+    (good / "cache" / "hub").mkdir(parents=True)
+    r = _installer_check(good, "cache")
+    assert r.returncode == 0 and r.stdout.strip() == f"{good}/cache", (r.stdout, r.stderr)
