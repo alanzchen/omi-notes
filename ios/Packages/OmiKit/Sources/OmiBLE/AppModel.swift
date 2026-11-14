@@ -266,7 +266,8 @@ public final class AppModel {
             let st = try await api.status()
             status = st
             let q = st.queue
-            let detail = "STT \(st.stt?.ready == true ? "ready" : "not ready"), LLM \(st.llm?.ready == true ? "ready" : "not ready"), \(q?.chunksPending ?? 0) chunks queued"
+            // `ready` is configured, not answering now (a down local engine is configured too)
+            let detail = "STT \(st.stt?.ready == true ? "configured" : "not configured"), LLM \(st.llm?.ready == true ? "configured" : "not configured"), \(q?.chunksPending ?? 0) chunks queued"
             reach = .reachable(version: st.serverVersion, detail: detail)
         } catch APIError.unauthorized {
             reach = .unauthorized
@@ -421,8 +422,9 @@ public final class AppModel {
         let api = APIClient(endpoint: ServerEndpoint(baseURL: url, token: token))
         do {
             let st = try await api.status()
-            return "Connected to server \(st.serverVersion ?? "?"). Transcription \(st.stt?.ready == true ? "ready" : "not ready"); "
-                + "summaries \(st.llm?.ready == true ? "ready" : "not ready")."
+            return "Connected to server \(st.serverVersion ?? "?"). Transcription \(st.stt?.ready == true ? "configured" : "not configured")"
+                + (st.stt?.engine?.healthy == false ? " (not answering now)" : "") + "; "
+                + "summaries \(st.llm?.ready == true ? "configured" : "not configured")."
         } catch APIError.http(401, _) {
             return "Couldn't connect: the server rejected this token."
         } catch {

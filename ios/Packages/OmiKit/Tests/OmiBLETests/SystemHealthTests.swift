@@ -164,7 +164,13 @@ import OmiWatchKit
         let before = step(health(streaming(), reachable(), try outage(ready: false)), .server)
         #expect(before.level == .needsAction && before.title == "Transcription isn't set up on the server")
         q["conversations_retrying"] = 0
-        #expect(step(health(streaming(), reachable(), try outage(ready: true)), .server).level != .needsAction)
+        // ASTRA-20261114-IT2-01: down with nothing retrying yet was "Connected; no reported problems"
+        let idle = health(streaming(), reachable(), try outage(ready: true))
+        #expect(step(idle, .server).level == .delayed && step(idle, .server).title == "Transcription on the server isn't answering")
+        #expect(idle.headline != "Connected; no reported problems")
+        // a stale answer stays unknown; a healthy engine is normal again
+        #expect(step(health(streaming(), reachable(), try outage(ready: true), age: 600), .server).level == .unknown)
+        #expect(health(streaming(), reachable(), try status()).level == .normal)
     }
 
     @Test func noNotesYetOnANewServer() throws {

@@ -260,6 +260,14 @@ public struct SystemHealth: Equatable, Sendable {
             return step(.delayed, "The server is retrying \(retrying) conversation\(retrying == 1 ? "" : "s")",
                         "A service it uses is having trouble; it keeps trying on its own.", .openServer)
         }
+        // the server's own transcription engine is known to be down (configured, not answering), with nothing waiting
+        // yet: still not "no problems" (ASTRA-20261114-IT2-01). A fresh answer only (the stale check above), and it
+        // clears as soon as the engine answers again.
+        if status.stt?.engine?.healthy == false || status.localTranscription?.available == false
+            || issues.contains(where: { $0.code == "local_transcription_unavailable" }) {
+            return step(.delayed, "Transcription on the server isn't answering",
+                        "New conversations wait for it and are transcribed when it's back.", .openServer)
+        }
         guard let q else {
             return step(.unknown, "Server reachable; processing status unavailable", "This server version doesn't report its queue.")
         }
