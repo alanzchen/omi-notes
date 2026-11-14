@@ -90,6 +90,7 @@ class Engine:
         self.models: tuple | None = None
         self.last_used = 0.0
         self.load_seconds: float | None = None
+        self.loading: tuple[str, float] | None = None  # (repo, monotonic start) of the model being loaded now
 
     # -- models ----------------------------------------------------------------------------------
 
@@ -100,9 +101,15 @@ class Engine:
             from mlx_audio.stt.utils import load_model
 
             t = time.perf_counter()
-            models = tuple(load_model(repo) for repo in (MOSS, QWEN, ALIGNER))
-            for m in models:
-                mx.eval(m.parameters())
+            loaded = []
+            try:
+                for repo in (MOSS, QWEN, ALIGNER):  # one at a time, so a hang names its model (`Guard.problem`)
+                    self.loading = (repo, time.monotonic())
+                    loaded.append(load_model(repo))
+                    mx.eval(loaded[-1].parameters())
+            finally:
+                self.loading = None
+            models = tuple(loaded)
             self.models = models
             self.load_seconds = round(time.perf_counter() - t, 2)
             log.info("models loaded in %.1f s", self.load_seconds)

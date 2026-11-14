@@ -164,3 +164,78 @@ def test_an_incomplete_transcription_is_a_422_and_not_an_engine_failure():
     assert client.get("/health").status_code == 200
     app.state.guard.check()
     assert exits == []
+
+
+# -- 2026-11-14: a model load that never returns (the HF cache moved to an external volume) --------------
+
+
+class HangingLoadEngine(FakeEngine):
+    """A load that blocks (as open() did on the external volume's privacy check) until released."""
+
+    def __init__(self):
+        super().__init__()
+        import threading
+        self.release = threading.Event()
+        self.loading = None
+
+    def self_test(self):
+        import time
+        self.loading = ("OpenMOSS-Team/MOSS-Transcribe-Diarize", time.monotonic())
+        self.release.wait(5)
+        self.loading = None
+
+
+def test_a_model_load_past_its_timeout_names_the_model_and_requests_answer_503_at_once(monkeypatch):
+    import threading
+    import time
+
+    monkeypatch.setattr(server, "LOAD_TIMEOUT", 0.05)
+    monkeypatch.setenv("HF_HUB_CACHE", "/internal/hf/hub")
+    exits, engine = [], HangingLoadEngine()
+    app = server.create_app(engine, exit=exits.append)
+    guard, client = app.state.guard, TestClient(app)
+    threading.Thread(target=guard.self_test, daemon=True).start()
+    time.sleep(0.2)
+    body = client.get("/health").json()
+    assert body["self_test"].startswith("failed: timeout loading OpenMOSS-Team/MOSS-Transcribe-Diarize from /internal/hf/hub")
+    assert body["ok"] is False and body["reason"].startswith("timeout loading")
+    r = client.post("/v1/audio/transcriptions", files={"file": ("a.flac", flac(), "audio/flac")})
+    assert r.status_code == 503 and "timeout loading" in r.json()["detail"] and engine.calls == []
+    guard.check()
+    assert exits == [], "a restart can't free a blocked load: reported, not restarted every few minutes"
+    monkeypatch.setattr(server, "LOAD_RETRY_AFTER", 0.0)
+    guard.check()
+    assert exits == [70], "but tried again in a fresh process now and then"
+    engine.release.set()
+
+
+def test_a_model_cache_linked_to_an_external_volume_is_reported_without_opening_it(tmp_path):
+    home = tmp_path / "hf"
+    home.mkdir()
+    (home / "hub").symlink_to("/Volumes/Some SSD/huggingface-hub")  # never created: only the link text is read
+    problem = server.cache_problem({"HF_HOME": str(home)})
+    assert problem and str(home / "hub") in problem and "/Volumes/Some SSD/huggingface-hub" in problem
+    linked_home = tmp_path / "home-link"
+    linked_home.symlink_to("/Volumes/Other/hf")
+    assert "/Volumes/Other/hf" in server.cache_problem({"HF_HOME": str(linked_home)})
+    internal = tmp_path / "internal"
+    (internal / "hub").mkdir(parents=True)
+    (tmp_path / "via").symlink_to(internal)
+    assert server.cache_problem({"HF_HOME": str(tmp_path / "via")}) is None
+    assert server.cache_problem({"HF_HOME": str(internal)}) is None
+
+
+def test_with_an_external_cache_the_self_test_fails_at_once_and_never_loads():
+    calls = []
+
+    class Engine(FakeEngine):
+        def self_test(self):
+            calls.append(1)
+
+    app = server.create_app(Engine(), exit=lambda code: None)
+    guard = app.state.guard
+    guard.cache_problem = "the model cache /x/hub links to /Volumes/SSD/hub on an external volume"
+    guard.self_test()
+    r = TestClient(app).get("/health")
+    assert calls == [] and r.status_code == 503 and "external volume" in r.json()["reason"]
+    assert TestClient(app).post("/v1/audio/transcriptions", files={"file": ("a.flac", flac(), "audio/flac")}).status_code == 503

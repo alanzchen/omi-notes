@@ -36,6 +36,31 @@ log = logging.getLogger("omi_asr")
 MAX_SECONDS = float(os.environ.get("OMI_ASR_MAX_SECONDS", str(2 * 3600)))
 DEADLINE_BASE = 300.0
 WATCHDOG_EXIT = 70
+LOAD_TIMEOUT = float(os.environ.get("OMI_ASR_LOAD_TIMEOUT", "180"))  # one model from the local cache takes seconds
+LOAD_RETRY_AFTER = 1800.0  # a load stuck this long: start over in a fresh process (a restart can't free it sooner)
+
+
+def cache_problem(env=os.environ) -> str | None:
+    """Why the Hugging Face cache can't be trusted from a launchd process, else None. Each component of the
+    cache path is checked with lstat and its link text read (never stat or open beyond a link): a link to an
+    external volume (/Volumes/...) can block every open() on a privacy check nobody can answer while the screen
+    is locked (2026-11-14: ~/.cache/huggingface/hub moved to an external SSD; every model load hung)."""
+    home = env.get("HF_HOME") or os.path.join(env.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "huggingface")
+    hub = env.get("HF_HUB_CACHE") or os.path.join(home, "hub")
+    prefix = os.sep
+    for part in os.path.abspath(hub).split(os.sep)[1:]:
+        prefix = os.path.join(prefix, part)
+        try:
+            if not os.path.islink(prefix):
+                continue
+            target = os.readlink(prefix)
+        except OSError:
+            return None  # missing: the load reports it
+        if target.startswith("/Volumes/"):
+            return f"the model cache {prefix} links to {target} on an external volume: use a cache on the internal disk (OMI_ASR_HF_HOME)"
+        if os.path.isabs(target):
+            prefix = target  # an internal link: keep checking from where it points
+    return None
 
 
 class Guard:
@@ -48,8 +73,13 @@ class Guard:
         self.busy_since: float | None = None  # monotonic, of the operation holding `op`
         self.deadline: float | None = None
         self.op = threading.Lock()  # one engine operation at a time; its holder owns the deadline
+        self.cache_problem: str | None = None  # set at startup (`cache_problem`)
 
     def self_test(self) -> None:
+        if self.cache_problem:  # never load from there: the open() would block, not fail
+            self.self_test_state = f"failed: {self.cache_problem}"[:300]
+            log.error("self-test skipped: %s", self.cache_problem)
+            return
         try:
             with self.op:  # under the deadline too: a hang at startup is caught
                 self.busy_since = time.monotonic()
@@ -79,11 +109,27 @@ class Guard:
             finally:
                 self.busy_since = self.deadline = None
 
+    def load_stuck(self) -> str | None:
+        """A model load running past LOAD_TIMEOUT, named (the request deadline is far longer and would only say
+        "stuck")."""
+        loading = getattr(self.engine, "loading", None)
+        if loading is None or time.monotonic() - loading[1] <= LOAD_TIMEOUT:
+            return None
+        cache = os.environ.get("HF_HUB_CACHE") or os.environ.get("HF_HOME") or "the default cache"
+        return f"timeout loading {loading[0]} from {cache} ({time.monotonic() - loading[1]:.0f} s)"
+
+    def self_test_label(self) -> str:
+        if self.self_test_state == "pending" and (stuck := self.load_stuck()):
+            return f"failed: {stuck}"
+        return self.self_test_state
+
     def problem(self) -> str | None:
         if self.self_test_state.startswith("failed"):
             return f"startup self-test {self.self_test_state}"
         if self.failed:
             return f"engine failed: {self.failed}"
+        if stuck := self.load_stuck():
+            return stuck
         deadline, since = self.deadline, self.busy_since
         if deadline is not None and time.monotonic() > deadline:
             return f"a transcription is stuck (running {time.monotonic() - (since or 0):.0f} s)"
@@ -93,6 +139,12 @@ class Guard:
         """Watchdog: a stuck transcription holds the models' lock for good, and an engine error (a Metal
         failure, memory) may leave MLX unusable; either way, start over in a fresh process."""
         problem = self.problem()
+        if problem and problem.startswith("timeout loading"):
+            loading = getattr(self.engine, "loading", None)  # reported by /health; retried only now and then
+            if loading is not None and time.monotonic() - loading[1] > LOAD_RETRY_AFTER:
+                log.critical("%s: exiting so launchd restarts the service", problem)
+                self.exit(WATCHDOG_EXIT)
+            return
         if problem and (problem.startswith("a transcription is stuck") or problem.startswith("engine failed")):
             log.critical("%s: exiting so launchd restarts the service", problem)
             self.exit(WATCHDOG_EXIT)
@@ -138,6 +190,9 @@ def create_app(engine: Engine | None = None, *, self_test: bool = False, exit=os
 
         loop = asyncio.get_running_loop()
         tasks = [loop.create_task(idle_watch()), loop.create_task(watchdog())]
+        guard.cache_problem = cache_problem()
+        if guard.cache_problem:
+            log.error("%s", guard.cache_problem)
         if self_test:
             threading.Thread(target=guard.self_test, name="self-test", daemon=True).start()
         yield
@@ -150,7 +205,7 @@ def create_app(engine: Engine | None = None, *, self_test: bool = False, exit=os
     @app.get("/health")
     def health() -> JSONResponse:
         problem = guard.problem()
-        body = {"ok": problem is None, "version": VERSION, "models_loaded": engine.loaded, "self_test": guard.self_test_state,
+        body = {"ok": problem is None, "version": VERSION, "models_loaded": engine.loaded, "self_test": guard.self_test_label(),
                 "models": {"diarization": MOSS, "text": QWEN, "aligner": ALIGNER}}  # fmt: skip
         if problem:
             body["reason"] = problem
@@ -160,6 +215,8 @@ def create_app(engine: Engine | None = None, *, self_test: bool = False, exit=os
     async def transcriptions(file: UploadFile = File(...), model: str = Form("omi-asr"), language: str | None = Form(None),
                              response_format: str | None = Form(None), context: str | None = Form(None),
                              prompt: str | None = Form(None), max_tokens: int | None = Form(None)) -> dict:  # fmt: skip
+        if blocked := guard.cache_problem or guard.load_stuck():  # never queue behind a load that won't finish
+            raise HTTPException(503, f"transcription engine unavailable: {blocked}"[:300])
         data = await file.read()
         try:
             pcm = decode(data)
