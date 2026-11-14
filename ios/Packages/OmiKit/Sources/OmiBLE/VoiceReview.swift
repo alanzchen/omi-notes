@@ -110,6 +110,10 @@ public final class VoiceReviewQueue {
     private var preparingTask: Task<Void, Never>?
     /// Bumped whenever the automatic round is cancelled: a fetch of an older round never schedules another.
     private var preparingRound = 0
+    /// Bumped by every fetch and by closing the screen: a fetch applies its answer, or reads another page, only while
+    /// it is still the latest one on a screen that shows it (ASTRA-20261114-IT1-03: a 刷新 still loading when the
+    /// screen closed went on paging offscreen).
+    private var loadEpoch = 0
 
     public init(speakers: SpeakersModel) {
         self.speakers = speakers
@@ -128,7 +132,12 @@ public final class VoiceReviewQueue {
     /// does.
     public func setVisible(_ shown: Bool) {
         visible = shown
-        if shown { schedulePreparingFetch() } else { cancelPreparingFetch() }
+        if shown {
+            schedulePreparingFetch()
+        } else {
+            cancelPreparingFetch()
+            loadEpoch += 1  // any fetch still running (automatic or 刷新) stops at its next step
+        }
     }
 
     /// "刷新" after the automatic fetches: asks again, with a fresh round of them (an automatic fetch still running
@@ -164,7 +173,8 @@ public final class VoiceReviewQueue {
     public func load() async {
         if phase != .preparing { phase = .loading }  // while preparing, a fetch again doesn't flash a spinner
         generation += 1
-        let asked = generation  // a newer fetch (or a cancelled one) never applies an older answer
+        loadEpoch += 1
+        let asked = loadEpoch  // a newer fetch, a cancelled one or a closed screen never applies an older answer
         do {
             var fetched: [ReviewItem] = []
             var open: [ReviewItem] = []
@@ -173,7 +183,7 @@ public final class VoiceReviewQueue {
             var more = false
             repeat {
                 let page = try await speakers.reviewItems(limit: ReviewBatch.window, offset: offset)
-                guard asked == generation, !Task.isCancelled else { return }
+                guard asked == loadEpoch, !Task.isCancelled else { return }
                 pages += 1
                 if !page.isReady, page.items.isEmpty, offset == 0 {
                     items = []
@@ -203,7 +213,7 @@ public final class VoiceReviewQueue {
             preparingTries = 0
             phase = items.isEmpty ? (fetched.isEmpty ? .empty : .onlySkipped) : .ready
         } catch {
-            guard asked == generation, !Task.isCancelled else { return }
+            guard asked == loadEpoch, !Task.isCancelled else { return }
             phase = .failed(SpeakersModel.describe(error))
         }
     }

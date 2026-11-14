@@ -167,6 +167,33 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
         #expect(queue.phase == .preparing, "a cancelled fetch is not an error")
     }
 
+    @Test func closingTheScreenDuringRefreshStopsItsPaging() async throws {
+        // ASTRA-20261114-IT1-03: a 刷新 still waiting for its answer when the screen closed went on: its page (empty,
+        // next_offset 70) made it fetch another page offscreen and flip the phase
+        let queue = VoiceReviewQueue(speakers: try speakers())
+        queue.preparingWaits = [.milliseconds(5), .milliseconds(5), .milliseconds(5)]
+        let cold = #"{"items":[],"total":0,"next_offset":null,"ready":false}"#
+        let skipped = #"{"items":[],"total":100,"next_offset":70,"ready":true}"#
+        let end = #"{"items":[],"total":100,"next_offset":null,"ready":true}"#
+        VoicesHubStub.routes["GET /v1/speakers/review"] = [(200, cold), (200, cold), (200, cold), (200, cold), (200, skipped), (200, end)]
+        queue.setVisible(true)
+        await queue.load()
+        for _ in 0..<200 where !(queue.preparingGaveUp && queue.phase == .preparing && sent("GET", "/v1/speakers/review").count == 4) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try await Task.sleep(for: .milliseconds(30))  // the fourth answer applied
+        #expect(queue.preparingGaveUp && sent("GET", "/v1/speakers/review").count == 4)
+        VoicesHubStub.delays["GET /v1/speakers/review"] = 0.3  // the 刷新's answer is on its way when the screen closes
+        let manual = Task { await queue.refreshPreparing() }
+        for _ in 0..<100 where sent("GET", "/v1/speakers/review").count < 5 { try await Task.sleep(for: .milliseconds(5)) }
+        queue.setVisible(false)
+        VoicesHubStub.delays = [:]
+        await manual.value
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(sent("GET", "/v1/speakers/review").count == 5, "no page fetched after the screen closed")
+        #expect(queue.phase == .preparing, "nothing applied offscreen")
+    }
+
     @Test func aPreparingServerIsNotAskedWhileTheScreenIsClosed() async throws {
         let queue = VoiceReviewQueue(speakers: try speakers())
         queue.preparingWaits = [.milliseconds(20), .milliseconds(20), .milliseconds(20)]
