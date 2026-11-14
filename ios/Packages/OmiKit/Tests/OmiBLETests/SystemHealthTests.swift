@@ -144,6 +144,29 @@ import OmiWatchKit
         #expect(busy.level == .working && busy.headline == "Recording; notes are catching up")
     }
 
+    @Test func aLocalEngineOutageIsAWaitNotASetupProblem() throws {
+        // 2026-11-14: while the omi-asr sidecar couldn't load its models (1 h 40 min), the server sent `stt.ready:
+        // false` and Home said, in red, "Transcription isn't set up on the server". The server now sends ready (it is
+        // configured) with `engine.healthy: false`: conversations wait and the phone says so without alarm.
+        var q = ["chunks_pending": 0, "conversations_open": 0, "conversations_pending": 0, "failed": 0, "conversations_failed": 0,
+                 "chunks_failed": 0, "conversations_retrying": 3, "notes_conflicted": 0]
+        func outage(ready: Bool) throws -> ServerStatus {
+            let body: [String: Any] = [
+                "ok": true, "stt": ["provider": "local", "ready": ready, "engine": ["name": "omi-asr sidecar", "healthy": false]],
+                "llm": ["provider": "fake", "ready": true], "queue": q, "worker": ["present": true],
+                "local_transcription": ["available": false, "down_since": "2026-09-21T11:35:00.000Z", "down_seconds": 1500],
+                "last_note_at": "2026-09-21T12:00:00.000Z", "read_only": NSNull(), "features": ["issues"],
+            ]
+            return try JSONDecoder().decode(ServerStatus.self, from: JSONSerialization.data(withJSONObject: body))
+        }
+        let now = step(health(streaming(), reachable(), try outage(ready: true)), .server)
+        #expect(now.level == .delayed && now.title != "Transcription isn't set up on the server")
+        let before = step(health(streaming(), reachable(), try outage(ready: false)), .server)
+        #expect(before.level == .needsAction && before.title == "Transcription isn't set up on the server")
+        q["conversations_retrying"] = 0
+        #expect(step(health(streaming(), reachable(), try outage(ready: true)), .server).level != .needsAction)
+    }
+
     @Test func noNotesYetOnANewServer() throws {
         let json = #"{"queue":{"failed":0,"conversations_failed":0,"chunks_failed":0},"worker":{"present":true},"last_note_at":null,"features":["issues"]}"#
         let st = try JSONDecoder().decode(ServerStatus.self, from: Data(json.utf8))

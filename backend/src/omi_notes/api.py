@@ -178,7 +178,9 @@ def create_app(
         short = {role: str(name).rsplit("/", 1)[-1] for role, name in models.items()}
         label = " · ".join(f"{short[role]} ({what})" for role, what in (("diarization", "speakers"), ("text", "text"),
                                                                           ("aligner", "timing")) if role in short)  # fmt: skip
-        return {"provider": "local", "model": label or "omi-asr sidecar", "diarization": "provider", "ready": ok,
+        # `ready` is configured, as for every provider: a phone shows ready:false as "isn't set up" (red), which an
+        # outage that waits and recovers on its own is not; whether it answers now is `engine.healthy`
+        return {"provider": "local", "model": label or "omi-asr sidecar", "diarization": "provider", "ready": True,
                 "engine": {"name": "omi-asr sidecar", "healthy": ok, "self_test": info.get("self_test"), "models": models}}
 
     @app.get("/v1/status")

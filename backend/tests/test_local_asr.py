@@ -733,6 +733,27 @@ def test_status_reports_the_local_engine_its_models_and_health(tmp_path):
     assert stt["engine"]["models"]["aligner"].endswith("Qwen3-ForcedAligner-0.6B-bf16")
 
 
+def test_a_local_engine_that_is_down_is_still_set_up_and_reports_its_health(tmp_path):
+    # 2026-11-14: while the sidecar couldn't load its models, `stt.ready` followed its health and the phone showed a red
+    # "Transcription isn't set up on the server" for an outage that waits and recovers on its own. `ready` is
+    # configured (as for every provider); whether it answers now is `engine.healthy` (and `local_transcription`).
+    from fastapi.testclient import TestClient
+
+    from omi_notes.api import create_app
+
+    from .conftest import make_settings
+
+    settings = make_settings(tmp_path).model_copy(update={"stt_local_url": "http://127.0.0.1:18793/v1"})
+    app = create_app(settings, start_worker=False)
+
+    def transport(request):
+        return httpx.Response(503, json={"ok": False, "self_test": "failed: timeout loading x", "reason": "timeout loading x"})
+
+    app.state.speakers.pipeline.providers._local_stt = LocalAsrStt("http://127.0.0.1:18793/v1", transport=httpx.MockTransport(transport))
+    stt = TestClient(app).get("/v1/status", headers=AUTH).json()["stt"]
+    assert stt["ready"] is True and stt["engine"]["healthy"] is False
+
+
 def test_a_recording_with_under_a_second_and_a_half_of_speech_is_set_aside_quietly(client, worker, settings):
     from omi_notes import views
 
