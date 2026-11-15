@@ -42,8 +42,31 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
 
 @pytest.fixture(autouse=True)
 def hermetic_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Ignore the developer's shell environment and backend/.env."""
+    """Ignore the developer's shell environment and backend/.env, and never reach the live ASR sidecar."""
     scrub_env(monkeypatch, tmp_path)
+    block_live_sidecar(monkeypatch)
+
+
+LIVE_SIDECAR_PORT = 18793  # the deployed omi-asr sidecar on this Mac (AGENTS.md)
+
+
+class LiveSidecarReached(RuntimeError):
+    """Not an httpx error, so no provider code treats it as "the sidecar is down": the test fails."""
+
+
+def block_live_sidecar(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A real (non-mock) HTTP request to the live sidecar's port fails the test (2026-11-15: a development seed
+    sent synthetic audio to it). Mock transports are untouched."""
+    import httpx
+
+    real = httpx.HTTPTransport.handle_request
+
+    def guarded(self, request):
+        if request.url.host in ("127.0.0.1", "localhost", "::1") and request.url.port == LIVE_SIDECAR_PORT:
+            raise LiveSidecarReached(f"a test reached the live sidecar at {request.url}")
+        return real(self, request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", guarded)
 
 
 def scrub_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

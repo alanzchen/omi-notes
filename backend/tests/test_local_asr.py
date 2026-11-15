@@ -1068,3 +1068,53 @@ def test_moving_labels_with_a_superseded_transcript_changes_nothing(client, work
         worker.pipeline.move_labels(row["id"], stale)
     assert (store.labels_transcript(row["id"]), store.voices_file(row["id"]), (directory / "speakers.json").read_bytes()) == before
     assert store.labels(row["id"])["S1"]["person_id"] == person
+
+
+# ASTRA-20261115-IT1-01: gaps across a request seam (split at 20 s; each request reaches 5 s past it)
+def _seam_stt(monkeypatch, replies):
+    from omi_notes.providers import SttRequest, local_asr
+
+    monkeypatch.setattr(local_asr, "split_points", lambda *a: [(20, None)])
+    stt = LocalAsrStt("http://127.0.0.1:9/v1", max_request_seconds=30)
+    answers = iter(replies)
+    monkeypatch.setattr(stt, "_post", lambda r: next(answers))
+    buf = io.BytesIO()
+    sf.write(buf, np.full(40 * SR, 0.1), SR, format="FLAC", subtype="PCM_16")
+    return stt.transcribe(SttRequest(flac=buf.getvalue(), duration=40, blocks=[(0, 40)], language="en", keyterms=[]))
+
+
+def _seg(a, b, text):
+    return {"start": a, "end": b, "text": text, "speaker_id": "S01"}
+
+
+def _gap(a, b):
+    return {"start": a, "end": b, "speech_seconds": b - a, "reason": "no_words"}
+
+
+def test_a_stretch_neither_side_of_a_seam_has_words_for_stays_a_gap(monkeypatch):
+    # each side's gap had its middle in the other's half: both were dropped and 18-22 s vanished
+    out = _seam_stt(monkeypatch, [{"segments": [_seg(0, 18, "left")], "gaps": [_gap(18, 25)]},
+                                  {"segments": [_seg(7, 25, "right")], "gaps": [_gap(0, 7)]}])  # fmt: skip
+    (gap,) = out["gaps"]
+    assert (gap["start"], gap["end"], gap["speech_seconds"]) == (18.0, 22.0, 4.0)
+
+
+def test_the_same_stretch_reported_by_both_sides_is_one_gap_counted_once(monkeypatch):
+    out = _seam_stt(monkeypatch, [{"segments": [_seg(0, 15, "left")], "gaps": [_gap(15, 22)]},
+                                  {"segments": [_seg(10, 25, "right")], "gaps": [_gap(3, 10)]}])  # fmt: skip
+    (gap,) = out["gaps"]
+    assert (gap["start"], gap["end"], gap["speech_seconds"]) == (15.0, 25.0, 10.0), "15-22 and 18-25: 10 s, not 14"
+
+
+def test_words_the_neighbour_recovered_clear_its_gap(monkeypatch):
+    out = _seam_stt(monkeypatch, [{"segments": [_seg(0, 15, "left")], "gaps": [_gap(15, 22)]},
+                                  {"segments": [_seg(0, 10, "recovered"), _seg(10, 25, "right")]}])  # fmt: skip
+    assert not out.get("gaps")
+
+
+def test_a_test_can_never_reach_the_live_sidecar():
+    # 2026-11-15: a development seed whose mock wasn't wired sent its audio to the deployed sidecar on 18793
+    from .conftest import LiveSidecarReached
+
+    with pytest.raises(LiveSidecarReached):
+        LocalAsrStt("http://127.0.0.1:18793/v1").healthy(refresh=True)

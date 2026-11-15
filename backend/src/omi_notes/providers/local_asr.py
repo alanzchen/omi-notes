@@ -50,6 +50,29 @@ def _gaps(data: dict) -> list[dict]:
     return out
 
 
+GAP_MIN_SECONDS = 0.5  # a stretch left after the kept words are taken out shorter than this isn't reported
+
+
+def _reconciled_gaps(gaps: list[dict], utterances: list[dict]) -> list[dict]:
+    """The stretches no kept word covers, from every request's gaps (absolute time; a shared stretch is heard
+    twice, ASTRA-20261115-IT1-01): their union, minus what the kept utterances cover (a neighbour that recovered
+    part of it), each piece once. A piece's speech is its length at the highest speech density of the gaps it
+    came from: never more than its length, never counted twice."""
+    if not gaps:
+        return []
+    covered = _union([(float(u["start"]), float(u["end"])) for u in utterances if u.get("transcript") or u.get("text")])
+    out = []
+    for a, b in _minus(_union([(g["start"], g["end"]) for g in gaps]), covered):
+        if b - a < GAP_MIN_SECONDS:
+            continue
+        sources = [g for g in gaps if g["start"] < b and g["end"] > a]
+        density = max((g["speech_seconds"] / (g["end"] - g["start"]) for g in sources if g["end"] > g["start"]), default=1.0)
+        reasons = {g["reason"] for g in sources}
+        out.append({"start": a, "end": b, "speech_seconds": round(min(b - a, density * (b - a)), 1),
+                    "reason": "moss_stopped" if "moss_stopped" in reasons else "no_words"})  # fmt: skip
+    return out
+
+
 def _shifted(gaps: list[dict], offset: float) -> list[dict]:
     return [dict(g, start=g["start"] + offset, end=g["end"] + offset) for g in gaps]
 
@@ -253,9 +276,7 @@ class LocalAsrStt(OpenAICompatStt):
             # after the left side's rescues are in: never both copies of one phrase
             kept[k + 1] += [u for u in heard[k + 1] if u not in kept[k + 1] and here(u) and not _covered(u, kept[k])]
         utterances = sorted((u for mine in kept for u in mine), key=lambda u: (u["start"], u["end"]))
-        # a gap belongs to the request owning its middle, like an utterance (the shared stretch is heard twice)
-        missing = sorted((g for k, mine in enumerate(gaps) for g in mine if bounds[k] <= (g["start"] + g["end"]) / 2 < bounds[k + 1]),
-                         key=lambda g: g["start"])  # fmt: skip
+        missing = _reconciled_gaps([g for mine in gaps for g in mine], utterances)
         groups = [list(g) for g in {tuple(g) for g in groups}]
         response = {"results": {"channels": [{"detected_language": language} if language else {}], "utterances": utterances}}
         if missing:  # only when there are some, so every other stored result stays byte-identical
