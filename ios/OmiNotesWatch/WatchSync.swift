@@ -75,6 +75,7 @@ final class WatchSync: NSObject, WCSessionDelegate {
         s["outstanding_active"] = transferCounts.moving
         s["outstanding_stalled"] = transferCounts.stalled
         s["outstanding_queued"] = transferCounts.queued
+        s["stall_resend"] = 1  // this build cancels and resends a stalled transfer (the phone may say so)
         if let oldest = ages.max() { s["outstanding_oldest_s"] = oldest }
         if let p50 = ackLatency.quantile(0.5) { s["ack_latency_p50_s"] = p50 }
         if let p90 = ackLatency.quantile(0.9) { s["ack_latency_p90_s"] = p90 }

@@ -292,9 +292,23 @@ import OmiWatchKit
         #expect(WatchSummary.onWatchHint(waiting, lastReceivedAt: now.addingTimeInterval(-60), now: now) == nil, "arriving: no advice")
         // 2026-11-15: all three waiting parts in transfers that stopped moving, for four days: not "move closer"
         var stuck = waiting
-        stuck.stats = ["outstanding_stalled": waiting.waitingParts]
+        stuck.stats = ["outstanding_stalled": waiting.waitingParts, "stall_resend": 1]
+        stuck.at = now.addingTimeInterval(-60)
         let hint = WatchSummary.onWatchHint(stuck, lastReceivedAt: now.addingTimeInterval(-4 * 86400), now: now)
         #expect(hint?.hasPrefix("The Watch's transfer stopped moving; last part arrived") == true && hint?.contains("nearby") == false)
+        #expect(hint?.hasSuffix("It sends it again on its own") == true)
+        // ASTRA-20261115-IT1-05: a Watch build that doesn't resend gets no promise; an old report no diagnosis; a mixed
+        // backlog (one stalled, two moving, kept parts apart) is not "stopped moving"
+        stuck.stats = ["outstanding_stalled": waiting.waitingParts]
+        #expect(WatchSummary.onWatchHint(stuck, lastReceivedAt: now.addingTimeInterval(-4 * 86400), now: now)?.contains("on its own") == false)
+        var old = stuck
+        old.at = now.addingTimeInterval(-86400)
+        old.stats = ["outstanding_stalled": waiting.waitingParts, "stall_resend": 1]
+        #expect(WatchSummary.onWatchHint(old, lastReceivedAt: nil, now: now)?.contains("stopped moving") == false)
+        var mixedStall = stuck
+        mixedStall.waitingParts = 3
+        mixedStall.stats = ["outstanding_stalled": 1, "outstanding_active": 2, "orphan_parts": 2, "stall_resend": 1]
+        #expect(WatchSummary.onWatchHint(mixedStall, lastReceivedAt: nil, now: now)?.contains("stopped moving") == false)
         stuck.stats = ["outstanding_stalled": 0]
         #expect(WatchSummary.onWatchHint(stuck, lastReceivedAt: nil, now: now) == "Moves when both are nearby with Omi Notes open")
     }
