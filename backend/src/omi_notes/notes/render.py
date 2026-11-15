@@ -64,6 +64,8 @@ class NoteData:
     possible_names: dict[str, str] = field(default_factory=dict)
     # The recording class this note was made for (`recording_class.effective`); empty: not classified.
     recording_class: dict = field(default_factory=dict)
+    # Speech neither transcription model had words for: wall-clock [start, end, seconds of speech] (kept audio).
+    untranscribed: list[list[float]] = field(default_factory=list)
 
 
 def neutralize(text: str) -> str:
@@ -147,6 +149,10 @@ def _clock(epoch: float, tz: ZoneInfo) -> str:
 
 def _transcript_line(seg: dict, d: NoteData) -> str:
     return f"**{_clock(seg['start'], d.tz)} · {speaker_label(seg['speaker'], d.notes, d.voice_names, d.possible_names, d.language)}:** {seg['text']}"
+
+
+def _gap_line(gap: list[float], d: NoteData) -> str:
+    return f"**{_clock(gap[0], d.tz)}** · _about {_duration_text(gap[2])} of speech here couldn't be transcribed_"
 
 
 def _duration_text(seconds: float) -> str:
@@ -242,6 +248,10 @@ def render_note(d: NoteData, my_notes: str | None = None) -> str:
     if d.audio_gaps:
         spans = ", ".join(f"{_clock(a, d.tz)}–{_clock(b, d.tz)}" for a, b in d.audio_gaps)
         out += [f"> [!warning] Audio missing: {spans}.", ""]
+    if d.untranscribed:
+        spans = ", ".join(f"{_clock(a, d.tz)}–{_clock(b, d.tz)} (about {_duration_text(s)})" for a, b, s in d.untranscribed)
+        out += [f"> [!warning] Not transcribed: {spans} had speech neither transcription model could put into words. "
+                "It is marked in the transcript; the audio is kept.", ""]
     if d.lost_seconds >= 0.05:
         out += [
             f"> [!warning] About {d.lost_seconds:.1f} s of audio was lost in transmission around this conversation "
@@ -336,8 +346,12 @@ def render_note(d: NoteData, my_notes: str | None = None) -> str:
     if d.segments and passive:  # folded: kept in full, out of the way
         out += ["> [!quote]- Transcript", *[line for seg in d.segments for line in (f"> {_transcript_line(seg, d)}", ">")], ""]
     elif d.segments:
+        marks = sorted(d.untranscribed)  # each where it happened, between the lines around it
         for seg in d.segments:
+            while marks and marks[0][0] < seg["start"]:
+                out += [_gap_line(marks.pop(0), d), ""]
             out += [_transcript_line(seg, d), ""]
+        out += [line for m in marks for line in (_gap_line(m, d), "")]
     else:
         out += ["_No speech was transcribed._", ""]
     return "\n".join(out).rstrip("\n") + "\n"

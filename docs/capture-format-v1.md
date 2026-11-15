@@ -456,7 +456,10 @@ notes directory.
 Codes: `listening` (open; the message says what it is waiting for), `processing`, `retrying` (an
 automatic retry is scheduled), `ready`, `transcript_only` (summary failed or summaries are turned
 off: the message says which), `kept_speaker_unknown` (kept from the phone as a transcript with the
-speaker unknown; see `resolution`), `failed` (no note), `discarded`. Messages are chosen by the server from
+speaker unknown; see `resolution`), `partial_transcript` (a note whose transcript has a stretch of speech neither
+transcription model had words for: the message gives its seconds, the note marks it where it was, the audio is kept;
+an older phone shows the code as a chip), `failed` (no note, also when half or more of the speech has no words),
+`discarded`. Messages are chosen by the server from
 the failure kind, never copied from a provider error. `issues` lists problems that coexist with
 readable content: `reprocess_failed` (an earlier note is still shown), `note_conflict` (edited
 outside My Notes; the server stopped updating it), `render_retrying`. `provisional`, `late_audio`

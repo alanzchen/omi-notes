@@ -70,7 +70,7 @@ from .. import recording_class as rclass
 from .segmenter import RingCapture, ring_resolved_until
 from .speakers import SpeakerResult, has_speakers, resolve_speakers
 from . import sources
-from .transcript import ConversationAudio, assemble, detected_language, merge_same_speaker, segments_from_deepgram
+from .transcript import ConversationAudio, assemble, detected_language, map_time, merge_same_speaker, segments_from_deepgram
 from .speaker_links import link as link_speakers
 from .speaker_links import overlap_spans
 from .turn_transcription import ASSEMBLY_FORMAT as WINDOW_ASSEMBLY_FORMAT
@@ -789,6 +789,11 @@ class ConversationPipeline:
             "speaker_clips": {label: [[c.start, c.end] for c in cs] for label, cs in clips.items()},
             "timemap": [[m.out_start, m.wall_start, m.duration] for m in audio.timemap],
         }
+        # speech the sidecar had no words for (a short stretch of a kept transcript): wall-clock [start, end, seconds]
+        untranscribed = [[round(map_time(audio.timemap, g["start"]), 3), round(map_time(audio.timemap, g["end"]), 3),
+                          g["speech_seconds"]] for g in cached["response"].get("gaps") or []]  # fmt: skip
+        if untranscribed:  # only then, so every other transcript stays byte-identical
+            transcript["untranscribed"] = untranscribed
         atomic_write_bytes(self.conv_dir(conv_id) / "transcript.json", json.dumps(transcript, indent=1).encode())
         if not unlabeled:  # no labels or voiceprints for a speaker nobody separated
             self.identify(conv_id, audio, audio_sha, clips, sha256_hex(canonical_json(segments).encode()),
@@ -1546,6 +1551,7 @@ class ConversationPipeline:
             voice_names={label: name for label, (name, _) in self.voice_names(conv_id).items()},
             possible_names={label: name for label, (name, _) in self.possible_voice_names(conv_id, row["transcript_sha"]).items()},
             recording_class=recording if kind != "discarded" else {},
+            untranscribed=transcript.get("untranscribed") or [],
         )  # fmt: skip
         content_sha = sha256_hex(render_note(data, "").encode())
         revision = row["revision"] if row["content_sha"] == content_sha and row["revision"] else row["revision"] + 1
@@ -1577,6 +1583,8 @@ class ConversationPipeline:
             **({"recording_class": recording} if recording.get("class") or recording.get("outcome") else {}),
             # only when true, so the records of every other note stay byte-identical
             **({"speakers_unknown": True} if data.speakers_unknown else {}),
+            # speech in the note without words (the sidecar's gaps): the list shows it isn't a clean success
+            **({"untranscribed_seconds": round(sum(g[2] for g in data.untranscribed), 1)} if data.untranscribed else {}),
         }
         llm_status = "ok" if llm_cached else ("none" if snap.get("llm_none") else ("failed" if summary_error else None))
         self._commit(

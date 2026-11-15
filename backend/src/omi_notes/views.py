@@ -165,6 +165,8 @@ def state(row: sqlite3.Row) -> dict:
         return {"code": "failed", "message": failure_message(row["error_kind"], row["failed_stage"])}
     if _kept(row):
         return {"code": "kept_speaker_unknown", "message": "Kept as a transcript; the speaker is unknown"}
+    if gap := _index(row).get("untranscribed_seconds"):  # a note with a stretch no model had words for
+        return {"code": "partial_transcript", "message": f"Note ready; about {gap:.0f} s of speech couldn't be transcribed"}
     if row["llm_status"] == "none":
         return {"code": "transcript_only", "message": "Transcript ready; summaries are turned off"}
     return {"code": "ready", "message": "Note ready"}

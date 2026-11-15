@@ -37,6 +37,23 @@ from .openai_stt import SAMPLE_RATE, OpenAICompatStt, _flac, _TooLarge, normaliz
 UNKNOWN = "UNKNOWN"  # the sidecar's label for words no MOSS line holds
 
 
+def _gaps(data: dict) -> list[dict]:
+    """The sidecar's `gaps` (speech neither of its models had words for), in the request's seconds: each
+    {start, end, speech_seconds, reason}; [] from an older sidecar or a malformed entry."""
+    out = []
+    for g in data.get("gaps") or []:
+        try:
+            out.append({"start": float(g["start"]), "end": float(g["end"]), "speech_seconds": float(g["speech_seconds"]),
+                        "reason": str(g.get("reason") or "no_words")})  # fmt: skip
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _shifted(gaps: list[dict], offset: float) -> list[dict]:
+    return [dict(g, start=g["start"] + offset, end=g["end"] + offset) for g in gaps]
+
+
 def _normalized(data: dict) -> dict:
     """`normalize_response`, with the sidecar's UNKNOWN words marked `unattributed` (speaker None): kept and
     shown as an unknown speaker, never numbered, linked or used for a voiceprint."""
@@ -196,12 +213,15 @@ class LocalAsrStt(OpenAICompatStt):
         heard: list[list[dict]] = []  # every utterance of each request, in absolute time (for anchors)
         language, base, group = None, 0, 0
         stretches: list[tuple[float, float]] = []
+        gaps: list[list[dict]] = []  # each request's gaps, in absolute time
         for k in range(len(edges) - 1):
             own_a, own_b = edges[k], edges[k + 1]
             a, b = (max(0.0, own_a - over) if k else 0.0), (min(total, own_b + over) if k < len(edges) - 2 else total)
             part = request if (a, b) == (0.0, total) else _sub_request(request, pcm, a, b)
             mine: list[dict] = []
+            gaps.append([])
             for offset, result in self._transcribe_part(a, part):
+                gaps[-1] += result.pop("gaps", [])  # absolute already (`_transcribe_part` shifts them)
                 top = -1
                 for u in result["results"]["utterances"]:
                     shifted = dict(u, start=float(u["start"]) + offset, end=float(u["end"]) + offset)
@@ -233,8 +253,13 @@ class LocalAsrStt(OpenAICompatStt):
             # after the left side's rescues are in: never both copies of one phrase
             kept[k + 1] += [u for u in heard[k + 1] if u not in kept[k + 1] and here(u) and not _covered(u, kept[k])]
         utterances = sorted((u for mine in kept for u in mine), key=lambda u: (u["start"], u["end"]))
+        # a gap belongs to the request owning its middle, like an utterance (the shared stretch is heard twice)
+        missing = sorted((g for k, mine in enumerate(gaps) for g in mine if bounds[k] <= (g["start"] + g["end"]) / 2 < bounds[k + 1]),
+                         key=lambda g: g["start"])  # fmt: skip
         groups = [list(g) for g in {tuple(g) for g in groups}]
         response = {"results": {"channels": [{"detected_language": language} if language else {}], "utterances": utterances}}
+        if missing:  # only when there are some, so every other stored result stays byte-identical
+            response["gaps"] = [{k: round(v, 3) if isinstance(v, float) else v for k, v in g.items()} for g in missing]
         if group > 1:
             response["omi_notes"] = {"pieces": group, "offsets": [round(e, 3) for e in edges[:-1]], "groups": sorted(groups),
                                      "anchors": [pair for pairs in found for pair in pairs], "overlap_seconds": over}  # fmt: skip
@@ -247,7 +272,7 @@ class LocalAsrStt(OpenAICompatStt):
             return super()._transcribe_part(offset, part)
         windows = sorted(data.get("windows") or [], key=lambda w: float(w["start"]))
         if len(windows) < 2:
-            return [(offset, _normalized(data))]
+            return [(offset, _normalized(data) | {"gaps": _shifted(_gaps(data), offset)})]
         # each segment belongs to the window whose label prefix it carries (the first window's is empty)
         groups: dict[int, list[dict]] = {}
         for seg in data.get("segments") or []:
@@ -259,6 +284,7 @@ class LocalAsrStt(OpenAICompatStt):
             start = float(windows[k]["start"])
             shifted = [dict(seg, start=float(seg["start"]) - start, end=float(seg["end"]) - start) for seg in segments]
             out.append((offset + start, _normalized(dict(data, segments=shifted))))
+        out[0][1]["gaps"] = _shifted(_gaps(data), offset)  # once per request, in absolute time
         return out
 
     def healthy(self, *, refresh: bool = False) -> bool:

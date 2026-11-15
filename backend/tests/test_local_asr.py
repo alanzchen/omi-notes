@@ -126,6 +126,50 @@ def test_the_pipeline_uses_the_sidecar_with_its_speakers_linked_into_one_transcr
     assert transcript["stt"] == "local-asr/omi-asr" and transcript["speaker_source"] == "provider"
     assert transcript["speaker_labels_consistent"] is True and transcript["timing_source"] == "provider"
     assert len({s["speaker"] for s in transcript["segments"]}) == 1, "one voice in every piece: one speaker"
+    assert "untranscribed" not in transcript, "a result without gaps is stored as before"
+
+
+def test_gaps_from_overlapping_pieces_are_placed_in_conversation_time_once():
+    # every piece reports the same stretch near its end: in the shared stretch the owner of its middle keeps it
+    def handler(request, n):
+        seconds = seconds_of(request)
+        return httpx.Response(200, json={"segments": [{"start": 0.5, "end": seconds - 3, "speaker_id": "S01", "text": f"p{n}"}],
+                                         "gaps": [{"start": seconds - 2.5, "end": seconds - 1.0, "speech_seconds": 1.5, "reason": "no_words"}]})  # fmt: skip
+    stt, seen = sidecar(handler, max_seconds=20)
+    result = stt.transcribe(audio_with_blocks([8, 8, 8, 8, 8]))
+    gaps = result["gaps"]
+    assert len(seen) >= 3 and gaps == sorted(gaps, key=lambda g: g["start"])
+    assert all(b["start"] >= a["end"] for a, b in zip(gaps, gaps[1:])), "no stretch twice"
+    assert len(gaps) <= len(seen) and gaps[-1]["end"] <= 42.5
+    no_gaps, _ = sidecar(lambda r, n: httpx.Response(200, json={"segments": [{"start": 0.5, "end": 2.0, "speaker_id": "S01", "text": "x"}]}))
+    assert "gaps" not in no_gaps.transcribe(audio_with_blocks([8])), "an older sidecar's answer: no gaps key at all"
+
+
+def test_a_short_stretch_the_sidecar_had_no_words_for_is_marked_in_a_kept_note(client, worker, settings):
+    # 2026-11-14 20:38: 15 s neither model had words for made the whole conversation fail (422, no note). The
+    # sidecar now returns the words and the stretch (`gaps`); the note marks it where it was, and the list says so.
+    def handler(request, n):
+        seconds = seconds_of(request)
+        return httpx.Response(200, json={"language": "en", "duration": seconds,
+                                         "segments": [{"start": 0.0, "end": seconds - 4, "speaker_id": "S01", "text": "the words"}],
+                                         "gaps": [{"start": seconds - 3.5, "end": seconds - 1.0, "speech_seconds": 2.4, "reason": "no_words"}]})  # fmt: skip
+
+    stt, _ = sidecar(handler)
+    worker.providers._local_stt = stt
+    replay(client, np.concatenate([np.zeros(SR, np.int16), voice(12, ALAN, 7), np.zeros(2 * SR, np.int16)]))
+    worker.tick(T0 + 400)
+    (row,) = convs(worker)
+    assert row["status"] == "done", row["error"]
+    transcript = json.loads((worker.pipeline.conv_dir(row["id"]) / "transcript.json").read_text())
+    ((a, b, speech),) = transcript["untranscribed"]
+    assert row["start"] <= a < b <= row["end"] + 1 and speech == 2.4, "wall-clock time of the stretch"
+    note = (worker.pipeline.vault.root / row["note_path"]).read_text()
+    assert "> [!warning] Not transcribed:" in note and "the audio is kept" in note
+    assert note.count("of speech here couldn't be transcribed_") == 1
+    assert note.index("the words") < note.index("of speech here couldn't be transcribed_"), "the marker sits where it was"
+    listed = client.get("/v1/conversations/recent", headers=AUTH).json()["conversations"]
+    (state,) = [c["state"] for c in listed if c["id"] == row["id"]]
+    assert state["code"] == "partial_transcript" and "2 s of speech couldn't be transcribed" in state["message"]
 
 
 def test_while_the_sidecar_is_down_conversations_wait_without_using_up_attempts_then_resume(client, worker):
