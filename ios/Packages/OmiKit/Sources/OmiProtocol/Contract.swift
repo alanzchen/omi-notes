@@ -813,14 +813,23 @@ public enum ISO8601UTC {
             Int(tmv.tm_hour), Int(tmv.tm_min), Int(tmv.tm_sec), ms)
     }
 
-    /// Parses the contract format (fractional seconds optional).
+    /// Parses the contract format (fractional seconds optional). One formatter per form, made once
+    /// (ISO8601DateFormatter is thread-safe; making one per call cost ~0.25 ms, ASTRA-20261115-IT2-01).
     public static func parse(_ string: String) -> Date? {
+        fractional.date(from: string) ?? whole.date(from: string)
+    }
+
+    nonisolated(unsafe) private static let fractional: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = f.date(from: string) { return d }
+        return f
+    }()
+
+    nonisolated(unsafe) private static let whole: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
-        return f.date(from: string)
-    }
+        return f
+    }()
 }
 
 /// `PUT /v1/conversations/{id}/priority`.

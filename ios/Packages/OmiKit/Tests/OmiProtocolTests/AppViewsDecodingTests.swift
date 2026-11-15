@@ -32,6 +32,61 @@ import Testing
         #expect(try decode(ConversationDetail.Transcript.self, page("", "null")).rows == [.segment(0), .segment(1)])
     }
 
+    /// A transcript page for the gap tests: segments and gaps at seconds after a fixed base.
+    private func gapPage(_ segs: [(Double, Double)], _ gaps: [(Double, Double, Double)]?, from: Int = 0, next: Int? = nil,
+                         total: Int? = nil, incomplete: Bool? = nil) throws -> ConversationDetail.Transcript {  // fmt: skip
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        func at(_ x: Double) -> String { ISO8601UTC.format(base.addingTimeInterval(x)) }
+        var d: [String: Any] = ["total": total ?? segs.count, "from": from, "next_from": next as Any? ?? NSNull(),
+                                "segments": segs.map { ["start": at($0.0), "end": at($0.1), "speaker": "S1", "text": "synthetic"] }]  // fmt: skip
+        if let gaps { d["untranscribed"] = gaps.map { ["start": at($0.0), "end": at($0.1), "speech_s": $0.2] } }
+        if let incomplete { d["untranscribed_incomplete"] = incomplete }
+        return try JSONDecoder().decode(ConversationDetail.Transcript.self, from: JSONSerialization.data(withJSONObject: d))
+    }
+
+    private func gapRows(_ t: ConversationDetail.Transcript) -> [ConversationDetail.Gap] {
+        t.rows.compactMap { if case .gap(let g) = $0 { g } else { nil } }
+    }
+
+    @Test func repeatedOverlappingOrImpossibleGapsAreShownOnceOrNotAtAll() throws {
+        // ASTRA-20261115-IT2-03: two identical stretches made two rows, overlapping ones two warnings for the same
+        // speech, and impossible ones (no speech, reversed, more speech than the stretch) a row with an invented amount
+        #expect(gapRows(try gapPage([(0, 5), (20, 25)], [(6, 9, 3), (6, 9, 3)])).count == 1)
+        let overlap = gapRows(try gapPage([(0, 5), (20, 25)], [(6, 10, 4), (8, 12, 4)]))
+        #expect(overlap.count == 1 && overlap[0].speechS == 6, "6-12 s: 8 s claimed is capped at its 6 s")
+        let bad = try gapPage([(0, 5), (20, 25)], [(6, 9, 0), (7, 10, -5), (11, 10, 1), (12, 13, 1e12)])
+        #expect(gapRows(bad).isEmpty && bad.droppedGaps, "left out, and said so")
+    }
+
+    @Test func eachPageAddsItsOwnGapsAndTheTailWaitsForTheLastPage() throws {
+        // ASTRA-20261115-IT2-02: pages carry only the stretches they own; the phone keeps them all, once each
+        var detail = try JSONDecoder().decode(ConversationDetail.self, from: Data(Self.detail.utf8))
+        detail.transcript = try gapPage([(0, 5), (10, 15)], [(-3, -1, 2), (7, 8, 1), (17, 18, 1)], next: 2, total: 3)
+        #expect(gapRows(detail.transcript!).count == 2, "17-18 s may belong after a later segment: it waits")
+        detail.append(try gapPage([(20, 25)], [(30, 32, 2), (7, 8, 1)], from: 2, total: 3, incomplete: true))
+        #expect(detail.transcript!.untranscribed?.count == 4 && gapRows(detail.transcript!).count == 4)
+        #expect(detail.transcript!.rows.map { if case .segment(let i) = $0 { i } else { -1 } } == [-1, 0, -1, 1, -1, 2, -1])
+        #expect(detail.transcript!.untranscribedIncomplete == true)
+    }
+
+    @Test func preparedRowsCostLittleAndReadingThemCostsNothing() throws {
+        // ASTRA-20261115-IT2-01: the view's rows parsed every segment's time on every draw (791 ms for 3,000 lines
+        // without a gap, optimized). They are prepared once; a bound generous enough for a loaded CI host
+        let segs = (0..<3000).map { (Double($0 * 4), Double($0 * 4 + 2)) }
+        let plain = try gapPage(segs, nil)
+        var clock = ContinuousClock.now
+        for _ in 0..<1000 { _ = plain.rows.count }
+        #expect(ContinuousClock.now - clock < .milliseconds(50) && plain.rows.count == 3000)
+        let gaps = (0..<1000).map { i in let k = (i * 337) % 1000; return (Double(k * 4 + 2), Double(k * 4 + 3), 1.0) }
+        clock = ContinuousClock.now
+        let gapped = try gapPage(segs, gaps)
+        let prepared = ContinuousClock.now - clock
+        #expect(prepared < .seconds(2) && gapRows(gapped).count == 1000, "prepared once in \(prepared)")
+        clock = ContinuousClock.now
+        for _ in 0..<1000 { _ = gapped.rows.count }
+        #expect(ContinuousClock.now - clock < .milliseconds(50))
+    }
+
     @Test func currentStatus() throws {
         let s = try decode(ServerStatus.self, Self.status)
         #expect(s.worker?.present == false && s.readOnly == nil && s.lastNoteAt != nil)

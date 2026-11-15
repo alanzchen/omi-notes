@@ -477,6 +477,11 @@ struct ConversationDetailView: View {
                             .id("gap-\(position)")
                         }
                     }
+                    if t.nextFrom == nil, t.untranscribedIncomplete == true || t.droppedGaps {
+                        // never silently complete: some stretches without words couldn't be listed or read
+                        Label("Some stretches without words couldn't be shown.", systemImage: "waveform.badge.exclamationmark")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
                     if t.nextFrom != nil {
                         Button {
                             Task { await loadMoreTranscript() }

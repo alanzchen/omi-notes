@@ -79,26 +79,116 @@ public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
         /// `segments_from` of the next page; nil on the last one.
         public var nextFrom: Int?
         public var segments: [Segment]
-        /// Speech without words (only from a server that reports it; absent: none known).
+        /// Speech without words received so far (each page carries the stretches it owns; absent: none known).
         public var untranscribed: [Gap]?
+        /// The server didn't list every stretch (unreadable, or more than a page carries).
+        public var untranscribedIncomplete: Bool?
 
         enum CodingKeys: String, CodingKey {
             case total, from, segments, untranscribed
             case nextFrom = "next_from"
+            case untranscribedIncomplete = "untranscribed_incomplete"
         }
 
-        /// The segments with each gap before the first segment that starts after it; a gap after the last segment
-        /// shown appears only once every page is loaded (until then, it may belong between later segments).
-        public var rows: [TranscriptRow] {
-            var gaps = (untranscribed ?? []).sorted { (ISO8601UTC.parse($0.start) ?? .distantPast) < (ISO8601UTC.parse($1.start) ?? .distantPast) }
+        /// The lines as shown: the segments, each gap before the first segment that starts after it; a gap after the
+        /// last segment loaded appears once every page is in. Prepared when the transcript arrives or grows
+        /// (`prepare`), never while a view draws (ASTRA-20261115-IT2-01).
+        public private(set) var rows: [TranscriptRow] = []
+        /// Some gap metadata on this phone couldn't be used (malformed, impossible): not every stretch is shown.
+        public private(set) var droppedGaps = false
+
+        public init(total: Int, from: Int, nextFrom: Int?, segments: [Segment], untranscribed: [Gap]? = nil,
+                    untranscribedIncomplete: Bool? = nil) {  // fmt: skip
+            self.total = total
+            self.from = from
+            self.nextFrom = nextFrom
+            self.segments = segments
+            self.untranscribed = untranscribed
+            self.untranscribedIncomplete = untranscribedIncomplete
+            prepare()
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            total = try c.decode(Int.self, forKey: .total)
+            from = try c.decode(Int.self, forKey: .from)
+            nextFrom = try c.decodeIfPresent(Int.self, forKey: .nextFrom)
+            segments = try c.decode([Segment].self, forKey: .segments)
+            untranscribed = try c.decodeIfPresent([Gap].self, forKey: .untranscribed)
+            untranscribedIncomplete = try c.decodeIfPresent(Bool.self, forKey: .untranscribedIncomplete)
+            prepare()
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(total, forKey: .total)
+            try c.encode(from, forKey: .from)
+            try c.encode(nextFrom, forKey: .nextFrom)
+            try c.encode(segments, forKey: .segments)
+            try c.encodeIfPresent(untranscribed, forKey: .untranscribed)
+            try c.encodeIfPresent(untranscribedIncomplete, forKey: .untranscribedIncomplete)
+        }
+
+        /// The next page added: its segments, and its stretches merged with those already here (once each).
+        public mutating func append(_ page: Transcript) {
+            segments += page.segments
+            nextFrom = page.nextFrom
+            total = page.total
+            if let more = page.untranscribed {  // a stretch already here (a repeated page) isn't kept twice
+                var known = untranscribed ?? []
+                var seen = Set(known)
+                known += more.filter { seen.insert($0).inserted }
+                untranscribed = known
+            }
+            if page.untranscribedIncomplete == true { untranscribedIncomplete = true }
+            prepare()
+        }
+
+        /// Rows from segments and gaps. No gaps: the segments as they are (no date read). Gaps: each read once, the
+        /// impossible ones left out (not finite, reversed, empty, speech of zero or less or more than the stretch),
+        /// exact repeats once, overlapping ones as one stretch (its speech never more than its length), then merged
+        /// with the segments by index (ASTRA-20261115-IT2-03).
+        mutating func prepare() {
+            guard let gaps = untranscribed, !gaps.isEmpty else {
+                rows = segments.indices.map(TranscriptRow.segment)
+                droppedGaps = false
+                return
+            }
+            var valid: [(a: Double, b: Double, gap: Gap)] = []
+            var dropped = false
+            for g in gaps {
+                guard let a = ISO8601UTC.parse(g.start)?.timeIntervalSince1970, let b = ISO8601UTC.parse(g.end)?.timeIntervalSince1970,
+                      a.isFinite, b.isFinite, b > a, g.speechS.isFinite, g.speechS > 0, g.speechS <= (b - a) + 0.5 else {
+                    dropped = true
+                    continue
+                }
+                valid.append((a, b, g))
+            }
+            valid.sort { ($0.a, $0.b) < ($1.a, $1.b) }
+            var merged: [(a: Double, b: Double, gap: Gap)] = []
+            for v in valid {
+                if let last = merged.last, v.a < last.b || (v.a == last.a && v.b == last.b) {
+                    let b = max(last.b, v.b)
+                    var gap = last.gap
+                    if b > last.b { gap.end = v.gap.end }
+                    let repeated = v.a == last.a && v.b == last.b  // the same stretch twice: the same speech
+                    gap.speechS = min(repeated ? max(last.gap.speechS, v.gap.speechS) : last.gap.speechS + v.gap.speechS, b - last.a)
+                    merged[merged.count - 1] = (last.a, b, gap)
+                } else {
+                    merged.append(v)
+                }
+            }
             var out: [TranscriptRow] = []
+            out.reserveCapacity(segments.count + merged.count)
+            var next = 0
             for (i, seg) in segments.enumerated() {
-                let at = ISO8601UTC.parse(seg.start) ?? .distantPast
-                while let g = gaps.first, (ISO8601UTC.parse(g.start) ?? .distantPast) < at { out.append(.gap(gaps.removeFirst())) }
+                let at = ISO8601UTC.parse(seg.start)?.timeIntervalSince1970 ?? -.infinity
+                while next < merged.count, merged[next].a < at { out.append(.gap(merged[next].gap)); next += 1 }
                 out.append(.segment(i))
             }
-            if nextFrom == nil { out += gaps.map(TranscriptRow.gap) }
-            return out
+            if nextFrom == nil { out += merged[next...].map { TranscriptRow.gap($0.gap) } }
+            rows = out
+            droppedGaps = dropped
         }
     }
 
@@ -233,9 +323,7 @@ public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
     /// Appends the next transcript page (ignored unless it continues this one).
     public mutating func append(_ page: Transcript) {
         guard var current = transcript, page.from == current.from + current.segments.count else { return }
-        current.segments += page.segments
-        current.nextFrom = page.nextFrom
-        current.total = page.total
+        current.append(page)
         transcript = current
     }
 }
