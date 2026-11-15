@@ -12,9 +12,9 @@ public enum WatchTransferWindow {
 
 /// Which outstanding transfers are actually moving. `isTransferring` alone isn't progress: a transfer it
 /// reports for minutes without a byte sent is stalled, and stops holding a window slot (the twice-the-window
-/// bound on everything outstanding still applies). A transfer stalled for `cancelAfter` is handed back (`overdue`):
-/// the Watch cancels it and sends the part again. Its file stays in the Watch's outbox until a receipt retires it
-/// (2026-11-15: three transfers stalled with no progress for four days were never cancelled, so never resent).
+/// bound on everything outstanding still applies). Stalled transfers are only counted apart (the Watch's report says so,
+/// and the phone tells the owner); the Watch app never cancels them. `overdue`, `cancelAfter` and the saved tracker are
+/// staged for a later automatic cancel-and-resend (2026-11-15: reverted after three review rounds; not used by the app).
 public struct WatchTransferStalls: Codable, Sendable {
     /// No progress for this long: stalled.
     public static let stallAfter: TimeInterval = 3 * 60

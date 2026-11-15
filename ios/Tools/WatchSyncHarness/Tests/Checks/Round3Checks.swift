@@ -1,5 +1,5 @@
 import Foundation
-// Checks from Astra's review OMI-NIGHTLY-2026-11-15-IT3-REVIEW (ASTRA-20261115-IT3-02/04), on the real WatchSync.
+// Checks from Astra's review OMI-NIGHTLY-2026-11-15-IT3-REVIEW (ASTRA-20261115-IT3); the cancel checks are gone with the reverted cancel-and-resend.
 import CryptoKit
 import Testing
 import OmiWatchKit
@@ -7,32 +7,6 @@ import WatchConnectivity
 @Suite(.serialized) @MainActor struct Round3Checks {
  func settle() async { for _ in 0..<30 { await Task.yield() } }
  func policy() throws -> WatchResendPolicy { try JSONDecoder().decode(WatchResendPolicy.self,from:try #require(ReviewDefaults.shared.data(forKey:"omi.resendPolicy"))) }
- @Test func legacyCancellationCannotEraseReplacement() async throws {
-  let (w,m,_)=try await DeltaChecks().setup();let old=try #require(WCSession.default.allFiles.first)
-  // An outstanding WC object made by build 55 has no attempt metadata.
-  old.file.metadata?["attempt"]=nil
-  ReviewClock.now=ReviewClock.now.addingTimeInterval(1);w.pump()
-  ReviewClock.now=ReviewClock.now.addingTimeInterval(1801);w.pump()
-  let replacement=try #require(WCSession.default.allFiles.last)
-  let before=try policy().entries[m.id]?.attempt
-  #expect(replacement !== old && before != nil)
-  await Task.detached { w.session(WCSession.default,didFinish:old,error:NSError(domain:"cancelled",code:1)) }.value
-  await settle()
-  let after=try policy().entries[m.id]?.attempt
-  print("LEGACY_FINISH before=\(String(describing:before)) after=\(String(describing:after))")
-  #expect(after==before,"legacy old callback must not delete replacement policy state")
-  #expect(w.outbox.segments().count==1)
- }
- @Test func cancellationWaitIsIdempotentAndCannotResendCurrentPart() async throws {
-  let (w,_,_)=try await DeltaChecks().setup();let old=try #require(WCSession.default.allFiles.first);old.retainsOnCancel=true
-  ReviewClock.now=ReviewClock.now.addingTimeInterval(1801);w.pump()
-  let firstReplacement=try #require(WCSession.default.allFiles.last)
-  ReviewClock.now=ReviewClock.now.addingTimeInterval(61);w.pump()
-  print("PENDING_CANCEL cancellations=\(old.cancelCount) transfers=\(WCSession.default.allFiles.count)")
-  #expect(old.cancelCount==1)
-  #expect(WCSession.default.allFiles.count==2,"old cancellation cannot remove current attempt from inFlight")
-  #expect(firstReplacement.cancelCount==0 && w.outbox.segments().count==1)
- }
  @Test func oldAttemptReceiptStillRetiresAudioAndOffActorCallbacksAreSafe() async throws {
   let (w,m,_)=try await DeltaChecks().setup();let old=try #require(WCSession.default.allFiles.first)
   ReviewClock.now=ReviewClock.now.addingTimeInterval(1801);w.pump()
@@ -71,7 +45,7 @@ import WatchConnectivity
   w.pump();w.pump();#expect(WCSession.default.outstandingFileTransfers.count==4)
   ReviewClock.now=ReviewClock.now.addingTimeInterval(181);w.pump();#expect(WCSession.default.outstandingFileTransfers.count==8)
   ReviewClock.now=ReviewClock.now.addingTimeInterval(1801);w.pump()
-  #expect(WCSession.default.outstandingFileTransfers.count==4)
+  #expect(WCSession.default.outstandingFileTransfers.count==8 && WCSession.default.allFiles.allSatisfy{$0.cancelCount==0},"never cancelled, never past twice the window")
   let before=WCSession.default.allFiles.count
   let fresh=WatchSync(outbox:w.outbox,perf:WatchPerfQueue(root:root.appendingPathComponent("perf")))
   fresh.session(WCSession.default,activationDidCompleteWith:.activated,error:nil);await settle()
