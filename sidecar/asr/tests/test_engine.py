@@ -200,13 +200,13 @@ def test_a_short_failed_span_with_no_moss_words_is_still_an_error():
 
 
 def test_a_failed_tail_just_after_a_line_is_not_covered_by_timing_slack():
-    from omi_asr.engine import _check_fallback, IncompleteTranscription
+    from omi_asr.engine import _fallback_gaps
 
     pcm = speech(181)
     lines = [{"start": 100.0, "end": 180.0, "speaker": "S01", "moss_text": "words"}]
-    with pytest.raises(IncompleteTranscription):
-        _check_fallback(pcm, [(180.0, 180.8)], lines)
-    _check_fallback(pcm, [(100.0, 180.0)], lines)  # a span MOSS words lie over is fine
+    (gap,) = _fallback_gaps(pcm, [(180.0, 180.8)], lines)
+    assert (gap["start"], gap["end"], gap["reason"]) == (180.0, 180.8, "no_words")
+    assert _fallback_gaps(pcm, [(100.0, 180.0)], lines) == []  # a span MOSS words lie over is fine
 
 
 def test_a_half_that_still_hits_the_cap_is_halved_once_more_before_mosss_gaps_make_it_incomplete():
@@ -239,7 +239,7 @@ def test_the_smallest_piece_is_tried_once_without_the_context_before_mosss_text(
     e = Engine()
     e.models = (FakeMoss([]), LoopsWithContext(), FakeAligner())
     out = e.transcribe(speech(15), ["Freedom"])
-    assert out["omi_asr"]["qwen_capped"] == 0 and out["omi_asr"]["qwen_without_context"] == 1
+    assert out["omi_asr"]["qwen_capped"] == 0 and out["omi_asr"]["qwen_without_context"] >= 1
 
 
 def test_an_empty_answer_from_the_context_free_retry_is_still_incomplete_not_silence():
@@ -275,7 +275,8 @@ def test_an_empty_context_free_retry_under_moss_words_keeps_mosss_text():
     e = Engine()
     e.models = (FakeMoss(lines_every(5, 15)), EmptyWithoutContext(), FakeAligner())
     out = e.transcribe(speech(15), ["Freedom"])
-    assert out["omi_asr"]["qwen_capped"] == 1 and [s["text"] for s in out["segments"]] == ["moss0", "moss5", "moss10"]
+    assert out["omi_asr"]["qwen_capped"] >= 1 and [s["text"] for s in out["segments"]] == ["moss0", "moss5", "moss10"]
+    assert out["gaps"] == []
 
 
 class NoAlignment(FakeAligner):
@@ -311,7 +312,7 @@ def test_a_retry_that_aligns_to_nothing_under_full_moss_words_keeps_mosss_text()
     e = Engine()
     e.models = (FakeMoss(lines_every(5, 15)), PunctuationWithoutContext(), NoAlignment())
     out = e.transcribe(speech(15), ["Freedom"])
-    assert out["omi_asr"]["qwen_unaligned"] == 1 and [s["text"] for s in out["segments"]] == ["moss0", "moss5", "moss10"]
+    assert out["omi_asr"]["qwen_unaligned"] >= 1 and [s["text"] for s in out["segments"]] == ["moss0", "moss5", "moss10"]
 
 
 def test_a_first_answer_that_aligns_to_nothing_is_a_failed_piece_too():
@@ -376,13 +377,11 @@ def test_a_dense_short_window_that_hits_the_short_cap_is_tried_again_and_keeps_e
 
 
 def test_a_window_still_capped_after_its_retry_with_qwen_failing_on_the_tail_is_incomplete_not_shortened():
-    from omi_asr.engine import IncompleteTranscription
-
     moss = DenseMoss(cost=70)  # 75 replies need 5,250 tokens: past the 4,800 retry too; MOSS stops at 68 (27.2 s)
     e = Engine()
     e.models = (moss, CappingQwen(limit=0), FakeAligner())
-    with pytest.raises(IncompleteTranscription):
-        e.transcribe(speech(30), [])
+    out = e.transcribe(speech(30), [])
+    assert_tail_gap(out)
     assert moss.caps == [1200, 4800]
 
 
@@ -404,14 +403,16 @@ def test_the_dense_window_over_http_is_complete_or_422_and_health_stays_up():
 
     buf = io.BytesIO()
     sf.write(buf, speech(30), SR, format="FLAC", subtype="PCM_16")
-    for cost, status in ((18, 200), (70, 422)):
+    for cost, status in ((18, 200), (70, 200)):  # 70: MOSS stops at 27.2 s; the unworded rest is a gap (2026-11-15)
         e = Engine()
         e.models = (DenseMoss(cost=cost), CappingQwen(limit=0), FakeAligner())
         client = TestClient(server.create_app(e, exit=lambda _: pytest.fail("unexpected watchdog exit")))
         r = client.post("/v1/audio/transcriptions", files={"file": ("a.flac", buf.getvalue(), "audio/flac")})
         assert r.status_code == status
-        if status == 200:
-            assert len(r.json()["segments"]) == 75
+        if cost == 18:
+            assert len(r.json()["segments"]) == 75 and r.json()["gaps"] == []
+        else:
+            assert_tail_gap(r.json())
         assert client.get("/health").status_code == 200
 
 
@@ -435,19 +436,24 @@ class PrefixMoss(DenseMoss):
 def test_a_retry_that_ends_below_its_cap_still_has_its_unworded_tail_checked():
     # ASTRA-20261110-IT3-01: 1200/1200, then 2006/4800 with the same 67 replies; Qwen fails throughout. The
     # retry's normal stop erased the cap hit and the 3.2 s tail passed the 25% allowance: a 200 ending at 26.8 s
-    from omi_asr.engine import IncompleteTranscription
-
     moss = PrefixMoss(loop=800)
     e = Engine()
     e.models = (moss, CappingQwen(limit=0), FakeAligner())
-    with pytest.raises(IncompleteTranscription):
-        e.transcribe(speech(30), [])
+    out = e.transcribe(speech(30), [])
+    assert_tail_gap(out)
     assert moss.caps == [1200, 4800]
 
 
 class OneWordQwen(FakeQwen):
     def generate(self, audio, hotwords=None, max_tokens=0, **_):
         return SimpleNamespace(text="tailword", generation_tokens=2, language=["English"])
+
+
+def assert_tail_gap(out):
+    """The words up to where MOSS stopped are kept, and the speech after it is named as a gap (never dropped)."""
+    (gap,) = out["gaps"]
+    assert gap["reason"] == "moss_stopped" and 26.0 <= gap["start"] <= 28.5 and gap["end"] == 30.0 and gap["speech_seconds"] > 0.5
+    assert out["segments"] and max(s["end"] for s in out["segments"]) <= 30.0
 
 
 class AtAligner:
@@ -458,12 +464,10 @@ class AtAligner:
 def test_qwen_wording_only_part_of_a_capped_tail_does_not_make_the_window_complete():
     # ASTRA-20261110-IT3-02: both MOSS tries capped at 26.8 s; Qwen aligns one word at 27-28 s and nothing up to
     # 30 s, without being marked failed: a 200 ending at 28 s
-    from omi_asr.engine import IncompleteTranscription
-
     e = Engine()
     e.models = (PrefixMoss(loop=6000), OneWordQwen(), AtAligner())
-    with pytest.raises(IncompleteTranscription):
-        e.transcribe(speech(30), [])
+    out = e.transcribe(speech(30), [])
+    assert_tail_gap(out)
 
 
 def test_a_capped_window_with_a_silent_tail_still_passes():
@@ -504,13 +508,11 @@ class PlacedAligner:
 def test_chained_short_holes_in_a_capped_tail_add_up_and_make_it_incomplete():
     # ASTRA-20261110-IT3FIX-01: three 0.1 s words at 27.6, 28.6 and 29.6 s after MOSS's last line at 26.8 s; each hole
     # is under 1 s, so bridging them certified 1.5 s of speech without a word (a 200)
-    from omi_asr.engine import IncompleteTranscription
-
     positions = [(27.6, 27.7), (28.6, 28.7), (29.6, 29.7)]
     e = Engine()
     e.models = (PrefixMoss(loop=6000), PlacedQwen(positions), PlacedAligner(positions))
-    with pytest.raises(IncompleteTranscription):
-        e.transcribe(np.full(30 * SR, 0.1, np.float32), [])
+    out = e.transcribe(np.full(30 * SR, 0.1, np.float32), [])
+    assert_tail_gap(out)
 
 
 def test_quiet_pauses_between_the_words_of_a_capped_tail_need_no_words():
@@ -524,3 +526,53 @@ def test_quiet_pauses_between_the_words_of_a_capped_tail_need_no_words():
     out = e.transcribe(samples, [])
     assert out["omi_asr"]["truncated_unresolved"] == 1
     assert [s["speaker_id"] for s in out["segments"]][-1] == "UNKNOWN" and max(s["end"] for s in out["segments"]) >= 29.6
+
+
+# -- 2026-11-15: a short stretch neither model has words for ---------------------------------------------------------
+
+
+def test_a_15_second_piece_qwen_loops_on_is_split_further_and_transcribed():
+    # 01a1dd08 (2026-11-14 20:38): Qwen looped on a 15 s piece (two speakers, short phrases) that was never split (only
+    # pieces over 20 s were), and MOSS had no words there: the whole conversation failed. The same audio in 5 s pieces
+    # transcribed cleanly.
+    e = Engine()
+    e.models = (FakeMoss([]), CappingQwen(limit=8), FakeAligner())
+    out = e.transcribe(speech(15), [])
+    assert out["omi_asr"]["qwen_capped"] == 0 and out["gaps"] == [] and out["segments"]
+
+
+def test_a_short_stretch_without_words_is_a_gap_in_a_kept_transcript():
+    # the last 12 s of 60 have no words from either model: the other 48 s are kept, the 12 s are named (start, end,
+    # speech, why), nothing is invented for them
+    e = Engine()
+    e.models = (FakeMoss(lines_every(6, 48)), CappingQwen(limit=0), FakeAligner())
+    out = e.transcribe(speech(60), [])
+    assert [s["text"] for s in out["segments"]] == [f"moss{t}" for t in range(0, 48, 6)]
+    (gap,) = out["gaps"]
+    assert gap["reason"] == "no_words" and 47.0 <= gap["start"] <= 48.5 and gap["end"] == 60.0 and 10 <= gap["speech_seconds"] <= 13
+    assert out["omi_asr"]["gaps"] == 1
+
+
+def test_a_request_mostly_without_words_is_still_a_422():
+    from omi_asr.engine import IncompleteTranscription
+
+    e = Engine()
+    e.models = (FakeMoss(lines_every(6, 24)), CappingQwen(limit=0), FakeAligner())  # 36 of 60 s without words
+    with pytest.raises(IncompleteTranscription):
+        e.transcribe(speech(60), [])
+
+
+def test_the_gaps_go_over_http_with_a_200():
+    import io
+
+    import soundfile as sf
+    from fastapi.testclient import TestClient
+
+    from omi_asr import server
+
+    buf = io.BytesIO()
+    sf.write(buf, speech(60), SR, format="FLAC", subtype="PCM_16")
+    e = Engine()
+    e.models = (FakeMoss(lines_every(6, 48)), CappingQwen(limit=0), FakeAligner())
+    r = TestClient(server.create_app(e, exit=lambda _: None)).post("/v1/audio/transcriptions", files={"file": ("a.flac", buf.getvalue(), "audio/flac")})
+    assert r.status_code == 200 and len(r.json()["gaps"]) == 1 and set(r.json()["gaps"][0]) == {"start", "end", "speech_seconds", "reason"}

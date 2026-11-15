@@ -45,40 +45,92 @@ def _uncovered_speech(pcm: np.ndarray, a: float, b: float, covered: list[tuple[f
     return float((loud & ~hit).sum()) * frame / plan.SR, float(loud.sum()) * frame / plan.SR
 
 
+def _uncovered_bounds(pcm: np.ndarray, a: float, b: float, covered: list[tuple[float, float]]) -> tuple[float, float, float]:
+    """(seconds of speech in [a, b] no covered span (+-SLACK) reaches, first and last such moment), (0, a, a) for none."""
+    frame = plan.SR // 50
+    energy = plan.frame_energy(pcm[round(a * plan.SR) : round(b * plan.SR)])
+    if len(energy) == 0:
+        return 0.0, a, a
+    loud = energy > plan._threshold(plan.frame_energy(pcm))
+    times = a + (np.arange(len(energy)) + 0.5) * frame / plan.SR
+    hit = np.zeros(len(energy), dtype=bool)
+    for x, y in covered:
+        hit |= (times >= x - SLACK) & (times <= y + SLACK)
+    left = times[loud & ~hit]
+    if len(left) == 0:
+        return 0.0, a, a
+    half = frame / plan.SR / 2
+    return float(len(left)) * frame / plan.SR, max(a, float(left[0]) - half), min(b, float(left[-1]) + half)
+
+
 TAIL_UNCOVERED_MAX = 0.5  # s of speech past MOSS's last line, in total, that no MOSS line or aligned Qwen word reaches
 
 
-def _check_tail(pcm: np.ndarray, lines: list[dict], units: list, start: float, stop: float) -> None:
+def _tail_gap(pcm: np.ndarray, lines: list[dict], units: list, start: float, stop: float) -> dict | None:
     """Past the last line of a MOSS answer that hit its cap (or stopped long before the speech did), the words
     are whatever Qwen aligned there. Its speech must be reached by a MOSS line or an aligned Qwen word (each
     +-SLACK), all its holes together leaving at most TAIL_UNCOVERED_MAX: a failed, empty or partial Qwen piece
-    there is an incomplete transcript, not a shorter one. Quiet audio (below the energy threshold), pauses
-    between words included, needs no words."""
+    there is a gap in the transcript, never a shorter one (returned, `Engine.transcribe` decides). Quiet audio
+    (below the energy threshold), pauses between words included, needs no words."""
     last = max((line["end"] for line in lines), default=start)
     covered = [(line["start"], line["end"]) for line in lines] + [(u.start, u.end) for u in units]
     missing, _ = _uncovered_speech(pcm, last, stop, covered)
     if missing > TAIL_UNCOVERED_MAX:
-        raise IncompleteTranscription(f"MOSS's answer stopped at {last:.1f} s and {missing:.1f} s of speech up to {stop:.1f} s has no words")
+        return {"start": round(last, 3), "end": round(stop, 3), "speech_seconds": round(missing, 1), "reason": "moss_stopped",
+                "message": f"MOSS's answer stopped at {last:.1f} s and {missing:.1f} s of speech up to {stop:.1f} s has no words"}  # fmt: skip
+    return None
 
 
-QWEN_SPLITS = 6  # a capped chunk is halved, and each capped piece again, until 20 s or less (this only bounds it)
+QWEN_SPLITS = 6  # a capped chunk is halved, and each capped piece again, down to QWEN_MIN_SPLIT (this only bounds it)
+# A chunk is halved only while longer than this. It was 20 s: on 2026-11-14 a 15 s piece (two speakers, short phrases)
+# sent Qwen into a two-character loop and was never split, though the same audio in 5 s pieces transcribed cleanly.
+QWEN_MIN_SPLIT = 6.0
+
+
+# A request whose untranscribed speech (all its gaps) is at least this share of its speech fails (422): the result
+# would be mostly gap, and a note made from the rest would misrepresent the conversation. Below it, the words are kept
+# and each gap is returned (`gaps`), so the note marks it instead of losing the whole conversation (2026-11-14).
+GAP_MAX_SHARE = 0.5
 
 
 class IncompleteTranscription(RuntimeError):
-    """Qwen failed on some audio and MOSS has no words there either: rather an error than silence."""
+    """Too much of the speech has no words from either model: rather an error than a mostly empty transcript."""
 
 
-def _check_fallback(pcm: np.ndarray, capped: list[tuple[float, float]], lines: list[dict]) -> None:
-    """The speech of every span Qwen failed on needs MOSS words over it, or it would vanish: a line with
-    text actually overlapping the span (no timing slack), and no more than a small share of its speech left
-    uncovered (noise between lines is tolerated)."""
+def _fallback_gaps(pcm: np.ndarray, capped: list[tuple[float, float]], lines: list[dict]) -> list[dict]:
+    """The speech of every span Qwen failed on needs MOSS words over it, or it has no words: a line with text
+    actually overlapping the span (no timing slack), and no more than a small share of its speech left uncovered
+    (noise between lines is tolerated). A span that fails this is a gap (returned, never silently dropped)."""
+    gaps = []
     for a, b in capped:
         spans = [(line["start"], line["end"]) for line in lines if line.get("moss_text")]
         missing, loud = _uncovered_speech(pcm, a, b, spans)
         if loud < 0.2:
             continue
         if not any(x < b and y > a for x, y in spans) or missing > max(UNCOVERED_MAX, UNCOVERED_SHARE * loud):
-            raise IncompleteTranscription(f"Qwen failed on {a:.1f}-{b:.1f} s and MOSS has no words for {missing:.0f} s of its speech")
+            gaps.append({"start": round(a, 3), "end": round(b, 3), "speech_seconds": round(missing, 1), "reason": "no_words",
+                         "message": f"Qwen failed on {a:.1f}-{b:.1f} s and MOSS has no words for {missing:.0f} s of its speech"})  # fmt: skip
+    return gaps
+
+
+def _merge_gaps(pcm: np.ndarray, gaps: list[dict], covered: list[tuple[float, float]]) -> list[dict]:
+    """Overlapping gaps as one (their speech counted once), trimmed to the speech no kept segment reaches (+-SLACK)."""
+    merged: list[dict] = []
+    for g in sorted(gaps, key=lambda g: g["start"]):
+        if merged and g["start"] <= merged[-1]["end"]:
+            last = merged[-1]
+            inside = g["end"] <= last["end"] or last["start"] >= g["start"]  # one holds the other: the same speech
+            last["speech_seconds"] = (max if inside else sum)((last["speech_seconds"], g["speech_seconds"]))
+            last["end"] = max(last["end"], g["end"])
+            last["reasons"].append(g["reason"])
+        else:
+            merged.append(dict(g, reasons=[g["reason"]]))
+    for g in merged:  # placed where its unworded speech is, so a note marks it there (its seconds as the checks counted them)
+        missing, first, last = _uncovered_bounds(pcm, g["start"], g["end"], covered)
+        if missing > 0:
+            g["start"], g["end"] = round(first, 3), round(last, 3)
+        g["reason"] = "moss_stopped" if "moss_stopped" in g.pop("reasons") else "no_words"
+    return merged
 
 
 UNKNOWN = "UNKNOWN"  # words no MOSS line holds (Omi renders the speaker as unknown and learns no voice from it)
@@ -158,6 +210,7 @@ class Engine:
                      "qwen_split": 0, "qwen_without_context": 0, "qwen_capped": 0, "qwen_unaligned": 0, "units": 0, "units_outside_lines": 0, "lines_with_moss_text": 0}  # fmt: skip
             lines: list[dict] = []
             languages: list[str] = []
+            gaps: list[dict] = []  # speech neither model has words for (`_fallback_gaps`, `_tail_gap`)
             windows: list[dict] = []  # where MOSS ran: its labels restart in each (the backend links them by voice)
             for k, (a, b) in enumerate(plan.plan_windows(pcm)):
                 for sub, (lines_w, start, stop, truncated) in enumerate(self._moss(moss, pcm, a, b, 0, stats)):
@@ -165,18 +218,28 @@ class Engine:
                     windows.append({"start": round(start, 3), "end": round(stop, 3), "label_prefix": prefix})
                     for line in lines_w:
                         line["speaker"] = prefix + line["speaker"]
-                    lines.extend(self._text(qwen, aligner, pcm, start, stop, lines_w, context, stats, languages, prefix, truncated))
+                    lines.extend(self._text(qwen, aligner, pcm, start, stop, lines_w, context, stats, languages, prefix, truncated, gaps))
             t_total = time.perf_counter() - t0
             self.last_used = time.monotonic()
             lines.sort(key=lambda s: (s["start"], s["end"]))
             segments = [{"start": round(s["start"], 3), "end": round(s["end"], 3), "speaker_id": s["speaker"], "text": s["text"]}
                         for s in lines if s["text"]]  # fmt: skip
+            if gaps:  # overlapping ones (a failed Qwen piece inside a tail MOSS left) are one gap, counted once
+                gaps = _merge_gaps(pcm, gaps, [(x["start"], x["end"]) for x in segments])
+                missing = sum(g["speech_seconds"] for g in gaps)
+                _, speech_total = _uncovered_speech(pcm, 0.0, duration, [])
+                if not segments or missing >= GAP_MAX_SHARE * speech_total:
+                    raise IncompleteTranscription(gaps[0]["message"] + (f" ({missing:.0f} of {speech_total:.0f} s of speech without words)"
+                                                                         if len(gaps) > 1 or segments else ""))  # fmt: skip
+                stats["gaps"] = len(gaps)
+                log.warning("%d gap(s) without words, %.0f of %.0f s of speech: kept as gaps", len(gaps), missing, speech_total)
             return {
                 "text": " ".join(s["text"] for s in segments),
                 "language": max(set(languages), key=languages.count) if languages else None,
                 "duration": round(duration, 3),
                 "segments": segments,
                 "windows": windows,
+                "gaps": [{k: g[k] for k in ("start", "end", "speech_seconds", "reason")} for g in sorted(gaps, key=lambda g: g["start"])],
                 "omi_asr": dict(stats, seconds=round(t_total, 2), rtf=round(t_total / max(duration, 1e-6), 4),
                                 peak_mlx_gb=round(mx.get_peak_memory() / 1e9, 2), load_seconds=self.load_seconds),  # fmt: skip
             }
@@ -221,7 +284,7 @@ class Engine:
               languages: list[str], capped: list[tuple[float, float]], splits: int = QWEN_SPLITS) -> list:  # fmt: skip
         """Aligned units for [a, b] (absolute s). A chunk where Qwen runs into its cap (a repetition loop,
         which depends on where the audio is cut) is tried again as two halves, and a capped half halved again,
-        down to 20 s; such a piece is tried once more without the context (a prompt can set off the loop).
+        while longer than QWEN_MIN_SPLIT; such a piece is tried once more without the context (a prompt can set off the loop).
         One that still hits it goes into `capped` (MOSS's text there)."""
         import mlx.core as mx
 
@@ -233,7 +296,7 @@ class Engine:
         r = qwen.generate(mx.array(padded), hotwords=context or None, max_tokens=cap)
         stats["qwen_chunks"] += 1
         if int(getattr(r, "generation_tokens", 0) or 0) >= cap:
-            if splits > 0 and b - a > 20:
+            if splits > 0 and b - a > QWEN_MIN_SPLIT:
                 stats["qwen_split"] += 1
                 mid = a + plan.middle_cut(chunk, 0.0, b - a)
                 log.warning("Qwen hit its cap on a %.0f s chunk: trying its halves", b - a)
@@ -268,7 +331,8 @@ class Engine:
         return units
 
     def _text(self, qwen, aligner, pcm: np.ndarray, start: float, stop: float, lines: list[dict], context: list[str],
-              stats: dict, languages: list[str], prefix: str = "", truncated: bool = False) -> list[dict]:  # fmt: skip
+              stats: dict, languages: list[str], prefix: str = "", truncated: bool = False,
+              gaps: list[dict] | None = None) -> list[dict]:  # fmt: skip
         """Qwen text on <= 180 s chunks of the whole window [start, stop] (speech MOSS left out included),
         aligned onto its MOSS lines. Words MOSS gave no speaker for (no lines at all, or past where a
         truncated MOSS stopped) go on `UNKNOWN` lines: kept, attributed to nobody."""
@@ -279,9 +343,13 @@ class Engine:
         for a, b in zip(cuts, cuts[1:], strict=False):
             units.extend(self._qwen(qwen, aligner, pcm, start + a, start + b, context, stats, languages, capped))
         lines = [dict(line) for line in lines]
-        _check_fallback(pcm, capped, lines)
-        if truncated:
-            _check_tail(pcm, lines, units, start, stop)
+        found = _fallback_gaps(pcm, capped, lines)
+        if truncated and (tail := _tail_gap(pcm, lines, units, start, stop)):
+            found.append(tail)
+        if gaps is not None:
+            gaps.extend(found)
+        elif found:  # a caller that keeps no gaps: the old all-or-nothing rule
+            raise IncompleteTranscription(found[0]["message"])
         if not lines:
             if not units:
                 return []
