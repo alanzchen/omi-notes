@@ -16,6 +16,22 @@ import Testing
         try JSONDecoder().decode(T.self, from: Data(json.utf8))
     }
 
+    @Test func aPartialTranscriptShowsEachGapWhereItWas() throws {
+        // 2026-11-15: the app showed a transcript with a stretch nobody could put into words as if it were complete
+        let page = { (gaps: String, next: String) in #"{"total": 3, "from": 0, "next_from": \#(next), "segments": [{"start": "2026-11-14T23:03:00.000Z", "end": "2026-11-14T23:03:05.000Z", "speaker": "S1", "name": null, "text": "a"}, {"start": "2026-11-14T23:03:30.000Z", "end": "2026-11-14T23:03:35.000Z", "speaker": "S2", "name": null, "text": "b"}]\#(gaps)}"# }
+        let gaps = #", "untranscribed": [{"start": "2026-11-14T23:03:40.000Z", "end": "2026-11-14T23:03:55.000Z", "speech_s": 12.5}, {"start": "2026-11-14T23:03:10.000Z", "end": "2026-11-14T23:03:25.000Z", "speech_s": 9.6}]"#
+        let full = try decode(ConversationDetail.Transcript.self, page(gaps, "null"))
+        #expect(full.untranscribed?.count == 2 && full.untranscribed?.first?.speechS == 12.5)
+        let rows = full.rows
+        #expect(rows.count == 4 && rows[0] == .segment(0) && rows[2] == .segment(1))
+        if case .gap(let g) = rows[1] { #expect(g.speechS == 9.6) } else { Issue.record("the earlier gap sits between the two segments") }
+        if case .gap(let g) = rows[3] { #expect(g.speechS == 12.5) } else { Issue.record("the later gap follows the last segment") }
+        // more pages to come: a gap after the last segment shown may belong between later ones, so it waits
+        #expect(try decode(ConversationDetail.Transcript.self, page(gaps, "2")).rows.count == 3)
+        // an older server, or no gap: just the segments
+        #expect(try decode(ConversationDetail.Transcript.self, page("", "null")).rows == [.segment(0), .segment(1)])
+    }
+
     @Test func currentStatus() throws {
         let s = try decode(ServerStatus.self, Self.status)
         #expect(s.worker?.present == false && s.readOnly == nil && s.lastNoteAt != nil)

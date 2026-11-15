@@ -110,7 +110,9 @@ struct ConversationDetailView: View {
         .onChange(of: detail?.transcript != nil) { _, loaded in
             guard loaded, UserDefaults.standard.bool(forKey: "OmiNotesDebugShowTranscript") else { return }
             showTranscript = true
-            Task { try? await Task.sleep(for: .milliseconds(400)); proxy.scrollTo("transcript", anchor: .top) }
+            // the first stretch without words when there is one (screenshots of the marker), else the transcript's top
+            let gap = detail?.transcript?.rows.firstIndex { if case .gap = $0 { true } else { false } }
+            Task { try? await Task.sleep(for: .milliseconds(400)); proxy.scrollTo(gap.map { "gap-\($0)" } ?? "transcript", anchor: .center) }
         }
         #endif
         }
@@ -445,17 +447,35 @@ struct ConversationDetailView: View {
         Section {
             if let t = d.transcript {
                 DisclosureGroup(isExpanded: $showTranscript) {
-                    ForEach(Array(t.segments.enumerated()), id: \.offset) { index, seg in
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack {
-                                Text(seg.name ?? ConversationDetail.anonymous(seg.speaker)).font(.caption.weight(.semibold))
-                                Spacer()
-                                Text(Fmt.time(ISO8601UTC.parse(seg.start))).font(.caption2).foregroundStyle(.tertiary)
+                    ForEach(Array(t.rows.enumerated()), id: \.offset) { position, row in
+                        switch row {
+                        case .segment(let index):
+                            let seg = t.segments[index]
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack {
+                                    Text(seg.name ?? ConversationDetail.anonymous(seg.speaker)).font(.caption.weight(.semibold))
+                                    Spacer()
+                                    Text(Fmt.time(ISO8601UTC.parse(seg.start))).font(.caption2).foregroundStyle(.tertiary)
+                                }
+                                Text(seg.text).font(.subheadline).textSelection(.enabled)
                             }
-                            Text(seg.text).font(.subheadline).textSelection(.enabled)
+                            .accessibilityElement(children: .combine)
+                            .id("seg-\(index)")
+                        case .gap(let gap):
+                            // speech the server couldn't put into words: said where it was, never filled in
+                            VStack(alignment: .leading, spacing: 2) {  // laid out like a segment: header, then its line
+                                HStack {
+                                    Label("Not transcribed", systemImage: "waveform.badge.exclamationmark")
+                                        .font(.caption.weight(.semibold)).foregroundStyle(.orange)
+                                    Spacer()
+                                    Text(Fmt.time(ISO8601UTC.parse(gap.start))).font(.caption2).foregroundStyle(.tertiary)
+                                }
+                                Text("About \(Fmt.duration(gap.speechS) ?? "a few seconds") of speech here couldn't be transcribed.")
+                                    .font(.subheadline).foregroundStyle(.secondary)
+                            }
+                            .accessibilityElement(children: .combine)
+                            .id("gap-\(position)")
                         }
-                        .accessibilityElement(children: .combine)
-                        .id("seg-\(index)")
                     }
                     if t.nextFrom != nil {
                         Button {

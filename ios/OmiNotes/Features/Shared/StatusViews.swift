@@ -165,6 +165,7 @@ struct StateChip: View {
         case "processing": return "Processing"
         case "retrying": return "Retrying"
         case "transcript_only": return "Transcript only"
+        case "partial_transcript": return "Gap in transcript"  // a note with a stretch without words (not a failure)
         case "failed": return "Failed"
         case "discarded": return "Skipped"
         case "kept_speaker_unknown": return "Transcript only"
@@ -176,7 +177,7 @@ struct StateChip: View {
     private var color: Color {
         switch state.code {
         case "listening", "processing": return .blue
-        case "retrying", "transcript_only": return .orange
+        case "retrying", "transcript_only", "partial_transcript": return .orange
         case "failed": return .red
         case "discarded", "kept_speaker_unknown": return .gray
         default: return .green

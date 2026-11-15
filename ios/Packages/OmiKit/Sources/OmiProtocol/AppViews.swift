@@ -56,16 +56,49 @@ public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
         public var text: String
     }
 
+    /// A stretch of speech neither transcription model had words for (`partial_transcript`), where it was.
+    public struct Gap: Codable, Equatable, Sendable, Hashable {
+        public var start: String
+        public var end: String
+        public var speechS: Double
+        enum CodingKeys: String, CodingKey {
+            case start, end
+            case speechS = "speech_s"
+        }
+    }
+
+    /// One line of the transcript as shown: a segment (by index), or a gap where it falls between them.
+    public enum TranscriptRow: Equatable, Sendable {
+        case segment(Int)
+        case gap(Gap)
+    }
+
     public struct Transcript: Codable, Equatable, Sendable {
         public var total: Int
         public var from: Int
         /// `segments_from` of the next page; nil on the last one.
         public var nextFrom: Int?
         public var segments: [Segment]
+        /// Speech without words (only from a server that reports it; absent: none known).
+        public var untranscribed: [Gap]?
 
         enum CodingKeys: String, CodingKey {
-            case total, from, segments
+            case total, from, segments, untranscribed
             case nextFrom = "next_from"
+        }
+
+        /// The segments with each gap before the first segment that starts after it; a gap after the last segment
+        /// shown appears only once every page is loaded (until then, it may belong between later segments).
+        public var rows: [TranscriptRow] {
+            var gaps = (untranscribed ?? []).sorted { (ISO8601UTC.parse($0.start) ?? .distantPast) < (ISO8601UTC.parse($1.start) ?? .distantPast) }
+            var out: [TranscriptRow] = []
+            for (i, seg) in segments.enumerated() {
+                let at = ISO8601UTC.parse(seg.start) ?? .distantPast
+                while let g = gaps.first, (ISO8601UTC.parse(g.start) ?? .distantPast) < at { out.append(.gap(gaps.removeFirst())) }
+                out.append(.segment(i))
+            }
+            if nextFrom == nil { out += gaps.map(TranscriptRow.gap) }
+            return out
         }
     }
 
