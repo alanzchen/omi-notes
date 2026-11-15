@@ -346,3 +346,47 @@ def test_no_speaker_failures_offer_keep_instead_of_a_futile_retry(client, worker
 def test_a_queued_retry_does_not_claim_the_server_is_down():
     from omi_notes import operations
     assert operations._MESSAGES["queued"] == "Queued on the server"
+
+
+def _publish_transcript(worker, row, gaps, count=501):
+    """Rewrites a finished conversation's transcript: `count` short segments 4 s apart, and these gaps."""
+    import json as _json
+
+    from omi_notes.util import canonical_json, sha256_hex
+
+    path = worker.pipeline.conv_dir(row["id"]) / "transcript.json"
+    doc = _json.loads(path.read_text())
+    segments = [dict(doc["segments"][0], start=row["start"] + i * 4, end=row["start"] + i * 4 + 2) for i in range(count)]
+    doc["segments"], doc["untranscribed"] = segments, gaps
+    path.write_text(_json.dumps(doc))
+    worker.db.execute("UPDATE conversations SET transcript_sha=? WHERE id=?", (sha256_hex(canonical_json(segments).encode()), row["id"]))
+
+
+def test_each_transcript_page_carries_only_its_own_gaps_and_all_appear_once(client, worker):
+    # ASTRA-20261115-IT2-02: every page carried the whole gap list (5,000 gaps on a one-segment page: 10,004 time
+    # conversions, 416 KB). A page now carries the stretches it owns; across the pages each appears once
+    row = finished(client, worker)
+    s = row["start"]
+    gaps = [[s - 3, s - 1, 2], [s + 6, s + 7, 1], [s + 1998, s + 1999, 1], [s + 2001, s + 2002, 1], [s + 2010, s + 2011, 1]]
+    _publish_transcript(worker, row, gaps)  # pages: segments 0-499 (0-1996 s), then 500 (2000 s)
+    first = get(client, f"/v1/conversations/{row['id']}")["transcript"]
+    last = get(client, f"/v1/conversations/{row['id']}?segments_from=500")["transcript"]
+    starts = lambda t: [g["start"] for g in t.get("untranscribed", [])]  # noqa: E731
+    assert len(starts(first)) == 3 and len(starts(last)) == 2, "before, between, up to page 2's first segment | the tail"
+    assert sorted(starts(first) + starts(last)) == sorted(set(starts(first) + starts(last))) and len(starts(first) + starts(last)) == 5
+    assert "untranscribed_incomplete" not in first and "untranscribed_incomplete" not in last
+    # many stretches after the last segment: the one-segment page carries a bounded number and says so
+    _publish_transcript(worker, row, [[s + 2002 + i * 2, s + 2003 + i * 2, 1] for i in range(5000)])
+    last = get(client, f"/v1/conversations/{row['id']}?segments_from=500")["transcript"]
+    assert len(last["untranscribed"]) == 4 and last["untranscribed_incomplete"] is True
+
+
+@pytest.mark.parametrize("bad", [[1e100, 1e100, 1], [None, 1800000001, 1], [1800000000, 1800000001, "x"], [5, 4, 1], [1, 2, 0]],
+                         ids=["huge", "null", "speech_not_a_number", "reversed", "no_speech"])  # fmt: skip
+def test_an_unreadable_gap_never_breaks_the_note_and_is_said_to_be_missing(client, worker, bad):
+    # ASTRA-20261115-IT2-04: a malformed optional gap made the whole detail a 500
+    row = finished(client, worker)
+    s = row["start"]
+    _publish_transcript(worker, row, [bad, [s + 6, s + 7, 1]], count=3)
+    t = get(client, f"/v1/conversations/{row['id']}")["transcript"]
+    assert t["segments"] and len(t["untranscribed"]) == 1 and t["untranscribed_incomplete"] is True
