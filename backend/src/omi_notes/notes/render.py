@@ -151,6 +151,16 @@ def _transcript_line(seg: dict, d: NoteData) -> str:
     return f"**{_clock(seg['start'], d.tz)} · {speaker_label(seg['speaker'], d.notes, d.voice_names, d.possible_names, d.language)}:** {seg['text']}"
 
 
+def _transcript_stream(d: NoteData) -> list[str]:
+    """The transcript's lines in time order, each untranscribed stretch where it happened between them."""
+    marks, out = sorted(d.untranscribed), []
+    for seg in d.segments:
+        while marks and marks[0][0] < seg["start"]:
+            out.append(_gap_line(marks.pop(0), d))
+        out.append(_transcript_line(seg, d))
+    return out + [_gap_line(m, d) for m in marks]
+
+
 def _gap_line(gap: list[float], d: NoteData) -> str:
     return f"**{_clock(gap[0], d.tz)}** · _about {_duration_text(gap[2])} of speech here couldn't be transcribed_"
 
@@ -343,15 +353,10 @@ def render_note(d: NoteData, my_notes: str | None = None) -> str:
     out += ["## My Notes", "", f"{MY_NOTES_START}{body_notes}{MY_NOTES_END}", ""]
 
     out += ["## Transcript", ""]
-    if d.segments and passive:  # folded: kept in full, out of the way
-        out += ["> [!quote]- Transcript", *[line for seg in d.segments for line in (f"> {_transcript_line(seg, d)}", ">")], ""]
+    if d.segments and passive:  # folded: kept in full, out of the way (its gaps marked too, ASTRA-20261115-IT1-06)
+        out += ["> [!quote]- Transcript", *[line for text in _transcript_stream(d) for line in (f"> {text}", ">")], ""]
     elif d.segments:
-        marks = sorted(d.untranscribed)  # each where it happened, between the lines around it
-        for seg in d.segments:
-            while marks and marks[0][0] < seg["start"]:
-                out += [_gap_line(marks.pop(0), d), ""]
-            out += [_transcript_line(seg, d), ""]
-        out += [line for m in marks for line in (_gap_line(m, d), "")]
+        out += [line for text in _transcript_stream(d) for line in (text, "")]
     else:
         out += ["_No speech was transcribed._", ""]
     return "\n".join(out).rstrip("\n") + "\n"

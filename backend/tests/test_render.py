@@ -148,3 +148,15 @@ def test_stub_and_daily_render():
     assert "## Discarded" in daily and "## In Progress" in daily
     assert "- [ ]" not in daily  # never duplicate tasks for Obsidian Tasks
     assert "$0.04 transcription + $0.04 summaries" in daily
+
+
+def test_a_folded_transcript_marks_its_untranscribed_stretch_too():
+    # ASTRA-20261115-IT1-06: a passive note's warning said the stretch was marked in the transcript, but the folded
+    # transcript had no marker
+    d = sample()
+    d.recording_class = {"class": "passive"}
+    d.untranscribed = [[d.start + 20, d.start + 25, 5.0]]
+    text = render_note(d)
+    assert "> [!warning] Not transcribed:" in text
+    folded = text[text.index("> [!quote]- Transcript"):]
+    assert folded.count("of speech here couldn't be transcribed_") == 1 and "> **" in folded
