@@ -26,6 +26,7 @@ import httpx
 
 from . import SttRequest
 import io
+import math
 import re
 
 import numpy as np
@@ -50,20 +51,16 @@ def _gaps(data: dict) -> list[dict]:
     return out
 
 
-GAP_MIN_SECONDS = 0.5  # a stretch left after the kept words are taken out shorter than this isn't reported
-
-
 def _reconciled_gaps(gaps: list[dict], utterances: list[dict]) -> list[dict]:
-    """The stretches no kept word covers, from every request's gaps (absolute time; a shared stretch is heard
-    twice, ASTRA-20261115-IT1-01): their union, minus what the kept utterances cover (a neighbour that recovered
-    part of it), each piece once. A piece's speech is its length at the highest speech density of the gaps it
-    came from: never more than its length, never counted twice."""
+    """`gaps` (one request's) minus what these utterances cover: each remaining piece once, with its speech at the
+    highest speech density of the gaps it came from (never more than its length). No minimum length: many short
+    stretches add up (ASTRA-20261115-IT3-03)."""
     if not gaps:
         return []
     covered = _union([(float(u["start"]), float(u["end"])) for u in utterances if u.get("transcript") or u.get("text")])
     out = []
     for a, b in _minus(_union([(g["start"], g["end"]) for g in gaps]), covered):
-        if b - a < GAP_MIN_SECONDS:
+        if b <= a:
             continue
         sources = [g for g in gaps if g["start"] < b and g["end"] > a]
         density = max((g["speech_seconds"] / (g["end"] - g["start"]) for g in sources if g["end"] > g["start"]), default=1.0)
@@ -71,6 +68,37 @@ def _reconciled_gaps(gaps: list[dict], utterances: list[dict]) -> list[dict]:
         out.append({"start": a, "end": b, "speech_seconds": round(min(b - a, density * (b - a)), 1),
                     "reason": "moss_stopped" if "moss_stopped" in reasons else "no_words"})  # fmt: skip
     return out
+
+
+def _stitched_gaps(gaps: list[list[dict]], heard: list[list[tuple[float, float]]]) -> list[dict]:
+    """The stretches without words across a conversation's requests (absolute time). Each request keeps its own
+    gaps: only another request's words, with explicit timing, can show part of one was heard after all
+    (ASTRA-20261115-IT1-01, IT3-01). A request never refutes its own gap (its coarse UNKNOWN line spans the hole), and
+    a word without its own times is no evidence. What remains is merged across requests and counted once."""
+    pieces: list[dict] = []
+    for k, mine in enumerate(gaps):
+        others = [{"start": a, "end": b, "text": "x"} for j, spans in enumerate(heard) if j != k for a, b in spans]
+        pieces += _reconciled_gaps(mine, others)
+    if not pieces:
+        return []
+    return _reconciled_gaps(pieces, [])  # the same stretch from two requests: once
+
+
+def _heard(data: dict, offset: float) -> list[tuple[float, float]]:
+    """Where one sidecar answer has words, in absolute time: its segments with text and their own start and end
+    (a defaulted time proves nothing), minus the stretches it says it had no words for (an UNKNOWN line's envelope
+    isn't word coverage)."""
+    spans = []
+    for seg in data.get("segments") or []:
+        if not isinstance(seg, dict) or not str(seg.get("text") or "").strip():
+            continue
+        a, b = seg.get("start"), seg.get("end")
+        if isinstance(a, bool) or isinstance(b, bool) or not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+            continue
+        if math.isfinite(a) and math.isfinite(b) and b > a:
+            spans.append((float(a) + offset, float(b) + offset))
+    holes = [(g["start"] + offset, g["end"] + offset) for g in _gaps(data)]
+    return _minus(_union(spans), _union(holes))
 
 
 def _shifted(gaps: list[dict], offset: float) -> list[dict]:
@@ -237,14 +265,17 @@ class LocalAsrStt(OpenAICompatStt):
         language, base, group = None, 0, 0
         stretches: list[tuple[float, float]] = []
         gaps: list[list[dict]] = []  # each request's gaps, in absolute time
+        word_spans: list[list[tuple[float, float]]] = []  # where each request has timed words (`_heard`)
         for k in range(len(edges) - 1):
             own_a, own_b = edges[k], edges[k + 1]
             a, b = (max(0.0, own_a - over) if k else 0.0), (min(total, own_b + over) if k < len(edges) - 2 else total)
             part = request if (a, b) == (0.0, total) else _sub_request(request, pcm, a, b)
             mine: list[dict] = []
             gaps.append([])
+            heard_words: list[tuple[float, float]] = []
             for offset, result in self._transcribe_part(a, part):
                 gaps[-1] += result.pop("gaps", [])  # absolute already (`_transcribe_part` shifts them)
+                heard_words += result.pop("heard", [])
                 top = -1
                 for u in result["results"]["utterances"]:
                     shifted = dict(u, start=float(u["start"]) + offset, end=float(u["end"]) + offset)
@@ -259,6 +290,7 @@ class LocalAsrStt(OpenAICompatStt):
                 channel = (result["results"].get("channels") or [{}])[0]
                 language = language or channel.get("detected_language")
             heard.append(mine)
+            word_spans.append(heard_words)
             if k:
                 lo, hi = max(0.0, own_a - over), min(total, own_a + over)
                 found.append(anchors(heard[k - 1], mine, lo, hi, min(ANCHOR_SECONDS, over)))
@@ -276,7 +308,7 @@ class LocalAsrStt(OpenAICompatStt):
             # after the left side's rescues are in: never both copies of one phrase
             kept[k + 1] += [u for u in heard[k + 1] if u not in kept[k + 1] and here(u) and not _covered(u, kept[k])]
         utterances = sorted((u for mine in kept for u in mine), key=lambda u: (u["start"], u["end"]))
-        missing = _reconciled_gaps([g for mine in gaps for g in mine], utterances)
+        missing = _stitched_gaps(gaps, word_spans)
         groups = [list(g) for g in {tuple(g) for g in groups}]
         response = {"results": {"channels": [{"detected_language": language} if language else {}], "utterances": utterances}}
         if missing:  # only when there are some, so every other stored result stays byte-identical
@@ -293,7 +325,7 @@ class LocalAsrStt(OpenAICompatStt):
             return super()._transcribe_part(offset, part)
         windows = sorted(data.get("windows") or [], key=lambda w: float(w["start"]))
         if len(windows) < 2:
-            return [(offset, _normalized(data) | {"gaps": _shifted(_gaps(data), offset)})]
+            return [(offset, _normalized(data) | {"gaps": _shifted(_gaps(data), offset), "heard": _heard(data, offset)})]
         # each segment belongs to the window whose label prefix it carries (the first window's is empty)
         groups: dict[int, list[dict]] = {}
         for seg in data.get("segments") or []:
@@ -306,6 +338,7 @@ class LocalAsrStt(OpenAICompatStt):
             shifted = [dict(seg, start=float(seg["start"]) - start, end=float(seg["end"]) - start) for seg in segments]
             out.append((offset + start, _normalized(dict(data, segments=shifted))))
         out[0][1]["gaps"] = _shifted(_gaps(data), offset)  # once per request, in absolute time
+        out[0][1]["heard"] = _heard(data, offset)
         return out
 
     def healthy(self, *, refresh: bool = False) -> bool:

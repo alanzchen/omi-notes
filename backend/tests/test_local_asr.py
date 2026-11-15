@@ -1118,3 +1118,43 @@ def test_a_test_can_never_reach_the_live_sidecar():
 
     with pytest.raises(LiveSidecarReached):
         LocalAsrStt("http://127.0.0.1:18793/v1").healthy(refresh=True)
+
+
+def _one_request(monkeypatch, answer, seconds=40):
+    from omi_notes.providers import SttRequest
+
+    stt = LocalAsrStt("http://127.0.0.1:9/v1")
+    monkeypatch.setattr(stt, "_post", lambda r: answer)
+    buf = io.BytesIO()
+    sf.write(buf, np.full(seconds * SR, 0.1), SR, format="FLAC", subtype="PCM_16")
+    return stt.transcribe(SttRequest(flac=buf.getvalue(), duration=seconds, blocks=[(0, seconds)], language="en", keyterms=[]))
+
+
+def test_a_request_never_refutes_its_own_gap_with_a_coarse_line(monkeypatch):
+    # ASTRA-20261115-IT3-01: the sidecar's words span 0-20 and 30-40 s, its UNKNOWN line 10-40 s, its gap 20.2-29.8 s; the
+    # line's envelope erased the gap
+    out = _one_request(monkeypatch, {"segments": [_seg(0, 10, "heard start"), {"start": 10, "end": 40, "speaker_id": "UNKNOWN", "text": "w"}],
+                                     "gaps": [{"start": 20.2, "end": 29.8, "speech_seconds": 9.6, "reason": "no_words"}]})  # fmt: skip
+    (gap,) = out["gaps"]
+    assert (gap["start"], gap["end"], gap["speech_seconds"]) == (20.2, 29.8, 9.6)
+
+
+def test_a_word_without_its_own_times_proves_nothing(monkeypatch):
+    out = _one_request(monkeypatch, {"segments": [{"end": 40.0, "speaker_id": "S01", "text": "untimed words"}],
+                                     "gaps": [_gap(10, 20)]})  # fmt: skip
+    assert [(g["start"], g["end"]) for g in out["gaps"]] == [(10.0, 20.0)]
+
+
+def test_many_short_stretches_are_all_kept(monkeypatch):
+    # ASTRA-20261115-IT3-03: fifteen 0.4 s stretches (6 s) each fell under a 0.5 s floor and the transcript looked complete
+    out = _one_request(monkeypatch, {"segments": [_seg(i, i + 0.3, f"w{i}") for i in range(15)],
+                                     "gaps": [{"start": i + 0.3, "end": i + 0.7, "speech_seconds": 0.4, "reason": "no_words"} for i in range(15)]},
+                       seconds=20)  # fmt: skip
+    assert len(out["gaps"]) == 15 and sum(g["speech_seconds"] for g in out["gaps"]) == pytest.approx(6.0)
+
+
+def test_part_of_a_gap_another_request_heard_is_taken_out_and_the_rest_kept():
+    from omi_notes.providers import local_asr
+
+    assert local_asr._reconciled_gaps([_gap(10, 20)], [{"start": 10.0, "end": 14.0, "transcript": "recovered"}]) == \
+        [{"start": 14.0, "end": 20.0, "speech_seconds": 6.0, "reason": "no_words"}]
