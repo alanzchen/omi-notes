@@ -103,6 +103,39 @@ import Testing
         #expect(stalls.overdue(now: late.addingTimeInterval(2)).isEmpty)
     }
 
+    @Test func aReplacementAttemptStartsItsOwnClockWithoutAGapBetweenObservations() {
+        // ASTRA-20261115-IT1-02: keyed by part id, the replacement (seen at the very next pump, zero bytes) inherited
+        // the cancelled attempt's 30 minutes and was cancelled again at once
+        var stalls = WatchTransferStalls()
+        typealias O = WatchTransferStalls.Observation
+        _ = stalls.observe([O(id: "part-1#1", transferring: true, completedBytes: 0)], now: t0)
+        let late = t0.addingTimeInterval(WatchTransferStalls.cancelAfter + 1)
+        _ = stalls.observe([O(id: "part-1#1", transferring: true, completedBytes: 0)], now: late)
+        #expect(stalls.overdue(now: late) == ["part-1#1"])
+        _ = stalls.observe([O(id: "part-1#2", transferring: true, completedBytes: 0)], now: late.addingTimeInterval(1))
+        #expect(stalls.overdue(now: late.addingTimeInterval(1)).isEmpty, "attempt 2 has its own clock")
+    }
+
+    @Test func aRelaunchKeepsAStalledAttemptsAgeAndAFutureClockWaitsAgain() {
+        // ASTRA-20261115-IT1-04: each launch started an empty tracker, so a Watch app relaunched every 20 min never
+        // reached 30 min of no progress
+        typealias O = WatchTransferStalls.Observation
+        var first = WatchTransferStalls()
+        _ = first.observe([O(id: "part-1#1", transferring: true, completedBytes: 0)], now: t0)
+        var later = WatchTransferStalls(restoring: first.saved, now: t0.addingTimeInterval(20 * 60))
+        _ = later.observe([O(id: "part-1#1", transferring: true, completedBytes: 0)], now: t0.addingTimeInterval(20 * 60))
+        var again = WatchTransferStalls(restoring: later.saved, now: t0.addingTimeInterval(40 * 60))
+        _ = again.observe([O(id: "part-1#1", transferring: true, completedBytes: 0)], now: t0.addingTimeInterval(40 * 60))
+        #expect(again.overdue(now: t0.addingTimeInterval(40 * 60)) == ["part-1#1"], "40 min since its last byte, across two launches")
+        // saved by a clock ahead of this one: counted from now, never cancelled early
+        var ahead = WatchTransferStalls()
+        _ = ahead.observe([O(id: "part-2#3", transferring: true, completedBytes: 0)], now: t0.addingTimeInterval(3600))
+        var restored = WatchTransferStalls(restoring: ahead.saved, now: t0)
+        _ = restored.observe([O(id: "part-2#3", transferring: true, completedBytes: 0)], now: t0.addingTimeInterval(WatchTransferStalls.cancelAfter - 60))
+        #expect(restored.overdue(now: t0.addingTimeInterval(WatchTransferStalls.cancelAfter - 60)).isEmpty)
+        #expect(WatchTransferStalls(restoring: Data("not json".utf8), now: t0).saved != nil, "unreadable: a new tracker")
+    }
+
     @Test func callbackWorkIsIdleOnlyWhenEveryQueuedCallbackFinished() {
         let work = WatchCallbackWork()
         #expect(work.isIdle)

@@ -45,7 +45,8 @@ final class WatchSync: NSObject, WCSessionDelegate {
     private var backgroundWakes = 0
     private var backgroundWakeParts = 0
     /// Which outstanding transfers are moving, stalled (no progress for minutes) or queued.
-    private var stalls = WatchTransferStalls()
+    /// Restored at launch, so a relaunch never resets a stalled attempt's 30 minutes (ASTRA-20261115-IT1-04).
+    private var stalls = WatchTransferStalls(restoring: UserDefaults.standard.data(forKey: "omi.transferStalls"), now: Date())
     private var transferCounts = WatchTransferStalls.Counts()
     /// Delegate callbacks whose main-actor work hasn't run yet (a background wake waits for them).
     nonisolated private let callbackWork = WatchCallbackWork()
@@ -225,22 +226,31 @@ final class WatchSync: NSObject, WCSessionDelegate {
         // only moving transfers hold a slot: queued ones waiting for app runtime, or "transferring" ones with no
         // progress for minutes, pinned the window at 4
         var outstanding = session.outstandingFileTransfers
-        func key(_ t: WCSessionFileTransfer) -> String { t.file.metadata?["id"] as? String ?? t.file.fileURL.lastPathComponent }
+        // one transfer attempt: its part and attempt number (a replacement is another attempt, with its own clock)
+        func key(_ t: WCSessionFileTransfer) -> String {
+            let id = t.file.metadata?["id"] as? String ?? t.file.fileURL.lastPathComponent
+            return (t.file.metadata?["attempt"] as? Int).map { "\(id)#\($0)" } ?? id
+        }
         transferCounts = stalls.observe(outstanding.map { t in
             WatchTransferStalls.Observation(id: key(t), transferring: t.isTransferring, completedBytes: t.progress.completedUnitCount)
         }, now: now)
+        UserDefaults.standard.set(stalls.saved, forKey: "omi.transferStalls")
         // stalled for half an hour: cancelled and sent again (four days without a byte, 2026-11-15); the part's file
         // stays in the outbox until a receipt, whatever happens to the transfer
         let overdue = stalls.overdue(now: now)
+        var cancelledIds: Set<String> = []
         for t in outstanding where overdue.contains(key(t)) {
             watchLog.info("cancelling a transfer stalled for \(Int(WatchTransferStalls.cancelAfter / 60)) min: \(key(t))")
-            t.cancel()
-            if let id = t.file.metadata?["id"] as? String { resend.failed(id) }  // due again (its normal resend)
+            t.cancel()  // its later callback names a superseded attempt and is ignored (`didFinish`)
+            if let id = t.file.metadata?["id"] as? String {
+                cancelledIds.insert(id)
+                if ownsCurrentAttempt(t) { resend.failed(id) }  // due again (its normal resend, a new attempt)
+            }
             count("stall_cancels")
         }
         if !overdue.isEmpty {
             outstanding = outstanding.filter { !overdue.contains(key($0)) }
-            inFlight.subtract(overdue)
+            inFlight.subtract(cancelledIds)
         }
         var room = WatchTransferWindow.room(maxInFlight: Self.maxInFlight, transferring: transferCounts.moving, outstanding: outstanding.count)
         // new audio first; re-checks of parts an older iPhone build already converted after it
@@ -250,7 +260,9 @@ final class WatchSync: NSObject, WCSessionDelegate {
             room -= 1
             watchLog.info("sending segment \(segment.id)")
             markSent(segment.id, now: now)
-            session.transferFile(file, metadata: [WatchWire.kind: WatchWire.segment, "id": segment.id, WatchWire.manifest: WatchWire.encode(segment)])
+            var metadata: [String: Any] = [WatchWire.kind: WatchWire.segment, "id": segment.id, WatchWire.manifest: WatchWire.encode(segment)]
+            metadata["attempt"] = resend.entries[segment.id]?.attempt  // which attempt this transfer is (callbacks, stall clock)
+            session.transferFile(file, metadata: metadata)
         }
         for end in outbox.ends() where end.binding == binding && !inFlight.contains(end.id) && resend.due(end.id, now: now) {
             markSent(end.id, now: now)
@@ -446,12 +458,24 @@ final class WatchSync: NSObject, WCSessionDelegate {
         onMain { self.handle(r) }
     }
 
+    /// Whether this transfer is its part's current attempt (one without an attempt number, from an older build, is).
+    private func ownsCurrentAttempt(_ t: WCSessionFileTransfer) -> Bool {
+        guard let id = t.file.metadata?["id"] as? String, let attempt = t.file.metadata?["attempt"] as? Int else { return true }
+        return resend.entries[id]?.attempt == attempt
+    }
+
     nonisolated func session(_ session: WCSession, didFinish fileTransfer: WCSessionFileTransfer, error: Error?) {
         // delivered or not, the file stays until the iPhone acknowledges it; failures are resent later
         let failed = error.map { "\($0.localizedDescription) (\(($0 as NSError).code))" }
         let failedCode = error.map { ($0 as NSError).code } ?? 0
         let transferId = fileTransfer.file.metadata?["id"] as? String
+        let transferAttempt = fileTransfer.file.metadata?["attempt"] as? Int
         onMain {
+            // a superseded attempt (cancelled as stalled, then sent again) never changes the current one
+            if let transferId, let transferAttempt, self.resend.entries[transferId]?.attempt != transferAttempt {
+                watchLog.info("ignoring the finish of a superseded attempt of \(transferId)")
+                return
+            }
             if let failed {
                 self.failures += 1
                 self.retryAt = Date().addingTimeInterval(min(300, 5 * pow(2, Double(min(self.failures - 1, 6)))))

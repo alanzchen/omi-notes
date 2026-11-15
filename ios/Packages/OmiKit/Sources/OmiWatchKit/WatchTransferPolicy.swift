@@ -15,7 +15,7 @@ public enum WatchTransferWindow {
 /// bound on everything outstanding still applies). A transfer stalled for `cancelAfter` is handed back (`overdue`):
 /// the Watch cancels it and sends the part again. Its file stays in the Watch's outbox until a receipt retires it
 /// (2026-11-15: three transfers stalled with no progress for four days were never cancelled, so never resent).
-public struct WatchTransferStalls: Sendable {
+public struct WatchTransferStalls: Codable, Sendable {
     /// No progress for this long: stalled.
     public static let stallAfter: TimeInterval = 3 * 60
     /// Stalled this long: cancelled and sent again (the part itself stays until a receipt).
@@ -41,19 +41,38 @@ public struct WatchTransferStalls: Sendable {
         }
     }
 
-    /// Each transfer's bytes when last seen changing, and when.
-    private var progress: [String: (bytes: Int64, at: Date)] = [:]
+    /// A transfer attempt's bytes when last seen changing, and when (saved: a relaunch keeps its age,
+    /// ASTRA-20261115-IT1-04).
+    public struct Progress: Codable, Equatable, Sendable {
+        public var bytes: Int64
+        public var at: Date
+    }
+
+    /// Keyed by transfer attempt (the part id and its attempt number), never the part id alone: a replacement starts
+    /// its own clock (ASTRA-20261115-IT1-02). Only attempts outstanding at the last observation are kept.
+    private var progress: [String: Progress] = [:]
     /// Transfers seen transferring without progress, as of the last observation.
     private var stalledIds: Set<String> = []
 
     public init() {}
 
+    /// A saved tracker (nil, unreadable: a new one). A last-progress time in the future (a clock that moved back) is
+    /// taken as now: such an attempt waits its full time again rather than being cancelled early.
+    public init(restoring data: Data?, now: Date) {
+        guard let data, let saved = try? JSONDecoder().decode(Self.self, from: data) else { return }
+        progress = saved.progress.mapValues { $0.at > now ? Progress(bytes: $0.bytes, at: now) : $0 }
+    }
+
+    public var saved: Data? { try? JSONEncoder().encode(self) }
+
+    enum CodingKeys: String, CodingKey { case progress }
+
     /// Records what WatchConnectivity reports now and counts moving, stalled and queued transfers.
     public mutating func observe(_ transfers: [Observation], now: Date) -> Counts {
-        var counts = Counts(), seen: [String: (bytes: Int64, at: Date)] = [:]
+        var counts = Counts(), seen: [String: Progress] = [:]
         stalledIds = []
         for t in transfers {
-            var entry: (bytes: Int64, at: Date) = (t.completedBytes, now)
+            var entry = Progress(bytes: t.completedBytes, at: now)
             if let last = progress[t.id], last.bytes == t.completedBytes { entry = last }
             seen[t.id] = entry
             if !t.transferring { counts.queued += 1 }
