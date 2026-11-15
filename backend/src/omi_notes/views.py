@@ -229,9 +229,8 @@ def summary(conv_dir: Path, row: sqlite3.Row) -> tuple[ConversationNotes | None,
         return None, "unavailable"
 
 
-GAP_CACHE: dict[tuple, tuple[list[float], list[tuple[float, float, float]], int]] = {}
-GAP_CACHE_MAX = 64
 _LATEST_EPOCH = 1e11  # far past any recording, well inside what a timestamp can be written as
+_GAPS_LOGGED: set[tuple[str, str]] = set()  # revisions whose unreadable gaps were logged (a race logs twice, no more)
 
 
 def _gap_number(value) -> float | None:
@@ -241,14 +240,12 @@ def _gap_number(value) -> float | None:
     return value if math.isfinite(value) else None
 
 
-def gap_index(conv_id: str, sha: str, raw: list, version: tuple = ()) -> tuple[list[float], list[tuple[float, float, float]], int]:
-    """A transcript's untranscribed stretches, checked and sorted once per transcript revision (cached): (starts,
-    [(start, end, speech)], how many were unreadable). One that isn't three finite numbers with
-    0 < start < end < 1e11 and 0 < speech <= its length (+0.5 s) is left out and counted, never a 500
-    (ASTRA-20261115-IT2-04); the count is logged once per revision. `version` tells rewrites of transcript.json apart."""
-    key = (conv_id, sha, version)
-    if key in GAP_CACHE:
-        return GAP_CACHE[key]
+def gap_list(raw: list, conv_id: str = "", sha: str = "") -> tuple[list[float], list[tuple[float, float, float]], int]:
+    """A transcript's untranscribed stretches, checked and sorted: (starts, [(start, end, speech)], how many were
+    unreadable). One that isn't three finite numbers with 0 < start < end < 1e11 and 0 < speech <= its length (+0.5 s)
+    is left out and counted, never a 500 (ASTRA-20261115-IT2-04); logged once per revision. Done per request, from
+    the transcript the route has just read and parsed in full: the same order of work as that parse (the writer
+    stores them sorted, so the sort is a pass). No cache, so no stale or racing copy (ASTRA-20261115-IT4-02/03)."""
     good, bad = [], 0
     for g in raw:
         a, b, n = ((_gap_number(x) for x in g) if isinstance(g, (list, tuple)) and len(g) == 3 else (None, None, None))
@@ -256,14 +253,13 @@ def gap_index(conv_id: str, sha: str, raw: list, version: tuple = ()) -> tuple[l
             bad += 1
             continue
         good.append((a, b, min(n, b - a)))
-    if bad:
+    if bad and (conv_id, sha) not in _GAPS_LOGGED:
+        if len(_GAPS_LOGGED) > 256:
+            _GAPS_LOGGED.clear()
+        _GAPS_LOGGED.add((conv_id, sha))
         log.warning("conversation %s: %d unreadable untranscribed stretch(es) left out of its transcript", conv_id, bad)
     good.sort()
-    entry = ([g[0] for g in good], good, bad)
-    if len(GAP_CACHE) >= GAP_CACHE_MAX:
-        GAP_CACHE.pop(next(iter(GAP_CACHE)))
-    GAP_CACHE[key] = entry
-    return entry
+    return [g[0] for g in good], good, bad
 
 
 def transcript(conv_dir: Path, row: sqlite3.Row, gaps: list | None = None) -> tuple[list[dict] | None, str]:
@@ -277,11 +273,7 @@ def transcript(conv_dir: Path, row: sqlite3.Row, gaps: list | None = None) -> tu
     except (OSError, ValueError, KeyError, TypeError):
         return None, "unavailable"
     if gaps is not None and isinstance(doc.get("untranscribed"), list):
-        try:  # which file this is (rewritten, its gaps may differ under the same segments): the cache key
-            st = (conv_dir / "transcript.json").stat()
-            gaps.append((doc["untranscribed"], (st.st_mtime_ns, st.st_size)))
-        except OSError:
-            pass
+        gaps.append(doc["untranscribed"])  # from this very read: never another version's
     if not isinstance(segments, list) or sha256_hex(canonical_json(segments).encode()) != row["transcript_sha"]:
         return None, "updating"
     return segments, "ready"
@@ -543,21 +535,25 @@ def detail(pipeline, row: sqlite3.Row, *, segments_from: int = 0) -> dict:
                 for s in page
             ],
         }
-        if gaps and gaps[0][0]:
+        if gaps and gaps[0]:
             # the stretches this page owns (ASTRA-20261115-IT2-02): from its first segment up to the next page's first
             # one (the first page also those before any segment, the last page those after the last). Two stretches
             # always have words between them, so a page owns about one per segment: more than twice that is cut, and
             # said (`untranscribed_incomplete`), as are stretches that couldn't be read (on the first page)
-            starts, valid, bad = gap_index(row["id"], row["transcript_sha"], *gaps[0])
-            lo = -math.inf if first == 0 or not page else page[0]["start"]
-            following = first + len(page)
-            hi = segments[following]["start"] if following < len(segments) else math.inf
-            owned = valid[bisect.bisect_left(starts, lo) : bisect.bisect_left(starts, hi)] if valid else []
+            starts, valid, bad = gap_list(gaps[0], row["id"], row["transcript_sha"])
             cap = 2 * len(page) + 2
+            if first > 0 and not page:  # past the end: the earlier pages own everything (ASTRA-20261115-IT4-05)
+                lower = upper = 0
+            else:
+                lo = -math.inf if first == 0 else page[0]["start"]
+                following = first + len(page)
+                hi = segments[following]["start"] if following < len(segments) else math.inf
+                lower, upper = bisect.bisect_left(starts, lo), bisect.bisect_left(starts, hi)
+            owned = valid[lower : min(upper, lower + cap)]  # never more than the page carries (ASTRA-20261115-IT4-01)
             if owned:
                 body["transcript"]["untranscribed"] = [{"start": iso_utc_epoch(a), "end": iso_utc_epoch(b), "speech_s": round(n, 1)}
-                                                       for a, b, n in owned[:cap]]  # fmt: skip
-            if len(owned) > cap or (bad and first == 0):
+                                                       for a, b, n in owned]  # fmt: skip
+            if upper - lower > cap or (bad and first == 0):
                 body["transcript"]["untranscribed_incomplete"] = True
     return body
 
