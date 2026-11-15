@@ -105,6 +105,14 @@ struct ConversationDetailView: View {
             }
         }
         .onChange(of: detail?.highlights) { _, _ in cueFocus() }
+        #if DEBUG
+        // simulator automation: `-OmiNotesDebugShowTranscript YES` opens the transcript and scrolls to it once loaded
+        .onChange(of: detail?.transcript != nil) { _, loaded in
+            guard loaded, UserDefaults.standard.bool(forKey: "OmiNotesDebugShowTranscript") else { return }
+            showTranscript = true
+            Task { try? await Task.sleep(for: .milliseconds(400)); proxy.scrollTo("transcript", anchor: .top) }
+        }
+        #endif
         }
         .navigationTitle(entry.title == nil ? "Conversation" : "")
         .navigationBarTitleDisplayMode(.inline)
