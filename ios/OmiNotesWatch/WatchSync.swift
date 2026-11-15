@@ -219,16 +219,29 @@ final class WatchSync: NSObject, WCSessionDelegate {
             return
         }
         let session = WCSession.default
-        let inFlight = Set(session.outstandingFileTransfers.compactMap { $0.file.metadata?["id"] as? String })
+        var inFlight = Set(session.outstandingFileTransfers.compactMap { $0.file.metadata?["id"] as? String })
             .union(session.outstandingUserInfoTransfers.compactMap { $0.userInfo["id"] as? String })
         let now = Date()
         // only moving transfers hold a slot: queued ones waiting for app runtime, or "transferring" ones with no
-        // progress for minutes, pinned the window at 4; never cancelled (their parts stay until a receipt)
-        let outstanding = session.outstandingFileTransfers
+        // progress for minutes, pinned the window at 4
+        var outstanding = session.outstandingFileTransfers
+        func key(_ t: WCSessionFileTransfer) -> String { t.file.metadata?["id"] as? String ?? t.file.fileURL.lastPathComponent }
         transferCounts = stalls.observe(outstanding.map { t in
-            WatchTransferStalls.Observation(id: t.file.metadata?["id"] as? String ?? t.file.fileURL.lastPathComponent,
-                                            transferring: t.isTransferring, completedBytes: t.progress.completedUnitCount)
+            WatchTransferStalls.Observation(id: key(t), transferring: t.isTransferring, completedBytes: t.progress.completedUnitCount)
         }, now: now)
+        // stalled for half an hour: cancelled and sent again (four days without a byte, 2026-11-15); the part's file
+        // stays in the outbox until a receipt, whatever happens to the transfer
+        let overdue = stalls.overdue(now: now)
+        for t in outstanding where overdue.contains(key(t)) {
+            watchLog.info("cancelling a transfer stalled for \(Int(WatchTransferStalls.cancelAfter / 60)) min: \(key(t))")
+            t.cancel()
+            if let id = t.file.metadata?["id"] as? String { resend.failed(id) }  // due again (its normal resend)
+            count("stall_cancels")
+        }
+        if !overdue.isEmpty {
+            outstanding = outstanding.filter { !overdue.contains(key($0)) }
+            inFlight.subtract(overdue)
+        }
         var room = WatchTransferWindow.room(maxInFlight: Self.maxInFlight, transferring: transferCounts.moving, outstanding: outstanding.count)
         // new audio first; re-checks of parts an older iPhone build already converted after it
         let waiting = resend.sendOrder(outbox.segments(), now: now) { $0.segment.id }

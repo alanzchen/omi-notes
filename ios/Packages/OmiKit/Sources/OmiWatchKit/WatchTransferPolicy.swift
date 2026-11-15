@@ -12,11 +12,14 @@ public enum WatchTransferWindow {
 
 /// Which outstanding transfers are actually moving. `isTransferring` alone isn't progress: a transfer it
 /// reports for minutes without a byte sent is stalled, and stops holding a window slot (the twice-the-window
-/// bound on everything outstanding still applies). Stalled transfers are only counted apart, never
-/// cancelled: the part stays on the Watch and in WatchConnectivity's queue until a receipt retires it.
+/// bound on everything outstanding still applies). A transfer stalled for `cancelAfter` is handed back (`overdue`):
+/// the Watch cancels it and sends the part again. Its file stays in the Watch's outbox until a receipt retires it
+/// (2026-11-15: three transfers stalled with no progress for four days were never cancelled, so never resent).
 public struct WatchTransferStalls: Sendable {
     /// No progress for this long: stalled.
     public static let stallAfter: TimeInterval = 3 * 60
+    /// Stalled this long: cancelled and sent again (the part itself stays until a receipt).
+    public static let cancelAfter: TimeInterval = 30 * 60
 
     public struct Observation: Sendable {
         public var id: String
@@ -40,22 +43,31 @@ public struct WatchTransferStalls: Sendable {
 
     /// Each transfer's bytes when last seen changing, and when.
     private var progress: [String: (bytes: Int64, at: Date)] = [:]
+    /// Transfers seen transferring without progress, as of the last observation.
+    private var stalledIds: Set<String> = []
 
     public init() {}
 
     /// Records what WatchConnectivity reports now and counts moving, stalled and queued transfers.
     public mutating func observe(_ transfers: [Observation], now: Date) -> Counts {
         var counts = Counts(), seen: [String: (bytes: Int64, at: Date)] = [:]
+        stalledIds = []
         for t in transfers {
             var entry: (bytes: Int64, at: Date) = (t.completedBytes, now)
             if let last = progress[t.id], last.bytes == t.completedBytes { entry = last }
             seen[t.id] = entry
             if !t.transferring { counts.queued += 1 }
             else if now.timeIntervalSince(entry.at) < Self.stallAfter { counts.moving += 1 }
-            else { counts.stalled += 1 }
+            else { counts.stalled += 1; stalledIds.insert(t.id) }
         }
         progress = seen  // finished transfers are forgotten
         return counts
+    }
+
+    /// Transfers stalled (transferring, no progress) for at least `cancelAfter` as of the last observation: to be
+    /// cancelled and sent again.
+    public func overdue(now: Date) -> Set<String> {
+        stalledIds.filter { id in progress[id].map { now.timeIntervalSince($0.at) >= Self.cancelAfter } ?? false }
     }
 }
 

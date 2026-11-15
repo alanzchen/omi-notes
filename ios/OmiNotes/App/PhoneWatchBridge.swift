@@ -102,7 +102,11 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
             let items = WatchWire.inventoryItems(from: message[WatchWire.inventoryItems])
             do {
                 let receipts = try engine.watchReceipts(items, binding: message[WatchWire.binding] as? String)
-                OmiLog.shared.log(.info, "watch", "sync ping: \(items.count) asked, \(receipts.count) held app=\(appState)")
+                // the parts asked about that this phone holds no receipt for, by id (none of their content)
+                let held = Set(receipts.map(\.id))
+                let missing = items.map(\.id).filter { !held.contains($0) }
+                OmiLog.shared.log(.info, "watch", "sync ping: \(items.count) asked, \(receipts.count) held app=\(appState)"
+                                  + (missing.isEmpty ? "" : " missing=\(missing.prefix(5).joined(separator: ","))"))
                 // receipts only: no question id, so nothing here makes the Watch send anything again
                 replyHandler([WatchWire.binding: phone, WatchWire.inventoryAcks: WatchWire.inventoryItems(receipts)])
             } catch {

@@ -81,6 +81,28 @@ import Testing
         #expect(stalls.observe([O(id: "b", transferring: true, completedBytes: 10)], now: later.addingTimeInterval(1)) == .init(moving: 1))
     }
 
+    @Test func aTransferStalledForHalfAnHourIsHandedBackToBeSentAgain() {
+        // 2026-11-15: three Watch transfers reported "transferring" without a byte for four days; never cancelled,
+        // they were never sent again. Stalled for `cancelAfter`, a transfer is overdue (the Watch cancels and resends
+        // it; the part stays in its outbox until a receipt). Moving, queued or briefly stalled ones are not.
+        var stalls = WatchTransferStalls()
+        typealias O = WatchTransferStalls.Observation
+        let stuck = O(id: "stuck", transferring: true, completedBytes: 512)
+        let moving = { (bytes: Int64) in O(id: "moving", transferring: true, completedBytes: bytes) }
+        let queued = O(id: "queued", transferring: false, completedBytes: 0)
+        _ = stalls.observe([stuck, moving(0), queued], now: t0)
+        _ = stalls.observe([stuck, moving(1), queued], now: t0.addingTimeInterval(WatchTransferStalls.stallAfter + 1))
+        #expect(stalls.overdue(now: t0.addingTimeInterval(WatchTransferStalls.stallAfter + 1)).isEmpty, "stalled, not yet for long")
+        let late = t0.addingTimeInterval(WatchTransferStalls.cancelAfter + 1)
+        _ = stalls.observe([stuck, moving(2), queued], now: late)
+        #expect(stalls.overdue(now: late) == ["stuck"])
+        // gone (cancelled), then sent again: a new transfer starts its own clock
+        _ = stalls.observe([moving(3), queued], now: late.addingTimeInterval(1))
+        #expect(stalls.overdue(now: late.addingTimeInterval(1)).isEmpty)
+        _ = stalls.observe([O(id: "stuck", transferring: true, completedBytes: 0)], now: late.addingTimeInterval(2))
+        #expect(stalls.overdue(now: late.addingTimeInterval(2)).isEmpty)
+    }
+
     @Test func callbackWorkIsIdleOnlyWhenEveryQueuedCallbackFinished() {
         let work = WatchCallbackWork()
         #expect(work.isIdle)
