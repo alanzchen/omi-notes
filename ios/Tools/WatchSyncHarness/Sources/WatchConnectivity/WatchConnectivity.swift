@@ -10,7 +10,8 @@ public final class WCSessionFileTransfer: @unchecked Sendable {
  public var isTransferring = true
  public let progress = Progress(totalUnitCount:1000)
  public var cancelCount = 0
- public func cancel() { cancelCount += 1; WCSession.default.outstandingFileTransfers.removeAll { $0 === self } }
+ public var retainsOnCancel = false
+ public func cancel() { cancelCount += 1; if !retainsOnCancel { WCSession.default.outstandingFileTransfers.removeAll { $0 === self } } }
  public let file: WCSessionFile
  public init(_ f: WCSessionFile) { file=f }
 }
