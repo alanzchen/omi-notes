@@ -113,24 +113,26 @@ def _fallback_gaps(pcm: np.ndarray, capped: list[tuple[float, float]], lines: li
     return gaps
 
 
-def _merge_gaps(pcm: np.ndarray, gaps: list[dict], covered: list[tuple[float, float]]) -> list[dict]:
-    """Overlapping gaps as one (their speech counted once), trimmed to the speech no kept segment reaches (+-SLACK)."""
+def _merge_gaps(pcm: np.ndarray, gaps: list[dict], evidence: list[tuple[float, float]]) -> list[dict]:
+    """Overlapping or touching gaps as one interval, each with the speech in it that no word evidence reaches
+    (+-SLACK), counted once over the union (ASTRA-20261115-IT1-03: per-gap totals added overlapping speech).
+    `evidence` is word-level (MOSS lines with words, aligned Qwen words): a broad segment's envelope never
+    hides holes between its words. Each is trimmed to where that speech is; `missing` is unrounded."""
     merged: list[dict] = []
     for g in sorted(gaps, key=lambda g: g["start"]):
         if merged and g["start"] <= merged[-1]["end"]:
-            last = merged[-1]
-            inside = g["end"] <= last["end"] or last["start"] >= g["start"]  # one holds the other: the same speech
-            last["speech_seconds"] = (max if inside else sum)((last["speech_seconds"], g["speech_seconds"]))
-            last["end"] = max(last["end"], g["end"])
-            last["reasons"].append(g["reason"])
+            merged[-1]["end"] = max(merged[-1]["end"], g["end"])
+            merged[-1]["reasons"].append(g["reason"])
         else:
-            merged.append(dict(g, reasons=[g["reason"]]))
-    for g in merged:  # placed where its unworded speech is, so a note marks it there (its seconds as the checks counted them)
-        missing, first, last = _uncovered_bounds(pcm, g["start"], g["end"], covered)
-        if missing > 0:
-            g["start"], g["end"] = round(first, 3), round(last, 3)
-        g["reason"] = "moss_stopped" if "moss_stopped" in g.pop("reasons") else "no_words"
-    return merged
+            merged.append({"start": g["start"], "end": g["end"], "reasons": [g["reason"]], "message": g.get("message", "")})
+    out = []
+    for g in merged:
+        missing, first, last = _uncovered_bounds(pcm, g["start"], g["end"], evidence)
+        if missing <= 0:
+            continue
+        out.append({"start": round(first, 3), "end": round(last, 3), "missing": missing, "speech_seconds": round(missing, 1),
+                    "reason": "moss_stopped" if "moss_stopped" in g["reasons"] else "no_words", "message": g["message"]})  # fmt: skip
+    return out
 
 
 UNKNOWN = "UNKNOWN"  # words no MOSS line holds (Omi renders the speaker as unknown and learns no voice from it)
@@ -211,6 +213,7 @@ class Engine:
             lines: list[dict] = []
             languages: list[str] = []
             gaps: list[dict] = []  # speech neither model has words for (`_fallback_gaps`, `_tail_gap`)
+            evidence: list[tuple[float, float]] = []  # where words are: MOSS lines with words, aligned Qwen words
             windows: list[dict] = []  # where MOSS ran: its labels restart in each (the backend links them by voice)
             for k, (a, b) in enumerate(plan.plan_windows(pcm)):
                 for sub, (lines_w, start, stop, truncated) in enumerate(self._moss(moss, pcm, a, b, 0, stats)):
@@ -218,21 +221,23 @@ class Engine:
                     windows.append({"start": round(start, 3), "end": round(stop, 3), "label_prefix": prefix})
                     for line in lines_w:
                         line["speaker"] = prefix + line["speaker"]
-                    lines.extend(self._text(qwen, aligner, pcm, start, stop, lines_w, context, stats, languages, prefix, truncated, gaps))
+                    lines.extend(self._text(qwen, aligner, pcm, start, stop, lines_w, context, stats, languages, prefix, truncated, gaps,
+                                            evidence))  # fmt: skip
             t_total = time.perf_counter() - t0
             self.last_used = time.monotonic()
             lines.sort(key=lambda s: (s["start"], s["end"]))
             segments = [{"start": round(s["start"], 3), "end": round(s["end"], 3), "speaker_id": s["speaker"], "text": s["text"]}
                         for s in lines if s["text"]]  # fmt: skip
             if gaps:  # overlapping ones (a failed Qwen piece inside a tail MOSS left) are one gap, counted once
-                gaps = _merge_gaps(pcm, gaps, [(x["start"], x["end"]) for x in segments])
-                missing = sum(g["speech_seconds"] for g in gaps)
+                gaps = _merge_gaps(pcm, gaps, evidence)
+                missing = sum(g["missing"] for g in gaps)  # the same count decides and is reported
                 _, speech_total = _uncovered_speech(pcm, 0.0, duration, [])
-                if not segments or missing >= GAP_MAX_SHARE * speech_total:
+                if gaps and (not segments or missing >= GAP_MAX_SHARE * speech_total):
                     raise IncompleteTranscription(gaps[0]["message"] + (f" ({missing:.0f} of {speech_total:.0f} s of speech without words)"
                                                                          if len(gaps) > 1 or segments else ""))  # fmt: skip
                 stats["gaps"] = len(gaps)
-                log.warning("%d gap(s) without words, %.0f of %.0f s of speech: kept as gaps", len(gaps), missing, speech_total)
+                if gaps:
+                    log.warning("%d gap(s) without words, %.0f of %.0f s of speech: kept as gaps", len(gaps), missing, speech_total)
             return {
                 "text": " ".join(s["text"] for s in segments),
                 "language": max(set(languages), key=languages.count) if languages else None,
@@ -332,7 +337,7 @@ class Engine:
 
     def _text(self, qwen, aligner, pcm: np.ndarray, start: float, stop: float, lines: list[dict], context: list[str],
               stats: dict, languages: list[str], prefix: str = "", truncated: bool = False,
-              gaps: list[dict] | None = None) -> list[dict]:  # fmt: skip
+              gaps: list[dict] | None = None, evidence: list | None = None) -> list[dict]:  # fmt: skip
         """Qwen text on <= 180 s chunks of the whole window [start, stop] (speech MOSS left out included),
         aligned onto its MOSS lines. Words MOSS gave no speaker for (no lines at all, or past where a
         truncated MOSS stopped) go on `UNKNOWN` lines: kept, attributed to nobody."""
@@ -343,6 +348,8 @@ class Engine:
         for a, b in zip(cuts, cuts[1:], strict=False):
             units.extend(self._qwen(qwen, aligner, pcm, start + a, start + b, context, stats, languages, capped))
         lines = [dict(line) for line in lines]
+        if evidence is not None:
+            evidence += [(line["start"], line["end"]) for line in lines if line.get("moss_text")] + [(u.start, u.end) for u in units]
         found = _fallback_gaps(pcm, capped, lines)
         if truncated and (tail := _tail_gap(pcm, lines, units, start, stop)):
             found.append(tail)

@@ -576,3 +576,22 @@ def test_the_gaps_go_over_http_with_a_200():
     e.models = (FakeMoss(lines_every(6, 48)), CappingQwen(limit=0), FakeAligner())
     r = TestClient(server.create_app(e, exit=lambda _: None)).post("/v1/audio/transcriptions", files={"file": ("a.flac", buf.getvalue(), "audio/flac")})
     assert r.status_code == 200 and len(r.json()["gaps"]) == 1 and set(r.json()["gaps"][0]) == {"start", "end", "speech_seconds", "reason"}
+
+
+def test_missing_speech_is_counted_once_over_the_union_of_gaps():
+    # ASTRA-20261115-IT1-03: merged gaps added their per-gap totals (20-25 plus 22-40 reported 23 s for 20 s)
+    from omi_asr.engine import _merge_gaps
+
+    gaps = [{"start": 20.0, "end": 25.0, "speech_seconds": 5.0, "reason": "no_words", "message": "a"},
+            {"start": 22.0, "end": 40.0, "speech_seconds": 18.0, "reason": "moss_stopped", "message": "b"}]  # fmt: skip
+    (gap,) = _merge_gaps(np.full(60 * SR, 0.1, np.float32), gaps, [])
+    assert (gap["start"], gap["end"], gap["reason"]) == (20.0, 40.0, "moss_stopped") and gap["speech_seconds"] == pytest.approx(20.0, abs=0.1)
+
+
+def test_less_than_half_without_words_stays_a_partial_transcript_not_a_422():
+    # ASTRA-20261115-IT1-03: MOSS words over 0-31 s of 60, Qwen failing throughout: about 29 s has no words, but the
+    # added totals claimed 32 s and refused the request
+    e = Engine()
+    e.models = (FakeMoss([{"start": 0.0, "end": 31.0, "speaker_id": "S01", "text": "[0][S01] heard prefix"}]), CappingQwen(limit=0), FakeAligner())
+    out = e.transcribe(speech(60), [])
+    assert 27 <= sum(g["speech_seconds"] for g in out["gaps"]) < 30
