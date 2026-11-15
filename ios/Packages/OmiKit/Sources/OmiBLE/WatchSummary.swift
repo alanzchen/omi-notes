@@ -90,6 +90,12 @@ public struct WatchSummary: Equatable, Sendable {
     /// audio only; nothing for kept parts alone).
     public static func onWatchHint(_ r: WatchReport, lastReceivedAt: Date?, now: Date) -> String? {
         guard r.waitingParts > 0, lastReceivedAt.map({ now.timeIntervalSince($0) > 15 * 60 }) ?? true else { return nil }
+        // every waiting part sits in a Watch transfer that stopped moving: "move closer" would be wrong advice (the
+        // phone was nearby for four days, 2026-11-15); the Watch cancels such a transfer and sends it again itself
+        if let stalled = r.stats?["outstanding_stalled"], stalled > 0, stalled >= r.waitingParts - (r.keptParts ?? 0) {
+            let since = lastReceivedAt.map { "; last part arrived \(SystemHealth.relative($0, now))" } ?? ""
+            return "The Watch's transfer stopped moving\(since). It sends it again on its own"
+        }
         return (r.keptParts ?? 0) > 0 ? "The waiting audio moves when both are nearby with Omi Notes open"
             : "Moves when both are nearby with Omi Notes open"
     }
@@ -132,7 +138,7 @@ public struct WatchSummary: Equatable, Sendable {
     }
 
     #if DEBUG
-    /// Simulator screenshots only: `-OmiNotesDebugWatchState recording|paused|stale|idle|set-aside|unknown-aside|future|received|installed|none`.
+    /// Simulator screenshots only: `-OmiNotesDebugWatchState recording|paused|stale|idle|stalled|set-aside|unknown-aside|future|received|installed|none`.
     public static func debugFixture(_ name: String, now: Date = Date()) -> (summary: WatchSummary, report: WatchReport?, lastReceivedAt: Date?)? {
         let report: WatchReport?, received: Date?, installed: Bool
         switch name {
@@ -140,6 +146,7 @@ public struct WatchSummary: Equatable, Sendable {
         case "paused": (report, received, installed) = (WatchReport(state: .paused, since: now.addingTimeInterval(-3600), waitingParts: 0, at: now.addingTimeInterval(-120)), now.addingTimeInterval(-150), true)
         case "stale": (report, received, installed) = (WatchReport(state: .recording, since: now.addingTimeInterval(-6 * 3600), waitingParts: 5, waitingSeconds: 290, at: now.addingTimeInterval(-2 * 3600)), now.addingTimeInterval(-2 * 3600), true)
         case "idle": (report, received, installed) = (WatchReport(state: .idle, since: now.addingTimeInterval(-5 * 3600), waitingParts: 3, waitingSeconds: 140, at: now.addingTimeInterval(-90), stats: ["orphan_parts": 0]), now.addingTimeInterval(-4 * 3600), true)
+        case "stalled": (report, received, installed) = (WatchReport(state: .idle, since: now.addingTimeInterval(-4 * 86400), waitingParts: 3, waitingSeconds: 140, at: now.addingTimeInterval(-90), stats: ["orphan_parts": 0, "outstanding_stalled": 3, "outstanding_active": 0]), now.addingTimeInterval(-4 * 86400), true)
         case "set-aside": (report, received, installed) = (WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now.addingTimeInterval(-90), stats: ["orphan_parts": 0]), now.addingTimeInterval(-4 * 3600), true)
         case "unknown-aside": (report, received, installed) = (WatchReport(state: .idle, since: nil, waitingParts: 0, waitingSeconds: 0, at: now.addingTimeInterval(-90), stats: ["orphan_parts": 0]), now.addingTimeInterval(-4 * 3600), true)
         case "future": (report, received, installed) = (WatchReport(state: .idle, since: nil, waitingParts: 3, waitingSeconds: 140, at: now.addingTimeInterval(3600), stats: ["orphan_parts": 0]), now.addingTimeInterval(-4 * 3600), true)

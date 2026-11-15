@@ -290,6 +290,13 @@ import OmiWatchKit
         let waiting = WatchReport(state: .recording, since: now, waitingParts: 3, waitingSeconds: 180, at: now, stats: ["orphan_parts": 0])
         #expect(WatchSummary.onWatchHint(waiting, lastReceivedAt: nil, now: now) == "Moves when both are nearby with Omi Notes open")
         #expect(WatchSummary.onWatchHint(waiting, lastReceivedAt: now.addingTimeInterval(-60), now: now) == nil, "arriving: no advice")
+        // 2026-11-15: all three waiting parts in transfers that stopped moving, for four days: not "move closer"
+        var stuck = waiting
+        stuck.stats = ["outstanding_stalled": waiting.waitingParts]
+        let hint = WatchSummary.onWatchHint(stuck, lastReceivedAt: now.addingTimeInterval(-4 * 86400), now: now)
+        #expect(hint?.hasPrefix("The Watch's transfer stopped moving; last part arrived") == true && hint?.contains("nearby") == false)
+        stuck.stats = ["outstanding_stalled": 0]
+        #expect(WatchSummary.onWatchHint(stuck, lastReceivedAt: nil, now: now) == "Moves when both are nearby with Omi Notes open")
     }
 
     /// Nightly 2026-11-12 round 2: the Watch page's "On the Watch" row was three lines ("2 min of audio not on this
