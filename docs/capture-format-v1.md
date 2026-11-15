@@ -552,7 +552,10 @@ included (with nothing to show yet). The body is the list entry plus:
   never among them but in `assistant_requests` (additive; proposals for an assistant, not tasks), as in
   the note's "Asked of an Assistant". A passive recording has neither others' tasks nor assistant requests.
 - `transcript_state`: `ready`, `pending`, `updating`, `unavailable`. Segments come 500 at a time;
-  `next_from` is the `segments_from` of the next page (null on the last).
+  `next_from` is the `segments_from` of the next page (null on the last). `transcript.untranscribed` (only when there
+  is some; the whole list on every page): `[{start, end, speech_s}]`, stretches of speech neither transcription model
+  had words for, where they were (the conversation's state is then `partial_transcript`). Show each where it falls
+  between segments; never fill it in.
 - Speaker names are shown only when the stored assignments were made for this transcript. A
   segment whose speaker nobody separated has speaker `unknown`.
 - `resolution` (additive; null otherwise): how the owner resolved the conversation from the phone,

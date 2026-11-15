@@ -170,6 +170,9 @@ def test_a_short_stretch_the_sidecar_had_no_words_for_is_marked_in_a_kept_note(c
     listed = client.get("/v1/conversations/recent", headers=AUTH).json()["conversations"]
     (state,) = [c["state"] for c in listed if c["id"] == row["id"]]
     assert state["code"] == "partial_transcript" and "2 s of speech couldn't be transcribed" in state["message"]
+    detail = client.get(f"/v1/conversations/{row['id']}", headers=AUTH).json()
+    (gap,) = detail["transcript"]["untranscribed"]
+    assert gap["speech_s"] == 2.4 and gap["start"] < gap["end"], "the app gets the stretch with its transcript"
 
 
 def test_while_the_sidecar_is_down_conversations_wait_without_using_up_attempts_then_resume(client, worker):

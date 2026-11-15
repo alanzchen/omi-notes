@@ -226,14 +226,18 @@ def summary(conv_dir: Path, row: sqlite3.Row) -> tuple[ConversationNotes | None,
         return None, "unavailable"
 
 
-def transcript(conv_dir: Path, row: sqlite3.Row) -> tuple[list[dict] | None, str]:
-    """(segments, availability): ready | pending | updating | unavailable."""
+def transcript(conv_dir: Path, row: sqlite3.Row, gaps: list | None = None) -> tuple[list[dict] | None, str]:
+    """(segments, availability): ready | pending | updating | unavailable. `gaps`, when given, receives the
+    transcript's untranscribed stretches (wall-clock [start, end, seconds]) from the same read."""
     if not row["transcript_sha"]:
         return None, "pending"
     try:
-        segments = json.loads((conv_dir / "transcript.json").read_text())["segments"]
+        doc = json.loads((conv_dir / "transcript.json").read_text())
+        segments = doc["segments"]
     except (OSError, ValueError, KeyError, TypeError):
         return None, "unavailable"
+    if gaps is not None and isinstance(doc.get("untranscribed"), list):
+        gaps.extend(g for g in doc["untranscribed"] if isinstance(g, list) and len(g) == 3)
     if not isinstance(segments, list) or sha256_hex(canonical_json(segments).encode()) != row["transcript_sha"]:
         return None, "updating"
     return segments, "ready"
@@ -433,7 +437,8 @@ def make_cursor(row: sqlite3.Row) -> str:
 def detail(pipeline, row: sqlite3.Row, *, segments_from: int = 0) -> dict:
     conv_dir = pipeline.conv_dir(row["id"])
     notes, summary_state = summary(conv_dir, row)
-    segments, transcript_state = transcript(conv_dir, row)
+    gaps: list = []
+    segments, transcript_state = transcript(conv_dir, row, gaps)
     names = speaker_names(pipeline.speakers, row["id"], row["transcript_sha"]) if segments is not None else {}
     note = note_file(pipeline.settings.vault_dir, row)
     idx = _index(row)
@@ -494,6 +499,9 @@ def detail(pipeline, row: sqlite3.Row, *, segments_from: int = 0) -> dict:
                 for s in page
             ],
         }
+        if gaps:  # speech without words, where it was (the whole list, on every page): only when there is some
+            body["transcript"]["untranscribed"] = [{"start": iso_utc_epoch(a), "end": iso_utc_epoch(b), "speech_s": round(n, 1)}
+                                                   for a, b, n in gaps]  # fmt: skip
     return body
 
 
