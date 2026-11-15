@@ -87,6 +87,22 @@ import Testing
         #expect(ContinuousClock.now - clock < .milliseconds(50))
     }
 
+    @Test func appendingAPageReadsOnlyItsOwnSegmentsTimes() throws {
+        // ASTRA-20261115-IT4-04: an append re-read every loaded segment's time on the main actor (201 ms for 500 onto
+        // 3,000 with one gap, optimized). Loaded times are kept; a bound generous enough for a loaded CI host
+        for gapCount in [1, 1000] {
+            let gaps = (0..<gapCount).map { i in let k = (i * 337) % 3500; return (Double(k * 4 + 2), Double(k * 4 + 3), 1.0) }
+            var t = try gapPage((0..<3000).map { (Double($0 * 4), Double($0 * 4 + 2)) }, gaps, next: 3000, total: 3500)
+            let more = try gapPage((3000..<3500).map { (Double($0 * 4), Double($0 * 4 + 2)) }, nil, from: 3000, total: 3500)
+            let clock = ContinuousClock.now
+            t.append(more)
+            let took = ContinuousClock.now - clock
+            let bound: Duration = _isDebugAssertConfiguration() ? .seconds(1) : .milliseconds(150)  // optimized: the real bound
+            #expect(took < bound && t.segments.count == 3500, "appended in \(took)")
+            #expect(gapRows(t).count == Set(gaps.map(\.0)).count, "every stretch placed once the last page is in")
+        }
+    }
+
     @Test func currentStatus() throws {
         let s = try decode(ServerStatus.self, Self.status)
         #expect(s.worker?.present == false && s.readOnly == nil && s.lastNoteAt != nil)

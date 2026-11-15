@@ -96,6 +96,16 @@ public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
         public private(set) var rows: [TranscriptRow] = []
         /// Some gap metadata on this phone couldn't be used (malformed, impossible): not every stretch is shown.
         public private(set) var droppedGaps = false
+        /// Each segment's start, read once (only while there are gaps): a page appended reads only its own segments
+        /// (ASTRA-20261115-IT4-04).
+        private var segmentTimes: [Double] = []
+        /// The gaps checked and merged (`prepare`), redone only when a page brings gaps.
+        private var preparedGaps: [PreparedGap] = []
+        private var preparedFrom = 0  // how many `untranscribed` entries `preparedGaps` was made from
+
+        struct PreparedGap: Equatable, Sendable {
+            var a: Double, b: Double, gap: Gap
+        }
 
         public init(total: Int, from: Int, nextFrom: Int?, segments: [Segment], untranscribed: [Gap]? = nil,
                     untranscribedIncomplete: Bool? = nil) {  // fmt: skip
@@ -131,6 +141,7 @@ public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
 
         /// The next page added: its segments, and its stretches merged with those already here (once each).
         public mutating func append(_ page: Transcript) {
+            if !segmentTimes.isEmpty { segmentTimes += page.segments.map(Self.time) }
             segments += page.segments
             nextFrom = page.nextFrom
             total = page.total
@@ -148,12 +159,31 @@ public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
         /// impossible ones left out (not finite, reversed, empty, speech of zero or less or more than the stretch),
         /// exact repeats once, overlapping ones as one stretch (its speech never more than its length), then merged
         /// with the segments by index (ASTRA-20261115-IT2-03).
+        private static func time(_ seg: Segment) -> Double { ISO8601UTC.parse(seg.start)?.timeIntervalSince1970 ?? -.infinity }
+
         mutating func prepare() {
             guard let gaps = untranscribed, !gaps.isEmpty else {
                 rows = segments.indices.map(TranscriptRow.segment)
                 droppedGaps = false
+                segmentTimes = []
+                preparedGaps = []
+                preparedFrom = 0
                 return
             }
+            if segmentTimes.count != segments.count { segmentTimes = segments.map(Self.time) }
+            if preparedFrom != gaps.count { prepareGaps(gaps) }
+            var out: [TranscriptRow] = []
+            out.reserveCapacity(segments.count + preparedGaps.count)
+            var next = 0
+            for (i, at) in segmentTimes.enumerated() {
+                while next < preparedGaps.count, preparedGaps[next].a < at { out.append(.gap(preparedGaps[next].gap)); next += 1 }
+                out.append(.segment(i))
+            }
+            if nextFrom == nil { out += preparedGaps[next...].map { TranscriptRow.gap($0.gap) } }
+            rows = out
+        }
+
+        private mutating func prepareGaps(_ gaps: [Gap]) {
             var valid: [(a: Double, b: Double, gap: Gap)] = []
             var dropped = false
             for g in gaps {
@@ -178,16 +208,8 @@ public struct ConversationDetail: Codable, Equatable, Sendable, Identifiable {
                     merged.append(v)
                 }
             }
-            var out: [TranscriptRow] = []
-            out.reserveCapacity(segments.count + merged.count)
-            var next = 0
-            for (i, seg) in segments.enumerated() {
-                let at = ISO8601UTC.parse(seg.start)?.timeIntervalSince1970 ?? -.infinity
-                while next < merged.count, merged[next].a < at { out.append(.gap(merged[next].gap)); next += 1 }
-                out.append(.segment(i))
-            }
-            if nextFrom == nil { out += merged[next...].map { TranscriptRow.gap($0.gap) } }
-            rows = out
+            preparedGaps = merged.map { PreparedGap(a: $0.a, b: $0.b, gap: $0.gap) }
+            preparedFrom = gaps.count
             droppedGaps = dropped
         }
     }
