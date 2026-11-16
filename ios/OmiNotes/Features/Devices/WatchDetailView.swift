@@ -47,6 +47,16 @@ struct WatchDetailView: View {
                               setAsideUnknown: s.outbox.quarantineSourceUnknownCount, inventoryReadable: s.outbox.inventoryReadable))
     }
 
+    /// The Watch app's build as last reported (nil: unknown, shows nothing).
+    private var watchBuild: Int? {
+        #if DEBUG
+        if let debug = UserDefaults.standard.string(forKey: "OmiNotesDebugWatchBuild") { return Int(debug) }
+        #endif
+        return model.snapshot.watchAppBuild?.build
+    }
+
+    private static let phoneBuild = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String).flatMap { Int($0) }
+
     var body: some View {
         TimelineView(.periodic(from: .now, by: 15)) { context in
             let (summary, flow) = current(context.date)
@@ -64,6 +74,17 @@ struct WatchDetailView: View {
                     }
                     .padding(.top, 14)
                     .accessibilityElement(children: .combine)
+
+                    if let line = WatchAppBuild.outdatedLine(watch: watchBuild, phone: Self.phoneBuild) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "exclamationmark").font(.system(size: 11, weight: .bold))
+                                .foregroundStyle(Pendant.warnForeground).frame(width: 22, height: 22)
+                                .background(Pendant.warnBackground, in: .rect(cornerRadius: 7))
+                                .accessibilityHidden(true)
+                            Text(line).font(.footnote.weight(.semibold)).foregroundStyle(Pendant.warnForeground)
+                        }
+                        .padding(.top, 12).padding(.horizontal, 16)
+                    }
 
                     if summary.configured {
                         heading("Where its audio is")

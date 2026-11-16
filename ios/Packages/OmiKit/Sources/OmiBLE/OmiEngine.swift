@@ -93,6 +93,8 @@ public struct EngineSnapshot: Equatable, Sendable {
     public var watchLastUploadedAt: Date?
     /// The Watch app's latest report about itself (as of its own timestamp).
     public var watchReport: WatchReport?
+    /// The Watch app's build as last reported (nil: unknown, e.g. an older Watch app that hasn't recorded since).
+    public var watchAppBuild: WatchAppBuild?
     public var transfer = TransferSnapshot()
     /// When this iPhone last stored a part from the Watch, in this run of the app (nil after a relaunch
     /// until one arrives: a later conversion of an older part isn't a receipt).
@@ -650,6 +652,10 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         let at = batch.data.samples.first?.at ?? ISO8601UTC.format(Date())
         let body = EventBody(deviceId: batch.deviceId, at: at, payload: .watchPerf(batch.data))
         try outbox.write(try ContractJSON.encode(body), kind: .event(eventId: batch.id))
+        // older Watch apps say their build only here
+        if let last = batch.data.samples.last, let build = WatchAppBuild.parse(app: last.app), let when = ISO8601UTC.parse(last.at) {
+            watchInbox.saveAppBuild(WatchAppBuild(build: build, at: when))
+        }
         queue.async { self.scheduleReconcile() }
         if watchStopAlertsEnabled {
             deliver(watchStopAlerts.process(deviceId: batch.deviceId, samples: batch.data.samples, now: Date()))
@@ -693,9 +699,10 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     public func acceptWatchReport(_ data: Data?) {
         guard let report = WatchWire.decode(WatchReport.self, data) else { return }
         watchInbox.saveReport(report)
+        if let build = report.appBuild { watchInbox.saveAppBuild(WatchAppBuild(build: build, at: report.at)) }
         if report.state == .recording { deliver(watchStopAlerts.recording(asOf: report.at, deviceId: report.deviceId)) }
         if let stats = report.stats, !stats.isEmpty {
-            log(.info, "watch", "Watch \(report.state.rawValue), \(report.waitingParts) waiting: " + stats.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
+            log(.info, "watch", "Watch \(report.state.rawValue), \(report.waitingParts) waiting, build \(report.appBuild.map(String.init) ?? "?"): " + stats.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
         }
         queue.async { self.scheduleSnapshot() }
     }
@@ -1592,6 +1599,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         s.transfer.pendingAudioUnknown = pendingAudio.unknown
         s.watchLastUploadedAt = watchUploads.lastAt
         s.watchReport = watchInbox.latestReport
+        s.watchAppBuild = watchInbox.appBuild
         s.recordingPaused = settings.recordingPaused
         s.autoCollect = settings.autoCollectPendantAudio
         s.buttonActionsEnabled = settings.buttonActionsEnabled

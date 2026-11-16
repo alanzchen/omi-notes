@@ -79,6 +79,8 @@ public struct WatchReport: Codable, Equatable, Sendable {
     /// Counters since the Watch app launched (transfers, resends, capture buffer allocations…), to
     /// compare builds; absent from older Watch apps.
     public var stats: [String: Int]?
+    /// The Watch app's build (`CFBundleVersion`); nil from older Watch apps: unknown.
+    public var appBuild: Int?
     /// Audio parts kept on the Watch that it can't send (no manifest matches them; `orphan_parts`).
     /// nil when the report doesn't say (older Watch apps): unknown, never taken as none.
     public var keptParts: Int? { stats?["orphan_parts"] }
@@ -88,14 +90,46 @@ public struct WatchReport: Codable, Equatable, Sendable {
     public var recheckSeconds: Int { stats?["recheck_s"] ?? 0 }
 
     public init(state: State, since: Date?, waitingParts: Int, waitingSeconds: Int? = nil, at: Date, deviceId: String? = nil,
-                stats: [String: Int]? = nil) {
+                stats: [String: Int]? = nil, appBuild: Int? = nil) {
         self.deviceId = deviceId
+        self.appBuild = appBuild
         self.state = state
         self.since = since
         self.waitingParts = waitingParts
         self.waitingSeconds = waitingSeconds
         self.at = at
         self.stats = stats
+    }
+}
+
+/// The Watch app's build as this iPhone last learned it: from a status report (`appBuild`) or, for Watch apps
+/// that don't report it, from a performance sample's `app` ("0.1.0 (49)"). The newer observation wins.
+public struct WatchAppBuild: Codable, Equatable, Sendable {
+    public var build: Int
+    /// When the Watch said so (its own clock).
+    public var at: Date
+
+    public init(build: Int, at: Date) {
+        self.build = build
+        self.at = at
+    }
+
+    /// The build in a performance sample's `app` ("0.1.0 (49)" → 49); nil when there is none ("0.1.0 (?)").
+    public static func parse(app: String) -> Int? {
+        guard let open = app.lastIndex(of: "("), app.hasSuffix(")") else { return nil }
+        return Int(app[app.index(after: open)..<app.index(before: app.endIndex)])
+    }
+
+    /// The Watch's build when it is older than this iPhone's app; nil when it is the same or newer, or either is
+    /// unknown (an unknown build is never called up to date, nor out of date).
+    public static func behind(watch: Int?, phone: Int?) -> Int? {
+        guard let watch, let phone, watch < phone else { return nil }
+        return watch
+    }
+
+    /// The Apple Watch page's one problem line when the Watch runs an older build than this iPhone; nil otherwise.
+    public static func outdatedLine(watch: Int?, phone: Int?) -> String? {
+        behind(watch: watch, phone: phone).map { "手表上的 Omi 不是最新版本（\($0)）· 在手表上更新" }
     }
 }
 
@@ -585,6 +619,19 @@ public final class PhoneWatchInbox: @unchecked Sendable {
         let url = root.appendingPathComponent("report.json")
         if let old = WatchWire.decode(WatchReport.self, try? Data(contentsOf: url)), old.at >= report.at { return }
         try? Files.durableWrite(WatchWire.encode(report), to: url)
+    }
+
+    /// Keeps what the Watch said its app build is (newer than the stored observation only).
+    public func saveAppBuild(_ build: WatchAppBuild) {
+        lock.lock(); defer { lock.unlock() }
+        let url = root.appendingPathComponent("app-build.json")
+        if let old = WatchWire.decode(WatchAppBuild.self, try? Data(contentsOf: url)), old.at >= build.at { return }
+        try? Files.durableWrite(WatchWire.encode(build), to: url)
+    }
+
+    public var appBuild: WatchAppBuild? {
+        lock.lock(); defer { lock.unlock() }
+        return WatchWire.decode(WatchAppBuild.self, try? Data(contentsOf: root.appendingPathComponent("app-build.json")))
     }
 
     public var latestReport: WatchReport? {
