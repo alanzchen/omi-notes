@@ -36,6 +36,7 @@ import OmiProtocol
     @Test func thePhoneKeepsTheNewestObservationFromEitherSource() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("omi-build-\(UUID().uuidString)")
         let settings = SettingsStore(defaults: UserDefaults(suiteName: "omi-build-\(UUID().uuidString)")!, tokens: InMemoryTokenStore())
+        _ = settings.phoneInstallId  // made before the engine starts: its queue reads it too, and two first reads could each make one
         let engine = OmiEngine(config: EngineConfiguration(dirs: CaptureDirectories(root: dir), appVersion: "0.1.0 (56)", timezone: "UTC", useCoreBluetooth: false),
                                settings: settings, uploadTransport: CountingUploadTransport())
         let t0 = Date(timeIntervalSince1970: 1_791_000_000)
@@ -59,6 +60,28 @@ import OmiProtocol
         // a report without a Watch id names no Watch: its build isn't kept
         engine.acceptWatchReport(WatchWire.encode(WatchReport(state: .idle, since: nil, waitingParts: 0, at: t0.addingTimeInterval(200), appBuild: 40)))
         #expect(engine.watchInbox.appBuild == nil && engine.watchInbox.appBuild(for: "watch-1")?.build == 57)
+    }
+
+    @Test func aSwitchedOrFutureDatedWatchNamesNoBuild() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("omi-build-\(UUID().uuidString)")
+        let inbox = PhoneWatchInbox(root: dir, currentBinding: { "p" })
+        let now = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded())  // stored to the millisecond
+        inbox.saveReport(WatchReport(state: .idle, since: nil, waitingParts: 0, at: now.addingTimeInterval(-60), deviceId: "A"))
+        inbox.saveAppBuild(WatchAppBuild(build: 49, at: now.addingTimeInterval(-60), deviceId: "A", source: .report, receivedAt: now))
+        #expect(inbox.appBuild?.build == 49)
+        // the paired Watch changed: no Watch is the one in use until one reports after it; A's history stays
+        inbox.watchChanged(at: now)
+        #expect(inbox.appBuild == nil && inbox.appBuild(for: "A")?.build == 49)
+        inbox.saveReport(WatchReport(state: .idle, since: nil, waitingParts: 0, at: now.addingTimeInterval(5), deviceId: "B"))
+        #expect(inbox.appBuild == nil, "B hasn't said its build: unknown, never A's")
+        inbox.saveReport(WatchReport(state: .idle, since: nil, waitingParts: 0, at: now.addingTimeInterval(10), deviceId: "A"))
+        #expect(inbox.appBuild?.build == 49, "A again, after the change")
+        // a report a day ahead, saved by an earlier run (a clock since corrected), names no Watch, and a current one replaces it
+        inbox.saveReport(WatchReport(state: .idle, since: nil, waitingParts: 0, at: now.addingTimeInterval(86400), deviceId: "A"), now: now.addingTimeInterval(86400))
+        let reloaded = PhoneWatchInbox(root: dir, currentBinding: { "p" })
+        #expect(reloaded.appBuild == nil)
+        reloaded.saveReport(WatchReport(state: .idle, since: nil, waitingParts: 0, at: now.addingTimeInterval(20), deviceId: "A"))
+        #expect(reloaded.latestReport?.at == now.addingTimeInterval(20) && reloaded.appBuild?.build == 49)
     }
 
     @Test func theLogSaysWhereTheBuildCameFrom() {

@@ -75,10 +75,12 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate, @unchecked Sendable {
     func sessionDidBecomeInactive(_ session: WCSession) {}
 
     func sessionDidDeactivate(_ session: WCSession) {
-        session.activate()  // a different Watch was paired: talk to it
+        engine.watchChanged()  // a different Watch was paired: the last one's build isn't this one's
+        session.activate()  // talk to it
     }
 
     func sessionWatchStateDidChange(_ session: WCSession) {
+        if !session.isPaired || !session.isWatchAppInstalled { engine.watchChanged() }
         onWatchState(session.isPaired && session.isWatchAppInstalled)
         announce(session)
     }

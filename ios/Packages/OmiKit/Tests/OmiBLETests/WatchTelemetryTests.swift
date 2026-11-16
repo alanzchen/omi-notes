@@ -59,6 +59,7 @@ import OmiProtocol
     @Test func thePhoneQueuesEachBatchOnceAsAnEventAndRefusesAnotherPhones() async throws {
         let dir = root()
         let settings = SettingsStore(defaults: UserDefaults(suiteName: "omi-perf-\(UUID().uuidString)")!, tokens: InMemoryTokenStore())
+        _ = settings.phoneInstallId  // made before the engine starts: its queue reads it too, and two first reads could each make one
         let engine = OmiEngine(config: EngineConfiguration(dirs: CaptureDirectories(root: dir), appVersion: "t", timezone: "UTC", useCoreBluetooth: false),
                                settings: settings, uploadTransport: CountingUploadTransport())
         let q = WatchPerfQueue(root: dir.appendingPathComponent("w"))

@@ -695,6 +695,12 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
                                 lastReceivedAt: received.last.map(ISO8601UTC.format), inboxPending: pending)
     }
 
+    /// WatchConnectivity says the paired Watch changed (switched or unpaired): its build is unknown until it reports.
+    public func watchChanged() {
+        watchInbox.watchChanged(at: Date())
+        queue.async { self.scheduleSnapshot() }
+    }
+
     /// The Watch app's application context (its latest status report).
     public func acceptWatchReport(_ data: Data?) {
         guard let report = WatchWire.decode(WatchReport.self, data) else { return }

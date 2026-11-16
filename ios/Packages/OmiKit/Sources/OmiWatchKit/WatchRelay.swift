@@ -626,11 +626,13 @@ public final class PhoneWatchInbox: @unchecked Sendable {
 
     public var pendingCount: Int { pending().count }
 
-    /// Keeps the Watch's latest report (newer than the stored one only).
-    public func saveReport(_ report: WatchReport) {
+    /// Keeps the Watch's latest report (newer than the stored one only; a stored one dated more than
+    /// `WatchAppBuild.futureSkew` ahead of now doesn't hold off a current one, ASTRA-20261116-IT3-01).
+    public func saveReport(_ report: WatchReport, now: Date = Date()) {
         lock.lock(); defer { lock.unlock() }
         let url = root.appendingPathComponent("report.json")
-        if let old = WatchWire.decode(WatchReport.self, try? Data(contentsOf: url)), old.at >= report.at { return }
+        if let old = WatchWire.decode(WatchReport.self, try? Data(contentsOf: url)), old.at >= report.at,
+           old.at <= now.addingTimeInterval(WatchAppBuild.futureSkew) { return }
         try? Files.durableWrite(WatchWire.encode(report), to: url)
     }
 
@@ -659,8 +661,27 @@ public final class PhoneWatchInbox: @unchecked Sendable {
     }
 
     /// The build of the Watch whose report is the latest (the one in use): another Watch's is never taken for it
-    /// (ASTRA-20261116-IT1-01).
-    public var appBuild: WatchAppBuild? { appBuild(for: latestReport?.deviceId) }
+    /// (ASTRA-20261116-IT1-01). None when that report is dated more than `futureSkew` ahead (its time can't be used,
+    /// even one saved by an earlier run) or from before the paired Watch last changed (ASTRA-20261116-IT3-01).
+    public var appBuild: WatchAppBuild? { appBuild(now: Date()) }
+
+    public func appBuild(now: Date) -> WatchAppBuild? {
+        guard let report = latestReport, report.at <= now.addingTimeInterval(WatchAppBuild.futureSkew) else { return nil }
+        if let changed = watchChangedAt, report.at <= changed { return nil }
+        return appBuild(for: report.deviceId)
+    }
+
+    /// The paired Watch changed (another Watch, or none): until a report from after this, no Watch is the one in use.
+    /// Only that pointer is cleared; what each Watch said stays.
+    public func watchChanged(at: Date) {
+        lock.lock(); defer { lock.unlock() }
+        try? Files.durableWrite(WatchWire.encode(["at": at]), to: root.appendingPathComponent("watch-changed.json"))
+    }
+
+    private var watchChangedAt: Date? {
+        lock.lock(); defer { lock.unlock() }
+        return WatchWire.decode([String: Date].self, try? Data(contentsOf: root.appendingPathComponent("watch-changed.json")))?["at"]
+    }
 
     public var latestReport: WatchReport? {
         lock.lock(); defer { lock.unlock() }

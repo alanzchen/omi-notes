@@ -1,4 +1,4 @@
-// ASTRA-20261116-IT1 review checks (reused; fixture root moved to a temporary directory).
+// ASTRA-20261116-IT1 review checks (reused; fixture root moved to a temporary directory, install id made before the engine, log line matched by its own waiting count).
 import Foundation
 import Testing
 @testable import OmiBLE
@@ -11,11 +11,12 @@ import OmiProtocol
     func fixture() -> (OmiEngine, URL, SettingsStore) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("astra-it1-20261116").appendingPathComponent(UUID().uuidString)
         let settings = SettingsStore(defaults: UserDefaults(suiteName: "astra-watch-build-" + UUID().uuidString)!, tokens: InMemoryTokenStore())
+        _ = settings.phoneInstallId  // made before the engine starts: its queue reads it too, and two first reads could each make one
         let engine = OmiEngine(config: EngineConfiguration(dirs: CaptureDirectories(root: root), appVersion: "0.1.0 (57)", timezone: "UTC", useCoreBluetooth: false), settings: settings, uploadTransport: CountingUploadTransport())
         return (engine, root, settings)
     }
-    func report(_ e: OmiEngine, device: String, build: Int?, at: Date) {
-        e.acceptWatchReport(WatchWire.encode(WatchReport(state: .idle, since: nil, waitingParts: 3, at: at, deviceId: device, stats: ["orphan_parts":0,"outstanding_stalled":3], appBuild: build)))
+    func report(_ e: OmiEngine, device: String, build: Int?, at: Date, waiting: Int = 3) {
+        e.acceptWatchReport(WatchWire.encode(WatchReport(state: .idle, since: nil, waitingParts: waiting, at: at, deviceId: device, stats: ["orphan_parts":0,"outstanding_stalled":3], appBuild: build)))
     }
     func perf(_ e: OmiEngine, _ root: URL, _ s: SettingsStore, device: String, build: Int, at: Date) throws {
         let q = WatchPerfQueue(root: root.appendingPathComponent("perf-" + UUID().uuidString))
@@ -64,9 +65,10 @@ import OmiProtocol
     @Test func telemetryFallbackMustAppearInReportLog() throws {
         let (e,r,s) = fixture()
         try perf(e,r,s,device:"A",build:49,at:now)
-        report(e,device:"A",build:nil,at:now.addingTimeInterval(60))
+        // a waiting count no other test uses: the log is shared with suites running in parallel
+        report(e,device:"A",build:nil,at:now.addingTimeInterval(60),waiting:7319)
         #expect(e.snapshotNow().watchAppBuild?.build == 49)
-        let line = try #require(OmiLog.shared.recent().last { $0.message.hasPrefix("Watch idle,") })
+        let line = try #require(OmiLog.shared.recent().last { $0.message.hasPrefix("Watch idle, 7319 waiting") })
         #expect(line.message.contains("build 49"),"learned fallback should appear in the uploaded diagnostic line: \(line.message)")
     }
     @Test func offActorReportAndPerfAcceptanceIsSafe() async throws {
