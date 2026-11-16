@@ -102,16 +102,29 @@ public struct WatchReport: Codable, Equatable, Sendable {
     }
 }
 
-/// The Watch app's build as this iPhone last learned it: from a status report (`appBuild`) or, for Watch apps
-/// that don't report it, from a performance sample's `app` ("0.1.0 (49)"). The newer observation wins.
+/// One Watch's app build as this iPhone learned it: from a status report (`appBuild`) or, for Watch apps that don't
+/// report it, from a performance sample's `app` ("0.1.0 (49)"). Kept per Watch (its device id); for each, the
+/// observation with the later Watch time wins (a later lower build too: a reinstall), never the larger build.
 public struct WatchAppBuild: Codable, Equatable, Sendable {
+    public enum Source: String, Codable, Sendable { case report, telemetry }
     public var build: Int
     /// When the Watch said so (its own clock).
     public var at: Date
+    public var deviceId: String
+    public var source: Source
+    /// When this iPhone received it (its clock).
+    public var receivedAt: Date
 
-    public init(build: Int, at: Date) {
+    /// A Watch time further ahead of this iPhone's than this isn't used: it would outrank every later observation
+    /// until the time came (ASTRA-20261116-IT1-02).
+    public static let futureSkew: TimeInterval = 10 * 60
+
+    public init(build: Int, at: Date, deviceId: String, source: Source, receivedAt: Date) {
         self.build = build
         self.at = at
+        self.deviceId = deviceId
+        self.source = source
+        self.receivedAt = receivedAt
     }
 
     /// The build in a performance sample's `app` ("0.1.0 (49)" → 49); nil when there is none ("0.1.0 (?)").
@@ -621,18 +634,33 @@ public final class PhoneWatchInbox: @unchecked Sendable {
         try? Files.durableWrite(WatchWire.encode(report), to: url)
     }
 
-    /// Keeps what the Watch said its app build is (newer than the stored observation only).
+    /// Keeps what a Watch said its app build is: per Watch, newer (by Watch time) than its stored observation only.
+    /// One dated ahead of `receivedAt` by more than `futureSkew` is dropped (unknown, never pinned).
     public func saveAppBuild(_ build: WatchAppBuild) {
+        guard build.at <= build.receivedAt.addingTimeInterval(WatchAppBuild.futureSkew) else { return }
         lock.lock(); defer { lock.unlock() }
-        let url = root.appendingPathComponent("app-build.json")
-        if let old = WatchWire.decode(WatchAppBuild.self, try? Data(contentsOf: url)), old.at >= build.at { return }
-        try? Files.durableWrite(WatchWire.encode(build), to: url)
+        var all = appBuilds()
+        if let old = all[build.deviceId], old.at >= build.at { return }
+        all[build.deviceId] = build
+        // a few Watches at most; the longest unheard ones go
+        for id in all.values.sorted(by: { $0.receivedAt > $1.receivedAt }).dropFirst(8).map(\.deviceId) { all[id] = nil }
+        try? Files.durableWrite(WatchWire.encode(all), to: root.appendingPathComponent("app-builds.json"))
     }
 
-    public var appBuild: WatchAppBuild? {
-        lock.lock(); defer { lock.unlock() }
-        return WatchWire.decode(WatchAppBuild.self, try? Data(contentsOf: root.appendingPathComponent("app-build.json")))
+    private func appBuilds() -> [String: WatchAppBuild] {
+        WatchWire.decode([String: WatchAppBuild].self, try? Data(contentsOf: root.appendingPathComponent("app-builds.json"))) ?? [:]
     }
+
+    /// What this Watch said its build is; nil when it hasn't, or when no Watch is named.
+    public func appBuild(for deviceId: String?) -> WatchAppBuild? {
+        guard let deviceId else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        return appBuilds()[deviceId]
+    }
+
+    /// The build of the Watch whose report is the latest (the one in use): another Watch's is never taken for it
+    /// (ASTRA-20261116-IT1-01).
+    public var appBuild: WatchAppBuild? { appBuild(for: latestReport?.deviceId) }
 
     public var latestReport: WatchReport? {
         lock.lock(); defer { lock.unlock() }

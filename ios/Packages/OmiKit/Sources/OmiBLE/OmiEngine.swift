@@ -654,7 +654,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         try outbox.write(try ContractJSON.encode(body), kind: .event(eventId: batch.id))
         // older Watch apps say their build only here
         if let last = batch.data.samples.last, let build = WatchAppBuild.parse(app: last.app), let when = ISO8601UTC.parse(last.at) {
-            watchInbox.saveAppBuild(WatchAppBuild(build: build, at: when))
+            watchInbox.saveAppBuild(WatchAppBuild(build: build, at: when, deviceId: batch.deviceId, source: .telemetry, receivedAt: Date()))
         }
         queue.async { self.scheduleReconcile() }
         if watchStopAlertsEnabled {
@@ -699,12 +699,24 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     public func acceptWatchReport(_ data: Data?) {
         guard let report = WatchWire.decode(WatchReport.self, data) else { return }
         watchInbox.saveReport(report)
-        if let build = report.appBuild { watchInbox.saveAppBuild(WatchAppBuild(build: build, at: report.at)) }
+        if let build = report.appBuild, let id = report.deviceId {
+            watchInbox.saveAppBuild(WatchAppBuild(build: build, at: report.at, deviceId: id, source: .report, receivedAt: Date()))
+        }
         if report.state == .recording { deliver(watchStopAlerts.recording(asOf: report.at, deviceId: report.deviceId)) }
         if let stats = report.stats, !stats.isEmpty {
-            log(.info, "watch", "Watch \(report.state.rawValue), \(report.waitingParts) waiting, build \(report.appBuild.map(String.init) ?? "?"): " + stats.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
+            log(.info, "watch", "Watch \(report.state.rawValue), \(report.waitingParts) waiting, \(Self.buildText(report, watchInbox.appBuild(for: report.deviceId))): " + stats.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
         }
         queue.async { self.scheduleSnapshot() }
+    }
+
+    /// The build in the "Watch …" log line: the report's own, else this Watch's last known one with where it came from
+    /// and how long ago this iPhone heard it (ASTRA-20261116-IT1-03), else "build ?".
+    static func buildText(_ report: WatchReport, _ known: WatchAppBuild?, now: Date = Date()) -> String {
+        if let build = report.appBuild { return "build \(build)" }
+        guard let known else { return "build ?" }
+        let s = max(0, Int(now.timeIntervalSince(known.receivedAt)))
+        let age = s < 3600 ? "\(s / 60)m" : s < 2 * 86400 ? "\(s / 3600)h" : "\(s / 86400)d"
+        return "build \(known.build) (last known, \(known.source.rawValue), \(age) ago)"
     }
 
     func processWatch() {

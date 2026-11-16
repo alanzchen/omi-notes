@@ -40,7 +40,7 @@ import OmiProtocol
                                settings: settings, uploadTransport: CountingUploadTransport())
         let t0 = Date(timeIntervalSince1970: 1_791_000_000)
         // an older Watch app: no build in its report, so nothing is known yet
-        engine.acceptWatchReport(WatchWire.encode(WatchReport(state: .idle, since: nil, waitingParts: 3, at: t0, stats: ["orphan_parts": 0])))
+        engine.acceptWatchReport(WatchWire.encode(WatchReport(state: .idle, since: nil, waitingParts: 3, at: t0, deviceId: "watch-1", stats: ["orphan_parts": 0])))
         #expect(engine.watchInbox.appBuild == nil)
         // its performance samples say "0.1.0 (49)"
         let q = WatchPerfQueue(root: dir.appendingPathComponent("w"))
@@ -49,12 +49,26 @@ import OmiProtocol
                                  app: "0.1.0 (49)", os: "t", model: "t"),
                  deviceId: "watch-1", binding: settings.phoneInstallId!, seal: true)
         _ = try engine.acceptWatchPerf(WatchWire.encode(try #require(q.batches().first)))
-        #expect(engine.watchInbox.appBuild == WatchAppBuild(build: 49, at: t0.addingTimeInterval(60)))
+        #expect(engine.watchInbox.appBuild?.build == 49 && engine.watchInbox.appBuild?.source == .telemetry && engine.watchInbox.appBuild?.at == t0.addingTimeInterval(60))
         // the updated Watch app reports its build
-        engine.acceptWatchReport(WatchWire.encode(WatchReport(state: .idle, since: nil, waitingParts: 0, at: t0.addingTimeInterval(120), appBuild: 57)))
+        engine.acceptWatchReport(WatchWire.encode(WatchReport(state: .idle, since: nil, waitingParts: 0, at: t0.addingTimeInterval(120), deviceId: "watch-1", appBuild: 57)))
         #expect(engine.watchInbox.appBuild?.build == 57)
         // an observation older than the stored one doesn't replace it
-        engine.acceptWatchReport(WatchWire.encode(WatchReport(state: .idle, since: nil, waitingParts: 0, at: t0.addingTimeInterval(90), appBuild: 49)))
+        engine.acceptWatchReport(WatchWire.encode(WatchReport(state: .idle, since: nil, waitingParts: 0, at: t0.addingTimeInterval(90), deviceId: "watch-1", appBuild: 49)))
         #expect(engine.watchInbox.appBuild?.build == 57)
+        // a report without a Watch id names no Watch: its build isn't kept
+        engine.acceptWatchReport(WatchWire.encode(WatchReport(state: .idle, since: nil, waitingParts: 0, at: t0.addingTimeInterval(200), appBuild: 40)))
+        #expect(engine.watchInbox.appBuild == nil && engine.watchInbox.appBuild(for: "watch-1")?.build == 57)
+    }
+
+    @Test func theLogSaysWhereTheBuildCameFrom() {
+        let now = Date(timeIntervalSince1970: 1_791_000_000)
+        let old = WatchReport(state: .idle, since: nil, waitingParts: 3, at: now, deviceId: "w")
+        let known = WatchAppBuild(build: 49, at: now, deviceId: "w", source: .telemetry, receivedAt: now.addingTimeInterval(-2 * 3600))
+        #expect(OmiEngine.buildText(old, known, now: now) == "build 49 (last known, telemetry, 2h ago)")
+        #expect(OmiEngine.buildText(old, nil, now: now) == "build ?")
+        var current = old
+        current.appBuild = 57
+        #expect(OmiEngine.buildText(current, known, now: now) == "build 57", "the report's own")
     }
 }
