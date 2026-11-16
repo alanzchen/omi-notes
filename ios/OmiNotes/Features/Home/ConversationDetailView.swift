@@ -474,6 +474,8 @@ struct ConversationDetailView: View {
                                     .font(.subheadline).foregroundStyle(.secondary)
                             }
                             .accessibilityElement(children: .combine)
+                            // the divider below starts where every other row's does, not after the icon
+                            .alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
                             .id("gap-\(position)")
                         }
                     }
