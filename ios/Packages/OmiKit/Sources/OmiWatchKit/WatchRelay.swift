@@ -229,30 +229,66 @@ public enum WatchRelayError: Error, Equatable, LocalizedError {
     }
 }
 
+/// Tests only: these paths (and, unless `exactly`, everything under them) fail fsync, to show what a failed sync does
+/// (ASTRA-20261117-IT2-02).
+enum SyncFaults {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var roots: Set<String> = []
+    nonisolated(unsafe) private static var exact: Set<String> = []
+
+    static func set(_ url: URL, failing: Bool, exactly: Bool = false) {
+        let path = url.standardizedFileURL.path
+        lock.withLock {
+            if failing { _ = exactly ? exact.insert(path) : roots.insert(path) } else { exact.remove(path); roots.remove(path) }
+        }
+    }
+
+    static func failing(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        return lock.withLock { exact.contains(path) || roots.contains { path == $0 || path.hasPrefix($0 + "/") } }
+    }
+}
+
 enum Files {
     static func sha256(_ url: URL) throws -> String {
         let data = try Data(contentsOf: url, options: .mappedIfSafe)
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Atomic, durable: write a temporary file, fsync it, rename, fsync the directory.
+    /// Atomic, durable: write a temporary file, fsync it, rename, fsync the directory. Throws if any step fails,
+    /// a sync included (ASTRA-20261117-IT2-02): a temporary file that didn't sync is removed, never renamed into place,
+    /// so nothing (a receipt, an acknowledgement) can stand for bytes that may not be on disk.
     static func durableWrite(_ data: Data, to url: URL) throws {
         let tmp = url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).tmp")
         try data.write(to: tmp)
-        try fsync(tmp)
-        try replace(url, with: tmp)
+        try place(tmp, at: url)
     }
 
     static func durableCopy(_ from: URL, to url: URL) throws {
         let tmp = url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).tmp")
         _ = try? FileManager.default.removeItem(at: tmp)
         try FileManager.default.copyItem(at: from, to: tmp)
-        try fsync(tmp)
+        try place(tmp, at: url)
+    }
+
+    /// Syncs the temporary file, then renames it over `url`; on any failure only the temporary file is removed.
+    private static func place(_ tmp: URL, at url: URL) throws {
+        do {
+            #if os(iOS) || os(watchOS)
+            // readable after first unlock, like everything written in the background (a copy keeps its source's class)
+            try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: tmp.path)
+            #endif
+            try fsync(tmp)
+        } catch {
+            _ = try? FileManager.default.removeItem(at: tmp)
+            throw error
+        }
         try replace(url, with: tmp)
     }
 
     /// rename(2): the name holds the old file or the new one, never nothing, even across a crash
     /// (ASTRA-20261117-IT1-01; removing first left a moment with no manifest, receipt or audio copy at all).
+    /// A failed directory sync is an error too: the rename may not survive a crash, so the write isn't reported durable.
     static func replace(_ url: URL, with tmp: URL) throws {
         guard rename(tmp.path, url.path) == 0 else { throw CocoaError(.fileWriteUnknown) }
         try fsync(url.deletingLastPathComponent())
@@ -262,7 +298,7 @@ enum Files {
         let fd = open(url.path, O_RDONLY)
         guard fd >= 0 else { throw CocoaError(.fileReadNoPermission) }
         defer { close(fd) }
-        _ = Darwin.fsync(fd)
+        guard !SyncFaults.failing(url), Darwin.fsync(fd) == 0 else { throw CocoaError(.fileWriteUnknown) }
     }
 
     static func names(_ dir: URL, suffix: String) -> [String] {
