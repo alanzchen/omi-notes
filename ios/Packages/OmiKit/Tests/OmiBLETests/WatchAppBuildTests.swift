@@ -84,6 +84,28 @@ import OmiProtocol
         #expect(reloaded.latestReport?.at == now.addingTimeInterval(20) && reloaded.appBuild?.build == 49)
     }
 
+    @Test func aSwitchIsOrderedByThisPhoneNotByAWatchClock() {
+        // ASTRA-20261116-IT4-01: A's report, its clock 5 min fast (inside the 10 min allowance), was still taken as
+        // the Watch in use after a switch, because the switch was compared with Watch time
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("omi-build-\(UUID().uuidString)")
+        let inbox = PhoneWatchInbox(root: dir, currentBinding: { "p" })
+        let now = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded())
+        inbox.saveReport(WatchReport(state: .idle, since: nil, waitingParts: 0, at: now.addingTimeInterval(300), deviceId: "A"))
+        inbox.saveAppBuild(WatchAppBuild(build: 49, at: now.addingTimeInterval(300), deviceId: "A", source: .report, receivedAt: now))
+        inbox.watchChanged(at: now.addingTimeInterval(1))
+        #expect(inbox.appBuild(now: now.addingTimeInterval(2)) == nil, "A's report came before the switch: no Watch is in use yet")
+        // B reports with its own (earlier) clock: it is the Watch in use, even though A's report is dated later
+        inbox.saveReport(WatchReport(state: .idle, since: nil, waitingParts: 0, at: now.addingTimeInterval(2), deviceId: "B"))
+        inbox.saveAppBuild(WatchAppBuild(build: 57, at: now.addingTimeInterval(2), deviceId: "B", source: .report, receivedAt: now))
+        #expect(inbox.latestReport?.deviceId == "B")
+        #expect(inbox.appBuild(now: now.addingTimeInterval(3))?.build == 57)
+        // survives a relaunch; a later switch clears it again
+        let reloaded = PhoneWatchInbox(root: dir, currentBinding: { "p" })
+        #expect(reloaded.appBuild(now: now.addingTimeInterval(3))?.build == 57)
+        reloaded.watchChanged(at: now.addingTimeInterval(4))
+        #expect(reloaded.appBuild(now: now.addingTimeInterval(5)) == nil)
+    }
+
     @Test func theLogSaysWhereTheBuildCameFrom() {
         let now = Date(timeIntervalSince1970: 1_791_000_000)
         let old = WatchReport(state: .idle, since: nil, waitingParts: 3, at: now, deviceId: "w")

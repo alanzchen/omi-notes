@@ -626,13 +626,16 @@ public final class PhoneWatchInbox: @unchecked Sendable {
 
     public var pendingCount: Int { pending().count }
 
-    /// Keeps the Watch's latest report (newer than the stored one only; a stored one dated more than
-    /// `WatchAppBuild.futureSkew` ahead of now doesn't hold off a current one, ASTRA-20261116-IT3-01).
+    /// Keeps the Watch's latest report (newer than the stored one only), with the Watch change it came after. A stored
+    /// one dated more than `WatchAppBuild.futureSkew` ahead of now (ASTRA-20261116-IT3-01), or from before the paired
+    /// Watch last changed (ASTRA-20261116-IT4-01), doesn't hold off a new one.
     public func saveReport(_ report: WatchReport, now: Date = Date()) {
         lock.lock(); defer { lock.unlock() }
         let url = root.appendingPathComponent("report.json")
+        let generation = changeGeneration
         if let old = WatchWire.decode(WatchReport.self, try? Data(contentsOf: url)), old.at >= report.at,
-           old.at <= now.addingTimeInterval(WatchAppBuild.futureSkew) { return }
+           old.at <= now.addingTimeInterval(WatchAppBuild.futureSkew), reportGeneration == generation { return }
+        try? Files.durableWrite(WatchWire.encode(["generation": generation]), to: root.appendingPathComponent("report-generation.json"))
         try? Files.durableWrite(WatchWire.encode(report), to: url)
     }
 
@@ -667,21 +670,32 @@ public final class PhoneWatchInbox: @unchecked Sendable {
 
     public func appBuild(now: Date) -> WatchAppBuild? {
         guard let report = latestReport, report.at <= now.addingTimeInterval(WatchAppBuild.futureSkew) else { return nil }
-        if let changed = watchChangedAt, report.at <= changed { return nil }
+        let current = lock.withLock { reportGeneration == changeGeneration }
+        guard current else { return nil }
         return appBuild(for: report.deviceId)
     }
 
-    /// The paired Watch changed (another Watch, or none): until a report from after this, no Watch is the one in use.
-    /// Only that pointer is cleared; what each Watch said stays.
+    /// The paired Watch changed (another Watch, or none): until a report received after this, no Watch is the one in
+    /// use. Counted on this iPhone, never compared with a Watch's clock (ASTRA-20261116-IT4-01). Only that pointer is
+    /// cleared; what each Watch said stays.
     public func watchChanged(at: Date) {
         lock.lock(); defer { lock.unlock() }
-        try? Files.durableWrite(WatchWire.encode(["at": at]), to: root.appendingPathComponent("watch-changed.json"))
+        try? Files.durableWrite(WatchWire.encode(["generation": changeGeneration + 1]), to: root.appendingPathComponent("watch-changed.json"))
     }
 
-    private var watchChangedAt: Date? {
-        lock.lock(); defer { lock.unlock() }
-        return WatchWire.decode([String: Date].self, try? Data(contentsOf: root.appendingPathComponent("watch-changed.json")))?["at"]
+    /// How many Watch changes this iPhone has seen (0: none). A file without a count (written by build 57, which kept
+    /// the change's time) counts as one.
+    private var changeGeneration: Int {
+        let url = root.appendingPathComponent("watch-changed.json")
+        guard let data = try? Data(contentsOf: url) else { return 0 }
+        return WatchWire.decode([String: Int].self, data)?["generation"] ?? 1
     }
+
+    /// The change count when the stored report was received (0 for a report saved before it was kept).
+    private var reportGeneration: Int {
+        WatchWire.decode([String: Int].self, try? Data(contentsOf: root.appendingPathComponent("report-generation.json")))?["generation"] ?? 0
+    }
+
 
     public var latestReport: WatchReport? {
         lock.lock(); defer { lock.unlock() }
