@@ -33,32 +33,45 @@ import Testing
 }
 
 /// ASTRA-20261117-IT1-01: `Files.durableWrite` removed the old file before moving the new one in, so a reader (or a
-/// crash) between the two found no file at all. A replace must never leave the name empty.
+/// crash) between the two found no file at all. A replace must never leave the name empty. The reader runs while the
+/// replaces happen (it signals before the first one); whether it lands in the old window is scheduling-dependent, so
+/// on the old code this fails often, not always (ASTRA-20261117-IT2-01).
 @Suite struct DurableReplaceTests {
     @Test func aReplacedFileIsNeverMissing() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("omi-replace-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent("manifest.json")
         try Files.durableWrite(Data("0".utf8), to: url)
-        let done = Flag()
-        let reader = Thread {
-            var missing = 0
-            while !done.value { if !FileManager.default.fileExists(atPath: url.path) { missing += 1 } }
-            done.missing = missing
-            done.finished = true
+        let state = ReaderState()
+        let started = DispatchSemaphore(value: 0), finished = DispatchSemaphore(value: 0)
+        let path = url.path
+        Thread {
+            started.signal()
+            while !state.stopping { state.look(FileManager.default.fileExists(atPath: path)) }
+            finished.signal()
+        }.start()
+        #expect(started.wait(timeout: .now() + 5) == .success, "the reader never started")
+        defer {
+            state.stop()
+            if finished.wait(timeout: .now() + 5) != .success { Issue.record("the reader didn't stop") }
         }
-        reader.start()
         for i in 1...400 { try Files.durableWrite(Data("\(i)".utf8), to: url) }
         let source = dir.appendingPathComponent("audio.src")
         try Data("audio".utf8).write(to: source)
         for _ in 1...100 { try Files.durableCopy(source, to: url) }
-        done.value = true
-        while !done.finished { usleep(1000) }
-        #expect(done.missing == 0, "the file was missing \(done.missing) times during replaces")
+        let (looks, missing) = state.counts
+        #expect(looks > 0, "the reader overlapped no replace")
+        #expect(missing == 0, "the file was missing \(missing) of \(looks) times during replaces")
         #expect(try Data(contentsOf: url) == Data("audio".utf8))
     }
 }
 
-private final class Flag: @unchecked Sendable {
-    var value = false, finished = false, missing = 0
+/// Shared between the reader thread and the test, under a lock.
+private final class ReaderState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stopped = false, looks = 0, missing = 0
+    var stopping: Bool { lock.withLock { stopped } }
+    func stop() { lock.withLock { stopped = true } }
+    func look(_ present: Bool) { lock.withLock { looks += 1; if !present { missing += 1 } } }
+    var counts: (Int, Int) { lock.withLock { (looks, missing) } }
 }
