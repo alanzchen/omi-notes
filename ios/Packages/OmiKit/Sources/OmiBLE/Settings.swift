@@ -238,12 +238,18 @@ public final class SettingsStore: @unchecked Sendable {
     }
 
     public var phoneInstallId: String? {
-        if let id = defaults.string(forKey: Key.installId) { return id }
-        guard unlockedSinceBoot else { return nil }
-        let id = UUID().uuidString.lowercased()
-        defaults.set(id, forKey: Key.installId)
-        return id
+        // one id even when first read on two threads at once (ASTRA-20261116-IT4-02): a second id would make Watch
+        // parts bound to the first look like another iPhone's
+        Self.installIdLock.withLock {
+            if let id = defaults.string(forKey: Key.installId) { return id }
+            guard unlockedSinceBoot else { return nil }
+            let id = UUID().uuidString.lowercased()
+            defaults.set(id, forKey: Key.installId)
+            return id
+        }
     }
+
+    private static let installIdLock = NSLock()
 
     /// Collect the audio stored on the pendant on every connection (on by default).
     public var autoCollectPendantAudio: Bool {
