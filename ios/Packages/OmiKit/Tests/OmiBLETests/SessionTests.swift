@@ -346,20 +346,39 @@ struct SessionHarness {
 
     @Test func audioAfterTheWatchdogIsLoggedWithItsDelay() {
         // 2026-11-17: 59 watchdog warnings in 48 h of the phone log, none followed by any line saying whether audio
-        // came; only the server's chunks could tell. Silence (the mic sleeps) is expected, so the watchdog says so at
-        // info level, and the first audio after it is logged with how long after subscribing it came
+        // came; only the server's chunks could tell. The watchdog line says what it saw (no cause: it can't know),
+        // and the first audio after it is logged with how long after the subscription was confirmed it came
         let h = SessionHarness()
         h.connectFully()
         h.clock.advance(11)
         h.session.tick()
         let watchdog = OmiLog.shared.recent().last { $0.message.hasPrefix("no audio within 10 s of subscribing") }
-        #expect(watchdog?.level == .info)
+        #expect(watchdog?.level == .info && watchdog?.message == "no audio within 10 s of subscribing (device may be silent); subscribing again")
         h.clock.advance(36.4)
         h.transport.audio(Data([1, 0, 0, 0xB8]))
         h.clock.advance(1)
         h.transport.audio(Data([2, 0, 0, 0xB8]))
         let lines = OmiLog.shared.recent().filter { $0.message == "first audio 47 s after subscribing" }
-        #expect(lines.count == 1, "once per subscription, not per notification")
+        #expect(lines.count == 1, "once, not per notification")
+    }
+
+    @Test func theWatchdogFiresOncePerConnectionAndTheDelayCountsFromTheLatestSubscription() {
+        // ASTRA-20261117-IT1-03: what "once" and "after subscribing" actually mean. The watchdog and the first-audio
+        // line are per connection (one DeviceSession); a pause and resume confirms a new subscription, which is what
+        // the delay is measured from, and doesn't fire the watchdog again
+        let h = SessionHarness()
+        h.connectFully()
+        h.clock.advance(11)
+        h.session.tick()
+        h.session.setAudioPaused(true)
+        h.session.setAudioPaused(false)
+        h.transport.confirmAudioSubscription()
+        h.clock.advance(11)
+        h.session.tick()
+        #expect(h.transport.calls.filter { $0 == "notify audioData true" }.count == 3, "connect, watchdog, resume: no second watchdog")
+        h.clock.advance(12.2)
+        h.transport.audio(Data([1, 0, 0, 0xB8]))
+        #expect(OmiLog.shared.recent().contains { $0.message == "first audio 23 s after subscribing" })
     }
 
     @Test func legacyStorageStatusGetsNoStorageWrites() {

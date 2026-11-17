@@ -2,15 +2,15 @@ import Foundation
 import Testing
 @testable import OmiBLE
 
-/// ASTRA-20261116-IT4-02: the phone's install id is made on first read. Two first reads at once (the engine's queue
-/// and a WatchConnectivity callback) could each make and save a different id, and a Watch part bound to the one
-/// that lost was refused as another iPhone's.
+/// ASTRA-20261116-IT4-02: the phone's install id is made on first read. Two first reads at once in the app's process
+/// (the engine's queue and a WatchConnectivity callback) could each make and save a different id, and a Watch part
+/// bound to the one that lost was refused as another iPhone's. The lock is per process.
 @Suite struct InstallIdTests {
     @Test func concurrentFirstReadsAgreeOnOneId() {
         var split = 0
         for _ in 0..<200 {
             let defaults = UserDefaults(suiteName: "omi-install-\(UUID().uuidString)")!
-            // two stores over the same defaults, as the app and an extension or a second engine could be
+            // two stores in one process over the same defaults
             let stores = [SettingsStore(defaults: defaults, tokens: InMemoryTokenStore()), SettingsStore(defaults: defaults, tokens: InMemoryTokenStore())]
             let seen = IdSet<Set<String>>([])
             DispatchQueue.concurrentPerform(iterations: 8) { i in

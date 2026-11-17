@@ -255,8 +255,9 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
            now &- s >= Self.livenessTimeout {
             watchdogFired = true
             info.noAudioYet = true
-            // usually the mic asleep in silence (device-protocol.md); the line after says when audio came
-            log(.info, "ble", "no audio within 10 s of subscribing (mic asleep or silent); subscribing again")
+            // what was seen, not why (a silent pendant's mic sleeps, device-protocol.md); once per connection, and the
+            // first audio after it is logged with its delay from the latest confirmed subscription
+            log(.info, "ble", "no audio within 10 s of subscribing (device may be silent); subscribing again")
             transport.setNotify(true, for: .audioData)
             delegate?.sessionDidChange(self)
         }
