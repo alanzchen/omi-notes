@@ -341,7 +341,8 @@ public struct PendantSummary: Equatable, Sendable {
 #if DEBUG
 extension PendantSummary {
     /// Simulator screenshots only (debug builds): synthetic states run through the real `evaluate`.
-    /// `normal`, `mid`, `charging`, `disconnected`, `unpaired`, `blocked` (uploads blocked + low battery + pendant sync).
+    /// `normal`, `mid`, `charging`, `disconnected`, `unpaired`, `blocked` (uploads blocked + low battery + pendant sync),
+    /// `silent` (connected, no audio since subscribing), `reconnecting`, `syncing` (collecting stored audio).
     public static func debugFixture(_ name: String, now: Date = Date()) -> PendantSummary? {
         var s = EngineSnapshot()
         s.ready = true
@@ -366,6 +367,19 @@ extension PendantSummary {
             s.device = d
             s.live = live
             s.offline = .complete(records: 0)
+        case "silent":
+            s.connection = .streaming
+            d.noAudioYet = true
+            s.device = d
+            s.offline = .complete(records: 0)
+        case "reconnecting":
+            s.connection = .settingUp
+            s.pendantLastConnectedAt = now.addingTimeInterval(-40)
+        case "syncing":
+            s.connection = .streaming
+            s.device = d
+            s.live = live
+            s.offline = .receiving(received: 68, total: 241)
         case "disconnected":
             s.connection = .waitingForDevice
             s.upload.lastSuccessAt = now.addingTimeInterval(-24 * 60)
