@@ -344,6 +344,24 @@ struct SessionHarness {
         #expect(!h.session.info.noAudioYet)
     }
 
+    @Test func audioAfterTheWatchdogIsLoggedWithItsDelay() {
+        // 2026-11-17: 59 watchdog warnings in 48 h of the phone log, none followed by any line saying whether audio
+        // came; only the server's chunks could tell. Silence (the mic sleeps) is expected, so the watchdog says so at
+        // info level, and the first audio after it is logged with how long after subscribing it came
+        let h = SessionHarness()
+        h.connectFully()
+        h.clock.advance(11)
+        h.session.tick()
+        let watchdog = OmiLog.shared.recent().last { $0.message.hasPrefix("no audio within 10 s of subscribing") }
+        #expect(watchdog?.level == .info)
+        h.clock.advance(36.4)
+        h.transport.audio(Data([1, 0, 0, 0xB8]))
+        h.clock.advance(1)
+        h.transport.audio(Data([2, 0, 0, 0xB8]))
+        let lines = OmiLog.shared.recent().filter { $0.message == "first audio 47 s after subscribing" }
+        #expect(lines.count == 1, "once per subscription, not per notification")
+    }
+
     @Test func legacyStorageStatusGetsNoStorageWrites() {
         let h = SessionHarness(values: FakeDeviceTransport.cv1Values(status: Data(count: 8)))
         h.connectFully()

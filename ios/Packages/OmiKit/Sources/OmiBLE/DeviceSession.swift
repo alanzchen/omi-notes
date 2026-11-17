@@ -255,7 +255,8 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
            now &- s >= Self.livenessTimeout {
             watchdogFired = true
             info.noAudioYet = true
-            log(.warning, "ble", "no audio notification within 10 s of subscribing (device may be silent); re-issuing subscribe")
+            // usually the mic asleep in silence (device-protocol.md); the line after says when audio came
+            log(.info, "ble", "no audio within 10 s of subscribing (mic asleep or silent); subscribing again")
             transport.setNotify(true, for: .audioData)
             delegate?.sessionDidChange(self)
         }
@@ -501,6 +502,9 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
         let ok = recorder.append(value)
         let now = clock.monotonicNanoseconds()
         let wokeFromSilence = lastNotificationMono.map { now &- $0 >= Self.silenceWakeThreshold } ?? false
+        if lastNotificationMono == nil, watchdogFired, let s = subscribedAtMono {
+            log(.info, "ble", "first audio \(Int((Double(now &- s) / 1e9).rounded())) s after subscribing")
+        }
         lastNotificationMono = now
         if info.noAudioYet { info.noAudioYet = false }
         if let h = AudioPacketHeader(value) { loss.record(h.sequence) }
