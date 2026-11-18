@@ -29,8 +29,6 @@ struct ServerView: View {
                 #if DEBUG
                 NavigationLink("Developer tools", value: Page.developer)
                 #endif
-            } footer: {
-                Text("Diagnostics shows the pendant, Bluetooth and upload details used for troubleshooting.")
             }
         }
         .navigationTitle("Server")
@@ -151,8 +149,6 @@ struct ServerView: View {
             }
         } header: {
             Text("Processing")
-        } footer: {
-            Text("Recordings stay on this phone until the server confirms it has saved them.")
         }
     }
 
