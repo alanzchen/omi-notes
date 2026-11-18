@@ -51,16 +51,24 @@ import Testing
             finished.signal()
         }.start()
         #expect(started.wait(timeout: .now() + 5) == .success, "the reader never started")
-        defer {
+        var joined = false
+        func join() {
+            guard !joined else { return }
+            joined = true
             state.stop()
             if finished.wait(timeout: .now() + 5) != .success { Issue.record("the reader didn't stop") }
         }
+        defer { join() }
+        // reads counted between the first and the last replace (ASTRA-20261117-IT3-04): they overlapped the replaces
+        let before = state.counts.0
         for i in 1...400 { try Files.durableWrite(Data("\(i)".utf8), to: url) }
         let source = dir.appendingPathComponent("audio.src")
         try Data("audio".utf8).write(to: source)
         for _ in 1...100 { try Files.durableCopy(source, to: url) }
+        let during = state.counts.0 - before
+        join()  // the counters are read once the reader has stopped
         let (looks, missing) = state.counts
-        #expect(looks > 0, "the reader overlapped no replace")
+        #expect(during > 0, "no read happened while the files were being replaced")
         #expect(missing == 0, "the file was missing \(missing) of \(looks) times during replaces")
         #expect(try Data(contentsOf: url) == Data("audio".utf8))
     }
