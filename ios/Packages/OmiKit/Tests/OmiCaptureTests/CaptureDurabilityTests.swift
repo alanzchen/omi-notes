@@ -124,3 +124,52 @@ import OmiProtocol
         #expect(t.pendingChunks().count == 1 && FileIO.contents(of: t.dirs.outboxQuarantine).isEmpty)
     }
 }
+
+/// ASTRA-20261118-IT3-01/02: each retained journal is retired only once its own chunk is accounted for where it actually
+/// is (pending synced, sent = acknowledged, quarantine synced) or, if it is gone, rebuilt under the same identity from
+/// the frozen journal and the header saved beside it. SYNTHETIC audio, real 0300 directories.
+@Suite(.serialized) struct JournalAccountingTests {
+    func restrict(_ dir: URL) throws {
+        try FileManager.default.setAttributes([.posixPermissions: 0o300], ofItemAtPath: dir.path)
+        let fd = open(dir.path, O_RDONLY), code = errno
+        if fd >= 0 { close(fd) }
+        try #require(fd < 0 && code == EACCES)
+    }
+    func allow(_ dir: URL) { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path) }
+
+    @Test func aLostChunkIsRebuiltWithTheSameBytesFromItsFrozenJournal() throws {
+        let t = TestEnv()
+        defer { allow(t.dirs.outboxPending) }
+        var recorder: LiveCaptureRecorder? = try LiveCaptureTests().recorder(t).0
+        let id = try #require(recorder?.captureId)
+        for n in 0..<5 { #expect(recorder?.append(notification(seq: UInt16(n))) == true); t.clock.advance(0.02) }
+        try restrict(t.dirs.outboxPending)
+        t.clock.advance(61)
+        recorder?.tick()
+        let output = t.dirs.outboxPending.appendingPathComponent(OutboxKind.chunk(captureId: id, sequence: 0).fileName)
+        recorder = nil
+        allow(t.dirs.outboxPending)
+        let original = try Data(contentsOf: output)
+        try FileManager.default.removeItem(at: output)  // the unconfirmed entry a crash may lose
+        _ = CaptureRecovery.run(env: TestEnv(root: t.dirs.root).env, codecFallback: { _ in 21 })
+        #expect(try Data(contentsOf: output) == original, "the same identity and the same bytes")
+        #expect(!FileIO.exists(t.dirs.journalLive.appendingPathComponent(id)), "and only then is the capture retired")
+    }
+
+    @Test func aRingChunkQuarantinedUnconfirmedKeepsItsJournalAndTheDeviceRecords() throws {
+        let h = RingHarness(recordsPerChunk: 1)
+        defer { allow(h.t.dirs.outboxPending); allow(h.t.dirs.outboxQuarantine) }
+        h.startThroughInfoRequest(unread: 2)
+        h.feed([RingWire.info(read: 100, write: 102), RingWire.readBegin(100, 2)])
+        try restrict(h.t.dirs.outboxPending)
+        h.feed(RingWire.data([ringRecord(seq: 100), ringRecord(seq: 101)]))  // chunk 0 rotates, unconfirmed
+        let captureId = try #require(FileIO.contents(of: h.t.dirs.journalRing).first?.lastPathComponent)
+        try restrict(h.t.dirs.outboxQuarantine)
+        try h.t.outbox.quarantine(OutboxKind.chunk(captureId: captureId, sequence: 0).fileName, reason: "422: synthetic")
+        allow(h.t.dirs.outboxPending)
+        h.feed([RingWire.done(0, 102)])
+        #expect(!h.transport.writes.contains(RingProtocol.advanceCommand(newReadSeq: 102)), "chunk 0 isn't confirmed where it is")
+        let dir = h.t.dirs.journalRing.appendingPathComponent(captureId)
+        #expect(FileIO.exists(dir.appendingPathComponent(CaptureManifest.journalName(0))))
+    }
+}

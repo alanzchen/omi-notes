@@ -392,10 +392,13 @@ public final class LiveCaptureRecorder {
             endedAt: ISO8601UTC.format(m.wallDate(offsetUs: sealEnd)), endOffsetUs: sealEnd,
             deviceId: m.deviceId, source: .liveBLE)
         do {
-            let item = try env.outbox.write(try ContractJSON.encode(seal), kind: .seal(captureId: m.captureId))
+            let sealData = try ContractJSON.encode(seal)
+            let item = try env.outbox.write(sealData, kind: .seal(captureId: m.captureId))
             journal?.close()
-            // the capture's journals go only once the outbox is confirmed; otherwise launch recovery confirms them later
-            if retirement.confirm(outbox: env.outbox, category: "capture") == nil, let dir { try? FileManager.default.removeItem(at: dir) }
+            // the capture's journals go only once each chunk and the seal are accounted for; otherwise launch recovery
+            if retirement.settle(outbox: env.outbox, category: "capture", seal: (.seal(captureId: m.captureId), sealData)) == nil, let dir {
+                try? FileManager.default.removeItem(at: dir)
+            }
             log(.info, "capture", "live capture \(m.captureId) sealed (\(reason.rawValue), last chunk \(seal.lastChunkSequence))")
             retirement.forget()
             reset()
@@ -519,6 +522,7 @@ public final class LiveCaptureRecorder {
                 chunkSequence: seq, codecId: codec, startUs: start, endUs: end,
                 recordCount: scan.records.count, payloadBytes: payload.count, ringInfo: nil)
             let body = try Envelope.build(header: header, payload: payload)
+            FrozenChunk.save(header, beside: journalURL)  // what a lost output is rebuilt from
             item = try env.outbox.write(body, kind: .chunk(captureId: m.captureId, sequence: seq))
             count = scan.records.count
         } catch {
@@ -538,7 +542,7 @@ public final class LiveCaptureRecorder {
         manifestDirty = true
         commitManifest()
         _ = ensureJournal()
-        retirement.retire([journalURL], outbox: env.outbox, category: "capture")  // kept until the outbox is confirmed
+        retirement.retire(journalURL, kind: .chunk(captureId: m.captureId, sequence: seq), outbox: env.outbox, category: "capture")
         log(.info, "capture", "chunk \(seq) of \(m.captureId) closed (\(reason.rawValue), \(count) records, \(item.size) B)")
         onChunkFinalized?(item)
         return true
@@ -685,9 +689,10 @@ public final class RingCaptureWriter {
             lastChunkSequence: m.openChunkSequence - 1, reason: reason,
             endedAt: ISO8601UTC.format(m.wallDate(offsetUs: sealEnd)), endOffsetUs: sealEnd, deviceId: m.deviceId,
             source: .deviceRing, ring: evidence)
-        let item = try env.outbox.write(try ContractJSON.encode(seal), kind: .seal(captureId: m.captureId))
+        let sealData = try ContractJSON.encode(seal)
+        let item = try env.outbox.write(sealData, kind: .seal(captureId: m.captureId))
         journal?.close()
-        let unconfirmed = retirement.confirm(outbox: env.outbox, category: "ring")
+        let unconfirmed = retirement.settle(outbox: env.outbox, category: "ring", seal: (.seal(captureId: m.captureId), sealData))
         if unconfirmed == nil, let dir { try? FileManager.default.removeItem(at: dir) }
         log(.info, "ring", "ring capture \(m.captureId) sealed (\(reason.rawValue), \(recordsWritten) records, last chunk \(seal.lastChunkSequence))")
         manifest = nil
@@ -734,6 +739,7 @@ public final class RingCaptureWriter {
             recordCount: entries.count, payloadBytes: payload.count,
             ringInfo: RingChunkInfo(firstSequence: first, readSeq: ring.infoReadSeq, writeSeq: ring.infoWriteSeq, dropped: ring.dropped))
         let body = try Envelope.build(header: header, payload: payload)
+        FrozenChunk.save(header, beside: journalURL)  // what a lost output is rebuilt from
         let item = try env.outbox.write(body, kind: .chunk(captureId: m.captureId, sequence: seq))
         // Published: freeze the segment, move on, then commit the manifest (retried if it fails).
         journal?.close()
@@ -744,7 +750,7 @@ public final class RingCaptureWriter {
         chunkCount = 0
         manifestDirty = true
         commitManifest()
-        retirement.retire([journalURL], outbox: env.outbox, category: "ring")  // kept until the outbox is confirmed
+        retirement.retire(journalURL, kind: .chunk(captureId: m.captureId, sequence: seq), outbox: env.outbox, category: "ring")
         log(.info, "ring", "ring chunk \(seq) of \(m.captureId) closed (\(reason.rawValue), \(entries.count) records from seq \(first))")
         onChunkFinalized?(item)
     }
@@ -936,13 +942,12 @@ public enum CaptureRecovery {
         }
         let outbox = env.outbox
         if outbox.contains(.seal(captureId: m.captureId)) {
-            // sealed earlier: its journals go once the outbox is confirmed (ASTRA-20261118-IT2-01), else next launch
-            do {
-                try outbox.confirmPending()
-                try? FileManager.default.removeItem(at: dir)
-            } catch {
+            // sealed earlier: a seal is no evidence for its chunks; every journal is accounted for first (IT3-01)
+            if let error = accountForJournals(in: dir, captureId: m.captureId, outbox: outbox) {
                 report.skipped.append(dir.lastPathComponent)
-                log(.warning, "recovery", "\(dir.lastPathComponent) kept until the outbox is confirmed: \(error.localizedDescription)")
+                log(.warning, "recovery", "\(dir.lastPathComponent) kept: not every chunk is accounted for (\(error.localizedDescription))")
+            } else {
+                try? FileManager.default.removeItem(at: dir)
             }
             return false
         }
@@ -981,7 +986,7 @@ public enum CaptureRecovery {
         }
         if !raw.isEmpty {
             do {
-                if let written = try finalizeRecovered(manifest: m, raw: raw, env: env, codecFallback: codecFallback, report: &report) {
+                if let written = try finalizeRecovered(manifest: m, raw: raw, dir: dir, env: env, codecFallback: codecFallback, report: &report) {
                     endUs = written
                     m.openChunkSequence = seq + 1
                 }
@@ -998,12 +1003,15 @@ public enum CaptureRecovery {
             endedAt: ISO8601UTC.format(m.wallDate(offsetUs: endUs)), endOffsetUs: endUs, deviceId: m.deviceId,
             source: m.source)
         do {
-            try outbox.write(try ContractJSON.encode(seal), kind: .seal(captureId: m.captureId))
-            do {
-                try outbox.confirmPending()
+            let sealData = try ContractJSON.encode(seal)
+            try outbox.write(sealData, kind: .seal(captureId: m.captureId))
+            // every journal in the folder, those below the manifest's sequence included, and the seal (IT3-01)
+            let unaccounted = accountForJournals(in: dir, captureId: m.captureId, outbox: outbox)
+                ?? { do { try outbox.account(.seal(captureId: m.captureId)) { sealData }; return nil } catch { return error } }()
+            if let unaccounted {
+                log(.warning, "recovery", "\(m.captureId) sealed; its journals kept: not every chunk is accounted for (\(unaccounted.localizedDescription))")
+            } else {
                 try? FileManager.default.removeItem(at: dir)
-            } catch {
-                log(.warning, "recovery", "\(m.captureId) sealed; its journals kept until the outbox is confirmed: \(error.localizedDescription)")
             }
             log(.info, "recovery", "\(m.source.rawValue) capture \(m.captureId) recovered and sealed app_recovered (last chunk \(seal.lastChunkSequence))")
             return true
@@ -1014,7 +1022,7 @@ public enum CaptureRecovery {
     }
 
     /// Returns the chunk end offset if a chunk was written.
-    private static func finalizeRecovered(manifest m: CaptureManifest, raw: Data, env: CaptureEnvironment, codecFallback: (String) -> Int?, report: inout Report) throws -> Int64? {
+    private static func finalizeRecovered(manifest m: CaptureManifest, raw: Data, dir: URL, env: CaptureEnvironment, codecFallback: (String) -> Int?, report: inout Report) throws -> Int64? {
         guard let codec = m.codecId ?? codecFallback(m.deviceId) else { throw RecoveryError.codecUnknown }
         let seq = m.openChunkSequence
         switch m.source {
@@ -1028,6 +1036,7 @@ public enum CaptureRecovery {
                 chunkSequence: seq, codecId: codec, startUs: m.openChunkStartOffsetUs, endUs: endUs,
                 recordCount: entries.count, payloadBytes: payload.count,
                 ringInfo: RingChunkInfo(firstSequence: first, readSeq: ring.infoReadSeq, writeSeq: ring.infoWriteSeq, dropped: ring.dropped))
+            FrozenChunk.save(header, beside: dir.appendingPathComponent(CaptureManifest.journalName(seq)))
             try env.outbox.write(try Envelope.build(header: header, payload: payload), kind: .chunk(captureId: m.captureId, sequence: seq))
             if let last = entries.last?.seq {
                 report.ringDurable.append(RingDurableMark(deviceId: m.deviceId, generation: ring.generation, seq: last))
@@ -1042,12 +1051,28 @@ public enum CaptureRecovery {
             let header = m.header(
                 chunkSequence: seq, codecId: codec, startUs: m.openChunkStartOffsetUs, endUs: endUs,
                 recordCount: scan.records.count, payloadBytes: payload.count, ringInfo: nil)
+            FrozenChunk.save(header, beside: dir.appendingPathComponent(CaptureManifest.journalName(seq)))
             try env.outbox.write(try Envelope.build(header: header, payload: payload), kind: .chunk(captureId: m.captureId, sequence: seq))
             if scan.validLength != raw.count {
                 log(.warning, "recovery", "cut torn tail of \(raw.count - scan.validLength) B from \(m.captureId) chunk \(seq)")
             }
             return endUs
         }
+    }
+
+    /// Accounts for every non-empty journal in a capture's folder by its own chunk (`Outbox.account`), whatever its sequence;
+    /// returns the first error, nil when all are accounted for. A sealed capture or a counter is no evidence (IT3-01).
+    static func accountForJournals(in dir: URL, captureId: String, outbox: Outbox) -> Error? {
+        var first: Error?
+        for url in FileIO.contents(of: dir) where url.pathExtension == "journal" && FileIO.fileSize(url) > 0 {
+            guard let seq = CaptureManifest.journalSequence(url.lastPathComponent) else { continue }
+            do {
+                try outbox.account(.chunk(captureId: captureId, sequence: seq)) { FrozenChunk.rebuild(journal: url) }
+            } catch {
+                first = first ?? error
+            }
+        }
+        return first
     }
 
     private static func existingChunkEnd(outbox: Outbox, kind: OutboxKind) -> Int64? {
@@ -1057,36 +1082,75 @@ public enum CaptureRecovery {
     }
 }
 
-/// Journals whose chunks are in the outbox but not yet confirmed durable. They go together once `outbox/pending` syncs
-/// (one directory sync covers every entry already published there); until then they stay, so a crash can't leave a
-/// chunk whose directory entry was lost after its journal was deleted (ASTRA-20261118-IT2-01). A rotated journal
-/// no longer grows (the next records go to the next chunk's journal), so nothing is ever rebuilt under a published
-/// identity. A failure is logged once until a confirmation succeeds.
-struct JournalRetirement {
-    private(set) var kept: [URL] = []
-    private var failureLogged = false
+/// A published chunk's envelope header, saved beside its journal before publication: with the frozen journal (a
+/// rotated journal no longer grows) it rebuilds the same envelope, bytes and identity, if the published entry is lost
+/// (ASTRA-20261118-IT3-01). Best effort: without it a lost entry's journal is kept, never deleted.
+enum FrozenChunk {
+    static func headerURL(_ journal: URL) -> URL { journal.deletingPathExtension().appendingPathExtension("header") }
 
-    /// Adds `journals` and confirms the outbox; they are removed if it is confirmed, kept otherwise.
-    mutating func retire(_ journals: [URL], outbox: Outbox, category: String) {
-        kept += journals
-        if !kept.isEmpty { _ = confirm(outbox: outbox, category: category) }
+    static func save(_ header: EnvelopeHeader, beside journal: URL) {
+        do { try FileIO.atomicWrite(try Envelope.headerJSON(header), to: headerURL(journal)) } catch {
+            log(.warning, "capture", "chunk header not saved (\(error.localizedDescription)); its journal is kept if the chunk is lost")
+        }
     }
 
-    /// Confirms the outbox and removes the journals kept; returns the error when it can't be confirmed.
-    mutating func confirm(outbox: Outbox, category: String) -> Error? {
-        do {
-            try outbox.confirmPending()
-        } catch {
+    /// The chunk's envelope from its frozen journal and saved header; nil when either is missing or they don't match.
+    static func rebuild(journal: URL) -> Data? {
+        guard let json = try? Data(contentsOf: headerURL(journal)), let header = try? JSONDecoder().decode(EnvelopeHeader.self, from: json),
+              let raw = try? Data(contentsOf: journal) else { return nil }
+        let payload: Data
+        if header.source == .deviceRing {
+            payload = RingJournal.scan(raw).entries.reduce(into: Data()) { $0.append($1.record) }
+        } else {
+            payload = Data(raw.prefix(BLERecord.scan(raw).validLength))
+        }
+        guard payload.count == header.payloadBytes else { return nil }
+        return try? Envelope.build(header: header, payload: payload)
+    }
+}
+
+/// Journals of published chunks not yet accounted for. Each goes (with its saved header) only once its own chunk is
+/// accounted for where it is (`Outbox.account`: pending or quarantine synced, sent acknowledged, or rebuilt); until
+/// then it stays, so a crash can't leave a chunk whose entry was lost after its journal was deleted
+/// (ASTRA-20261118-IT2-01, IT3-01/02). Work scales with the journals kept, not the outbox. A failure is logged once
+/// until everything kept is accounted for.
+struct JournalRetirement {
+    private(set) var kept: [(journal: URL, kind: OutboxKind)] = []
+    private var failureLogged = false
+
+    /// Adds a rotated journal and accounts for everything kept.
+    mutating func retire(_ journal: URL, kind: OutboxKind, outbox: Outbox, category: String) {
+        kept.append((journal, kind))
+        _ = settle(outbox: outbox, category: category)
+    }
+
+    /// Accounts for every kept journal (and `seal`, when given): removes those accounted for; returns the first error.
+    mutating func settle(outbox: Outbox, category: String, seal: (OutboxKind, Data)? = nil) -> Error? {
+        var remaining: [(journal: URL, kind: OutboxKind)] = []
+        var first: Error?
+        for entry in kept {
+            do {
+                try outbox.account(entry.kind) { FrozenChunk.rebuild(journal: entry.journal) }
+                try? FileManager.default.removeItem(at: entry.journal)
+                try? FileManager.default.removeItem(at: FrozenChunk.headerURL(entry.journal))
+            } catch {
+                remaining.append(entry)
+                first = first ?? error
+            }
+        }
+        kept = remaining
+        if first == nil, let (kind, data) = seal {
+            do { try outbox.account(kind) { data } } catch { first = error }
+        }
+        if let first {
             if !failureLogged {
-                log(.error, category, "outbox not confirmed durable (\(error.localizedDescription)); \(kept.count) journal(s) kept")
+                log(.error, category, "outbox not accounted for (\(first.localizedDescription)); \(kept.count) journal(s) kept")
                 failureLogged = true
             }
-            return error
+        } else {
+            failureLogged = false
         }
-        for url in kept { try? FileManager.default.removeItem(at: url) }
-        kept = []
-        failureLogged = false
-        return nil
+        return first
     }
 
     /// The capture ended: what is still kept stays in its directory, for launch recovery.

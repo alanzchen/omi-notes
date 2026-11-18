@@ -164,10 +164,25 @@ public final class Outbox: @unchecked Sendable {
         return item
     }
 
-    /// Confirms every entry already published into `pending/` (one directory sync); throws when it can't. An entry no longer
-    /// there was moved by a rename (to `sent/` after the server's acknowledgement, or to quarantine), so it is in one
-    /// place or the other either way (ASTRA-20261118-IT2-01).
-    public func confirmPending() throws { try FileIO.syncDirectory(dirs.outboxPending) }
+    /// Accounts for one published entry where it actually is, under the outbox lock so no move slips between finding it
+    /// and syncing its directory (ASTRA-20261118-IT3-02): in `sent/`, the server acknowledged it; in `pending/` or
+    /// quarantine, that directory synced; gone, `rebuild` (the same bytes under the same identity) published into
+    /// `pending/` with its directory synced. Throws when it can't be accounted for: the caller keeps its source.
+    public func account(_ kind: OutboxKind, rebuild: () -> Data?) throws {
+        lock.lock(); defer { lock.unlock() }
+        let name = kind.fileName
+        if FileIO.exists(dirs.outboxSent.appendingPathComponent(name)) { return }
+        for dir in [dirs.outboxPending, dirs.outboxQuarantine] where FileIO.exists(dir.appendingPathComponent(name)) {
+            try FileIO.syncDirectory(dir)
+            return
+        }
+        guard let data = rebuild() else { throw FileIOError.posix("rebuild missing output", ENOENT) }
+        let url = dirs.outboxPending.appendingPathComponent(name)
+        let fresh = isFreshLocked(dirs.outboxPending)
+        try FileIO.atomicWrite(data, to: url, requireDirectorySync: true)
+        let item = OutboxItem(kind: kind, url: url, size: Int64(data.count), modified: FileIO.modificationDate(url))
+        updateLocked(dirs.outboxPending, wasFresh: fresh) { $0[name] = item }
+    }
 
     /// Location of an item in any directory (pending first).
     public func locate(_ kind: OutboxKind) -> URL? {
