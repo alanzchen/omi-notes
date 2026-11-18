@@ -268,12 +268,22 @@ enum SyncFaults {
 }
 #endif
 
-/// A file operation that failed: which one, on which file, and errno (ASTRA-20261117-IT3-02).
-struct DurableFileError: Error, CustomStringConvertible {
+/// A file operation that failed: which one, on what kind of file, and errno (ASTRA-20261117-IT3-02). Said the same by
+/// `localizedDescription`, which is what the logs use (ASTRA-20261118-IT1-02); the kind, never a file name (they carry
+/// recording ids).
+struct DurableFileError: Error, CustomStringConvertible, LocalizedError {
     let operation: String
     let file: String
     let code: Int32
+    init(operation: String, url: URL, code: Int32) {
+        self.operation = operation
+        self.code = code
+        let name = url.lastPathComponent
+        file = name.hasSuffix(".tmp") ? "temporary file" : name.hasSuffix(".m4a") ? "audio file"
+            : name.hasSuffix(".json") || name.hasSuffix(".intent") ? "manifest" : url.hasDirectoryPath || !name.contains(".") ? "directory or marker" : "file"
+    }
     var description: String { "\(operation) \(file) failed: errno \(code) (\(String(cString: strerror(code))))" }
+    var errorDescription: String? { description }
 }
 
 enum Files {
@@ -317,25 +327,27 @@ enum Files {
     /// (ASTRA-20261117-IT1-01; removing first left a moment with no manifest, receipt or audio copy at all).
     /// A failed directory sync is an error too: the rename may not survive a crash, so the write isn't reported durable.
     static func replace(_ url: URL, with tmp: URL) throws {
-        guard rename(tmp.path, url.path) == 0 else { throw DurableFileError(operation: "rename", file: url.lastPathComponent, code: errno) }
+        guard rename(tmp.path, url.path) == 0 else { throw DurableFileError(operation: "rename", url: url, code: errno) }
         try fsync(url.deletingLastPathComponent())
     }
 
-    /// fsync(2), retried when interrupted (EINTR); any other failure throws with its errno (ASTRA-20261117-IT3-02).
+    /// fsync(2), retried when interrupted (EINTR, at most 100 times); any other failure throws with its errno
+    /// (ASTRA-20261117-IT3-02).
     static func fsync(_ url: URL) throws {
         let fd = open(url.path, O_RDONLY)
-        guard fd >= 0 else { throw DurableFileError(operation: "open", file: url.lastPathComponent, code: errno) }
+        guard fd >= 0 else { throw DurableFileError(operation: "open", url: url, code: errno) }
         defer { close(fd) }
-        while true {
+        var code: Int32 = EINTR
+        for _ in 0..<100 where code == EINTR {  // a bounded retry: an endless run of interruptions is a failure too
             #if DEBUG
             let injected = SyncFaults.fault(url)
             #else
             let injected: Int32? = nil
             #endif
-            let code: Int32 = injected ?? (Darwin.fsync(fd) == 0 ? 0 : errno)
+            code = injected ?? (Darwin.fsync(fd) == 0 ? 0 : errno)
             if code == 0 { return }
-            if code != EINTR { throw DurableFileError(operation: "fsync", file: url.lastPathComponent, code: code) }
         }
+        throw DurableFileError(operation: "fsync", url: url, code: code)
     }
 
     static func names(_ dir: URL, suffix: String) -> [String] {
