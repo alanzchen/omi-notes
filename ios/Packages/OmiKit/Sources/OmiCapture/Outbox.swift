@@ -139,21 +139,26 @@ public final class Outbox: @unchecked Sendable {
     /// Writes atomically into `pending/`. An identity is immutable once published: if a file with
     /// the same name exists anywhere (pending, sent, quarantine), identical bytes are a no-op and
     /// different (or unreadable) bytes throw `OutboxError.identityConflict` — never an overwrite.
+    /// `requireDurable`: throws unless `pending/`'s directory sync succeeds, for a caller that retires its source on
+    /// success (the Watch relay); capture callers keep best-effort directory syncs.
     @discardableResult
-    public func write(_ data: Data, kind: OutboxKind) throws -> OutboxItem {
+    public func write(_ data: Data, kind: OutboxKind, requireDurable: Bool = false) throws -> OutboxItem {
         lock.lock(); defer { lock.unlock() }
         let name = kind.fileName
         for dir in [dirs.outboxPending, dirs.outboxSent, dirs.outboxQuarantine] {
             let existing = dir.appendingPathComponent(name)
             guard FileIO.exists(existing) else { continue }
             if let bytes = try? Data(contentsOf: existing), bytes == data {
+                // already there, from an earlier attempt that may have failed its directory sync: being there isn't
+                // being durable (ASTRA-20261118-IT1-01)
+                if requireDurable { try FileIO.syncDirectory(dir) }
                 return OutboxItem(kind: kind, url: existing, size: Int64(data.count), modified: FileIO.modificationDate(existing))
             }
             throw OutboxError.identityConflict(name)
         }
         let url = dirs.outboxPending.appendingPathComponent(name)
         let fresh = isFreshLocked(dirs.outboxPending)
-        try FileIO.atomicWrite(data, to: url)
+        try FileIO.atomicWrite(data, to: url, requireDirectorySync: requireDurable)
         let item = OutboxItem(kind: kind, url: url, size: Int64(data.count), modified: FileIO.modificationDate(url))
         updateLocked(dirs.outboxPending, wasFresh: fresh) { $0[name] = item }
         return item

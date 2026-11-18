@@ -56,12 +56,17 @@ final class WatchRelayProcessor {
                     chunkStartOffsetUs: segment.startOffsetUs, chunkEndOffsetUs: end, clockQuality: .unknown,
                     timezone: timezone, recordCount: samples, payloadBytes: payload.count, offlineStorage: nil, ring: nil,
                     appVersion: appVersion)
-                try outbox.write(try Envelope.build(header: header, payload: payload), kind: .chunk(captureId: segment.recordingId, sequence: segment.index))
+                // durably published before the original goes: it is what the receipt then rests on (ASTRA-20261118-IT1-01)
+                try outbox.write(try Envelope.build(header: header, payload: payload), kind: .chunk(captureId: segment.recordingId, sequence: segment.index),
+                                 requireDurable: true)
                 try inbox.markConverted(segment, chunkEndUs: end)
                 written += 1
             } catch let e as OutboxError {
                 log(.error, "watch", "segment \(segment.id) conflicts with what was already queued: \(e)")
                 inbox.quarantine(segment, reason: "\(e)")
+            } catch let e as FileIOError {
+                // storage, not the part: kept in the inbox as it is and tried again on the next pass
+                log(.error, "watch", "segment \(segment.id) not stored yet: \(e)")
             } catch {
                 // unreadable audio: kept aside (never deleted), and the recording can still be sealed
                 log(.error, "watch", "segment \(segment.id) couldn't be converted: \(error)")
@@ -73,7 +78,7 @@ final class WatchRelayProcessor {
                                 endedAt: ISO8601UTC.format(end.endedAt), endOffsetUs: lastChunkEnd ?? end.endOffsetUs,
                                 deviceId: end.deviceId, source: .watchMic)
             do {
-                try outbox.write(try ContractJSON.encode(seal), kind: .seal(captureId: end.recordingId))
+                try outbox.write(try ContractJSON.encode(seal), kind: .seal(captureId: end.recordingId), requireDurable: true)
                 try inbox.markSealed(end)
                 written += 1
             } catch {

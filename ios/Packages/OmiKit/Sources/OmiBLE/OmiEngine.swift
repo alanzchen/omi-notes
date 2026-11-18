@@ -651,7 +651,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
         guard batch.binding == phone else { throw WatchRelayError.wrongPhone }
         let at = batch.data.samples.first?.at ?? ISO8601UTC.format(Date())
         let body = EventBody(deviceId: batch.deviceId, at: at, payload: .watchPerf(batch.data))
-        try outbox.write(try ContractJSON.encode(body), kind: .event(eventId: batch.id))
+        try outbox.write(try ContractJSON.encode(body), kind: .event(eventId: batch.id), requireDurable: true)  // the Watch drops it on our ACK
         // older Watch apps say their build only here
         if let last = batch.data.samples.last, let build = WatchAppBuild.parse(app: last.app), let when = ISO8601UTC.parse(last.at) {
             watchInbox.saveAppBuild(WatchAppBuild(build: build, at: when, deviceId: batch.deviceId, source: .telemetry, receivedAt: Date()))

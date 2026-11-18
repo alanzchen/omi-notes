@@ -335,13 +335,15 @@ public struct ServerEndpoint: Sendable, Equatable {
 
 // MARK: - File I/O
 
-public enum FileIOError: Error, CustomStringConvertible {
+public enum FileIOError: Error, CustomStringConvertible, LocalizedError {
     case posix(String, Int32)
     public var description: String {
         switch self {
-        case .posix(let op, let code): return "\(op): \(String(cString: strerror(code)))"
+        case .posix(let op, let code): return "\(op): errno \(code) (\(String(cString: strerror(code))))"
         }
     }
+    /// What `localizedDescription` (and so the logs) show: the operation and errno (ASTRA-20261118-IT1-02).
+    public var errorDescription: String? { description }
     public var isOutOfSpace: Bool {
         if case .posix(_, let code) = self { return code == ENOSPC || code == EDQUOT }
         return false
@@ -358,12 +360,15 @@ public enum FileIO {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true, attributes: attrs)
     }
 
-    /// temp file in the same directory → write → fsync (F_FULLFSYNC) → rename → fsync directory.
-    public static func atomicWrite(_ data: Data, to url: URL) throws {
+    /// temp file in the same directory → write → fsync (F_FULLFSYNC) → rename → fsync directory. With
+    /// `requireDirectorySync` a failed directory sync throws (the file is renamed in but not known durable: the caller
+    /// must not act as if it were, ASTRA-20261118-IT1-01); without it the sync is best effort, as for the capture
+    /// journal's chunks and the stores, whose callers retry or rebuild what a crash loses.
+    public static func atomicWrite(_ data: Data, to url: URL, requireDirectorySync: Bool = false) throws {
         let dir = url.deletingLastPathComponent()
         let tmp = dir.appendingPathComponent(".tmp-\(UUID().uuidString.lowercased())-\(url.lastPathComponent)")
         let fd = open(tmp.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
-        guard fd >= 0 else { throw FileIOError.posix("open \(tmp.lastPathComponent)", errno) }
+        guard fd >= 0 else { throw FileIOError.posix("open temporary file", errno) }
         var ok = false
         defer {
             if !ok { unlink(tmp.path) }
@@ -377,15 +382,23 @@ public enum FileIO {
         }
         guard rename(tmp.path, url.path) == 0 else { throw FileIOError.posix("rename", errno) }
         ok = true
-        fsyncDirectory(dir)
+        if requireDirectorySync { try syncDirectory(dir) } else { fsyncDirectory(dir) }
     }
 
-    public static func fsyncDirectory(_ url: URL) {
+    /// The one directory sync: open read-only and fsync, retried when interrupted; any failure throws.
+    public static func syncDirectory(_ url: URL) throws {
         let fd = open(url.path, O_RDONLY)
-        guard fd >= 0 else { return }
-        _ = fsync(fd)
-        close(fd)
+        guard fd >= 0 else { throw FileIOError.posix("open directory", errno) }
+        defer { close(fd) }
+        for _ in 0..<100 where fsync(fd) != 0 {
+            guard errno == EINTR else { throw FileIOError.posix("fsync directory", errno) }
+        }
     }
+
+    /// Best effort (`syncDirectory`, failure ignored): for callers that recover what a lost entry costs, e.g. a
+    /// re-queue whose rename is atomic either way. Returns whether it synced.
+    @discardableResult
+    public static func fsyncDirectory(_ url: URL) -> Bool { (try? syncDirectory(url)) != nil }
 
     static func writeAll(fd: Int32, data: Data) throws {
         try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
