@@ -120,6 +120,8 @@ struct StepRow: View {
     var onFix: (SystemHealth.Fix) -> Void
     /// A fix not to offer here (e.g. "Open Server" on the Server page itself).
     var hiding: SystemHealth.Fix?
+    /// The area's caption ("Server", "Pendant"…); off where the page title already says it.
+    var showsArea = true
     @Environment(\.dynamicTypeSize) private var typeSize
     @ScaledMetric private var iconWidth: CGFloat = 22
 
@@ -128,7 +130,7 @@ struct StepRow: View {
             Image(systemName: step.level.symbol).foregroundStyle(step.level.color)
                 .frame(width: typeSize.isAccessibilitySize ? nil : iconWidth).accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
-                Text(step.area.title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                if showsArea { Text(step.area.title).font(.caption.weight(.semibold)).foregroundStyle(.secondary) }
                 Text(step.title).font(.subheadline)
                 if let detail = step.detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
                 if let fix = step.fix, fix != hiding, step.level >= .delayed {

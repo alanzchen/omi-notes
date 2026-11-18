@@ -55,7 +55,8 @@ struct ServerView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     // the problems themselves are listed right below: the line doesn't repeat or point to them
                     let server = Self.headline(model.health(now: context.date).steps.first { $0.area == .server }!, listed: !model.issues.isEmpty)
-                    StepRow(step: server, onFix: onFix, hiding: .openServer)  // already on the Server page
+                    // already on the Server page: no "Open Server", and no "Server" caption under the page title
+                    StepRow(step: server, onFix: onFix, hiding: .openServer, showsArea: false)
                     if let at = model.serverStatusAt {
                         Text("Last answered \(SystemHealth.relative(at, context.date))").font(.caption).foregroundStyle(.secondary)
                     }
@@ -129,7 +130,9 @@ struct ServerView: View {
     private var processingSection: some View {
         Section {
             LabeledContent("Files waiting to upload", value: "\(s.outbox.pendingCount)")
-            if s.upload.inFlight > 0 { LabeledContent("Uploading now", value: "\(s.upload.inFlight)") }
+            // tasks handed to iOS's background session: moving only while the server answers. Otherwise iOS holds them
+            // for retry and "Files waiting to upload" (which counts them) is the whole truth
+            if s.upload.inFlight > 0, case .reachable = model.server { LabeledContent("Uploading now", value: "\(s.upload.inFlight)") }
             LabeledContent("Last upload", value: Fmt.relative(s.upload.lastSuccessAt))
             if let q = status?.queue {
                 LabeledContent("In progress", value: "\(q.conversationsOpen ?? 0)")
