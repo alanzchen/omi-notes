@@ -71,7 +71,8 @@ struct AlertsSection: View {
         } header: {
             Text("Alerts")
         } footer: {
-            Text("For problems this phone can see: recording stopped because storage is full, audio that couldn't be uploaded, uploads paused, or an Apple Watch recording stopped without you stopping it. Alerts never include what was said, and go away once fixed. They may arrive late: iOS decides when the app runs in the background.")
+            // one line: what the toggle can't say (iOS may deliver them late; they carry nothing that was said)
+            Text("They can arrive late and never include what was said.")
         }
         .onAppear { on = model.problemAlerts.enabled }
     }
