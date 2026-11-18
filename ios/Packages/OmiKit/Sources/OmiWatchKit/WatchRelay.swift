@@ -229,24 +229,51 @@ public enum WatchRelayError: Error, Equatable, LocalizedError {
     }
 }
 
+#if DEBUG
 /// Tests only: these paths (and, unless `exactly`, everything under them) fail fsync, to show what a failed sync does
-/// (ASTRA-20261117-IT2-02).
+/// (ASTRA-20261117-IT2-02). A rule can let `after` syncs succeed first, fail only `times` times, and give the errno.
 enum SyncFaults {
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var roots: Set<String> = []
-    nonisolated(unsafe) private static var exact: Set<String> = []
+    private struct Rule {
+        var exactly: Bool
+        var after: Int
+        var times: Int?
+        var code: Int32
+    }
 
-    static func set(_ url: URL, failing: Bool, exactly: Bool = false) {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var rules: [String: Rule] = [:]
+
+    static func set(_ url: URL, failing: Bool, exactly: Bool = false, after: Int = 0, times: Int? = nil, errno code: Int32 = EIO) {
         let path = url.standardizedFileURL.path
-        lock.withLock {
-            if failing { _ = exactly ? exact.insert(path) : roots.insert(path) } else { exact.remove(path); roots.remove(path) }
+        lock.withLock { rules[path] = failing ? Rule(exactly: exactly, after: after, times: times, code: code) : nil }
+    }
+
+    /// The errno this sync of `url` fails with, or nil (it goes ahead).
+    static func fault(_ url: URL) -> Int32? {
+        let path = url.standardizedFileURL.path
+        return lock.withLock {
+            guard let key = rules.keys.first(where: { $0 == path || (!rules[$0]!.exactly && path.hasPrefix($0 + "/")) }),
+                  var rule = rules[key] else { return nil }
+            defer { rules[key] = rule }
+            if rule.after > 0 { rule.after -= 1; return nil }
+            if let t = rule.times {
+                guard t > 0 else { return nil }
+                rule.times = t - 1
+            }
+            return rule.code
         }
     }
 
-    static func failing(_ url: URL) -> Bool {
-        let path = url.standardizedFileURL.path
-        return lock.withLock { exact.contains(path) || roots.contains { path == $0 || path.hasPrefix($0 + "/") } }
-    }
+    static func failing(_ url: URL) -> Bool { fault(url) != nil }
+}
+#endif
+
+/// A file operation that failed: which one, on which file, and errno (ASTRA-20261117-IT3-02).
+struct DurableFileError: Error, CustomStringConvertible {
+    let operation: String
+    let file: String
+    let code: Int32
+    var description: String { "\(operation) \(file) failed: errno \(code) (\(String(cString: strerror(code))))" }
 }
 
 enum Files {
@@ -290,15 +317,25 @@ enum Files {
     /// (ASTRA-20261117-IT1-01; removing first left a moment with no manifest, receipt or audio copy at all).
     /// A failed directory sync is an error too: the rename may not survive a crash, so the write isn't reported durable.
     static func replace(_ url: URL, with tmp: URL) throws {
-        guard rename(tmp.path, url.path) == 0 else { throw CocoaError(.fileWriteUnknown) }
+        guard rename(tmp.path, url.path) == 0 else { throw DurableFileError(operation: "rename", file: url.lastPathComponent, code: errno) }
         try fsync(url.deletingLastPathComponent())
     }
 
+    /// fsync(2), retried when interrupted (EINTR); any other failure throws with its errno (ASTRA-20261117-IT3-02).
     static func fsync(_ url: URL) throws {
         let fd = open(url.path, O_RDONLY)
-        guard fd >= 0 else { throw CocoaError(.fileReadNoPermission) }
+        guard fd >= 0 else { throw DurableFileError(operation: "open", file: url.lastPathComponent, code: errno) }
         defer { close(fd) }
-        guard !SyncFaults.failing(url), Darwin.fsync(fd) == 0 else { throw CocoaError(.fileWriteUnknown) }
+        while true {
+            #if DEBUG
+            let injected = SyncFaults.fault(url)
+            #else
+            let injected: Int32? = nil
+            #endif
+            let code: Int32 = injected ?? (Darwin.fsync(fd) == 0 ? 0 : errno)
+            if code == 0 { return }
+            if code != EINTR { throw DurableFileError(operation: "fsync", file: url.lastPathComponent, code: code) }
+        }
     }
 
     static func names(_ dir: URL, suffix: String) -> [String] {
@@ -348,6 +385,18 @@ public final class WatchOutbox: @unchecked Sendable {
     /// write, or the app ending in between) is published again from it on the next load.
     public func add(segmentFile: URL, segment: WatchSegment) throws {
         lock.lock(); defer { lock.unlock() }
+        do {
+            try publish(segmentFile: segmentFile, segment: segment)
+        } catch {
+            // whatever got written (intent, audio) is found by the next read, which reloads and republishes it from its
+            // intent, not only after a relaunch (ASTRA-20261117-IT3-03)
+            segmentIndex = nil
+            throw error
+        }
+    }
+
+    /// Called with `lock` held.
+    private func publish(segmentFile: URL, segment: WatchSegment) throws {
         let intent = segmentsDir.appendingPathComponent("\(segment.id).intent")
         try Files.durableWrite(WatchWire.encode(segment), to: intent)
         let audio = segmentsDir.appendingPathComponent("\(segment.id).m4a")
@@ -365,7 +414,12 @@ public final class WatchOutbox: @unchecked Sendable {
 
     public func add(end: WatchRecordingEnd) throws {
         lock.lock(); defer { lock.unlock() }
-        try Files.durableWrite(WatchWire.encode(end), to: endsDir.appendingPathComponent("\(end.id).json"))
+        do {
+            try Files.durableWrite(WatchWire.encode(end), to: endsDir.appendingPathComponent("\(end.id).json"))
+        } catch {
+            endIndex = nil  // an end that was renamed in is read again (ASTRA-20261117-IT3-03)
+            throw error
+        }
         loadEnds()
         endIndex?[end.id] = end
     }
@@ -500,6 +554,9 @@ public final class PhoneWatchInbox: @unchecked Sendable {
     /// This iPhone's identity, read at each use; nil while unreadable (nothing is accepted then).
     private let binding: () -> String?
     private let lock = NSLock()
+    /// Files (by path) whose sync and directory sync succeeded in this run: what "held" may rest on. Not saved: after a
+    /// relaunch each is synced again before it is trusted.
+    private var synced: Set<String> = []
     private var inboxDir: URL { root.appendingPathComponent("inbox", isDirectory: true) }
     private var endsDir: URL { root.appendingPathComponent("ends", isDirectory: true) }
     private var doneDir: URL { root.appendingPathComponent("done", isDirectory: true) }
@@ -532,9 +589,22 @@ public final class PhoneWatchInbox: @unchecked Sendable {
         let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? Int) ?? -1
         guard size == segment.bytes else { throw WatchRelayError.damaged("size \(size) ≠ \(segment.bytes)") }
         guard try Files.sha256(file) == segment.sha256 else { throw WatchRelayError.damaged("SHA-256") }
-        let audio = inboxDir.appendingPathComponent("\(segment.id).m4a")
+        let audio = inboxDir.appendingPathComponent("\(segment.id).m4a"), manifest = inboxDir.appendingPathComponent("\(segment.id).json")
+        synced.subtract([audio.path, manifest.path])
         try Files.durableCopy(file, to: audio)
-        try Files.durableWrite(WatchWire.encode(segment), to: inboxDir.appendingPathComponent("\(segment.id).json"))
+        synced.insert(audio.path)
+        try Files.durableWrite(WatchWire.encode(segment), to: manifest)
+        synced.insert(manifest.path)
+    }
+
+    /// The one rule for every answer that says "held" (a repeat accept, the inventory answer, a sync-ping receipt):
+    /// each file, and its directory, synced successfully, in this run or now. Caller holds the lock.
+    private func durable(_ files: [URL]) -> Bool {
+        for url in files where !synced.contains(url.path) {
+            guard (try? Files.fsync(url)) != nil, (try? Files.fsync(url.deletingLastPathComponent())) != nil else { return false }
+            synced.insert(url.path)
+        }
+        return true
     }
 
     /// What a conversion leaves behind: the bytes it converted (checksum, size) for this iPhone.
@@ -547,15 +617,19 @@ public final class PhoneWatchInbox: @unchecked Sendable {
     /// This iPhone durably holds these bytes under `id` (caller holds the lock): converted with a
     /// matching receipt, or a readable copy in the inbox or kept aside whose audio still hashes to it.
     private func holds(_ id: String, sha256: String, binding: String) -> Bool {
-        if let r = try? JSONDecoder().decode(Receipt.self, from: Data(contentsOf: receiptsDir.appendingPathComponent("\(id).json"))) {
-            return r.sha256 == sha256 && r.binding == binding
+        let receipt = receiptsDir.appendingPathComponent("\(id).json")
+        if let r = try? JSONDecoder().decode(Receipt.self, from: Data(contentsOf: receipt)) {
+            // a receipt not known durable falls through to a copy still in the inbox (kept until the receipt is written)
+            if r.sha256 == sha256, r.binding == binding, durable([receipt]) { return true }
+            if r.sha256 != sha256 || r.binding != binding { return false }
         }
         for dir in [inboxDir, quarantineDir] {
-            guard let s = WatchWire.decode(WatchSegment.self, try? Data(contentsOf: dir.appendingPathComponent("\(id).json"))),
+            let manifest = dir.appendingPathComponent("\(id).json")
+            guard let s = WatchWire.decode(WatchSegment.self, try? Data(contentsOf: manifest)),
                   s.id == id, s.binding == binding, s.sha256 == sha256 else { continue }
             let audio = dir.appendingPathComponent("\(id).m4a")
             let size = (try? FileManager.default.attributesOfItem(atPath: audio.path)[.size] as? Int) ?? -1
-            if size == s.bytes, (try? Files.sha256(audio)) == sha256 { return true }
+            if size == s.bytes, (try? Files.sha256(audio)) == sha256, durable([audio, manifest]) { return true }
         }
         return false
     }
@@ -630,8 +704,11 @@ public final class PhoneWatchInbox: @unchecked Sendable {
     public func markConverted(_ segment: WatchSegment, chunkEndUs: Int64) throws {
         lock.lock(); defer { lock.unlock() }
         // the receipt (which bytes were converted) first: it is what a later acknowledgement relies on
+        let receipt = receiptsDir.appendingPathComponent("\(segment.id).json")
+        synced.remove(receipt.path)
         try Files.durableWrite(try JSONEncoder().encode(Receipt(sha256: segment.sha256, bytes: segment.bytes, binding: segment.binding)),
-                               to: receiptsDir.appendingPathComponent("\(segment.id).json"))
+                               to: receipt)
+        synced.insert(receipt.path)
         try Files.durableWrite(Data(String(chunkEndUs).utf8), to: doneDir.appendingPathComponent(segment.id))
         for url in [inboxDir.appendingPathComponent("\(segment.id).m4a"), inboxDir.appendingPathComponent("\(segment.id).json")] {
             _ = try? FileManager.default.removeItem(at: url)

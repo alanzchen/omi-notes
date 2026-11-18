@@ -29,6 +29,24 @@ import Testing
         #expect(try inbox.answer(items: [WatchInventoryItem(id: segment.id, sha256: sha)], binding: "phone-A").acks == [segment.id])
     }
 
+    @Test func anInterruptedSyncIsRetriedAndAFailureSaysWhatFailed() throws {
+        // ASTRA-20261117-IT3-02: EINTR was taken as a failure, and the error said nothing of the call or errno
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("omi-sync-eintr-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("part.json")
+        SyncFaults.set(dir, failing: true, exactly: true, times: 2, errno: EINTR)
+        defer { SyncFaults.set(dir, failing: false) }
+        try Files.durableWrite(Data("x".utf8), to: url)  // interrupted twice, then done
+        SyncFaults.set(dir, failing: true, exactly: true, errno: EIO)
+        do {
+            try Files.durableWrite(Data("y".utf8), to: url)
+            Issue.record("no error")
+        } catch {
+            let text = String(describing: error)
+            #expect(text.contains("fsync") && text.contains("\(EIO)"), "\(text)")
+        }
+    }
+
     @Test func aFailedDirectorySyncIsAnErrorToo() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("omi-sync-dir-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
