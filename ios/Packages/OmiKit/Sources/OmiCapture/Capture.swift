@@ -205,6 +205,8 @@ public struct CaptureEnvironment: Sendable {
 ///
 /// Not thread-safe: confine to the engine queue.
 public final class LiveCaptureRecorder {
+    /// Journals of published chunks not yet confirmed durable (ASTRA-20261118-IT2-01).
+    private var retirement = JournalRetirement()
     public struct Stats: Equatable, Sendable {
         public var chunkSequence = 0
         public var chunkRecords = 0
@@ -392,8 +394,10 @@ public final class LiveCaptureRecorder {
         do {
             let item = try env.outbox.write(try ContractJSON.encode(seal), kind: .seal(captureId: m.captureId))
             journal?.close()
-            if let dir { try? FileManager.default.removeItem(at: dir) }
+            // the capture's journals go only once the outbox is confirmed; otherwise launch recovery confirms them later
+            if retirement.confirm(outbox: env.outbox, category: "capture") == nil, let dir { try? FileManager.default.removeItem(at: dir) }
             log(.info, "capture", "live capture \(m.captureId) sealed (\(reason.rawValue), last chunk \(seal.lastChunkSequence))")
+            retirement.forget()
             reset()
             onSealWritten?(item)
             return seal
@@ -427,6 +431,7 @@ public final class LiveCaptureRecorder {
     // MARK: Private
 
     private func reset() {
+        retirement.forget()  // what is kept stays in the capture's directory, for launch recovery
         manifest = nil
         anchor = nil
         journal = nil
@@ -533,7 +538,7 @@ public final class LiveCaptureRecorder {
         manifestDirty = true
         commitManifest()
         _ = ensureJournal()
-        try? FileManager.default.removeItem(at: journalURL)
+        retirement.retire([journalURL], outbox: env.outbox, category: "capture")  // kept until the outbox is confirmed
         log(.info, "capture", "chunk \(seq) of \(m.captureId) closed (\(reason.rawValue), \(count) records, \(item.size) B)")
         onChunkFinalized?(item)
         return true
@@ -546,6 +551,8 @@ public final class LiveCaptureRecorder {
 /// sequence and fsync'd ≥ 1×/s; chunks hold consecutive records and rotate on a record count, a
 /// sequence discontinuity, or ~60 s of monotonic time (spans stay far below the u32-µs limit).
 public final class RingCaptureWriter {
+    /// Journals of published chunks not yet confirmed durable (ASTRA-20261118-IT2-01).
+    private var retirement = JournalRetirement()
     public struct Context: Sendable {
         public var meta: CaptureDeviceMeta
         public var codecId: Int
@@ -680,13 +687,17 @@ public final class RingCaptureWriter {
             source: .deviceRing, ring: evidence)
         let item = try env.outbox.write(try ContractJSON.encode(seal), kind: .seal(captureId: m.captureId))
         journal?.close()
-        if let dir { try? FileManager.default.removeItem(at: dir) }
+        let unconfirmed = retirement.confirm(outbox: env.outbox, category: "ring")
+        if unconfirmed == nil, let dir { try? FileManager.default.removeItem(at: dir) }
         log(.info, "ring", "ring capture \(m.captureId) sealed (\(reason.rawValue), \(recordsWritten) records, last chunk \(seal.lastChunkSequence))")
         manifest = nil
         self.anchor = nil
         journal = nil
         self.dir = nil
+        retirement.forget()
         onSealWritten?(item)
+        // sealed but not confirmed: the journals stay (launch recovery confirms them), and the caller sends no ADVANCE
+        if let unconfirmed { throw unconfirmed }
         return seal
     }
 
@@ -733,7 +744,7 @@ public final class RingCaptureWriter {
         chunkCount = 0
         manifestDirty = true
         commitManifest()
-        try? FileManager.default.removeItem(at: journalURL)
+        retirement.retire([journalURL], outbox: env.outbox, category: "ring")  // kept until the outbox is confirmed
         log(.info, "ring", "ring chunk \(seq) of \(m.captureId) closed (\(reason.rawValue), \(entries.count) records from seq \(first))")
         onChunkFinalized?(item)
     }
@@ -925,7 +936,14 @@ public enum CaptureRecovery {
         }
         let outbox = env.outbox
         if outbox.contains(.seal(captureId: m.captureId)) {
-            try? FileManager.default.removeItem(at: dir)
+            // sealed earlier: its journals go once the outbox is confirmed (ASTRA-20261118-IT2-01), else next launch
+            do {
+                try outbox.confirmPending()
+                try? FileManager.default.removeItem(at: dir)
+            } catch {
+                report.skipped.append(dir.lastPathComponent)
+                log(.warning, "recovery", "\(dir.lastPathComponent) kept until the outbox is confirmed: \(error.localizedDescription)")
+            }
             return false
         }
         // Rotations published but not committed to the manifest.
@@ -981,7 +999,12 @@ public enum CaptureRecovery {
             source: m.source)
         do {
             try outbox.write(try ContractJSON.encode(seal), kind: .seal(captureId: m.captureId))
-            try? FileManager.default.removeItem(at: dir)
+            do {
+                try outbox.confirmPending()
+                try? FileManager.default.removeItem(at: dir)
+            } catch {
+                log(.warning, "recovery", "\(m.captureId) sealed; its journals kept until the outbox is confirmed: \(error.localizedDescription)")
+            }
             log(.info, "recovery", "\(m.source.rawValue) capture \(m.captureId) recovered and sealed app_recovered (last chunk \(seal.lastChunkSequence))")
             return true
         } catch {
@@ -1031,5 +1054,44 @@ public enum CaptureRecovery {
         guard let url = outbox.locate(kind), let data = try? Data(contentsOf: url),
               let parsed = try? Envelope.parse(data) else { return nil }
         return parsed.header.chunkEndOffsetUs
+    }
+}
+
+/// Journals whose chunks are in the outbox but not yet confirmed durable. They go together once `outbox/pending` syncs
+/// (one directory sync covers every entry already published there); until then they stay, so a crash can't leave a
+/// chunk whose directory entry was lost after its journal was deleted (ASTRA-20261118-IT2-01). A rotated journal
+/// no longer grows (the next records go to the next chunk's journal), so nothing is ever rebuilt under a published
+/// identity. A failure is logged once until a confirmation succeeds.
+struct JournalRetirement {
+    private(set) var kept: [URL] = []
+    private var failureLogged = false
+
+    /// Adds `journals` and confirms the outbox; they are removed if it is confirmed, kept otherwise.
+    mutating func retire(_ journals: [URL], outbox: Outbox, category: String) {
+        kept += journals
+        if !kept.isEmpty { _ = confirm(outbox: outbox, category: category) }
+    }
+
+    /// Confirms the outbox and removes the journals kept; returns the error when it can't be confirmed.
+    mutating func confirm(outbox: Outbox, category: String) -> Error? {
+        do {
+            try outbox.confirmPending()
+        } catch {
+            if !failureLogged {
+                log(.error, category, "outbox not confirmed durable (\(error.localizedDescription)); \(kept.count) journal(s) kept")
+                failureLogged = true
+            }
+            return error
+        }
+        for url in kept { try? FileManager.default.removeItem(at: url) }
+        kept = []
+        failureLogged = false
+        return nil
+    }
+
+    /// The capture ended: what is still kept stays in its directory, for launch recovery.
+    mutating func forget() {
+        kept = []
+        failureLogged = false
     }
 }

@@ -164,6 +164,11 @@ public final class Outbox: @unchecked Sendable {
         return item
     }
 
+    /// Confirms every entry already published into `pending/` (one directory sync); throws when it can't. An entry no longer
+    /// there was moved by a rename (to `sent/` after the server's acknowledgement, or to quarantine), so it is in one
+    /// place or the other either way (ASTRA-20261118-IT2-01).
+    public func confirmPending() throws { try FileIO.syncDirectory(dirs.outboxPending) }
+
     /// Location of an item in any directory (pending first).
     public func locate(_ kind: OutboxKind) -> URL? {
         [dirs.outboxPending, dirs.outboxSent, dirs.outboxQuarantine]
