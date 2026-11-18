@@ -390,9 +390,20 @@ public enum FileIO {
         let fd = open(url.path, O_RDONLY)
         guard fd >= 0 else { throw FileIOError.posix("open directory", errno) }
         defer { close(fd) }
-        for _ in 0..<100 where fsync(fd) != 0 {
-            guard errno == EINTR else { throw FileIOError.posix("fsync directory", errno) }
+        try retryInterrupted("fsync directory") { fsync(fd) }
+    }
+
+    /// Runs `call` (a syscall returning 0 or -1 with errno): returns on its first success, throws at once on any error
+    /// but EINTR, and throws after 100 interruptions (ASTRA-20261118-IT2-02). Same semantics as OmiWatchKit's
+    /// `Files.fsync`, which the Watch app links without OmiCapture.
+    static func retryInterrupted(_ operation: String, _ call: () -> Int32) throws {
+        var code = EINTR
+        for _ in 0..<100 {
+            if call() == 0 { return }
+            code = errno
+            if code != EINTR { break }
         }
+        throw FileIOError.posix(operation, code)
     }
 
     /// Best effort (`syncDirectory`, failure ignored): for callers that recover what a lost entry costs, e.g. a
