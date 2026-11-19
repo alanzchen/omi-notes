@@ -57,6 +57,7 @@ extension AppModel {
         noteCache.clear()
         recentSavedAt = nil
         detailSavedAt = [:]
+        notesRevision += 1  // an answer from the saved notes no longer holds (ASTRA-20261119-IT5-01)
     }
 
     public struct SearchResult: Sendable {

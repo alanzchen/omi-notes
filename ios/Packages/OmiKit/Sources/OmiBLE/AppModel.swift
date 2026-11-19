@@ -103,7 +103,7 @@ public final class AppModel {
     /// is not saved (it would bring cleared notes back).
     var cacheEpoch = 0
     /// Bumped whenever the notes a search can find may have changed: a list refresh the server answered, a note saved
-    /// for offline reading, a server or vault change. A search view asks again when it changes (2026-11-19 R5,
+    /// for offline reading, the saved notes cleared, a server or vault change. A search view asks again when it changes (2026-11-19 R5,
     /// ASTRA-20261119-IT3-02: a kept error or empty answer stayed after the server recovered or a note was saved).
     public internal(set) var notesRevision = 0
     /// Set while the list shown is the saved copy (the server couldn't be reached).

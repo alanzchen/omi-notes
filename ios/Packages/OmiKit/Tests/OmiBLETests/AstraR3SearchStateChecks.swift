@@ -141,6 +141,19 @@ extension RetryFlowTests {
   #expect(AppModel.searchRerun(answered:"q",answeredRevision:2,question:"q",revision:2,hasResult:false,hasError:true) == .keep)
   #expect(AppModel.searchRerun(answered:"p",answeredRevision:2,question:"q",revision:2,hasResult:true,hasError:false) == .fresh)
  }
+ // ASTRA-20261119-IT5-01 (omi-notes-reviews/nightly-2026-11-19-it5/swift/AstraR5ExtraChecks.swift), copied as is:
+ // clearing the saved notes must not leave an offline answer from them on screen.
+ @Test func clearedOfflineNotesMustInvalidateTheKeptAnswer() async throws {
+  let(m,root)=try RetryFlowTests().model();defer{try? FileManager.default.removeItem(at:root)}
+  await m.refreshServer()
+  let d=try JSONDecoder().decode(ConversationDetail.self,from:Data(NoteCacheTests().detailJSON.utf8))
+  m.saveForOffline(d,m.engine.settings.serverConfig());AppServerStub.offline=true
+  let v=ExtractedSearchState(m);await v.reappear();try #require(v.result?.conversations.map(\.id)==["c1"])
+  m.clearSavedNotes();#expect(m.savedConversations().isEmpty)
+  // Actual model would now return empty, but same-query view still takes .keep.
+  #expect(try await m.search("budget",personId:nil,range:.any).get().conversations.isEmpty)
+  await v.reappear();#expect(v.result?.conversations.isEmpty==true,"cleared offline cache still shown as searchable")
+ }
  @Test func searchLoggingIsRateLimitedAndContainsNoSearchContent() {
   SearchLog.reset();let now=Date();let marker="r3-rate-probe-event"
   let before=OmiLog.shared.recent().filter{$0.category=="search" && $0.message.hasPrefix(marker)}.count
