@@ -90,6 +90,13 @@ extension AppModel {
     /// Server search, or the saved copies when the server can't be reached. Answers for a server
     /// that is no longer configured, or for a cancelled search, come back as `CancellationError`.
     public func search(_ query: String, personId: String?, range: SearchRange, before: String? = nil) async -> Result<SearchResult, Error> {
+        let askedServer = engine.settings.serverConfig().endpoint != nil && (serverStatus?.supportsSearch == true || serverStatus == nil)
+        let result = await searchOnce(query, personId: personId, range: range, before: before)
+        SearchLog.line("finished", "asked server: \(askedServer ? "yes" : "no"), outcome: \(SearchLog.outcome(result))")
+        return result
+    }
+
+    private func searchOnce(_ query: String, personId: String?, range: SearchRange, before: String?) async -> Result<SearchResult, Error> {
         let config = engine.settings.serverConfig()
         guard let endpoint = config.endpoint else { return .failure(APIError.notConfigured) }
         var fromDate: Date?
@@ -148,5 +155,33 @@ extension AppModel {
         f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyy-MM-dd"
         return f.string(from: date)
+    }
+}
+
+/// `[search]` lines for the phone log, at most one per second per event and never the query (2026-11-19: a search left on
+/// "Searching…" in the field said nothing about why).
+@MainActor
+public enum SearchLog {
+    private static var last: [String: Date] = [:]
+
+    public static func line(_ event: String, _ detail: String, now: Date = Date()) {
+        if let t = last[event], now.timeIntervalSince(t) < 1 { return }
+        last[event] = now
+        OmiLog.shared.log(.info, "search", "\(event): \(detail)")
+    }
+
+    static func reset() { last = [:] }
+
+    /// The kind of answer, without its content.
+    public static func outcome(_ result: Result<AppModel.SearchResult, Error>) -> String {
+        switch result {
+        case .success(let r):
+            return "\(r.conversations.count) result(s)" + (r.offline ? ", saved notes (server unreachable)" : "")
+                + (r.serverLacksSearch ? ", saved notes (server can't search)" : "")
+        case .failure(is CancellationError):
+            return "dropped (the search or the server's data changed meanwhile)"
+        case .failure(let e):
+            return "failed (\(String(describing: type(of: e))))"
+        }
     }
 }

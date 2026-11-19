@@ -330,6 +330,15 @@ struct SearchResults: View {
     @State private var loading = false
     /// Bumped when the search changes: an answer (or "Show more") for an earlier one is dropped.
     @State private var generation = 0
+    /// A search is waiting or running: the only time "Searching…" shows (2026-11-19 R3). An answer dropped while this
+    /// search is still the current one ends it without a result: "Search didn't finish" with Retry, never a spinner.
+    @State private var inFlight = false
+    /// Bumped by Retry: runs the same search again.
+    @State private var retries = 0
+    /// The question (and Retry count) the answer on screen is for. The task also restarts when the view reappears,
+    /// which offline happened several times a second (2026-11-19 R3 `[search]` log: search 112, 120, 128… each
+    /// answered in ~6 ms, then wiped): the same question keeps its answer instead of going back to "Searching…".
+    @State private var answeredFor: String?
 
     var body: some View {
         Section {
@@ -354,8 +363,14 @@ struct SearchResults: View {
                 if result.nextCursor != nil {
                     Button("Show more") { Task { await load(more: true) } }.disabled(loading)
                 }
-            } else {
+            } else if inFlight {
                 HStack { ProgressView(); Text("Searching…").foregroundStyle(.secondary).padding(.leading, 6) }
+            } else {
+                HStack {
+                    Text("Search didn't finish").foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Retry") { retries += 1 }
+                }
             }
         } footer: {
             if result?.serverLacksSearch == true || result?.offline == true {
@@ -364,26 +379,38 @@ struct SearchResults: View {
                 Text("\(pending) not searchable yet.")
             }
         }
-        .task(id: "\(key)|\(model.serverIdentity)") {
+        .task(id: "\(key)|\(model.serverIdentity)|\(retries)") {
+            if answeredFor == "\(key)|\(model.serverIdentity)|\(retries)", result != nil || error != nil {
+                SearchLog.line("kept", "the same search reappeared; its answer stays")
+                return
+            }
             generation += 1
+            let mine = generation
             result = nil
             error = nil
+            inFlight = true
             try? await Task.sleep(for: .milliseconds(300))  // wait for typing to pause
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else {
+                if mine == generation { inFlight = false }  // not replaced by a newer search: nothing runs now
+                return
+            }
+            SearchLog.line("started", "search \(mine)")
             await load(more: false)
+            if mine == generation { inFlight = false }
         }
     }
 
     private var key: String { "\(query)|\(personId ?? "")|\(range.rawValue)" }
 
     private func load(more: Bool) async {
-        let asked = generation
+        let asked = generation, question = "\(key)|\(model.serverIdentity)|\(retries)"
         loading = true
         defer { loading = false }
         let answer = await model.search(query, personId: personId, range: range, before: more ? result?.nextCursor : nil)
         guard asked == generation else { return }  // the search changed meanwhile: this answer is for another one
         switch answer {
         case .failure(is CancellationError):
+            SearchLog.line("dropped", "search \(asked) ended without an answer")
             return
         case .success(let r):
             if more, var current = result {
@@ -395,9 +422,11 @@ struct SearchResults: View {
                 result = r
             }
             error = nil
+            answeredFor = question
         case .failure(let e):
             result = nil  // never leave results that don't match the chosen search
             error = (e as? LocalizedError)?.errorDescription ?? "Couldn't search: \(AppModel.describe(e))"
+            answeredFor = question
         }
     }
 }

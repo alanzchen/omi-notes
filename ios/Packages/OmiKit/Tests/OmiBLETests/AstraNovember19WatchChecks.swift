@@ -60,3 +60,20 @@ import Testing
   #expect(m.serverIdentity==key)
  }
 }
+
+/// 2026-11-19 R3: a search left on "Searching…" in the field said nothing in the phone log. Each finished search now
+/// leaves one rate-limited `[search]` line: whether the server was asked and the outcome, never the query.
+@MainActor @Suite(.serialized) struct SearchLogTests {
+    @Test func aSearchLeavesALineWithItsOutcomeButNotItsQuery() async throws {
+        let (m, root) = try RetryFlowTests().model()
+        defer { try? FileManager.default.removeItem(at: root) }
+        AppServerStub.offline = true
+        await m.refreshServer()
+        SearchLog.reset()
+        _ = await m.search("zebra-synthetic-query", personId: nil, range: .any)
+        let lines = OmiLog.shared.recent().filter { $0.category == "search" }
+        let line = try #require(lines.last)
+        #expect(line.message.contains("asked server") && line.message.contains("outcome"), "\(line.message)")
+        #expect(!lines.contains { $0.message.contains("zebra") }, "never the query text")
+    }
+}
