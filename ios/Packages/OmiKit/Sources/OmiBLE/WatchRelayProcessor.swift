@@ -63,14 +63,18 @@ final class WatchRelayProcessor {
                 written += 1
             } catch let e as OutboxError {
                 log(.error, "watch", "segment \(segment.id) conflicts with what was already queued: \(e)")
-                inbox.quarantine(segment, reason: "\(e)")
+                if !inbox.quarantine(segment, reason: "\(e)") {
+                    log(.error, "watch", "segment \(segment.id) not set aside yet (its quarantine copy isn't confirmed); kept in the inbox")
+                }
             } catch let e as FileIOError {
                 // storage, not the part: kept in the inbox as it is and tried again on the next pass
                 log(.error, "watch", "segment \(segment.id) not stored yet: \(e)")
             } catch {
                 // unreadable audio: kept aside (never deleted), and the recording can still be sealed
                 log(.error, "watch", "segment \(segment.id) couldn't be converted: \(error)")
-                inbox.quarantine(segment, reason: "\(error)")
+                if !inbox.quarantine(segment, reason: "\(error)") {
+                    log(.error, "watch", "segment \(segment.id) not set aside yet (its quarantine copy isn't confirmed); kept in the inbox")
+                }
             }
         }
         for (end, lastChunkEnd) in inbox.readyEnds() {

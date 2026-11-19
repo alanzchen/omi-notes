@@ -735,20 +735,33 @@ public final class PhoneWatchInbox: @unchecked Sendable {
     }
 
     /// A segment that couldn't be converted is set aside (kept), not retried forever or deleted.
-    public func quarantine(_ segment: WatchSegment, reason: String) {
+    /// A durable handoff (ASTRA-20261119-IT1-01): the inbox copy goes, and the part counts as handled, only once its
+    /// audio and manifest are confirmed in `quarantine/` (each copied, synced and its directory synced). Until then it
+    /// stays in the inbox, pending, and the next pass tries again. Returns whether it was set aside.
+    @discardableResult
+    public func quarantine(_ segment: WatchSegment, reason: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
         let q = quarantineDir
-        try? FileManager.default.createDirectory(at: q, withIntermediateDirectories: true)
-        for ext in ["m4a", "json"] {
-            let from = inboxDir.appendingPathComponent("\(segment.id).\(ext)")
-            guard FileManager.default.fileExists(atPath: from.path) else { continue }
-            let to = q.appendingPathComponent("\(segment.id).\(ext)")
-            _ = try? FileManager.default.replaceItemAt(to, withItemAt: from)  // a newer copy replaces an older one
-            if FileManager.default.fileExists(atPath: from.path) { try? FileManager.default.moveItem(at: from, to: to) }
+        do {
+            try FileManager.default.createDirectory(at: q, withIntermediateDirectories: true)
+            var moved: [URL] = []
+            for ext in ["m4a", "json"] {
+                let from = inboxDir.appendingPathComponent("\(segment.id).\(ext)")
+                guard FileManager.default.fileExists(atPath: from.path) else { continue }
+                let to = q.appendingPathComponent("\(segment.id).\(ext)")
+                synced.remove(to.path)
+                try Files.durableCopy(from, to: to)  // a newer copy replaces an older one, atomically
+                synced.insert(to.path)
+                moved.append(from)
+            }
+            try? Data(reason.utf8).write(to: q.appendingPathComponent("\(segment.id).reason"))
+            // counted as handled so the recording can still be sealed
+            try Files.durableWrite(Data(), to: doneDir.appendingPathComponent(segment.id))
+            for from in moved { _ = try? FileManager.default.removeItem(at: from) }
+            return true
+        } catch {
+            return false
         }
-        try? Data(reason.utf8).write(to: q.appendingPathComponent("\(segment.id).reason"))
-        // counted as handled so the recording can still be sealed
-        try? Files.durableWrite(Data(), to: doneDir.appendingPathComponent(segment.id))
     }
 
     private func isDone(_ id: String) -> Bool { FileManager.default.fileExists(atPath: doneDir.appendingPathComponent(id).path) }
