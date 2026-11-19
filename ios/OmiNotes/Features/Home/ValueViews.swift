@@ -329,17 +329,20 @@ struct ShortClipsGroup: View {
     var body: some View {
         DisclosureGroup(isExpanded: $open) {
             let groups = HomeDay.byKind(shown)
-            if groups.isEmpty {
-                if model.shortDayFailed.contains(day) {
-                    // couldn't load: said, with a way to try again, never a spinner that never ends (lane A F8)
-                    HStack {
-                        Label("无法加载", systemImage: "exclamationmark.circle").font(.subheadline).foregroundStyle(.secondary)
-                        Spacer()
-                        Button("重试") { Task { await model.loadShortSessions(day: day) } }.font(.subheadline)
-                    }
-                } else {
-                    ProgressView().frame(maxWidth: .infinity)  // the day's list is loading (none on this page yet)
+            switch model.shortDayPhase(day: day, hasRows: !groups.isEmpty) {
+            case .rows:
+                EmptyView()
+            case .loading:
+                ProgressView().frame(maxWidth: .infinity)  // a request for the day is starting or running
+            case .failed:
+                // couldn't load: said, with a way to try again (it turns into the spinner at once: no second request)
+                HStack {
+                    Label("无法加载", systemImage: "exclamationmark.circle").font(.subheadline).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("重试") { Task { await model.loadShortSessions(day: day) } }.font(.subheadline)
                 }
+            case .empty:
+                Text("没有短片段").font(.subheadline).foregroundStyle(.secondary)  // the server's answer: none that day
             }
             ForEach(groups, id: \.kind) { group in
                 if groups.count > 1 { ShortKindHeader(kind: group.kind, count: group.rows.count) }
@@ -352,6 +355,14 @@ struct ShortClipsGroup: View {
             if isOpen { Task { await model.loadShortSessions(day: day) } }
         }
         .onAppear { if Self.debugOpenDay == day { open = true } }
+        #if DEBUG
+        // simulator automation: `-OmiNotesDebugShortDayLoad failed|loading|empty` shows the opened day's fold in that state
+        .task(id: open) {
+            guard open, Self.debugOpenDay == day, let raw = UserDefaults.standard.string(forKey: "OmiNotesDebugShortDayLoad") else { return }
+            try? await Task.sleep(for: .milliseconds(800))  // after the real load the fold just started
+            model.debugShortDay(day, load: raw == "failed" ? .failed : raw == "empty" ? .loaded : .loading)
+        }
+        #endif
     }
 }
 

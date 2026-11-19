@@ -52,8 +52,13 @@ public final class AppModel {
     public internal(set) var shortSeconds: Double = 60
     /// A day's short sessions as the server lists them (loaded when the folded row opens), by day.
     public internal(set) var shortDayRows: [String: [ConversationSummary]] = [:]
+    /// Where each day's short-session load stands (ASTRA-20261119-IT2-01): one state per day, set to loading the moment a
+    /// load starts (so Retry can't be pressed twice) and finished only by the newest request for that day.
+    public enum ShortDayLoad: Equatable, Sendable { case loading, loaded, failed }
+    public internal(set) var shortDayLoad: [String: ShortDayLoad] = [:]
+    var shortDayRequest: [String: Int] = [:]
     /// Days whose short sessions couldn't be loaded (the fold says so rather than loading forever).
-    public internal(set) var shortDayFailed: Set<String> = []
+    public var shortDayFailed: Set<String> { Set(shortDayLoad.filter { $0.value == .failed }.keys) }
     /// Deferred sessions whose opening already asked for their transcription (once per opening state; a refusal is
     /// retried from 转写, never by opening again).
     var transcribedOnOpen: Set<String> = []
@@ -193,7 +198,7 @@ public final class AppModel {
         recentCursor = nil
         shortDays = [:]
         shortDayRows = [:]
-        shortDayFailed = []
+        shortDayLoad = [:]
         transcribedOnOpen = []
         recentError = nil
         recentLoadedAt = nil

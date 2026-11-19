@@ -48,6 +48,9 @@ extension AppModel {
     public func loadShortSessions(day: String) async {
         let config = engine.settings.serverConfig()
         guard !day.isEmpty else { return }
+        let request = (shortDayRequest[day] ?? 0) + 1
+        shortDayRequest[day] = request
+        shortDayLoad[day] = .loading
         guard let endpoint = config.endpoint, serverStatus?.supportsDeferredTranscription == true else {
             return finishShortDay(day, .failure(APIError.notConfigured))
         }
@@ -58,18 +61,42 @@ extension AppModel {
                 try await api.recentConversations(limit: 200, before: cursor, day: day, short: true)
             })
         }
-        guard isCurrent(config), data == dataEpoch else { return }
+        // only the newest request for this day finishes it (an older answer, failed or not, is dropped)
+        guard isCurrent(config), data == dataEpoch, shortDayRequest[day] == request else { return }
         finishShortDay(day, result)
+    }
+
+    #if DEBUG
+    /// Simulator automation only: a day's fold in a given state with no rows loaded (`-OmiNotesDebugShortDayLoad`).
+    public func debugShortDay(_ day: String, load: ShortDayLoad) {
+        shortDayRequest[day] = (shortDayRequest[day] ?? 0) + 1  // any request already running for it no longer applies
+        shortDayRows[day] = []
+        shortDayLoad[day] = load
+    }
+    #endif
+
+    /// What an opened 短片段 fold shows (one decision for the view and its tests): its rows when it has any; otherwise the
+    /// spinner only while a request is starting or running, "无法加载" after a failure, and a quiet "nothing" after an
+    /// answer with no short sessions, never a spinner that nothing will end (ASTRA-20261119-IT2-01/02).
+    public enum ShortDayPhase: Equatable, Sendable { case rows, loading, failed, empty }
+
+    public func shortDayPhase(day: String, hasRows: Bool) -> ShortDayPhase {
+        if hasRows { return .rows }
+        switch shortDayLoad[day] {
+        case .failed: return .failed
+        case .loaded: return .empty
+        case .loading, nil: return .loading
+        }
     }
 
     /// A day's load ended: its rows, or (2026-11-19 lane A F8) a failure the fold shows instead of a spinner.
     func finishShortDay(_ day: String, _ result: Result<(rows: [ConversationSummary], days: [String: ShortDay]), Error>) {
         switch result {
         case .success(let collected):
-            shortDayFailed.remove(day)
+            shortDayLoad[day] = .loaded
             applyShortDay(day, rows: collected.rows, days: collected.days)
         case .failure:
-            shortDayFailed.insert(day)
+            shortDayLoad[day] = .failed
         }
     }
 
