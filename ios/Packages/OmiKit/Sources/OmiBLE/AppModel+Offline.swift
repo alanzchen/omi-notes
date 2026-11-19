@@ -21,6 +21,7 @@ extension AppModel {
     func saveForOffline(_ detail: ConversationDetail, _ config: UploadConfig) {
         guard isCurrent(config), let scope = cacheScope(config) else { return }
         noteCache.saveDetail(detail, scope: scope)
+        notesRevision += 1
     }
 
     func showSavedList(_ config: UploadConfig) {
@@ -85,6 +86,24 @@ extension AppModel {
         public var errorDescription: String? {
             "The server can't be reached, and filtering by person needs it. Choose Anyone to search the notes saved on this phone."
         }
+    }
+
+    /// What a search view does when its task runs again (2026-11-19 R5, ASTRA-20261119-IT3-02).
+    public enum SearchRerun: Equatable, Sendable {
+        /// The same question over the same notes: the answer on screen (results or an error) stays; nothing is asked.
+        case keep
+        /// The same question, but the notes changed since its answer: ask again; the results stay until the new answer.
+        case refresh
+        /// Another question, a Retry, or nothing to keep: start over.
+        case fresh
+    }
+
+    /// `question` identifies the search (query, filters, server, Retry count); `revision` is `notesRevision` now.
+    public static func searchRerun(answered: String?, answeredRevision: Int?, question: String, revision: Int,
+                                   hasResult: Bool, hasError: Bool) -> SearchRerun {
+        guard answered == question, hasResult || hasError else { return .fresh }
+        if answeredRevision == revision { return .keep }
+        return hasResult ? .refresh : .fresh  // an error isn't left on screen once the notes changed
     }
 
     /// Server search, or the saved copies when the server can't be reached. Answers for a server

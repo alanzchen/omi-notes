@@ -339,6 +339,9 @@ struct SearchResults: View {
     /// which offline happened several times a second (2026-11-19 R3 `[search]` log: search 112, 120, 128… each
     /// answered in ~6 ms, then wiped): the same question keeps its answer instead of going back to "Searching…".
     @State private var answeredFor: String?
+    /// The notes revision (`AppModel.notesRevision`) that answer saw: when the notes change (a refresh the server
+    /// answered, a newly saved note) the same question is asked again (2026-11-19 R5, ASTRA-20261119-IT3-02).
+    @State private var answeredRevision: Int?
 
     var body: some View {
         Section {
@@ -354,14 +357,16 @@ struct SearchResults: View {
         }
         // on this section, whose rows stay the same while a search runs: on the results section, every change of its rows
         // (spinner → results) replaced its cells and restarted the task, which cleared the results (2026-11-19 R4)
-        .task(id: "\(key)|\(model.serverIdentity)|\(retries)") {
-            if answeredFor == "\(key)|\(model.serverIdentity)|\(retries)", result != nil || error != nil {
+        .task(id: "\(question)|\(model.notesRevision)") {
+            let rerun = AppModel.searchRerun(answered: answeredFor, answeredRevision: answeredRevision, question: question,
+                                             revision: model.notesRevision, hasResult: result != nil, hasError: error != nil)
+            if rerun == .keep {
                 SearchLog.line("kept", "the same search reappeared; its answer stays")
                 return
             }
             generation += 1
             let mine = generation
-            result = nil
+            if rerun == .fresh { result = nil }  // a refresh keeps the results shown until its answer
             error = nil
             inFlight = true
             try? await Task.sleep(for: .milliseconds(300))  // wait for typing to pause
@@ -375,7 +380,11 @@ struct SearchResults: View {
         }
         Section {
             if let error {
-                Text(error).foregroundStyle(.secondary)
+                HStack {
+                    Text(error).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Retry") { retries += 1 }
+                }
             } else if let result {
                 if result.conversations.isEmpty {
                     Text(loading ? "Searching…" : "No matching conversations.").foregroundStyle(.secondary)
@@ -403,9 +412,11 @@ struct SearchResults: View {
     }
 
     private var key: String { "\(query)|\(personId ?? "")|\(range.rawValue)" }
+    /// The search asked: its filters, the server and the Retry count.
+    private var question: String { "\(key)|\(model.serverIdentity)|\(retries)" }
 
     private func load(more: Bool) async {
-        let asked = generation, question = "\(key)|\(model.serverIdentity)|\(retries)"
+        let asked = generation, question = self.question, revision = model.notesRevision
         loading = true
         defer { loading = false }
         let answer = await model.search(query, personId: personId, range: range, before: more ? result?.nextCursor : nil)
@@ -425,10 +436,12 @@ struct SearchResults: View {
             }
             error = nil
             answeredFor = question
+            answeredRevision = revision
         case .failure(let e):
             result = nil  // never leave results that don't match the chosen search
             error = (e as? LocalizedError)?.errorDescription ?? "Couldn't search: \(AppModel.describe(e))"
             answeredFor = question
+            answeredRevision = revision
         }
     }
 }
