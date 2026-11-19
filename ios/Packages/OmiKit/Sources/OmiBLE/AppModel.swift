@@ -52,6 +52,8 @@ public final class AppModel {
     public internal(set) var shortSeconds: Double = 60
     /// A day's short sessions as the server lists them (loaded when the folded row opens), by day.
     public internal(set) var shortDayRows: [String: [ConversationSummary]] = [:]
+    /// Days whose short sessions couldn't be loaded (the fold says so rather than loading forever).
+    public internal(set) var shortDayFailed: Set<String> = []
     /// Deferred sessions whose opening already asked for their transcription (once per opening state; a refusal is
     /// retried from 转写, never by opening again).
     var transcribedOnOpen: Set<String> = []
@@ -191,6 +193,7 @@ public final class AppModel {
         recentCursor = nil
         shortDays = [:]
         shortDayRows = [:]
+        shortDayFailed = []
         transcribedOnOpen = []
         recentError = nil
         recentLoadedAt = nil

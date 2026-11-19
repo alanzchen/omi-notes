@@ -93,6 +93,15 @@ import Testing
         #expect(sections[0].showsFold)
     }
 
+    @Test func aDayThatCouldNotBeLoadedSaysSoInsteadOfLoadingForever() {
+        // 2026-11-19 lane A F8: a failed fetch was dropped (`try?`), so an opened fold with no rows spun for good
+        let m = model()
+        m.finishShortDay("2026-11-18", .failure(URLError(.cannotConnectToHost)))
+        #expect(m.shortDayFailed.contains("2026-11-18"))
+        m.finishShortDay("2026-11-18", .success(([row("1", day: "2026-11-18", start: "s", speech: 9)], ["2026-11-18": ShortDay(short: 1)])))
+        #expect(!m.shortDayFailed.contains("2026-11-18") && m.shortDayRows["2026-11-18"]?.map(\.id) == ["1"])
+    }
+
     @Test func aDayIsLoadedPageByPage() async throws {
         var asked: [String?] = []
         let pages: [String?: RecentConversationsResponse] = [

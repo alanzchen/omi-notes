@@ -47,13 +47,30 @@ extension AppModel {
     /// while it has been opened). Kept apart from the main list: they never enter `recent`.
     public func loadShortSessions(day: String) async {
         let config = engine.settings.serverConfig()
-        guard let endpoint = config.endpoint, serverStatus?.supportsDeferredTranscription == true, !day.isEmpty else { return }
+        guard !day.isEmpty else { return }
+        guard let endpoint = config.endpoint, serverStatus?.supportsDeferredTranscription == true else {
+            return finishShortDay(day, .failure(APIError.notConfigured))
+        }
         let data = dataEpoch
         let api = APIClient(endpoint: endpoint, session: session)
-        guard let collected = try? await Self.collectPages(fetch: { cursor in
-            try await api.recentConversations(limit: 200, before: cursor, day: day, short: true)
-        }), isCurrent(config), data == dataEpoch else { return }
-        applyShortDay(day, rows: collected.rows, days: collected.days)
+        let result = await Result {
+            try await Self.collectPages(fetch: { cursor in
+                try await api.recentConversations(limit: 200, before: cursor, day: day, short: true)
+            })
+        }
+        guard isCurrent(config), data == dataEpoch else { return }
+        finishShortDay(day, result)
+    }
+
+    /// A day's load ended: its rows, or (2026-11-19 lane A F8) a failure the fold shows instead of a spinner.
+    func finishShortDay(_ day: String, _ result: Result<(rows: [ConversationSummary], days: [String: ShortDay]), Error>) {
+        switch result {
+        case .success(let collected):
+            shortDayFailed.remove(day)
+            applyShortDay(day, rows: collected.rows, days: collected.days)
+        case .failure:
+            shortDayFailed.insert(day)
+        }
     }
 
     /// A day just fetched from the server: its rows become the day's list, they replace the matching rows of the main
