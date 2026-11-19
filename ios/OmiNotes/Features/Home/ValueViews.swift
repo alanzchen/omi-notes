@@ -349,7 +349,7 @@ struct ShortClipsGroup: View {
                 ForEach(group.rows) { c in ShortClipRow(model: model, conversation: c) }
             }
         } label: {
-            ShortClipsLabel(totals: HomeDay.totals(shown, server: model.shortDays[day] ?? totals))
+            ShortClipsLabel(totals: model.shortDayTotals(day: day, rows: rows, estimate: totals))
         }
         .onChange(of: open) { _, isOpen in
             if isOpen { Task { await model.loadShortSessions(day: day) } }

@@ -89,6 +89,14 @@ extension AppModel {
         }
     }
 
+    /// The 短片段 fold's totals for `day`. Once the server answered the day itself, that answer alone (its rows, and its
+    /// totals when it sent any): an empty page carries no totals for the day, and the list's earlier estimate must not
+    /// say "短片段 1" above "没有短片段" (2026-11-19 R5). Before that (or after a failure), the list's estimate.
+    public func shortDayTotals(day: String, rows: [ConversationSummary], estimate: ShortDay) -> ShortDay {
+        if shortDayLoad[day] == .loaded { return HomeDay.totals(shortDayRows[day] ?? [], server: shortDayAnswered[day]) }
+        return HomeDay.totals(shortDayRows[day] ?? rows, server: shortDays[day] ?? estimate)
+    }
+
     /// A day's load ended: its rows, or (2026-11-19 lane A F8) a failure the fold shows instead of a spinner.
     func finishShortDay(_ day: String, _ result: Result<(rows: [ConversationSummary], days: [String: ShortDay]), Error>) {
         switch result {
@@ -104,6 +112,7 @@ extension AppModel {
     /// list (older pages kept by `mergeFirstPage` may be stale; nothing is appended there), and its totals are kept.
     func applyShortDay(_ day: String, rows: [ConversationSummary], days: [String: ShortDay]) {
         shortDayRows[day] = rows
+        shortDayAnswered[day] = days[day]
         let byId = Dictionary(rows.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         for i in recent.indices {
             if let fresh = byId[recent[i].id] { recent[i] = fresh }

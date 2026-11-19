@@ -57,6 +57,8 @@ public final class AppModel {
     public enum ShortDayLoad: Equatable, Sendable { case loading, loaded, failed }
     public internal(set) var shortDayLoad: [String: ShortDayLoad] = [:]
     var shortDayRequest: [String: Int] = [:]
+    /// The totals the day's own answer carried for it (nil: it sent none, as an empty page does).
+    var shortDayAnswered: [String: ShortDay] = [:]
     /// Days whose short sessions couldn't be loaded (the fold says so rather than loading forever).
     public var shortDayFailed: Set<String> { Set(shortDayLoad.filter { $0.value == .failed }.keys) }
     /// Deferred sessions whose opening already asked for their transcription (once per opening state; a refusal is
@@ -203,6 +205,7 @@ public final class AppModel {
         shortDays = [:]
         shortDayRows = [:]
         shortDayLoad = [:]
+        shortDayAnswered = [:]
         transcribedOnOpen = []
         recentError = nil
         recentLoadedAt = nil
