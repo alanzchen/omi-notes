@@ -352,6 +352,27 @@ struct SearchResults: View {
                 }
             }
         }
+        // on this section, whose rows stay the same while a search runs: on the results section, every change of its rows
+        // (spinner → results) replaced its cells and restarted the task, which cleared the results (2026-11-19 R4)
+        .task(id: "\(key)|\(model.serverIdentity)|\(retries)") {
+            if answeredFor == "\(key)|\(model.serverIdentity)|\(retries)", result != nil || error != nil {
+                SearchLog.line("kept", "the same search reappeared; its answer stays")
+                return
+            }
+            generation += 1
+            let mine = generation
+            result = nil
+            error = nil
+            inFlight = true
+            try? await Task.sleep(for: .milliseconds(300))  // wait for typing to pause
+            guard !Task.isCancelled else {
+                if mine == generation { inFlight = false }  // not replaced by a newer search: nothing runs now
+                return
+            }
+            SearchLog.line("started", "search \(mine)")
+            await load(more: false)
+            if mine == generation { inFlight = false }
+        }
         Section {
             if let error {
                 Text(error).foregroundStyle(.secondary)
@@ -378,25 +399,6 @@ struct SearchResults: View {
             } else if let pending = result?.pending, pending > 0 {
                 Text("\(pending) not searchable yet.")
             }
-        }
-        .task(id: "\(key)|\(model.serverIdentity)|\(retries)") {
-            if answeredFor == "\(key)|\(model.serverIdentity)|\(retries)", result != nil || error != nil {
-                SearchLog.line("kept", "the same search reappeared; its answer stays")
-                return
-            }
-            generation += 1
-            let mine = generation
-            result = nil
-            error = nil
-            inFlight = true
-            try? await Task.sleep(for: .milliseconds(300))  // wait for typing to pause
-            guard !Task.isCancelled else {
-                if mine == generation { inFlight = false }  // not replaced by a newer search: nothing runs now
-                return
-            }
-            SearchLog.line("started", "search \(mine)")
-            await load(more: false)
-            if mine == generation { inFlight = false }
         }
     }
 
