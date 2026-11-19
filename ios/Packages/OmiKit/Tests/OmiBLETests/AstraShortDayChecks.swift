@@ -5,6 +5,8 @@ import Testing
 @testable import OmiCapture
 @testable import OmiProtocol
 
+// nested in RetryFlowTests (serialized): every suite on the shared AppServerStub runs one at a time
+extension RetryFlowTests {
 @MainActor @Suite(.serialized) struct AstraShortDayChecks {
     let day = "2026-11-18"
     let path = "/v1/conversations/recent"
@@ -94,4 +96,5 @@ import Testing
         await m.refreshServer()
         #expect(m.serverURL != nil, "Home's search gate remains true while a configured server is offline")
     }
+}
 }

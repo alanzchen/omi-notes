@@ -41,6 +41,8 @@ import Testing
   #expect(FileManager.default.fileExists(atPath:p.inboxDir.appendingPathComponent("\(p.segment.id).m4a").path),"keep durable inbox source until quarantine directory sync succeeds")
  }
 }
+// nested in RetryFlowTests (serialized): every suite on the shared AppServerStub runs one at a time
+extension RetryFlowTests {
 @MainActor @Suite(.serialized) struct AstraNovember19SearchChecks {
  @Test func immediateOfflineFailureCompletesTheRealModel() async throws {
   let(m,root)=try RetryFlowTests().model();defer {try? FileManager.default.removeItem(at:root)}
@@ -60,9 +62,12 @@ import Testing
   #expect(m.serverIdentity==key)
  }
 }
+}
 
 /// 2026-11-19 R3: a search left on "Searching…" in the field said nothing in the phone log. Each finished search now
 /// leaves one rate-limited `[search]` line: whether the server was asked and the outcome, never the query.
+// nested in RetryFlowTests (serialized): every suite on the shared AppServerStub runs one at a time
+extension RetryFlowTests {
 @MainActor @Suite(.serialized) struct SearchLogTests {
     @Test func aSearchLeavesALineWithItsOutcomeButNotItsQuery() async throws {
         let (m, root) = try RetryFlowTests().model()
@@ -76,4 +81,5 @@ import Testing
         #expect(line.message.contains("asked server") && line.message.contains("outcome"), "\(line.message)")
         #expect(!lines.contains { $0.message.contains("zebra") }, "never the query text")
     }
+}
 }
