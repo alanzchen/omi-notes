@@ -230,8 +230,6 @@ struct WorthRevisitingSection: View {
                 }
             } header: {
                 Text("Worth revisiting")
-            } footer: {
-                Text("Suggested from each note's own content. Your marks always win.")
             }
         }
     }

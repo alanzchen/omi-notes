@@ -153,8 +153,9 @@ struct HomeView: View {
     @ViewBuilder private var conversationSections: some View {
         if model.recent.isEmpty {
             Section("Conversations") {
-                if let error = model.recentError {
-                    Label("Couldn't load conversations: \(error)", systemImage: "wifi.exclamationmark")
+                if model.recentError != nil {
+                    // the reason is on the status card above; no raw, nested error text here
+                    Label("Couldn't load conversations", systemImage: "exclamationmark.circle")
                         .font(.subheadline).foregroundStyle(.secondary)
                     NavigationLink("Notes saved on this phone") { SavedConversationsView(model: model) }
                 } else if model.serverURL == nil {
@@ -162,7 +163,7 @@ struct HomeView: View {
                 } else if model.recentLoadedAt == nil, model.recentSavedAt == nil {
                     HStack { ProgressView(); Text("Loading conversations…").foregroundStyle(.secondary).padding(.leading, 6) }
                 } else {
-                    Text("No conversations yet. A note appears here a few minutes after a conversation ends.")
+                    Text("No conversations yet.")
                         .font(.subheadline).foregroundStyle(.secondary)
                 }
             }
@@ -200,10 +201,11 @@ struct HomeView: View {
                     NavigationLink("Notes saved on this phone") { SavedConversationsView(model: model) }
                 }
             } footer: {
+                // what is shown and how old it is; the reason is on the status card (it isn't always "can't be reached")
                 if let saved = model.recentSavedAt {
-                    Text("The server can't be reached. Showing the list saved \(Fmt.relative(saved)).")
-                } else if let error = model.recentError {
-                    Text("Couldn't refresh (\(error)). Showing what was loaded before.")
+                    Text("Showing the list saved \(Fmt.relative(saved)).")
+                } else if model.recentError != nil {
+                    Text("Couldn't refresh. Showing what was loaded before.")
                 }
             }
         }
@@ -354,12 +356,10 @@ struct SearchResults: View {
                 HStack { ProgressView(); Text("Searching…").foregroundStyle(.secondary).padding(.leading, 6) }
             }
         } footer: {
-            if result?.serverLacksSearch == true {
-                Text("This server doesn't support search yet, so only notes saved on this phone were searched (their transcripts may be partial).")
-            } else if result?.offline == true {
-                Text("The server can't be reached, so only notes saved on this phone were searched (their transcripts may be partial).")
+            if result?.serverLacksSearch == true || result?.offline == true {
+                Text("Notes saved on this phone only.")
             } else if let pending = result?.pending, pending > 0 {
-                Text("\(pending) conversation\(pending == 1 ? " isn't" : "s aren't") searchable yet; the server is still indexing.")
+                Text("\(pending) not searchable yet.")
             }
         }
         .task(id: "\(key)|\(model.serverIdentity)") {
