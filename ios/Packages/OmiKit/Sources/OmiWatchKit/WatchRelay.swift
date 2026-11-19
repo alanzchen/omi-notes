@@ -412,9 +412,10 @@ public final class WatchOutbox: @unchecked Sendable {
         let intent = segmentsDir.appendingPathComponent("\(segment.id).intent")
         try Files.durableWrite(WatchWire.encode(segment), to: intent)
         let audio = segmentsDir.appendingPathComponent("\(segment.id).m4a")
-        if segmentFile != audio {
-            _ = try? FileManager.default.removeItem(at: audio)
-            try FileManager.default.moveItem(at: segmentFile, to: audio)
+        // one step: an existing file stays unless the new one takes its place (a remove-then-move left a part with no
+        // audio when the move failed, 2026-11-19 X1)
+        if segmentFile != audio, rename(segmentFile.path, audio.path) != 0 {
+            throw DurableFileError(operation: "rename", url: audio, code: errno)
         }
         try Files.fsync(audio)
         try Files.durableWrite(WatchWire.encode(segment), to: segmentsDir.appendingPathComponent("\(segment.id).json"))

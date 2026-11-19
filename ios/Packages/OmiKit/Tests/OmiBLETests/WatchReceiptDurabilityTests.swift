@@ -99,3 +99,29 @@ import Testing
         #expect(outbox.ends().contains { $0.id == end.id }, "the end that was written is sent without a relaunch")
     }
 }
+
+/// 2026-11-19 boundary X1: `WatchOutbox.publish` removed the part's existing audio before moving the new file in, so a
+/// move that failed (its source already gone, e.g. moved in by an earlier attempt) left the part with no audio at all.
+/// The audio is now replaced in one step: the existing file stays unless the new one takes its place. SYNTHETIC bytes.
+@Suite(.serialized) struct WatchOutboxReplaceTests {
+    @Test func aFailedMoveNeverLeavesAPartWithoutItsAudio() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("omi-publish-\(UUID().uuidString)")
+        let outbox = WatchOutbox(root: root)
+        let file = root.appendingPathComponent("rec.m4a")
+        try Data(repeating: 4, count: 2048).write(to: file)
+        let sha = SHA256.hash(data: try Data(contentsOf: file)).map { String(format: "%02x", $0) }.joined()
+        let segment = WatchSegment(recordingId: "r", index: 0, deviceId: "watch-1", deviceName: "W", binding: "p",
+                                   recordingStartedAt: Date(timeIntervalSince1970: 1_790_500_000), startOffsetUs: 0, endOffsetUs: 2_000_000,
+                                   bytes: 2048, sha256: sha)
+        let segmentsDir = root.appendingPathComponent("segments")
+        SyncFaults.set(segmentsDir, failing: true, exactly: true, after: 1, times: 1)  // the audio moves in, its manifest fails
+        defer { SyncFaults.set(segmentsDir, failing: false) }
+        #expect(throws: (any Error).self) { try outbox.add(segmentFile: file, segment: segment) }
+        let audio = segmentsDir.appendingPathComponent("\(segment.id).m4a")
+        #expect(FileManager.default.fileExists(atPath: audio.path))
+        // the same part handed in again from its old path, which is already gone
+        #expect(throws: (any Error).self) { try outbox.add(segmentFile: file, segment: segment) }
+        #expect(FileManager.default.fileExists(atPath: audio.path), "its audio is still there")
+        #expect(outbox.segments().contains { $0.segment.id == segment.id }, "and it is still sent (republished from its intent)")
+    }
+}
