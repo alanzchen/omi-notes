@@ -943,7 +943,10 @@ public enum CaptureRecovery {
         let outbox = env.outbox
         if outbox.contains(.seal(captureId: m.captureId)) {
             // sealed earlier: a seal is no evidence for its chunks; every journal is accounted for first (IT3-01)
-            if let error = accountForJournals(in: dir, captureId: m.captureId, outbox: outbox) {
+            // and the seal itself, where it actually is (ASTRA-20261118-IT4-02)
+            let unaccounted = accountForJournals(in: dir, captureId: m.captureId, outbox: outbox)
+                ?? { do { try outbox.account(.seal(captureId: m.captureId)) { nil }; return nil } catch { return error } }()
+            if let error = unaccounted {
                 report.skipped.append(dir.lastPathComponent)
                 log(.warning, "recovery", "\(dir.lastPathComponent) kept: not every chunk is accounted for (\(error.localizedDescription))")
             } else {
@@ -984,7 +987,21 @@ public enum CaptureRecovery {
                 return false
             }
         }
-        if !raw.isEmpty {
+        if !raw.isEmpty, let frozen = FrozenChunk.load(journal: journalURL) {
+            // published before a manifest commit was lost: the chunk keeps the identity it was published with (its
+            // frozen header), never one derived again from the stale manifest (ASTRA-20261118-IT4-01)
+            do {
+                try outbox.write(frozen.envelope, kind: .chunk(captureId: m.captureId, sequence: seq))
+            } catch {
+                log(.error, "recovery", "could not republish chunk \(seq) of \(m.captureId): \(error)")
+                return false
+            }
+            if m.source == .deviceRing, let last = RingJournal.scan(raw).entries.last?.seq, let ring = m.ring {
+                report.ringDurable.append(RingDurableMark(deviceId: m.deviceId, generation: ring.generation, seq: last))
+            }
+            endUs = frozen.header.chunkEndOffsetUs
+            m.openChunkSequence = seq + 1
+        } else if !raw.isEmpty {
             do {
                 if let written = try finalizeRecovered(manifest: m, raw: raw, dir: dir, env: env, codecFallback: codecFallback, report: &report) {
                     endUs = written
@@ -1095,7 +1112,10 @@ enum FrozenChunk {
     }
 
     /// The chunk's envelope from its frozen journal and saved header; nil when either is missing or they don't match.
-    static func rebuild(journal: URL) -> Data? {
+    static func rebuild(journal: URL) -> Data? { load(journal: journal)?.envelope }
+
+    /// The saved header and the envelope it rebuilds; nil when either is missing or they don't match.
+    static func load(journal: URL) -> (header: EnvelopeHeader, envelope: Data)? {
         guard let json = try? Data(contentsOf: headerURL(journal)), let header = try? JSONDecoder().decode(EnvelopeHeader.self, from: json),
               let raw = try? Data(contentsOf: journal) else { return nil }
         let payload: Data
@@ -1104,8 +1124,8 @@ enum FrozenChunk {
         } else {
             payload = Data(raw.prefix(BLERecord.scan(raw).validLength))
         }
-        guard payload.count == header.payloadBytes else { return nil }
-        return try? Envelope.build(header: header, payload: payload)
+        guard payload.count == header.payloadBytes, let envelope = try? Envelope.build(header: header, payload: payload) else { return nil }
+        return (header, envelope)
     }
 }
 
