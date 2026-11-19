@@ -80,7 +80,7 @@ struct HomeView: View {
                 SearchResults(model: model, query: query)
             }
         }
-        .searchable(text: $query, prompt: "Search conversations")
+        .modifier(SearchWhenConfigured(configured: model.serverURL != nil, query: $query))
         .navigationTitle("Omi Notes")
         .refreshable { await model.refreshServer() }
         .task { await model.speakers.refresh() }
@@ -108,7 +108,9 @@ struct HomeView: View {
         if !s.attention.isEmpty || newVoices > 0 {
             Section("Needs you") {
                 ForEach(s.attention, id: \.self) { msg in
-                    Label(msg, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.subheadline)
+                    // the text in the primary color (orange text was ~2.2:1 in light mode); the icon keeps the warning
+                    Label { Text(msg) } icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
+                        .font(.subheadline)
                 }
                 if !s.attention.isEmpty {
                     Button("Dismiss phone messages") { model.engine.clearAttention() }.font(.subheadline)
@@ -305,7 +307,7 @@ struct ConversationRow: View {
 
     private var title: String {
         if let t = c.title { return [c.emoji, t].compactMap { $0 }.joined(separator: " ") }
-        return c.displayState.code == "listening" ? "Conversation in progress" : "Conversation"
+        return "Conversation"  // "in progress" is the chip's to say (lane A F6)
     }
 
     private var meta: String {
@@ -453,5 +455,15 @@ struct VoicesCard: View {
         }
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// Search only once a server is set up: without one it can only fail (lane B F8).
+private struct SearchWhenConfigured: ViewModifier {
+    let configured: Bool
+    @Binding var query: String
+
+    func body(content: Content) -> some View {
+        if configured { content.searchable(text: $query, prompt: "Search conversations") } else { content }
     }
 }

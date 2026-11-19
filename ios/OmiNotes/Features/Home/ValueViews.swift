@@ -330,7 +330,16 @@ struct ShortClipsGroup: View {
         DisclosureGroup(isExpanded: $open) {
             let groups = HomeDay.byKind(shown)
             if groups.isEmpty {
-                ProgressView().frame(maxWidth: .infinity)  // the day's list is loading (none on this page yet)
+                if model.shortDayFailed.contains(day) {
+                    // couldn't load: said, with a way to try again, never a spinner that never ends (lane A F8)
+                    HStack {
+                        Label("无法加载", systemImage: "exclamationmark.circle").font(.subheadline).foregroundStyle(.secondary)
+                        Spacer()
+                        Button("重试") { Task { await model.loadShortSessions(day: day) } }.font(.subheadline)
+                    }
+                } else {
+                    ProgressView().frame(maxWidth: .infinity)  // the day's list is loading (none on this page yet)
+                }
             }
             ForEach(groups, id: \.kind) { group in
                 if groups.count > 1 { ShortKindHeader(kind: group.kind, count: group.rows.count) }
@@ -400,13 +409,13 @@ struct ShortClipRow: View {
     var body: some View {
         if model.serverStatus?.supportsConversationDetail == true || model.details[c.id] != nil {
             // a hidden link under the row keeps 转写 its own tap target
-            line.background(NavigationLink { ConversationDetailView(model: model, summary: c) } label: { EmptyView() }.opacity(0))
+            line(opens: true).background(NavigationLink { ConversationDetailView(model: model, summary: c) } label: { EmptyView() }.opacity(0))
         } else {
-            line
+            line(opens: false)
         }
     }
 
-    private var line: some View {
+    private func line(opens: Bool) -> some View {
         let state = model.transcribeState(of: c)
         return VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 10) {
@@ -430,6 +439,10 @@ struct ShortClipRow: View {
                     .buttonStyle(.borderless)
                 case .offer(nil), .none, .unavailable:
                     EmptyView()  // waiting: opening it transcribes it
+                }
+                if opens {  // the standard sign that the row opens (lane A F12)
+                    Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+                        .accessibilityHidden(true)
                 }
             }
             if case .offer(let message?) = state {
