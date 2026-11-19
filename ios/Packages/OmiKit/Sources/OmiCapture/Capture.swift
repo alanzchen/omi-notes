@@ -1001,6 +1001,13 @@ public enum CaptureRecovery {
             }
             endUs = frozen.header.chunkEndOffsetUs
             m.openChunkSequence = seq + 1
+        } else if !raw.isEmpty, FrozenChunk.wasPublished(journal: journalURL, raw: raw, source: m.source) {
+            // published under a header that can't be used now (gone, unreadable, or not matching its journal): its
+            // identity must not come back with metadata derived from the stale manifest (ASTRA-20261119-IT1-02); the
+            // journal stays as it is, with its audio, and is looked at again on the next launch
+            report.skipped.append(dir.lastPathComponent)
+            log(.error, "recovery", "chunk \(seq) of \(m.captureId) was published but its saved header can't be used; journal kept")
+            return false
         } else if !raw.isEmpty {
             do {
                 if let written = try finalizeRecovered(manifest: m, raw: raw, dir: dir, env: env, codecFallback: codecFallback, report: &report) {
@@ -1114,16 +1121,32 @@ enum FrozenChunk {
     /// The chunk's envelope from its frozen journal and saved header; nil when either is missing or they don't match.
     static func rebuild(journal: URL) -> Data? { load(journal: journal)?.envelope }
 
+    /// The payload a journal publishes: ring records, or the valid prefix of BLE records.
+    static func payload(_ raw: Data, source: CaptureSource) -> Data {
+        source == .deviceRing ? RingJournal.scan(raw).entries.reduce(into: Data()) { $0.append($1.record) }
+            : Data(raw.prefix(BLERecord.scan(raw).validLength))
+    }
+
+    /// Whether a journal with no usable header was nevertheless published (ASTRA-20261119-IT1-02). A header is saved just
+    /// before publication and a published journal no longer grows, so: a readable header for fewer bytes than the
+    /// journal now holds belongs to a publication that failed (the journal went on): not published. No header: published
+    /// only if the next chunk's journal exists (a rotation opens it after publishing). Anything else (an unreadable
+    /// header, or one for more bytes than the journal holds) can't be told apart: taken as published, never re-derived.
+    static func wasPublished(journal: URL, raw: Data, source: CaptureSource) -> Bool {
+        let header = headerURL(journal)
+        guard let json = try? Data(contentsOf: header) else {
+            guard let seq = CaptureManifest.journalSequence(journal.lastPathComponent) else { return true }
+            return FileIO.exists(journal.deletingLastPathComponent().appendingPathComponent(CaptureManifest.journalName(seq + 1)))
+        }
+        guard let h = try? JSONDecoder().decode(EnvelopeHeader.self, from: json) else { return true }
+        return h.payloadBytes >= payload(raw, source: source).count
+    }
+
     /// The saved header and the envelope it rebuilds; nil when either is missing or they don't match.
     static func load(journal: URL) -> (header: EnvelopeHeader, envelope: Data)? {
         guard let json = try? Data(contentsOf: headerURL(journal)), let header = try? JSONDecoder().decode(EnvelopeHeader.self, from: json),
               let raw = try? Data(contentsOf: journal) else { return nil }
-        let payload: Data
-        if header.source == .deviceRing {
-            payload = RingJournal.scan(raw).entries.reduce(into: Data()) { $0.append($1.record) }
-        } else {
-            payload = Data(raw.prefix(BLERecord.scan(raw).validLength))
-        }
+        let payload = payload(raw, source: header.source)
         guard payload.count == header.payloadBytes, let envelope = try? Envelope.build(header: header, payload: payload) else { return nil }
         return (header, envelope)
     }
