@@ -464,7 +464,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             if self.settings.rememberedDeviceId == SimulatedDevice.deviceIdentifier, self.settings.simulatedMode {
                 self.connectSimulated(after: 0.3)
             } else {
-                self.central?.ensureConnected()
+                self.central?.ensureConnected(explicit: true)
             }
             self.scheduleSnapshot()
         }
@@ -1040,7 +1040,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             self.endKeepAlive()
             self.liftCodecStall(why: "the app was opened")
             self.resetDiscoveryBackoff()
-            self.central?.ensureConnected()  // re-kick a pending connect on foreground
+            self.central?.ensureConnected(explicit: true)  // re-kick a pending connect on foreground
             self.uploader.reconcile()
             if self.session?.phase == .streaming { self.writeHeartbeat(reason: "foreground") }
             self.checkStorage()

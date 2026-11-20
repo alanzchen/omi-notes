@@ -123,6 +123,9 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
     private var backoffUntil: DispatchTime?
     /// Bumped by every reconnect scheduled or lifted: an older short timer that fires later does nothing (one kick).
     private var reconnectGeneration = 0
+    /// A pending connect the system restored with the app (state restoration): adopted, not re-issued, until the owner
+    /// asks (explicit `ensureConnected`) or it ends (connected, failed, disconnected) (ASTRA-20261120-IT3-02).
+    private var restoredPending: UUID?
 
     private var backend: CentralBackend!
     private var peripheral: PeripheralHandle?
@@ -197,6 +200,7 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
     /// or asked to reconnect. Still refused while any suppression (e.g. storage guard) is active.
     public func connect(to id: UUID) {
         stopScan()
+        restoredPending = nil
         guard connectionAllowed, id == rememberedId else {
             log(.warning, "ble", "not connecting to \(id): \(suppression.isEmpty ? "not the remembered device" : "suppressed (\(suppression.map(\.rawValue).sorted().joined(separator: ", ")))")")
             return
@@ -221,19 +225,37 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
     }
 
     /// Idempotent: (re)issue a pending connect for the remembered device if allowed.
-    public func ensureConnected() {
+    /// - Parameter explicit: the owner asked (Reconnect, the app opened): a pending connect is re-issued at once.
+    ///   Otherwise (powered on, startup, automatic recovery) a pending connect the system already holds is adopted.
+    public func ensureConnected(explicit: Bool = false) {
         guard backend.state == .poweredOn, connectionAllowed, let id = rememberedId else { return }
-        guard !inBackoff else { return }  // the backoff's own scheduled attempt connects
+        if explicit { restoredPending = nil }
         if let p = peripheral, p.identifier == id {
             if p.connectionState == .connected {
                 if deliveredId != p.identifier { deliver(p) }
                 return
             }
+            if inBackoff {
+                // a deadline is not a request (ASTRA-20261120-IT3-01: a radio reset or a suppression can drop the
+                // delayed connect): adopt one that is pending, else submit one for the time left
+                submitDelayedConnect(p)
+                return
+            }
+            if p.connectionState == .connecting, restoredPending == p.identifier { return }  // the restored one stands
             if p.connectionState == .disconnected { log(.info, "ble", "waiting to connect to the remembered pendant") }
             backend.connect(p)  // re-kick even while .connecting
             return
         }
         connect(to: id)
+    }
+
+    /// During a backoff: the system's own pending connect, started when the backoff ends. One per link: a link already
+    /// connecting keeps its request; a disconnected one gets one for the time left (ASTRA-20261120-IT2-01, IT3-01).
+    private func submitDelayedConnect(_ p: PeripheralHandle) {
+        guard let until = backoffUntil, p.connectionState == .disconnected || p.connectionState == .disconnecting else { return }
+        peripheral = p
+        let remaining = until > .now() ? Double(until.uptimeNanoseconds - DispatchTime.now().uptimeNanoseconds) / 1_000_000_000 : 0
+        backend.connect(p, after: max(remaining, reconnectDelay))
     }
 
     /// Cancels the link or pending connect (the caller sets the suppression reason first).
@@ -314,7 +336,10 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
             case .connected:
                 if mayAccept(p) { deliver(p) } else { prohibited.append(p) }
             case .connecting:
-                if !mayAccept(p) { prohibited.append(p) } else { log(.info, "ble", "waiting (restored pending connect)") }
+                if !mayAccept(p) { prohibited.append(p) } else {
+                    restoredPending = p.identifier
+                    log(.info, "ble", "waiting (restored pending connect)")
+                }
             default:
                 break
             }
@@ -362,6 +387,7 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
     }
 
     public func backendDidConnect(_ p: PeripheralHandle) {
+        if restoredPending == p.identifier { restoredPending = nil }
         guard mayAccept(p) else {
             log(.warning, "ble", "refusing connection to \(p.identifier) (\(p.identifier == rememberedId ? "suppressed" : "not the remembered device"))")
             backend.cancelConnection(p)
@@ -372,6 +398,7 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
     }
 
     public func backendDidFailToConnect(_ p: PeripheralHandle, error: Error?) {
+        if restoredPending == p.identifier { restoredPending = nil }
         let lost = PairingPolicy.isPairingLost(error)
         if lost { suppression.insert(.pairingLost) }
         p.resetTransport()
@@ -381,6 +408,7 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
     }
 
     public func backendDidDisconnect(_ p: PeripheralHandle, error: Error?) {
+        if restoredPending == p.identifier { restoredPending = nil }
         let lost = PairingPolicy.isPairingLost(error)
         if lost { suppression.insert(.pairingLost) }
         let wasDelivered = deliveredId == p.identifier
@@ -409,9 +437,7 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
                 }
                 return
             }
-            peripheral = p
-            let remaining = Double(until.uptimeNanoseconds - DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
-            backend.connect(p, after: max(remaining, reconnectDelay))
+            submitDelayedConnect(p)
             return
         }
         // Peripheral handles are only ever touched on `queue`, which this closure also runs on.
