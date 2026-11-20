@@ -352,7 +352,7 @@ extension PendantSummary {
     /// Simulator screenshots only (debug builds): synthetic states run through the real `evaluate`.
     /// `normal`, `mid`, `charging`, `disconnected`, `unpaired`, `blocked` (uploads blocked + low battery + pendant sync),
     /// `silent` (connected, no audio since subscribing), `reconnecting`, `syncing` (collecting stored audio),
-    /// `refused`, `codec`, `pairingLost`, `storage`, `btOff` (problem states).
+    /// `refused`, `codec`, `pairingLost`, `storage`, `btOff` (problem states), `pausedSettingUp`.
     public static func debugFixture(_ name: String, now: Date = Date()) -> PendantSummary? {
         var s = EngineSnapshot()
         s.ready = true
@@ -384,6 +384,10 @@ extension PendantSummary {
             s.offline = .complete(records: 0)
         case "reconnecting":
             s.connection = .settingUp
+            s.pendantLastConnectedAt = now.addingTimeInterval(-40)
+        case "pausedSettingUp":  // an existing link still being set up, recording paused from this phone
+            s.connection = .settingUp
+            s.recordingPaused = true
             s.pendantLastConnectedAt = now.addingTimeInterval(-40)
         case "syncing":
             s.connection = .streaming
