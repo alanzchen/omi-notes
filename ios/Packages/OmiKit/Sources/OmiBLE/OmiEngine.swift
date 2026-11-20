@@ -125,6 +125,8 @@ public struct EngineConfiguration: Sendable {
     /// Test hook: a central backend (fake) instead of CoreBluetooth.
     public var testCentralBackend: (@Sendable (CentralBackendEvents) -> CentralBackend)?
     public var storagePolicy = StorageGuardPolicy()
+    /// The first backoff after `discoveryFailureLimit` failed discoveries in a row (doubles, capped at 10×). Tests shorten it.
+    public var discoveryBackoffBase: TimeInterval = 30
     /// Where the app keeps its rolling diagnostic log for the phone-log upload (nil: not kept; tests).
     public var diagnosticLogURL: URL?
 
@@ -185,6 +187,10 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     /// At `codecFailureLimit` the engine stops reconnecting (a new connection resets the session's own count, so
     /// it would otherwise retry every 200 ms forever) until the owner taps Reconnect.
     private var codecFailures: [String: Int] = [:]
+    /// Failed discoveries in a row per pendant (no successful connection in between): from `discoveryFailureLimit` on,
+    /// reconnects back off (2026-11-20; a failed discovery reconnects instead of refusing since 5a802a0).
+    private var discoveryFailures: [String: Int] = [:]
+    static let discoveryFailureLimit = 3
     static let codecFailureLimit = 3
     private var codecStall: String?
     private var codecStallSinceMono: UInt64?
@@ -421,6 +427,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             self.refusal = nil
             for r in [ReconnectSuppression.userDisconnected, .pairingLost, .unsupportedDevice, .codecUnreadable] { self.central?.unsuppress(r) }
             self.codecFailures.removeAll()
+            self.resetDiscoveryBackoff()
             self.codecStall = nil
             self.codecStallSinceMono = nil
             if id == SimulatedDevice.deviceIdentifier {
@@ -450,6 +457,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             self.refusal = nil
             for r in [ReconnectSuppression.userDisconnected, .pairingLost, .unsupportedDevice, .codecUnreadable] { self.central?.unsuppress(r) }
             self.codecFailures.removeAll()
+            self.resetDiscoveryBackoff()
             self.codecStall = nil
             self.codecStallSinceMono = nil
             self.attention.removeAll { $0.contains("pairing") }
@@ -475,6 +483,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             self.refusal = nil
             for r in [ReconnectSuppression.userDisconnected, .pairingLost, .unsupportedDevice, .codecUnreadable] { self.central?.unsuppress(r) }
             self.codecFailures.removeAll()
+            self.resetDiscoveryBackoff()
             self.codecStall = nil
             self.codecStallSinceMono = nil
             self.scheduleSnapshot()
@@ -1030,6 +1039,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             self.writePhoneStatus(trigger: "foreground")
             self.endKeepAlive()
             self.liftCodecStall(why: "the app was opened")
+            self.resetDiscoveryBackoff()
             self.central?.ensureConnected()  // re-kick a pending connect on foreground
             self.uploader.reconcile()
             if self.session?.phase == .streaming { self.writeHeartbeat(reason: "foreground") }
@@ -1221,9 +1231,18 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
 
     public func sessionDidChange(_ session: DeviceSession) { scheduleSnapshot() }
 
-    public func sessionDidStartCapture(_ session: DeviceSession) { scheduleSnapshot() }
+    public func sessionDidStartCapture(_ session: DeviceSession) {
+        discoveryFailures[session.deviceId] = nil  // discovery worked on this connection
+        scheduleSnapshot()
+    }
+
+    private func resetDiscoveryBackoff() {
+        discoveryFailures.removeAll()
+        central?.clearBackoff()
+    }
 
     public func sessionDidBecomeReady(_ session: DeviceSession) {
+        discoveryFailures[session.deviceId] = nil
         if settings.rememberedDeviceName == nil { settings.rememberedDeviceName = session.info.name }
         if let updater = firmwareUpdater, updater.session !== session {
             updater.reconnected(reporting: session.info.firmwareRevision)  // back after the update's restart
@@ -1315,7 +1334,18 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             simulated?.linkDown()
             connectSimulated(after: 1)
         } else {
-            central?.restartLink()  // not suppressed: reconnects 200 ms after the link is down (also one already lost)
+            // not suppressed: reconnects 200 ms after the link is down (also one already lost); a discovery that keeps
+            // failing backs off instead (30 s doubling to 5 min), never a refusal
+            var backoff: TimeInterval?
+            if session.discoveryFailed {
+                let failures = (discoveryFailures[session.deviceId] ?? 0) + 1
+                discoveryFailures[session.deviceId] = failures
+                if failures >= Self.discoveryFailureLimit {
+                    let base = config.discoveryBackoffBase
+                    backoff = min(base * pow(2, Double(min(failures - Self.discoveryFailureLimit, 8))), base * 10)
+                }
+            }
+            central?.restartLink(backoff: backoff)
         }
     }
 

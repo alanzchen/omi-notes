@@ -220,6 +220,9 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
         transport.discover()
     }
 
+    /// This connection asked for a reconnect because discovery failed or timed out (the engine's backoff counts these).
+    public private(set) var discoveryFailed = false
+
     private func requestReconnect(_ reason: String) {
         guard !reconnectRequested, phase != .ended else { return }
         reconnectRequested = true
@@ -286,6 +289,7 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
                 log(.warning, "ble", "service discovery timed out; retrying")
                 requestDiscovery()
             } else {
+                discoveryFailed = true
                 requestReconnect("service discovery timed out")
             }
             return
@@ -359,6 +363,7 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
                 // A link that dropped or a GATT error during discovery says nothing about the device: reconnect (not
                 // suppressed), never refuse. Build 60 field log 2026-11-19 20:10:32Z: a restored link already gone,
                 // "The specified device is not connected.", refused Alan's own pendant until the app was relaunched.
+                discoveryFailed = true
                 requestReconnect(failure)
                 return
             }

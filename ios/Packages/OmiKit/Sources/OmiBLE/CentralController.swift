@@ -115,6 +115,9 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
     public private(set) var suppression: Set<ReconnectSuppression> = []
     public private(set) var isScanning = false
     public var reconnectDelay: TimeInterval = 0.2
+    /// No reconnect before this (a backoff after repeated failed discoveries); never a suppression: a user Disconnect still
+    /// stops everything, and `clearBackoff` (success, foreground, Reconnect, pair, forget) lifts it.
+    private var backoffUntil: DispatchTime?
 
     private var backend: CentralBackend!
     private var peripheral: PeripheralHandle?
@@ -210,6 +213,7 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
     /// Idempotent: (re)issue a pending connect for the remembered device if allowed.
     public func ensureConnected() {
         guard backend.state == .poweredOn, connectionAllowed, let id = rememberedId else { return }
+        guard !inBackoff else { return }  // the backoff's own scheduled attempt connects
         if let p = peripheral, p.identifier == id {
             if p.connectionState == .connected {
                 if deliveredId != p.identifier { deliver(p) }
@@ -232,11 +236,19 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
     /// The session gave up on this link (a link problem, not a refusal): end it and connect again. The reconnect is
     /// scheduled here too, not only from `didDisconnect`: a link CoreBluetooth had already lost may send none (build 60
     /// field log 2026-11-19 20:10:32Z: no "disconnected" after the cancel). A second pending connect is harmless.
-    public func restartLink() {
+    public func restartLink(backoff: TimeInterval? = nil) {
         guard let p = peripheral else { return }
+        if let backoff {
+            backoffUntil = .now() + backoff
+            log(.warning, "ble", "discovery keeps failing; next connection attempt in \(Int(backoff)) s")
+        }
         if p.connectionState != .disconnected { backend.cancelConnection(p) }
         scheduleReconnect(p)
     }
+
+    public func clearBackoff() { backoffUntil = nil }
+
+    private var inBackoff: Bool { backoffUntil.map { $0 > .now() } ?? false }
 
     public func forget() {
         disconnect()
@@ -284,7 +296,7 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
             case .connected:
                 if mayAccept(p) { deliver(p) } else { prohibited.append(p) }
             case .connecting:
-                if !mayAccept(p) { prohibited.append(p) }
+                if !mayAccept(p) { prohibited.append(p) } else { log(.info, "ble", "waiting (restored pending connect)") }
             default:
                 break
             }
@@ -365,8 +377,9 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
         guard p.identifier == rememberedId else { return }
         // Peripheral handles are only ever touched on `queue`, which this closure also runs on.
         nonisolated(unsafe) let handle = p
-        queue.asyncAfter(deadline: .now() + reconnectDelay) { [weak self] in
-            guard let self, self.connectionAllowed, self.backend.state == .poweredOn,
+        let at = max(DispatchTime.now() + reconnectDelay, backoffUntil ?? .now())
+        queue.asyncAfter(deadline: at) { [weak self] in
+            guard let self, !self.inBackoff, self.connectionAllowed, self.backend.state == .poweredOn,
                   handle.identifier == self.rememberedId, handle.connectionState != .connected else { return }
             self.peripheral = handle
             self.backend.connect(handle)  // pending connect: free while the device is away
