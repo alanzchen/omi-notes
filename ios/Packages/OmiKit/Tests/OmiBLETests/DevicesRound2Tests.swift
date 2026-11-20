@@ -14,8 +14,9 @@ import OmiWatchKit
         for name in ["refused", "codec", "pairingLost", "storage", "btOff"] {
             let s = try #require(PendantSummary.debugFixture(name, now: now), "fixture \(name)")
             let issue = try #require(s.rows.first { $0.attention }, "an issue row for \(name)")
-            #expect(s.cardState == "Not connected", "\(name): \(s.cardState)")
-            #expect(issue.title != s.cardState)
+            #expect(issue.title != s.cardState, "\(name): said twice")
+            // the pendant's own problem: the plain connection fact above it (storage full is the phone's row)
+            if issue.kind != .phone { #expect(s.cardState == "Not connected", "\(name): \(s.cardState)") }
         }
         // no issue of its own: the state line as before
         #expect(PendantSummary.debugFixture("normal", now: now)?.cardState == "Recording")

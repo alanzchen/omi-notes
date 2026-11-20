@@ -406,7 +406,7 @@ extension PendantSummary {
             case "refused": s.connection = .refused("not an Omi device (no audio characteristic)")
             case "codec": s.connection = .paused(OmiEngine.codecStallReason)
             case "pairingLost": s.connection = .paused("pairing information removed")
-            case "storage": s.connection = .paused("phone storage low")
+            case "storage": s.connection = .paused("phone storage low"); s.storageTripped = true  // as the engine sets both
             default: s.connection = .bluetoothUnavailable("off")
             }
         case "blocked":
