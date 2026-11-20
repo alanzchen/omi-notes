@@ -144,7 +144,9 @@ public struct PendantSummary: Equatable, Sendable {
     /// ("This pendant can't be used" was both, 2026-11-20).
     public var cardState: String {
         let head = stateLine.components(separatedBy: " · ").first ?? stateLine
-        guard !connected, let issue = rows.first(where: \.attention), issue.kind != .phone else { return head }
+        // only for a link known to be down (waiting, refused, Bluetooth, a stop): while setting up an existing link it
+        // stays "Connecting…" (ASTRA-20261120-IT2-03, e.g. paused while setting up)
+        guard !connected, connectionTitle != "Connecting…", let issue = rows.first(where: \.attention), issue.kind != .phone else { return head }
         return "Not connected"
     }
 
