@@ -73,10 +73,6 @@ struct DevicesView: View {
                         }
                         .padding(.top, layout.cards.isEmpty ? 0 : 6)
                     }
-                    if layout.cards.count == 2 {
-                        Text("Both can record at the same time. Each sends its audio through this iPhone.")
-                            .font(.footnote).foregroundStyle(Pendant.secondary).padding(.horizontal, 4)
-                    }
                     // where audio is right now: Watch → iPhone → server, each from its own source
                     if model.snapshot.serverConfigured || !layout.cards.isEmpty || model.snapshot.outbox.pendingCount > 0 {
                         TransferCardView(model: model, watchInstalled: Self.watchAppInstalled) { page = .transfers }
