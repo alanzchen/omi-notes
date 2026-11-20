@@ -342,7 +342,8 @@ public struct PendantSummary: Equatable, Sendable {
 extension PendantSummary {
     /// Simulator screenshots only (debug builds): synthetic states run through the real `evaluate`.
     /// `normal`, `mid`, `charging`, `disconnected`, `unpaired`, `blocked` (uploads blocked + low battery + pendant sync),
-    /// `silent` (connected, no audio since subscribing), `reconnecting`, `syncing` (collecting stored audio).
+    /// `silent` (connected, no audio since subscribing), `reconnecting`, `syncing` (collecting stored audio),
+    /// `refused`, `codec`, `pairingLost`, `storage`, `btOff` (problem states).
     public static func debugFixture(_ name: String, now: Date = Date()) -> PendantSummary? {
         var s = EngineSnapshot()
         s.ready = true
@@ -389,6 +390,16 @@ extension PendantSummary {
             s.ready = true
             server = .notConfigured
             statusAt = nil
+        case "refused", "codec", "pairingLost", "storage", "btOff":
+            // problem states (2026-11-20): each the engine's real connection state, away from the phone
+            s.pendantLastConnectedAt = now.addingTimeInterval(-5 * 60)
+            switch name {
+            case "refused": s.connection = .refused("not an Omi device (no audio characteristic)")
+            case "codec": s.connection = .paused(OmiEngine.codecStallReason)
+            case "pairingLost": s.connection = .paused("pairing information removed")
+            case "storage": s.connection = .paused("phone storage low")
+            default: s.connection = .bluetoothUnavailable("off")
+            }
         case "blocked":
             s.connection = .streaming
             d.battery = 12

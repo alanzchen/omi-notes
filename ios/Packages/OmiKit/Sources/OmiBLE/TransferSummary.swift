@@ -33,6 +33,9 @@ public struct TransferSummary: Equatable, Sendable {
         /// says "all sent" while any remain; they are only named apart.
         public var recheckParts: Int = 0
         public var recheckSeconds: Int = 0
+        /// Every waiting part sits in a Watch transfer that stopped moving (`WatchSummary.transferStalled`, the rule the
+        /// Devices card and the Watch page use).
+        public var stalled = false
 
         /// Waiting parts that aren't re-checks.
         public var newParts: Int? { waitingParts.map { max(0, $0 - recheckParts) } }
@@ -103,7 +106,8 @@ public struct TransferSummary: Equatable, Sendable {
             waitingParts: report?.waitingParts, waitingSeconds: report?.waitingSeconds,
             receivedOnPhone: s.watchReceived, lastReceivedAt: s.watchLastReceiptAt,
             converting: s.watchPending, waitingForServer: s.watchWaitingUpload, keptOnWatch: report?.keptParts,
-            recheckParts: report?.recheckParts ?? 0, recheckSeconds: report?.recheckSeconds ?? 0)
+            recheckParts: report?.recheckParts ?? 0, recheckSeconds: report?.recheckSeconds ?? 0,
+            stalled: report.map { WatchSummary.transferStalled($0, lastReceivedAt: s.watchLastReceivedAt, now: now) } ?? false)
 
         let m = s.transfer.meter
         let rate = m.rate(atMono: nowMono)
@@ -157,7 +161,7 @@ public struct TransferSummary: Equatable, Sendable {
 
     #if DEBUG
     /// Simulator screenshots only (debug builds): SYNTHETIC values, labelled as such on screen.
-    /// `-OmiNotesDebugTransferState backlog|sending|waiting|offline|retrying|kept-aside|all-sent|unknown-watch`
+    /// `-OmiNotesDebugTransferState backlog|sending|waiting|offline|retrying|kept-aside|all-sent|unknown-watch|watch-stalled`
     public static func debugFixture(_ name: String, now: Date) -> TransferSummary? {
         var watch = Watch(inUse: true, reportAt: now.addingTimeInterval(-120), reportFresh: true, waitingParts: 4, waitingSeconds: 230,
                           receivedOnPhone: 266, lastReceivedAt: now.addingTimeInterval(-95), converting: 0, waitingForServer: 3)
@@ -190,6 +194,10 @@ public struct TransferSummary: Equatable, Sendable {
             phone.state = .allSent; phone.queuedFiles = 0; phone.queuedAudioFiles = 0; phone.queuedBytes = 0; phone.queuedAudioSeconds = 0
             phone.deliveredAudioFiles = 9; phone.deliveredAudioBytes = 2_300_000
             watch.waitingParts = 0; watch.waitingSeconds = 0; watch.waitingForServer = 0
+        case "watch-stalled":  // Alan's Watch, 2026-11-20: three parts in stalled transfers, this iPhone sent everything
+            phone.state = .allSent; phone.queuedFiles = 0; phone.queuedAudioFiles = 0; phone.queuedBytes = 0; phone.queuedAudioSeconds = 0
+            watch.waitingParts = 3; watch.waitingSeconds = 140; watch.waitingForServer = 0; watch.lastReceivedAt = nil
+            watch.stalled = true
         case "unknown-watch":
             watch = Watch(inUse: nil, reportAt: nil, reportFresh: false, waitingParts: nil, waitingSeconds: nil, receivedOnPhone: 0,
                           lastReceivedAt: nil, converting: 0, waitingForServer: 0)
