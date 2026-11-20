@@ -254,7 +254,10 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
     private func submitDelayedConnect(_ p: PeripheralHandle) {
         guard let until = backoffUntil, p.connectionState == .disconnected || p.connectionState == .disconnecting else { return }
         peripheral = p
-        let remaining = until > .now() ? Double(until.uptimeNanoseconds - DispatchTime.now().uptimeNanoseconds) / 1_000_000_000 : 0
+        // one clock sample for the comparison and the subtraction: two could straddle the deadline and the unsigned
+        // subtraction would trap (ASTRA-20261120-IT4-01)
+        let now = DispatchTime.now().uptimeNanoseconds, end = until.uptimeNanoseconds
+        let remaining = end > now ? Double(end - now) / 1_000_000_000 : 0
         backend.connect(p, after: max(remaining, reconnectDelay))
     }
 
