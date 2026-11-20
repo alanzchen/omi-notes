@@ -207,10 +207,8 @@ private struct PendantCardView: View {
         }
     }
 
-    private var state: String {
-        // the state line before its "·" detail: "Recording", "Not connected", "Connected"
-        summary.stateLine.components(separatedBy: " · ").first ?? summary.stateLine
-    }
+    /// "Recording", "Not connected", "Connected": a problem of the pendant's own is said only in the issue row
+    private var state: String { summary.cardState }
 
     /// Away from the phone: when it was last connected (the state line's "last connected …"), in the slot the
     /// battery uses while connected.

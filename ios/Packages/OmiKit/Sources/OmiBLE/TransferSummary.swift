@@ -266,6 +266,8 @@ public struct TransferSummary: Equatable, Sendable {
             if !w.reportFresh {
                 // the same window as `reportFresh`: more than a minute ahead of this iPhone is a clock problem
                 out.append(at > now.addingTimeInterval(60) ? "手表时间与 iPhone 不一致" : "手表报告已过时")
+            } else if w.stalled {
+                out.append("手表传输已停止")  // not progress: the parts haven't moved (Alan's Watch, 11 days, 2026-11-20)
             } else if let kept = w.keptOnWatch, kept > 0 {
                 out.append("手表上有录音无法发送")
             }
@@ -306,8 +308,8 @@ public struct TransferSummary: Equatable, Sendable {
             default: return "无可发送的录音"
             }
         }
-        guard let seconds = w.waitingSeconds, seconds > 0 else { return "手表未报告剩余时长" }
-        return "还剩 \(Self.durationText(seconds))录音"
+        guard let seconds = w.waitingSeconds, seconds > 0 else { return w.stalled ? "未在发送" : "手表未报告剩余时长" }
+        return "还剩 \(Self.durationText(seconds))录音" + (w.stalled ? " · 未在发送" : "")
     }
 
     /// The server's state from its last answer: working, or done with what it has. nil when that

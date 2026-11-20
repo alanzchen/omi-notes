@@ -139,6 +139,15 @@ public struct PendantSummary: Equatable, Sendable {
             notes: notes(status, statusAt: statusAt, now: now), collecting: collecting)
     }
 
+    /// The Devices card's state line: the state before its "·" detail ("Recording", "Not connected"), except that a
+    /// problem of the pendant's own shown in the issue row under it isn't said again: the plain connection fact then
+    /// ("This pendant can't be used" was both, 2026-11-20).
+    public var cardState: String {
+        let head = stateLine.components(separatedBy: " · ").first ?? stateLine
+        guard !connected, let issue = rows.first(where: \.attention), issue.kind != .phone else { return head }
+        return "Not connected"
+    }
+
     // MARK: Parts
 
     static func connectionTitle(_ s: EngineSnapshot) -> String {
