@@ -1314,7 +1314,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
             simulated?.linkDown()
             connectSimulated(after: 1)
         } else {
-            central?.disconnect()  // not suppressed: the central reconnects 200 ms after didDisconnect
+            central?.restartLink()  // not suppressed: reconnects 200 ms after the link is down (also one already lost)
         }
     }
 

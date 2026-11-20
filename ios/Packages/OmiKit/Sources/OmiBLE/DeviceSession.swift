@@ -14,6 +14,8 @@ public protocol DeviceTransport: AnyObject {
     var maximumWriteValueLength: Int { get }
     var isSimulated: Bool { get }
     var delegate: DeviceTransportDelegate? { get set }
+    /// Why the last discovery can't be trusted (see the extension's default), checked when `didDiscover` is complete.
+    var discoveryFailure: String? { get }
 
     /// Discover services and characteristics → `didDiscover` (possibly several times, last with `complete`).
     func discover()
@@ -23,6 +25,12 @@ public protocol DeviceTransport: AnyObject {
     func setNotify(_ enabled: Bool, for characteristic: OmiCharacteristic)
     /// Write without response (SMP accepts nothing else). False when it can't be sent right now.
     func writeWithoutResponse(_ data: Data, to characteristic: OmiCharacteristic) -> Bool
+}
+
+extension DeviceTransport {
+    /// Why the last discovery can't be trusted: it reported an error, or the link was no longer connected when it ended
+    /// (nil: it finished without an error on a live link). A failed discovery is a link problem, never "not an Omi".
+    public var discoveryFailure: String? { nil }
 }
 
 extension DeviceTransport {
@@ -347,8 +355,19 @@ public final class DeviceSession: DeviceTransportDelegate, RingTransport, @unche
         discoveryComplete = true
         discoveryDeadline = nil
         if !characteristics.contains(.audioData) {
+            if let failure = t.discoveryFailure {
+                // A link that dropped or a GATT error during discovery says nothing about the device: reconnect (not
+                // suppressed), never refuse. Build 60 field log 2026-11-19 20:10:32Z: a restored link already gone,
+                // "The specified device is not connected.", refused Alan's own pendant until the app was relaunched.
+                requestReconnect(failure)
+                return
+            }
+            // complete, error-free discovery on a live link, and still no audio characteristic: not an Omi
             refuse("not an Omi device (no audio characteristic)")
             return
+        }
+        if let failure = t.discoveryFailure {
+            log(.warning, "ble", "discovery finished with an error (\(failure)); continuing with the audio characteristic")
         }
         startConfigurationIfReady()
     }

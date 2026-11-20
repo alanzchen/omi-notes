@@ -229,6 +229,15 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
         }
     }
 
+    /// The session gave up on this link (a link problem, not a refusal): end it and connect again. The reconnect is
+    /// scheduled here too, not only from `didDisconnect`: a link CoreBluetooth had already lost may send none (build 60
+    /// field log 2026-11-19 20:10:32Z: no "disconnected" after the cancel). A second pending connect is harmless.
+    public func restartLink() {
+        guard let p = peripheral else { return }
+        if p.connectionState != .disconnected { backend.cancelConnection(p) }
+        scheduleReconnect(p)
+    }
+
     public func forget() {
         disconnect()
         rememberedId = nil
@@ -491,6 +500,9 @@ final class CBDeviceTransport: NSObject, DeviceTransport, CBPeripheralDelegate {
     }
     private var characteristics: [OmiCharacteristic: CBCharacteristic] = [:]
     private var pendingServices = 0
+    /// The first error of the discovery in progress (service or characteristic), for `discoveryFailure`.
+    private var discoveryError: String?
+    private(set) var discoveryFailure: String?
     private var deferred: [() -> Void] = []
     private var buffered: [(OmiCharacteristic, Data?)] = []
 
@@ -533,6 +545,8 @@ final class CBDeviceTransport: NSObject, DeviceTransport, CBPeripheralDelegate {
     }
 
     func discover() {
+        discoveryError = nil
+        discoveryFailure = nil
         if cacheComplete {
             delegate?.transport(self, didDiscover: Set(characteristics.keys), complete: true)
             return
@@ -595,13 +609,16 @@ final class CBDeviceTransport: NSObject, DeviceTransport, CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         let services = peripheral.services ?? []
-        if let error { log(.error, "ble", "service discovery failed: \(error.localizedDescription)") }
+        if let error {
+            log(.error, "ble", "service discovery failed: \(error.localizedDescription)")
+            discoveryError = discoveryError ?? "service discovery failed: \(error.localizedDescription)"
+        }
         // The audio service first, so its characteristics (and the subscription) come back first.
         let isAudio = { (s: CBService) in OmiCharacteristic.normalize(s.uuid.uuidString) == OmiUUID.audioService }
         let ordered = services.filter(isAudio) + services.filter { !isAudio($0) }
         pendingServices = ordered.count
         if ordered.isEmpty {
-            delegate?.transport(self, didDiscover: [], complete: true)
+            finishDiscovery()
             return
         }
         for s in ordered { peripheral.discoverCharacteristics(nil, for: s) }
@@ -611,8 +628,30 @@ final class CBDeviceTransport: NSObject, DeviceTransport, CBPeripheralDelegate {
         for ch in service.characteristics ?? [] {
             if let c = omi(ch) { characteristics[c] = ch }
         }
+        if let error {
+            log(.error, "ble", "characteristic discovery failed: \(error.localizedDescription)")
+            discoveryError = discoveryError ?? "characteristic discovery failed: \(error.localizedDescription)"
+        }
         pendingServices -= 1
-        delegate?.transport(self, didDiscover: Set(characteristics.keys), complete: pendingServices <= 0)
+        if pendingServices > 0 {
+            delegate?.transport(self, didDiscover: Set(characteristics.keys), complete: false)
+        } else {
+            finishDiscovery()
+        }
+    }
+
+    /// The last discovery callback: whether it can be trusted is decided before the session sees it complete.
+    private func finishDiscovery() {
+        discoveryFailure = Self.discoveryFailure(error: discoveryError, connected: peripheral.state == .connected)
+        discoveryError = nil
+        delegate?.transport(self, didDiscover: Set(characteristics.keys), complete: true)
+    }
+
+    /// A discovery that reported an error, or ended on a link that is no longer connected, can't tell what the device
+    /// is (nil: an error-free discovery on a live link, the only one that may refuse a device).
+    static func discoveryFailure(error: String?, connected: Bool) -> String? {
+        if let error { return error }
+        return connected ? nil : "the link dropped during discovery"
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {

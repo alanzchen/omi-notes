@@ -31,6 +31,9 @@ final class FakeDeviceTransport: DeviceTransport {
     var alreadyNotifying: Set<OmiCharacteristic> = []
     /// Restored link with cached services: discover() answers synchronously.
     var cachedCharacteristics: Set<OmiCharacteristic>?
+    /// Why the last discovery can't be trusted (a GATT error, or the link was gone), like `CBDeviceTransport`; nil: it
+    /// finished on a live link without an error.
+    var discoveryFailure: String?
 
     init(identifier: UUID = UUID(uuidString: "D1F0C2AA-0000-4000-8000-000000000001")!) {
         self.identifier = identifier
