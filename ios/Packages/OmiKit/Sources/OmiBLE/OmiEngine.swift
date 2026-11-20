@@ -1232,8 +1232,15 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     public func sessionDidChange(_ session: DeviceSession) { scheduleSnapshot() }
 
     public func sessionDidStartCapture(_ session: DeviceSession) {
-        discoveryFailures[session.deviceId] = nil  // discovery worked on this connection
+        discoveryWorked(session)
         scheduleSnapshot()
+    }
+
+    /// Discovery worked on this connection: the failure count and the central's backoff deadline both go, so a later
+    /// drop reconnects at the usual 200 ms (ASTRA-20261120-IT2-02: only the count was cleared).
+    private func discoveryWorked(_ session: DeviceSession) {
+        discoveryFailures[session.deviceId] = nil
+        if !session.transport.isSimulated { central?.clearBackoff() }
     }
 
     private func resetDiscoveryBackoff() {
@@ -1242,7 +1249,7 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
     }
 
     public func sessionDidBecomeReady(_ session: DeviceSession) {
-        discoveryFailures[session.deviceId] = nil
+        discoveryWorked(session)
         if settings.rememberedDeviceName == nil { settings.rememberedDeviceName = session.info.name }
         if let updater = firmwareUpdater, updater.session !== session {
             updater.reconnected(reporting: session.info.firmwareRevision)  // back after the update's restart

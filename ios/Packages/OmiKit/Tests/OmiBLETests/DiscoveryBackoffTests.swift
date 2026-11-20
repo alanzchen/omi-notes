@@ -70,8 +70,15 @@ import OmiProtocol
         defer { try? FileManager.default.removeItem(at: r.root) }
         #expect(try await r.connectOnce(window: 0.35) == 1, "1st failure: the usual 200 ms reconnect")
         #expect(try await r.connectOnce(window: 0.35) == 1, "2nd failure: the usual 200 ms reconnect")
-        #expect(try await r.connectOnce(window: 0.35) == 0, "3rd failure: no reconnect at 200 ms")
-        #expect(try await r.connects(within: 0.6) == 1, "the backoff ends in a reconnect: never a refusal")
+        #expect(r.engine.queue.sync { r.backend.delays.isEmpty }, "no delayed connect before the 3rd failure")
+        // 3rd failure: the reconnect is the system's pending connect, started after the backoff (it survives the app
+        // being suspended: ASTRA-20261120-IT2-01), issued at once, never a refusal
+        _ = try await r.connectOnce(window: 0.35)  // its connect is issued inside the connection's own handling
+        #expect(r.engine.queue.sync { r.backend.delays.count } == 1)
+        let delay = try #require(r.engine.queue.sync { r.backend.delays.last })
+        #expect(delay > 0.4 && delay <= 0.6, "delay \(delay)")
+        #expect(r.p.connectionState == .connecting)
+        #expect(try await r.connects(within: 0.6) == 0, "nothing else kicks it meanwhile")
         #expect(!r.engine.snapshotNow().attention.contains { $0.hasPrefix("Not recording") })
     }
 

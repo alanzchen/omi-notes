@@ -77,6 +77,9 @@ public protocol CentralBackend: AnyObject {
     func scan(serviceUUIDs: [String]?, allowDuplicates: Bool)
     func stopScan()
     func connect(_ p: PeripheralHandle)
+    /// A pending connect the system starts only after `delay` (CBConnectPeripheralOptionStartDelayKey): it is the
+    /// system's, so it survives the app being suspended and wakes it, unlike an in-process timer (ASTRA-20261120-IT2-01).
+    func connect(_ p: PeripheralHandle, after delay: TimeInterval)
     func cancelConnection(_ p: PeripheralHandle)
     func retrievePeripheral(_ id: UUID) -> PeripheralHandle?
 }
@@ -118,6 +121,8 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
     /// No reconnect before this (a backoff after repeated failed discoveries); never a suppression: a user Disconnect still
     /// stops everything, and `clearBackoff` (success, foreground, Reconnect, pair, forget) lifts it.
     private var backoffUntil: DispatchTime?
+    /// Bumped by every reconnect scheduled or lifted: an older short timer that fires later does nothing (one kick).
+    private var reconnectGeneration = 0
 
     private var backend: CentralBackend!
     private var peripheral: PeripheralHandle?
@@ -159,7 +164,12 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
 
     private func mayAccept(_ p: PeripheralHandle) -> Bool { connectionAllowed && p.identifier == rememberedId }
 
-    public func suppress(_ reason: ReconnectSuppression) { suppression.insert(reason) }
+    public func suppress(_ reason: ReconnectSuppression) {
+        suppression.insert(reason)
+        reconnectGeneration += 1  // no short reconnect timer acts after this
+        // a pending connect already handed to the system (a backoff's delayed one) is withdrawn: suppression wins
+        if let p = peripheral, p.connectionState == .connecting { backend.cancelConnection(p) }
+    }
     public func unsuppress(_ reason: ReconnectSuppression) { suppression.remove(reason) }
 
     // MARK: Scanning (foreground pairing)
@@ -246,7 +256,15 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
         scheduleReconnect(p)
     }
 
-    public func clearBackoff() { backoffUntil = nil }
+    /// Lifts a backoff (a working connection, foreground, Reconnect, pair, forget). A delayed pending connect still
+    /// waiting is withdrawn; the caller connects at once (foreground and Reconnect `ensureConnected`, pair `connect`),
+    /// or nothing should (forget). A working connection has none.
+    public func clearBackoff() {
+        guard backoffUntil != nil else { return }
+        backoffUntil = nil
+        reconnectGeneration += 1
+        if let p = peripheral, p.connectionState == .connecting { backend.cancelConnection(p) }
+    }
 
     private var inBackoff: Bool { backoffUntil.map { $0 > .now() } ?? false }
 
@@ -375,12 +393,32 @@ public final class CentralController: CentralBackendEvents, @unchecked Sendable 
 
     private func scheduleReconnect(_ p: PeripheralHandle) {
         guard p.identifier == rememberedId else { return }
+        reconnectGeneration += 1
+        let generation = reconnectGeneration
+        if let until = backoffUntil, until > .now() {
+            // a backoff: the system's own pending connect, started at the deadline. It survives suspension and wakes
+            // the app; an in-process timer would not (ASTRA-20261120-IT2-01). One per link: already pending, nothing to add.
+            guard connectionAllowed, backend.state == .poweredOn, p.connectionState != .connecting else { return }
+            if p.connectionState == .connected {
+                // the cancel hasn't taken effect yet; its didDisconnect comes here again. A link CoreBluetooth had
+                // already lost may send none (2026-11-19 field log): look again shortly, once
+                nonisolated(unsafe) let handle = p
+                queue.asyncAfter(deadline: .now() + reconnectDelay) { [weak self] in
+                    guard let self, generation == self.reconnectGeneration, handle.connectionState != .connected else { return }
+                    self.scheduleReconnect(handle)
+                }
+                return
+            }
+            peripheral = p
+            let remaining = Double(until.uptimeNanoseconds - DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+            backend.connect(p, after: max(remaining, reconnectDelay))
+            return
+        }
         // Peripheral handles are only ever touched on `queue`, which this closure also runs on.
         nonisolated(unsafe) let handle = p
-        let at = max(DispatchTime.now() + reconnectDelay, backoffUntil ?? .now())
-        queue.asyncAfter(deadline: at) { [weak self] in
-            guard let self, !self.inBackoff, self.connectionAllowed, self.backend.state == .poweredOn,
-                  handle.identifier == self.rememberedId, handle.connectionState != .connected else { return }
+        queue.asyncAfter(deadline: .now() + reconnectDelay) { [weak self] in
+            guard let self, generation == self.reconnectGeneration, !self.inBackoff, self.connectionAllowed,
+                  self.backend.state == .poweredOn, handle.identifier == self.rememberedId, handle.connectionState != .connected else { return }
             self.peripheral = handle
             self.backend.connect(handle)  // pending connect: free while the device is away
         }
@@ -425,6 +463,11 @@ final class CoreBluetoothBackend: NSObject, CentralBackend, CBCentralManagerDele
     func connect(_ p: PeripheralHandle) {
         guard let h = p as? CBPeripheralHandle else { return }
         manager.connect(h.peripheral, options: nil)
+    }
+
+    func connect(_ p: PeripheralHandle, after delay: TimeInterval) {
+        guard let h = p as? CBPeripheralHandle else { return }
+        manager.connect(h.peripheral, options: [CBConnectPeripheralOptionStartDelayKey: NSNumber(value: delay)])
     }
 
     func cancelConnection(_ p: PeripheralHandle) {

@@ -316,6 +316,7 @@ final class SilentCentral: CentralBackend, @unchecked Sendable {
     func scan(serviceUUIDs: [String]?, allowDuplicates: Bool) {}
     func stopScan() {}
     func connect(_ p: PeripheralHandle) {}
+    func connect(_ p: PeripheralHandle, after delay: TimeInterval) {}
     func cancelConnection(_ p: PeripheralHandle) {}
     func retrievePeripheral(_ id: UUID) -> PeripheralHandle? { nil }
 }

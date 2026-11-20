@@ -48,6 +48,12 @@ final class FakeBackend: CentralBackend, @unchecked Sendable {
         connects.append(p.identifier)
         if let f = p as? FakePeripheral, f.connectionState == .disconnected { f.connectionState = .connecting }
     }
+    /// The system's delayed pending connect: recorded like any connect, with its start delay.
+    var delays: [TimeInterval] = []
+    func connect(_ p: PeripheralHandle, after delay: TimeInterval) {
+        delays.append(delay)
+        connect(p)
+    }
     func cancelConnection(_ p: PeripheralHandle) {
         cancels.append(p.identifier)
         (p as? FakePeripheral)?.connectionState = .disconnected
