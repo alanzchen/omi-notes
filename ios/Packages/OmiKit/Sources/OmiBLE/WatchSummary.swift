@@ -54,6 +54,12 @@ public struct WatchSummary: Equatable, Sendable {
                         summary.cardDetail = (r.waitingSeconds ?? 0) > 0
                             ? "\(WaitingAudio.text(r.waitingSeconds!)) waiting on the Watch" : "Audio waiting on the Watch"
                     }
+                    // every waiting part sits in a transfer that stopped moving: not "waiting", which reads as queued
+                    // (Alan's Watch, 2026-11-20: three parts for 11 days under "2 min waiting")
+                    if Self.transferStalled(r, lastReceivedAt: lastReceivedAt, now: now) {
+                        summary.cardDetail = "\(r.waitingParts) part\(r.waitingParts == 1 ? "" : "s") stuck on the Watch"
+                        summary.tone = .attention
+                    }
                     return summary
                 }
             }
@@ -90,16 +96,24 @@ public struct WatchSummary: Equatable, Sendable {
     /// audio only; nothing for kept parts alone).
     public static func onWatchHint(_ r: WatchReport, lastReceivedAt: Date?, now: Date) -> String? {
         guard r.waitingParts > 0, lastReceivedAt.map({ now.timeIntervalSince($0) > 15 * 60 }) ?? true else { return nil }
+        if transferStalled(r, lastReceivedAt: lastReceivedAt, now: now) {
+            let since = lastReceivedAt.map { "; last part arrived \(SystemHealth.relative($0, now))" } ?? ""
+            return "The Watch's transfer stopped moving\(since)" + (r.stats?["stall_resend"] == 1 ? ". It sends it again on its own" : "")
+        }
         // every waiting part sits in a Watch transfer that stopped moving: "move closer" would be wrong advice (the
         // phone was nearby for four days, 2026-11-15). Said only from a current report (ASTRA-20261115-IT1-05), against
         // the sendable parts (`waitingParts` already leaves kept parts out), and "sends it again" only from a Watch
         // build that does (`stall_resend`)
-        if isCurrent(r, now: now), let stalled = r.stats?["outstanding_stalled"], stalled > 0, stalled >= r.waitingParts {
-            let since = lastReceivedAt.map { "; last part arrived \(SystemHealth.relative($0, now))" } ?? ""
-            return "The Watch's transfer stopped moving\(since)" + (r.stats?["stall_resend"] == 1 ? ". It sends it again on its own" : "")
-        }
         return (r.keptParts ?? 0) > 0 ? "The waiting audio moves when both are nearby with Omi Notes open"
             : "Moves when both are nearby with Omi Notes open"
+    }
+
+    /// Every sendable waiting part sits in a Watch transfer that stopped moving, as of a current report, and nothing has
+    /// arrived for 15 minutes: the card and the Watch page's hint say the same thing from this one rule.
+    public static func transferStalled(_ r: WatchReport, lastReceivedAt: Date?, now: Date) -> Bool {
+        guard r.waitingParts > 0, lastReceivedAt.map({ now.timeIntervalSince($0) > 15 * 60 }) ?? true else { return false }
+        guard isCurrent(r, now: now), let stalled = r.stats?["outstanding_stalled"], stalled > 0 else { return false }
+        return stalled >= r.waitingParts
     }
 
     /// A report that is about now: not older than `fresh` and not from the future (a Watch clock ahead of the iPhone).

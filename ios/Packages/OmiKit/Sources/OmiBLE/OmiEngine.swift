@@ -1307,7 +1307,8 @@ public final class OmiEngine: CentralControllerDelegate, DeviceSessionDelegate, 
                 return
             }
         }
-        addAttention("Reconnecting to the device: \(reason)")
+        // an automatic reconnect isn't something that needs the owner (the session logged why): no attention line, which
+        // carried CoreBluetooth's raw text and stayed on Home after the pendant streamed again (2026-11-20)
         pendingDisconnectReason = .bleDisconnected
         endSession(reason: .bleDisconnected)
         if transport.isSimulated {
