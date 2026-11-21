@@ -506,14 +506,10 @@ class Ingest:
                           same: bool | _Unavailable | None = None) -> tuple[int, dict]:  # fmt: skip
         db, vault = self.db, self.vault
         with _lock:
+            # Only this identity: a file left without its row is adopted below (`_adopt_orphan`, after syncing that one
+            # file). The capture's other orphans are not this request's work; the startup sweep (and a seal) indexes them
+            # (ASTRA-20261121-IT5-02: a dirty capture's PUT synced every orphan under the global lock).
             existing = db.one("SELECT sha256 FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq))
-            if existing is None:
-                capture = db.one("SELECT device_id FROM captures WHERE capture_id=?", (capture_id,))
-                if capture is not None:
-                    self._recover(capture["device_id"], capture_id)
-                    existing = db.one(
-                        "SELECT sha256 FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq)
-                    )
             if existing is not None:
                 if existing["sha256"] == digest:
                     return ok(200, True)
@@ -538,13 +534,6 @@ class Ingest:
                 if isinstance(decoded, aac.AacError):
                     raise ApiError(422, "invalid_audio", str(decoded)) from decoded
             header = env.header
-            if (header.device_id, capture_id) in self._dirty:
-                self._recover(header.device_id, capture_id)
-                existing = db.one("SELECT sha256 FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq))
-                if existing is not None:
-                    if existing["sha256"] == digest:
-                        return ok(200, True)
-                    return ok(200, True) if self._same_audio_again(capture_id, seq, body, digest, same) else self._conflict()
 
             capture = db.one("SELECT * FROM captures WHERE capture_id=?", (capture_id,))
             started = header.capture_started_at.timestamp()
