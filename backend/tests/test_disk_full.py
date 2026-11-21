@@ -73,7 +73,9 @@ def test_disk_full_at_the_index_commit_is_507_and_a_retry_stores_it_once(client,
     def full_once(*a, **k):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise sqlite3.OperationalError("database or disk is full")
+            full = sqlite3.OperationalError("database or disk is full")
+            full.sqlite_errorcode = sqlite3.SQLITE_FULL  # as SQLite raises it (classified by code, not message)
+            raise full
         return real(*a, **k)
 
     monkeypatch.setattr(ingest, "index_chunk", full_once)

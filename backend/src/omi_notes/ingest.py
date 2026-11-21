@@ -372,11 +372,16 @@ def tombstone_header(tomb: dict) -> EnvelopeHeader:
 # -- ingest ----------------------------------------------------------------------------------------
 
 
-def _disk_full_error(exc: BaseException) -> bool:
-    """ENOSPC, or SQLite's "database or disk is full"."""
-    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
-        return True
-    return isinstance(exc, sqlite3.OperationalError) and "full" in str(exc).lower()
+def _disk_full_error(exc: BaseException | None) -> bool:
+    """ENOSPC or SQLITE_FULL, by code (not message), on the error or what it was raised from/during."""
+    seen = 0
+    while exc is not None and seen < 5:
+        if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+            return True
+        if isinstance(exc, sqlite3.Error) and (getattr(exc, "sqlite_errorcode", None) or 0) & 0xFF == sqlite3.SQLITE_FULL:
+            return True
+        exc, seen = exc.__cause__ or exc.__context__, seen + 1
+    return False
 
 
 class Ingest:
@@ -450,12 +455,22 @@ class Ingest:
         if plan is None and self.db.one("SELECT 1 FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq)) is None:
             decoded = self._check_aac(capture_id, seq, body)
         try:
-            return self._put_chunk_locked(capture_id, seq, body, digest, ok, decoded, plan.same if plan is not None else None)
-        except _CompareFirst:
-            if plan is not None:
-                raise NeedsComparison from None
-            same = self._compare(capture_id, seq, body, digest)
-            return self._put_chunk_locked(capture_id, seq, body, digest, ok, decoded, same)
+            try:
+                return self._put_chunk_locked(capture_id, seq, body, digest, ok, decoded, plan.same if plan is not None else None)
+            except _CompareFirst:
+                if plan is not None:
+                    raise NeedsComparison from None
+                same = self._compare(capture_id, seq, body, digest)
+                return self._put_chunk_locked(capture_id, seq, body, digest, ok, decoded, same)
+        except (ApiError, NeedsComparison):
+            raise
+        except Exception as exc:
+            # a full disk anywhere on the way (recovering an orphan, adopting it, the index) is 507: the phone keeps the
+            # part and sends it again; nothing was acknowledged (ASTRA-20261121-IT1-01)
+            if _disk_full_error(exc):
+                self._disk_full(f"storing a chunk failed: {exc}")
+                raise ApiError(507, "storage_full", "server disk is full") from exc
+            raise
 
     @staticmethod
     def _check_aac(capture_id: str, seq: int, body: bytes) -> bool | aac.AacError | None:
@@ -661,16 +676,18 @@ class Ingest:
         make_dirs_durable(self.vault.raw)
         free = shutil.disk_usage(self.vault.raw).free
         if free < MIN_FREE_BYTES:
-            self._disk_full("free space below the upload floor", free)
+            self._disk_full("free space below the upload floor", free, kind="space")
             raise ApiError(507, "storage_full", "server disk is nearly full")
 
-    def _disk_full(self, reason: str, free: int | None = None) -> None:
-        if free is None:
-            try:
+    def _disk_full(self, reason: str, free: int | None = None, kind: str = "write") -> None:
+        """Note the alert; never let the alert itself change the answer (ASTRA-20261121-IT1-02)."""
+        try:
+            if free is None:
                 free = shutil.disk_usage(self.vault.raw).free
-            except OSError:
-                free = None
-        disk_alert.note_down(self.settings.logs_dir, free_bytes=free, floor_bytes=MIN_FREE_BYTES, reason=reason, now=self.clock())
+            disk_alert.note_down(self.settings.logs_dir, free_bytes=free, floor_bytes=MIN_FREE_BYTES, reason=reason,
+                                 now=self.clock(), kind=kind)  # fmt: skip
+        except Exception:
+            log.exception("couldn't note the disk alert")
 
     # -- seals -----------------------------------------------------------------------------------
 

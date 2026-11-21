@@ -663,10 +663,13 @@ class Database:
         conn.execute("BEGIN IMMEDIATE")
         try:
             yield conn
+            conn.execute("COMMIT")
         except BaseException:
-            conn.execute("ROLLBACK")
+            # SQLite may already have rolled back (SQLITE_FULL, an I/O error): a second ROLLBACK would raise "no
+            # transaction is active" and hide the real error (ASTRA-20261121-IT1-01)
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
-        conn.execute("COMMIT")
 
     def query(self, sql: str, params: tuple | dict = ()) -> list[sqlite3.Row]:
         return self.conn().execute(sql, params).fetchall()
