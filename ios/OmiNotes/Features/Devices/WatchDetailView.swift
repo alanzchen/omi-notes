@@ -24,12 +24,14 @@ struct WatchDetailView: View {
         var setAside = 0
         var setAsideUnknown = 0
         var inventoryReadable = true
-        /// The server verdict the Transfers card also uses: an upload queue that can't move says why.
-        var server: ServerReachability?
+        /// The iPhone → server state the Transfers card shows, and whether the server's disk is full.
+        var upload: TransferSummary.UploadState?
+        var serverFull = false
     }
 
     private func current(_ now: Date) -> (WatchSummary, Flow) {
         let (summary, report, _) = DevicesView.watch(model, now)
+        let uploadPhone = model.transfers(watchInstalled: nil, now: now).phone
         #if DEBUG
         if let name = UserDefaults.standard.string(forKey: "OmiNotesDebugWatchState"), let f = WatchSummary.debugFixture(name, now: now) {
             let some = f.lastReceivedAt != nil
@@ -40,7 +42,7 @@ struct WatchDetailView: View {
                                   waitingUpload: some && !idle ? 3 : 0, othersWaiting: name == "stale" ? 1_960 : 0,
                                   lastUploadedAt: idle ? f.lastReceivedAt?.addingTimeInterval(60) : some ? now.addingTimeInterval(-4 * 60) : nil,
                                   setAside: name == "set-aside" ? 1 : 0, setAsideUnknown: name == "unknown-aside" ? 1 : 0,
-                                  server: model.server))
+                                  upload: uploadPhone.state, serverFull: uploadPhone.serverFull))
         }
         #endif
         let s = model.snapshot
@@ -48,7 +50,7 @@ struct WatchDetailView: View {
                               waitingUpload: s.watchWaitingUpload, othersWaiting: max(0, s.outbox.pendingChunks - s.watchWaitingUpload),
                               lastUploadedAt: s.watchLastUploadedAt, setAside: s.outbox.quarantineWatchCount,
                               setAsideUnknown: s.outbox.quarantineSourceUnknownCount, inventoryReadable: s.outbox.inventoryReadable,
-                              server: model.server))
+                              upload: uploadPhone.state, serverFull: uploadPhone.serverFull))
     }
 
     /// The build of the Watch in use, as it said (nil: unknown, shows nothing). Only while WatchConnectivity says a
@@ -210,7 +212,8 @@ struct WatchDetailView: View {
         place("arrow.up", "Upload to your server",
               WatchSummary.uploadLine(waiting: f.waitingUpload, othersWaiting: f.othersWaiting, setAside: f.setAside,
                                       inventoryReadable: f.inventoryReadable, lastUploadedAt: f.lastUploadedAt,
-                                      received: f.receivedTotal, now: now, setAsideUnknown: f.setAsideUnknown, server: f.server))
+                                      received: f.receivedTotal, now: now, setAsideUnknown: f.setAsideUnknown,
+                                      upload: f.upload, serverFull: f.serverFull))
     }
 
     private func heading(_ text: String) -> some View {

@@ -129,7 +129,7 @@ public struct PendantSummary: Equatable, Sendable {
             also.append(low)
         }
 
-        let rows = [pausedRow(s), pendantRow(s, pendant: pendant), phoneRow(s, server: server, now: now), storageRow(s),
+        let rows = [pausedRow(s), pendantRow(s, pendant: pendant), phoneRow(s, server: server, now: now, status: status), storageRow(s),
                     gesturesRow(s)].compactMap { $0 }
         return PendantSummary(
             rows: rows, name: s.rememberedDeviceName ?? "Omi", connected: s.connection == .streaming, connectionTitle: connectionTitle(s),
@@ -177,7 +177,7 @@ public struct PendantSummary: Equatable, Sendable {
         return Row(kind: .pendant, title: pendant.title, detail: pendant.detail, attention: true, fix: pendant.fix)
     }
 
-    static func phoneRow(_ s: EngineSnapshot, server: ServerReachability, now: Date) -> Row {
+    static func phoneRow(_ s: EngineSnapshot, server: ServerReachability, now: Date, status: ServerStatus? = nil) -> Row {
         func row(_ title: String, _ detail: String?, attention: Bool = false, fix: SystemHealth.Fix? = nil) -> Row {
             Row(kind: .phone, title: title, detail: detail, attention: attention, fix: fix)
         }
@@ -198,7 +198,12 @@ public struct PendantSummary: Equatable, Sendable {
                                           s.upload.lastSuccessAt.map { "Server unreachable · last upload \(SystemHealth.relative($0, now))" } ?? "Server unreachable",
                                           attention: true, fix: .retryUploads)
             case .unauthorized: return row("\(files) waiting on iPhone", "The server rejected this iPhone", attention: true, fix: .openServer)
-            default: return row("\(files) uploading", "Stored on this iPhone")
+            default:
+                // the server answered and refused for lack of disk: not "uploading" (2026-11-21)
+                if SystemHealth.serverDiskFull(s, status: status) {
+                    return row("\(files) waiting on iPhone", "Server disk is full", attention: true, fix: .openServer)
+                }
+                return row("\(files) uploading", "Stored on this iPhone")
             }
         }
         return row("Nothing waiting on this iPhone",

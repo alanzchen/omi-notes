@@ -133,14 +133,17 @@ public struct WatchSummary: Equatable, Sendable {
     /// (couldn't upload) is named, and an unreadable outbox is unknown, never "Nothing waiting" (ASTRA-20261112-IT2-01).
     public static func uploadLine(waiting: Int, othersWaiting: Int, setAside: Int, inventoryReadable: Bool,
                                   lastUploadedAt: Date?, received: Int, now: Date, setAsideUnknown: Int = 0,
-                                  server: ServerReachability? = nil) -> String {
+                                  upload: TransferSummary.UploadState? = nil, serverFull: Bool = false) -> String {
         let aside = setAside > 0 ? "\(setAside) part\(setAside == 1 ? "" : "s") set aside" : nil
         if waiting > 0 {
-            // the same verdict the Transfers card shows: a queue that can't move isn't a calm "waiting" (2026-11-21)
+            // the iPhone → server state Transfers shows (moving bytes win over a retained "can't reach",
+            // ASTRA-20261121-IT2-03): a queue that can't move isn't a calm "waiting" (2026-11-21)
             let line: String
-            switch server {
-            case .unreachable?: line = "Waiting: can't reach your server"
-            case .unauthorized?: line = "Waiting: the server rejected this iPhone"
+            switch upload {
+            case _ where serverFull: line = "Waiting: server disk is full"
+            case .offline(let why)?: line = why == TransferSummary.rejectedReason ? "Waiting: the server rejected this iPhone" : "Waiting: can't reach your server"
+            case .paused?: line = "Waiting: uploads paused"
+            case .sending?: line = "Watch audio uploading"
             default: line = othersWaiting > 50 ? "Watch audio waiting, in turn after other recordings on this iPhone" : "Watch audio waiting to upload"
             }
             return [line, aside].compactMap { $0 }.joined(separator: " · ")
