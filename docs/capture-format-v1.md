@@ -283,7 +283,9 @@ The response is cheap and calls no provider: `ready` means *configured*, not tha
 `worker.present` means a process holds the vault's worker lock (the pipeline, or a maintenance
 command); it is not proof of progress. `last_note_at` is when the newest kept note was first
 written (discarded and enrollment rows excluded). `read_only` is the reason the vault stopped
-accepting writes, or null. `activity` says what the pipeline is doing: conversations being worked
+accepting writes, or null. `disk` is `{"full": true, "since": "…"}` while the server's disk is
+too full to take audio (uploads are answered 507 and stay on the phone; from `logs/alerts/disk.json`), and null
+otherwise; older servers omit it and older phones ignore it. `activity` says what the pipeline is doing: conversations being worked
 on now, how many wait or back off after a service error, and when the oldest waiting one *ended*
 (not how long it has been queued). `stt`/`llm` are the last successful and failed *requests* to the
 configured service (cached results don't count, so reuse never looks like a working service; a

@@ -30,6 +30,7 @@ from .pipeline.worker import Worker, read_only_reason
 from .rebuild import open_index
 from .settings import Settings
 from .speakers.service import SpeakerService
+from . import disk_alert
 from .util import UUID_RE, iso_utc_epoch
 from .vault import LeaseError, Vault, VaultBusy
 
@@ -183,6 +184,12 @@ def create_app(
         return {"provider": "local", "model": label or "omi-asr sidecar", "diarization": "provider", "ready": True,
                 "engine": {"name": "omi-asr sidecar", "healthy": ok, "self_test": info.get("self_test"), "models": models}}
 
+    def disk_status(logs_dir) -> dict | None:
+        alert = disk_alert.read(logs_dir)
+        if not alert or alert.get("state") != "down":
+            return None
+        return {"full": True, "since": alert.get("down_since")}
+
     @app.get("/v1/status")
     def status() -> dict:
         return {
@@ -215,6 +222,9 @@ def create_app(
             "vault_dir": str(settings.vault_dir),
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
+            # the server's disk is too full to take audio (logs/alerts/disk.json, one small file read; absent otherwise):
+            # the phone says so instead of "uploading" (2026-11-21). Older phones ignore the key.
+            "disk": disk_status(settings.logs_dir),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes
             "features": ["voice_enrollment", "conversation_detail", "issues", "retry", "keep", "name_voice", "recording", "value_notes", "search", "stats", "pendant_star", "watch_performance", "phone_log", "dismiss", "same_audio_resend", "voice_review", "voice_calibration", "enrollment_import", "recording_class", "deferred_transcription"] + (["watch_aac"] if aac.available() else []),
             "vault_id": vault.vault_id,
