@@ -54,7 +54,7 @@ import OmiWatchKit
         #expect(WatchSummary.uploadLine(waiting: 3, othersWaiting: 0, setAside: 0, inventoryReadable: true, lastUploadedAt: nil,
                                         received: 10, now: now, upload: .retrying, serverFull: true) == "Waiting: server disk is full")
         #expect(WatchSummary.uploadLine(waiting: 3, othersWaiting: 0, setAside: 0, inventoryReadable: true, lastUploadedAt: nil,
-                                        received: 10, now: now, upload: .sending) == "Watch audio uploading")
+                                        received: 10, now: now, upload: .sending) == "Watch audio waiting to upload")  // IT4-03: no claim
     }
 
     /// R4: the Pendant page's phone row said "N files uploading" while the server refused them for lack of disk.
