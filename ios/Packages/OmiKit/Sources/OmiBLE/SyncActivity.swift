@@ -26,6 +26,8 @@ extension SyncActivityState {
         if p.queuedAudioFiles == 0 { queuedAudio = stage == .queueUnreadable ? nil : 0 }
         else { queuedAudio = knownAudio > 0 ? p.queuedAudioSeconds : nil }
         let watchWaiting = t.watch.inUse == true ? t.watch.waitingSeconds : nil  // re-checks included: not acknowledged
+        // server work only from a current answer, as Transfers shows it; otherwise the phone-side copy (IT6-03)
+        let serverPending = t.serverAnswerIsCurrent(now: now) ? t.server.conversationsPending : nil
         var detail: String?
         switch p.state {
         // the title already says it; a transport error's own text ("The request timed out.") is not for the lock screen
@@ -33,7 +35,7 @@ extension SyncActivityState {
         case .paused(let why): detail = why
         case .keptAside(let n): detail = "\(n) not uploaded; see Devices"
         case .preparing(let n): detail = "\(n) Watch part\(n == 1 ? "" : "s") being prepared"
-        case .allSent: detail = t.server.conversationsPending.map { $0 > 0 ? "Your server is processing \($0)" : "Notes appear once your server processes them" }
+        case .allSent: detail = serverPending.map { $0 > 0 ? "Your server is processing \($0)" : "Notes appear once your server processes them" }
             ?? "Notes appear once your server processes them"
         default: detail = nil
         }
@@ -44,7 +46,7 @@ extension SyncActivityState {
             batchSent: p.inFlightTotal > 0 ? p.inFlightSent : nil, batchTotal: p.inFlightTotal > 0 ? p.inFlightTotal : nil,
             batchUnknownUploads: p.inFlightTotal > 0 ? p.inFlightUnknownTotals : nil,
             watchWaitingSeconds: watchWaiting, watchReportAt: watchWaiting == nil ? nil : t.watch.reportAt,
-            serverPending: t.server.conversationsPending, asOf: now)
+            serverPending: serverPending, asOf: now)
     }
 }
 

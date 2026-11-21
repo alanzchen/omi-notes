@@ -319,10 +319,16 @@ public struct TransferSummary: Equatable, Sendable {
     /// The server's state from its last answer: working, or done with what it has. nil when that
     /// answer is missing, older than 5 minutes, partial, or the server isn't reachable (the problem
     /// line says so).
+    /// The server answer behind this summary is about now: not from an unreachable server, not old, not from the future
+    /// (the shared rule). Every server-derived line, here and on the Live Activity, checks this (ASTRA-20261121-IT6-03).
+    public func serverAnswerIsCurrent(now: Date) -> Bool {
+        if case .offline = phone.state { return false }
+        guard server.reachable != false, let at = server.checkedAt else { return false }
+        return ServiceLabel.isCurrent(age: now.timeIntervalSince(at))
+    }
+
     public func serverLine(now: Date) -> String? {
-        if case .offline = phone.state { return nil }
-        guard server.reachable != false, let at = server.checkedAt, ServiceLabel.isCurrent(age: now.timeIntervalSince(at)),
-              let work = serverWork, !work.atLeast || work.left > 0 else { return nil }
+        guard serverAnswerIsCurrent(now: now), let work = serverWork, !work.atLeast || work.left > 0 else { return nil }
         if work.left > 0 { return "服务器处理中" }
         return everythingSent ? "已是最新" : "服务器已处理完收到的录音"
     }
