@@ -347,12 +347,13 @@ public final class AppModel {
         guard isCurrent(config), data == dataEpoch, mine == refreshGeneration else { return }
         if let newIssues { issues = newIssues }
         issuesStale = newIssues == nil  // kept, but not renewed by this status answer
-        await settleRetries(api: api, config: config, data: data)
+        await settleRetries(api: api, config: config, data: data, refresh: mine)
         guard isCurrent(config), data == dataEpoch, mine == refreshGeneration else { return }
         switch page {
         case .success(let page):
             mergeFirstPage(page)
             await reloadOpenedShortDays()  // an opened fold follows refreshes: no stale "waiting" or spinner
+            guard isCurrent(config), data == dataEpoch, mine == refreshGeneration else { return }
             await settlePriorities(api: api, data: data)
             guard isCurrent(config), data == dataEpoch, mine == refreshGeneration else { return }
             recentError = nil

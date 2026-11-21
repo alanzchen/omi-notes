@@ -99,8 +99,8 @@ extension AppModel {
     }
 
     /// `data`: the data epoch the request belongs to; an answer after a server or vault change is dropped.
-    func send(_ entry: RetryStore.Entry, api: APIClient, config: UploadConfig, data: Int) async {
-        func current() -> Bool { isCurrent(config) && data == dataEpoch }
+    func send(_ entry: RetryStore.Entry, api: APIClient, config: UploadConfig, data: Int, refresh: Int? = nil) async {
+        func current() -> Bool { isCurrent(config) && data == dataEpoch && refresh.map { $0 == refreshGeneration } != false }
         guard current() else { return }  // never send a retry meant for a previous server or vault
         do {
             let op = switch entry.kind {
@@ -129,8 +129,10 @@ extension AppModel {
     }
 
     /// On every refresh: follow unsettled retries of this server, re-sending those with no answer.
-    func settleRetries(api: APIClient, config: UploadConfig, data: Int) async {
-        func current() -> Bool { isCurrent(config) && data == dataEpoch }
+    /// - Parameter refresh: the server refresh this runs for: an older one's late answers change nothing
+    ///   (ASTRA-20261121-IT3-05).
+    func settleRetries(api: APIClient, config: UploadConfig, data: Int, refresh: Int? = nil) async {
+        func current() -> Bool { isCurrent(config) && data == dataEpoch && refresh.map { $0 == refreshGeneration } != false }
         guard let key = retryServerKey, serverStatus?.supportsRetry == true else { return }
         for entry in retryStore.entries(server: key) {
             guard current() else { return }
@@ -141,13 +143,13 @@ extension AppModel {
                     retryStore.record(fresh, for: entry.requestId)
                     retries[entry.conversationId] = fresh
                 } catch APIError.http(404, _) {
-                    await send(entry, api: api, config: config, data: data)  // accepted state was lost: the same id again
+                    await send(entry, api: api, config: config, data: data, refresh: refresh)  // accepted state was lost: the same id again
                 } catch {
                     guard current() else { return }
                     retries[entry.conversationId] = op  // keep showing the last known state
                 }
             } else {
-                await send(entry, api: api, config: config, data: data)
+                await send(entry, api: api, config: config, data: data, refresh: refresh)
             }
         }
     }
