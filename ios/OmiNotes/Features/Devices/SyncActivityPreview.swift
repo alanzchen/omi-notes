@@ -17,7 +17,7 @@ struct SyncActivityPreviewGallery: View {
                                                watchReportAt: now.addingTimeInterval(-120), asOf: now), false),
          ("Sending, gone stale", SyncActivityState(stage: .sending, title: "Sending to your server", rate: 1_240_000, queuedAudioSeconds: 2_170,
                                                    queuedFiles: 38, asOf: now.addingTimeInterval(-600)), true),
-         ("Offline", SyncActivityState(stage: .offline, title: "Can't reach your server", detail: "timed out", queuedAudioSeconds: 2_170,
+         ("Offline", SyncActivityState(stage: .offline, title: "Can't reach your server", queuedAudioSeconds: 2_170,
                                        queuedFiles: 38, asOf: now), false),
          ("Some lengths unknown", SyncActivityState(stage: .waiting, title: "Waiting to send", queuedAudioSeconds: 600, queuedAudioPartial: true,
                                                     queuedFiles: 12, asOf: now), false),
