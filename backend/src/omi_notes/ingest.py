@@ -15,6 +15,7 @@ import errno
 import hashlib
 import json
 import logging
+import os
 import shutil
 import sqlite3
 import threading
@@ -32,6 +33,7 @@ from . import disk_alert
 from .db import Database
 from .envelope import EnvelopeError, EnvelopeHeader, parse_envelope
 from .settings import Settings
+from . import spool
 from .spool import atomic_write_bytes, make_dirs_durable
 from .util import UUID_RE, canonical_json, sha256_hex
 from .vault import Vault
@@ -372,6 +374,18 @@ def tombstone_header(tomb: dict) -> EnvelopeHeader:
 # -- ingest ----------------------------------------------------------------------------------------
 
 
+def durable_existing(path) -> None:
+    """A file found on disk counts as stored only once it and its directory are synced now: a matching hash proves its
+    content, not that it was durably published (a crash or a failed directory sync after the rename may have left it
+    only in the page cache; ASTRA-20261121-IT3-01). Raises OSError; nothing is rewritten."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    spool.fsync_dir(path.parent)
+
+
 def _disk_full_error(exc: BaseException | None) -> bool:
     """ENOSPC or SQLITE_FULL, by code (not message), on the error or what it was raised from/during."""
     seen = 0
@@ -602,7 +616,9 @@ class Ingest:
             log.warning("chunk %s/%d: alternate copy %s was damaged; writing it again", capture_id, seq, alternate.name)
             self._writable()
             atomic_write_bytes(alternate, body)
-        if not alternate.exists():
+        if alternate.exists():
+            durable_existing(alternate)  # a copy found on disk is kept only once synced now (IT3-01)
+        else:
             self._writable()
             self._ensure_space()
             atomic_write_bytes(alternate, body)
@@ -652,11 +668,13 @@ class Ingest:
             if sha256_hex(data) != digest:
                 raise ApiError(409, "chunk_conflict", "different content is already stored under this identity")
             deleted = False
+            durable_existing(path)  # before any receipt, row or 2xx (ENOSPC -> 507 in put_chunk)
         else:
             tomb = json.loads(tomb_path.read_text())
             if tomb.get("sha256") != digest:
                 raise ApiError(409, "chunk_conflict", "different content was stored (and expired) under this identity")
             deleted = True
+            durable_existing(tomb_path)
         received = receipt_time(self.vault, header.device_id, header.capture_id, header.chunk_sequence)
         if received is None:
             self._writable()

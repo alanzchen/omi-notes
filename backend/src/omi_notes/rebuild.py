@@ -490,8 +490,14 @@ def index_capture_orphans(db: Database, vault: Vault, device: str, capture: str)
         return 0
     receipts = _receipts(vault, device, capture)
     now = time.time()
+    from .ingest import durable_existing
+
     for op in ops:
         seq = op.key[1]
+        if seq >= 0:
+            # a file found without its row is indexed only once it and its directory are synced (ASTRA-20261121-IT3-01)
+            data = vault.chunk_path(device, capture, seq)
+            durable_existing(data if data.exists() else vault.tombstone_path(device, capture, seq))
         if seq >= 0 and seq not in receipts:
             # Adopted now: persist a receipt so the next rebuild sees the same time.
             data = vault.chunk_path(device, capture, seq)
@@ -520,7 +526,10 @@ def sweep(db: Database, vault: Vault) -> dict:
         indexed = db.one("SELECT COUNT(*) AS n FROM chunks WHERE capture_id=?", (capture,))["n"]
         seal_missing = (cap_dir / "seal.json").exists() and (cap is None or cap["seal_json"] is None)
         if files != indexed or seal_missing:
-            counts["raw"] += index_capture_orphans(db, vault, device, capture)
+            try:
+                counts["raw"] += index_capture_orphans(db, vault, device, capture)
+            except OSError as exc:  # a file that can't be synced now stays unindexed (a retry adopts it); startup goes on
+                log.warning("sweep: capture %s not indexed yet: %s", capture, exc)
     latest = db.one("SELECT MAX(received_at) AS m FROM events")["m"]
     if vault.events_dir.exists():
         from datetime import UTC, datetime
