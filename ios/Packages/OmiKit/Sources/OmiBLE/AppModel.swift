@@ -125,6 +125,8 @@ public final class AppModel {
     var refreshGeneration = 0
     /// The latest /issues request failed: `issues` is the earlier list (last-known).
     public internal(set) var issuesStale = false
+    /// When /issues last answered: the list's own time, never renewed by a status answer (ASTRA-20261121-IT4-01).
+    public internal(set) var issuesAt: Date?
 
     /// Identifies what the shown data belongs to (views reset their own state when it changes).
     public var serverIdentity: String { "\(answeredFor?.generation ?? -1)|\(answeredVault ?? "")" }
@@ -181,7 +183,10 @@ public final class AppModel {
 
     /// The issues list is as of now: the status answer is current and the latest /issues request answered too (a failed
     /// one keeps the old list, which is then last-known, ASTRA-20261121-IT2-02).
-    public func issuesAreCurrent(now: Date = Date()) -> Bool { serverAnswerIsCurrent(now: now) && !issuesStale }
+    public func issuesAreCurrent(now: Date = Date()) -> Bool {
+        guard serverAnswerIsCurrent(now: now), !issuesStale, let at = issuesAt else { return false }
+        return ServiceLabel.isCurrent(age: now.timeIntervalSince(at))
+    }
 
     /// The Server page's service rows as of now: the last answer's names, with a health only while that
     /// answer is current (a failed latest request or an old answer makes it last-known). nil before any answer.
@@ -216,6 +221,7 @@ public final class AppModel {
         lastRefreshFailed = false
         issues = []
         issuesStale = false
+        issuesAt = nil
         recent = []
         recentCursor = nil
         shortDays = [:]
@@ -320,6 +326,7 @@ public final class AppModel {
         server = reach
         lastRefreshFailed = status == nil
         guard let status else {
+            issuesStale = true  // the issues list is last-known until /issues itself answers again (IT4-01)
             // Shown conversations (if any) are now of unknown freshness; an empty list isn't "none yet".
             recentError = Self.describeReach(reach)
             if recent.isEmpty { showSavedList(config) }
@@ -346,7 +353,12 @@ public final class AppModel {
         let (newIssues, page) = await (issuesTask, pageTask)
         guard isCurrent(config), data == dataEpoch, mine == refreshGeneration else { return }
         if let newIssues { issues = newIssues }
-        issuesStale = newIssues == nil  // kept, but not renewed by this status answer
+        if newIssues != nil {
+            issuesStale = false
+            issuesAt = Date()
+        } else {
+            issuesStale = true  // kept, but not renewed by this status answer
+        }
         await settleRetries(api: api, config: config, data: data, refresh: mine)
         guard isCurrent(config), data == dataEpoch, mine == refreshGeneration else { return }
         switch page {
