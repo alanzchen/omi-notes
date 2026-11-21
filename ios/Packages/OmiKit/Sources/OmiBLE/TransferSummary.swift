@@ -80,6 +80,8 @@ public struct TransferSummary: Equatable, Sendable {
         public var queuedAudioUnknown: Int
         public var retryingFiles: Int
         public var keptAside: Int
+        /// The server refused audio for lack of disk (507, or its status): said instead of a generic retry (2026-11-21).
+        public var serverFull = false
     }
 
     // MARK: server
@@ -145,7 +147,8 @@ public struct TransferSummary: Equatable, Sendable {
             deliveredOtherFiles: m.deliveredOtherFiles, retryingAttempts: m.retryingAttempts, heldAttempts: m.heldAttempts,
             queuedFiles: s.outbox.pendingCount, queuedAudioFiles: s.outbox.pendingChunks, queuedBytes: s.outbox.pendingBytes,
             queuedAudioSeconds: s.transfer.pendingAudioSeconds, queuedAudioUnknown: s.transfer.pendingAudioUnknown,
-            retryingFiles: s.upload.backingOff, keptAside: s.outbox.quarantineCount)
+            retryingFiles: s.upload.backingOff, keptAside: s.outbox.quarantineCount,
+            serverFull: SystemHealth.serverDiskFull(s, status: status))
 
         let reachable: Bool?
         switch server {
@@ -254,9 +257,10 @@ public struct TransferSummary: Equatable, Sendable {
         case .notConfigured: out.append("未连接服务器")
         case .paused: out.append("上传已暂停")
         case .offline(let why): out.append(why == Self.rejectedReason ? "服务器拒绝了这台 iPhone" : "连不上服务器")
-        case .retrying: out.append("上传失败，稍后重试")
+        case .retrying: out.append(phone.serverFull ? "服务器磁盘已满" : "上传失败，稍后重试")
         case .keptAside: out.append("有文件被搁置，未上传")
         case .queueUnreadable: out.append("无法读取上传队列")
+        case .waiting where phone.serverFull: out.append("服务器磁盘已满")
         case .sending, .waiting, .preparing, .allSent, .unknown: break
         }
         if server.reachable == false, out.isEmpty { out.append("连不上服务器") }

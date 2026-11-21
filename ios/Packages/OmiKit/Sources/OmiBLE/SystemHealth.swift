@@ -74,7 +74,7 @@ public struct SystemHealth: Equatable, Sendable {
         snapshot s: EngineSnapshot, server: ServerReachability, status: ServerStatus?, statusAt: Date?, now: Date,
         issues: [ServerIssue] = [], watchAppInstalled: Bool? = nil
     ) -> SystemHealth {
-        let steps = [pendant(s, watchAppInstalled: watchAppInstalled)] + [watch(s, now: now)].compactMap { $0 } + [phone(s, server: server),
+        let steps = [pendant(s, watchAppInstalled: watchAppInstalled)] + [watch(s, now: now)].compactMap { $0 } + [phone(s, server: server, status: status),
                      self.server(server, status: status, statusAt: statusAt, now: now, issues: issues),
                      notes(status, statusAt: statusAt, now: now)]
         let worst = steps.map(\.level).max() ?? .unknown
@@ -169,7 +169,12 @@ public struct SystemHealth: Equatable, Sendable {
         }
     }
 
-    static func phone(_ s: EngineSnapshot, server: ServerReachability) -> Step {
+    /// The server refused audio for lack of disk (the latest upload got 507, or its status says the disk is full).
+    public static func serverDiskFull(_ s: EngineSnapshot, status: ServerStatus?) -> Bool {
+        s.upload.lastResult?.status == 507 || status?.disk?.full == true
+    }
+
+    static func phone(_ s: EngineSnapshot, server: ServerReachability, status: ServerStatus? = nil) -> Step {
         func step(_ level: Level, _ title: String, _ detail: String? = nil, _ fix: Fix? = nil) -> Step {
             Step(area: .phone, level: level, title: title, detail: detail, fix: fix)
         }
@@ -196,6 +201,10 @@ public struct SystemHealth: Equatable, Sendable {
             case .unreachable, .unauthorized:
                 return step(.delayed, "Audio is waiting to upload", "\(files) stored safely on this phone; they upload when the server is reachable.", .retryUploads)
             default:
+                // the server answered: its disk is full (507, or its status says so). Not "uploading", not "can't reach"
+                if serverDiskFull(s, status: status) {
+                    return step(.delayed, "Server disk is full", "\(files) wait on this phone", .openServer)
+                }
                 return step(.working, "Uploading audio", "\(files) to go")
             }
         }

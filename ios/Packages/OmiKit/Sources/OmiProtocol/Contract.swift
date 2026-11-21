@@ -437,8 +437,15 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
     /// Optional capabilities, e.g. `voice_enrollment` (older servers send none).
     public var features: [String]?
     public var localTranscription: LocalTranscription?
+    /// The server's disk is too full to take audio (newer servers; nil otherwise): uploads get 507 and wait here.
+    public var disk: Disk?
+    public struct Disk: Decodable, Equatable, Sendable {
+        public var full: Bool?
+        public var since: String?
+    }
 
     enum CodingKeys: String, CodingKey {
+        case disk
         case localTranscription = "local_transcription"
         case ok
         case serverVersion = "server_version"
