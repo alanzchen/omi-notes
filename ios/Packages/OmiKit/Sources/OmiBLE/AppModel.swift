@@ -267,13 +267,19 @@ public final class AppModel {
         if debugServerFixture { serverStatusAt = Date(); return }
         #endif
         let config = engine.settings.serverConfig()
+        let sameServer = config == answeredForConfig
         adopt(config)
         guard let endpoint = config.endpoint else {
             server = .notConfigured
             lastRefreshFailed = true
             return
         }
-        server = .checking
+        // A re-check of the same server keeps its last verdict on screen until this answer: a server that times out
+        // spent up to 15 s of every minute as "checking", which every surface read as calm or uploading (2026-11-21).
+        switch server {
+        case .reachable, .unreachable, .unauthorized: if !sameServer { server = .checking }
+        default: server = .checking
+        }
         let data = dataEpoch  // before any await: a reset while we wait makes this answer stale
         let api = APIClient(endpoint: endpoint, session: session)
         let reach: ServerReachability

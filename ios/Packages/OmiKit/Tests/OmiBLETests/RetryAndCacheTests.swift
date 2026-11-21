@@ -559,7 +559,8 @@ final class AppServerStub: URLProtocol, @unchecked Sendable {
         AppServerStub.holdNext = ["/v1/status"]
         pending = Task { await m.refreshServer() }
         try await AppServerStub.waitUntilHeld("/v1/status")
-        if case .checking = m.server {} else { Issue.record("expected a refresh in flight") }
+        // the held request is the refresh in flight; since 2026-11-21 a re-check keeps the last verdict meanwhile
+        if case .unreachable = m.server {} else { Issue.record("expected the last verdict during a re-check: \(m.server)") }
         var during = try #require(m.serviceLabels(now: answered))
         #expect(during.transcription.health == .lastKnown && during.summaries.health == .lastKnown,
                 "an unanswered retry can't undo the last failure")

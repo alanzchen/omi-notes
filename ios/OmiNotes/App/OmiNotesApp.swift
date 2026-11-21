@@ -114,7 +114,9 @@ struct RootView: View {
         case .reconnectDevice: model.engine.reconnect()
         case .openBluetoothSettings:
             if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
-        case .retryUploads: model.engine.retryUploads()
+        case .retryUploads:
+            model.engine.retryUploads()
+            Task { await model.refreshServer() }  // and ask the server again: "Can't reach" clears only on its answer
         case .openServer:
             serverPath = NavigationPath()
             tab = .server
