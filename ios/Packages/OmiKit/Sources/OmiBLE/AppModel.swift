@@ -123,6 +123,8 @@ public final class AppModel {
     var dataEpoch = 0
     /// Bumped by each refreshServer: what an older one heard after a newer one started is dropped.
     var refreshGeneration = 0
+    /// The latest /issues request failed: `issues` is the earlier list (last-known).
+    public internal(set) var issuesStale = false
 
     /// Identifies what the shown data belongs to (views reset their own state when it changes).
     public var serverIdentity: String { "\(answeredFor?.generation ?? -1)|\(answeredVault ?? "")" }
@@ -174,8 +176,12 @@ public final class AppModel {
     /// what it said (issues, activity, queue counts) is as of `serverStatusAt`, not current (2026-11-21).
     public func serverAnswerIsCurrent(now: Date = Date()) -> Bool {
         guard let at = serverStatusAt, !lastRefreshFailed else { return false }
-        return now.timeIntervalSince(at) <= SystemHealth.staleAfter
+        return ServiceLabel.isCurrent(age: now.timeIntervalSince(at))  // the rule the service rows use (ASTRA-20261121-IT2-01)
     }
+
+    /// The issues list is as of now: the status answer is current and the latest /issues request answered too (a failed
+    /// one keeps the old list, which is then last-known, ASTRA-20261121-IT2-02).
+    public func issuesAreCurrent(now: Date = Date()) -> Bool { serverAnswerIsCurrent(now: now) && !issuesStale }
 
     /// The Server page's service rows as of now: the last answer's names, with a health only while that
     /// answer is current (a failed latest request or an old answer makes it last-known). nil before any answer.
@@ -209,6 +215,7 @@ public final class AppModel {
         serverStatusAt = nil
         lastRefreshFailed = false
         issues = []
+        issuesStale = false
         recent = []
         recentCursor = nil
         shortDays = [:]
@@ -339,6 +346,7 @@ public final class AppModel {
         let (newIssues, page) = await (issuesTask, pageTask)
         guard isCurrent(config), data == dataEpoch, mine == refreshGeneration else { return }
         if let newIssues { issues = newIssues }
+        issuesStale = newIssues == nil  // kept, but not renewed by this status answer
         await settleRetries(api: api, config: config, data: data)
         guard isCurrent(config), data == dataEpoch, mine == refreshGeneration else { return }
         switch page {

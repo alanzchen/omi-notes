@@ -17,6 +17,9 @@ public struct ServiceLabel: Equatable, Sendable {
     /// A status answer, and the local engine's last check, count as current this long (the app's
     /// `SystemHealth.staleAfter`: an older server answer is unknown).
     public static let currentFor: TimeInterval = 5 * 60
+    /// The one freshness rule for a server answer: no older than `currentFor`, and no more than a minute in the future
+    /// (a phone clock set back makes old answers look new).
+    public static func isCurrent(age: TimeInterval?) -> Bool { age.map { $0 <= currentFor && $0 >= -60 } == true }
     public struct Detail: Equatable, Sendable, Hashable {
         public var title: String
         public var value: String
@@ -117,7 +120,7 @@ extension ServerStatus {
     /// last check (`local_transcription.checked_at`) counts only while it is that recent too.
     public func serviceLabels(answeredAt: Date?, latestRequestFailed: Bool, now: Date) -> (transcription: ServiceLabel, summaries: ServiceLabel) {
         let age = answeredAt.map { now.timeIntervalSince($0) }
-        let current = !latestRequestFailed && age.map { $0 <= ServiceLabel.currentFor && $0 >= -60 } == true
+        let current = !latestRequestFailed && ServiceLabel.isCurrent(age: age)
         return (Self.label(stt, local: localTranscription, checkAge: engineCheckAge(answeredAt: answeredAt, now: now), current: current),
                 Self.label(llm, local: nil, checkAge: nil, current: current))
     }
