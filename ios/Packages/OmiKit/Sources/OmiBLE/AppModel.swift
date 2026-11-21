@@ -348,17 +348,12 @@ public final class AppModel {
         if status.supportsPhoneLog { uploadPhoneLogIfDue(api: api) }
         let epoch = cacheEpoch
         guard data == dataEpoch, mine == refreshGeneration else { return }  // a vault change just reset everything
-        async let issuesTask: [ServerIssue]? = status.supportsIssues ? try? api.issues() : []
+        // in parallel; each applies its own answer when it arrives (the issues list doesn't wait for the page, IT6-01)
+        async let issuesApplied: Void = applyIssues(api: api, supported: status.supportsIssues, config: config, data: data, refresh: mine)
         async let pageTask = Result { try await api.recentConversations(limit: Self.pageSize) }
-        let (newIssues, page) = await (issuesTask, pageTask)
+        let page = await pageTask
+        await issuesApplied
         guard isCurrent(config), data == dataEpoch, mine == refreshGeneration else { return }
-        if let newIssues { issues = newIssues }
-        if newIssues != nil {
-            issuesStale = false
-            issuesAt = Date()
-        } else {
-            issuesStale = true  // kept, but not renewed by this status answer
-        }
         await settleRetries(api: api, config: config, data: data, refresh: mine)
         guard isCurrent(config), data == dataEpoch, mine == refreshGeneration else { return }
         switch page {
@@ -376,6 +371,20 @@ public final class AppModel {
         case .failure(let error):
             recentError = Self.describe(error)  // the list already shown stays, marked stale
             if recent.isEmpty { showSavedList(config) }
+        }
+    }
+
+    /// `/issues`' outcome, applied the moment it answers, with that time, under the refresh's own guards: a failure
+    /// marks the kept list last-known at once, not after the unrelated page answers (ASTRA-20261121-IT6-01).
+    private func applyIssues(api: APIClient, supported: Bool, config: UploadConfig, data: Int, refresh: Int) async {
+        let answer: [ServerIssue]? = supported ? try? await api.issues() : []
+        guard isCurrent(config), data == dataEpoch, refresh == refreshGeneration else { return }
+        if let answer {
+            issues = answer
+            issuesStale = false
+            issuesAt = Date()
+        } else {
+            issuesStale = true  // kept, but not renewed by this status answer
         }
     }
 
