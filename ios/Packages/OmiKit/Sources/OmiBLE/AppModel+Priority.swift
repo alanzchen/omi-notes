@@ -56,17 +56,20 @@ extension AppModel {
     }
 
     /// On every refresh: send what's still unconfirmed for this server (only the latest per conversation).
-    func settlePriorities(api: APIClient, data: Int) async {
+    /// - Parameter refresh: the server refresh this runs for: an older one's late answers change nothing
+    ///   (ASTRA-20261121-IT5-06). A user's own choice passes none.
+    func settlePriorities(api: APIClient, data: Int, refresh: Int? = nil) async {
         guard supportsValueNotes, let key = priorityKey else { return }
-        for entry in priorityStore.entries(server: key) where data == dataEpoch {
-            await sendPriority(entry, api: api, data: data)
+        for entry in priorityStore.entries(server: key) where data == dataEpoch && refresh.map({ $0 == refreshGeneration }) != false {
+            await sendPriority(entry, api: api, data: data, refresh: refresh)
         }
     }
 
-    func sendPriority(_ entry: PriorityStore.Entry, api: APIClient, data: Int) async {
+    func sendPriority(_ entry: PriorityStore.Entry, api: APIClient, data: Int, refresh: Int? = nil) async {
+        func current() -> Bool { data == dataEpoch && refresh.map { $0 == refreshGeneration } != false }
         do {
             let answer = try await api.putPriority(entry.conversationId, state: entry.state, requestId: entry.requestId, setAt: entry.setAt)
-            guard data == dataEpoch else { return }
+            guard current() else { return }
             priorityStore.settle(entry.requestId)
             // only the latest choice's answer is shown: a newer one (pending, or answered first) stands
             let latest = priorityLatest[entry.conversationId]
@@ -74,11 +77,11 @@ extension AppModel {
                 applyPriority(entry.conversationId, ConversationValue.Choice(state: answer.state, revision: answer.revision, setAt: answer.setAt))
             }
         } catch APIError.http(let code, let detail) where (400..<500).contains(code) {
-            guard data == dataEpoch else { return }
+            guard current() else { return }
             priorityStore.settle(entry.requestId)
             priorityMessages[entry.conversationId] = "The server didn't take that choice (\(detail))."
         } catch {
-            guard data == dataEpoch else { return }
+            guard current() else { return }
             if priorityStore.failed(entry.requestId) {
                 priorityMessages[entry.conversationId] = "Couldn't save your choice; the server stayed unreachable."
             }

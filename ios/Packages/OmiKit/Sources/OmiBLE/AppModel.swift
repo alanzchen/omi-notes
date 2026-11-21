@@ -366,7 +366,7 @@ public final class AppModel {
             mergeFirstPage(page)
             await reloadOpenedShortDays()  // an opened fold follows refreshes: no stale "waiting" or spinner
             guard isCurrent(config), data == dataEpoch, mine == refreshGeneration else { return }
-            await settlePriorities(api: api, data: data)
+            await settlePriorities(api: api, data: data, refresh: mine)
             guard isCurrent(config), data == dataEpoch, mine == refreshGeneration else { return }
             recentError = nil
             recentLoadedAt = Date()
