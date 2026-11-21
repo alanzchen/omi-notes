@@ -21,13 +21,13 @@ import threading
 import time
 from collections import OrderedDict
 
-from .. import __version__, deferral, home, operations, priority, search
+from .. import __version__, deferral, disk_alert, home, operations, priority, search
 from .. import recording_class as rclass
 from ..audio.timeline import RING_RECORD_SECONDS, CaptureTimeline, ChunkDecode
 from ..audio.vad import MIN_SPEECH, VadChoice, VadStream, make_vad
 from ..db import Database
 from ..envelope import OPUS_CODECS, parse_envelope
-from ..ingest import seal_end_epoch
+from ..ingest import MIN_FREE_BYTES, seal_end_epoch
 from ..lock import worker_lock
 from ..notes.writer import remove
 from ..rebuild import advance_processed
@@ -109,6 +109,8 @@ class Worker:
 
     def tick(self, now: float | None = None) -> dict:
         now = self.clock() if now is None else now
+        # the disk alert first: it needs no index write, which a full disk may be what stops (2026-11-20 18:05)
+        disk_alert.watch(self.settings.logs_dir, self.settings.vault_dir, floor_bytes=MIN_FREE_BYTES, now=now)
         blocked = read_only_reason(self.db)
         if blocked:
             self._status(now, force=False)

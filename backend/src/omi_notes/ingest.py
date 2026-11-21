@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import shutil
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ import numpy as np
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationError
 
 from .audio import aac
+from . import disk_alert
 from .db import Database
 from .envelope import EnvelopeError, EnvelopeHeader, parse_envelope
 from .settings import Settings
@@ -36,7 +38,10 @@ from .vault import Vault
 
 log = logging.getLogger(__name__)
 
-MIN_FREE_BYTES = 256 * 1024 * 1024
+# Below this much free space new audio is refused with 507 (the phone keeps it and retries), so SQLite, notes and the
+# worker keep room to write: the index's WAL and checkpoints, transcripts, cached transcription requests and a burst of
+# uploads fit in it. 256 MiB was not enough: on 2026-11-20 the disk filled and the worker's index writes failed.
+MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
 _lock = threading.Lock()
 # AAC decodes (ffmpeg runs) at once for checks outside `_lock`: a resend burst can't take every core
 UPLOAD_DECODES = 4
@@ -367,6 +372,13 @@ def tombstone_header(tomb: dict) -> EnvelopeHeader:
 # -- ingest ----------------------------------------------------------------------------------------
 
 
+def _disk_full_error(exc: BaseException) -> bool:
+    """ENOSPC, or SQLite's "database or disk is full"."""
+    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+        return True
+    return isinstance(exc, sqlite3.OperationalError) and "full" in str(exc).lower()
+
+
 class Ingest:
     """HTTP ingest against one vault + index. One process-wide lock serializes identity checks."""
 
@@ -526,6 +538,7 @@ class Ingest:
                 atomic_write_bytes(path, body)
             except OSError as exc:
                 if exc.errno == errno.ENOSPC:
+                    self._disk_full("a chunk write hit ENOSPC")
                     raise ApiError(507, "storage_full", "server disk is full") from exc
                 raise
             now = self.clock()
@@ -535,8 +548,13 @@ class Ingest:
                 with db.tx() as conn:
                     index_chunk(conn, header, digest=digest, size=len(body), path=vault.relpath(path), received_at=now,
                                 ring=ring_record_hashes(env))  # fmt: skip
-            except BaseException:
+            except BaseException as exc:
                 self._dirty.add((header.device_id, capture_id))
+                # the file is durable but not indexed (an orphan a retry with the same bytes adopts): a full disk here
+                # is 507 like any other, so the phone keeps the part and sends it again (2026-11-21)
+                if _disk_full_error(exc):
+                    self._disk_full(f"storing a chunk's receipt/index failed: {exc}")
+                    raise ApiError(507, "storage_full", "server disk is full") from exc
                 raise
         return ok(201, False)
 
@@ -641,8 +659,18 @@ class Ingest:
 
     def _ensure_space(self) -> None:
         make_dirs_durable(self.vault.raw)
-        if shutil.disk_usage(self.vault.raw).free < MIN_FREE_BYTES:
+        free = shutil.disk_usage(self.vault.raw).free
+        if free < MIN_FREE_BYTES:
+            self._disk_full("free space below the upload floor", free)
             raise ApiError(507, "storage_full", "server disk is nearly full")
+
+    def _disk_full(self, reason: str, free: int | None = None) -> None:
+        if free is None:
+            try:
+                free = shutil.disk_usage(self.vault.raw).free
+            except OSError:
+                free = None
+        disk_alert.note_down(self.settings.logs_dir, free_bytes=free, floor_bytes=MIN_FREE_BYTES, reason=reason, now=self.clock())
 
     # -- seals -----------------------------------------------------------------------------------
 
