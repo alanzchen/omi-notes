@@ -55,7 +55,7 @@ struct AlertsSection: View {
 
     var body: some View {
         Section {
-            Toggle("Alert me when recording or uploads stop", isOn: Binding(get: { on }, set: { value in
+            Toggle("Alert me when recording stops or uploads are paused", isOn: Binding(get: { on }, set: { value in
                 Task {
                     if value, !(await LocalAlerts.requestPermission()) {
                         message = "Notifications are turned off for Omi Notes in the iPhone Settings app."
