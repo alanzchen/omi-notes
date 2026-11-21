@@ -343,7 +343,7 @@ public struct PendantSummary: Equatable, Sendable {
         case .unreachable: return flow(.delayed, "Can't reach", last)
         case .unknown, .checking: return flow(.unknown, "Checking…", last)
         case .reachable:
-            guard let statusAt, now.timeIntervalSince(statusAt) <= SystemHealth.staleAfter else {
+            guard let statusAt, ServiceLabel.isCurrent(age: now.timeIntervalSince(statusAt)) else {
                 return flow(.unknown, "Last checked \(statusAt.map { SystemHealth.relative($0, now) } ?? "never")", last)
             }
             return flow(.normal, "Reachable", last)
@@ -353,7 +353,7 @@ public struct PendantSummary: Equatable, Sendable {
     static func notes(_ status: ServerStatus?, statusAt: Date?, now: Date) -> Notes? {
         guard let status, let statusAt else { return nil }
         return Notes(processing: status.queue?.conversationsPending, lastNoteAt: status.lastNoteAt.flatMap(ISO8601UTC.parse),
-                     asOf: statusAt, stale: now.timeIntervalSince(statusAt) > SystemHealth.staleAfter)
+                     asOf: statusAt, stale: !ServiceLabel.isCurrent(age: now.timeIntervalSince(statusAt)))
     }
 }
 

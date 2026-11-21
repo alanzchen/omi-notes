@@ -321,7 +321,7 @@ public struct TransferSummary: Equatable, Sendable {
     /// line says so).
     public func serverLine(now: Date) -> String? {
         if case .offline = phone.state { return nil }
-        guard server.reachable != false, let at = server.checkedAt, now.timeIntervalSince(at) <= 300, at <= now.addingTimeInterval(60),
+        guard server.reachable != false, let at = server.checkedAt, ServiceLabel.isCurrent(age: now.timeIntervalSince(at)),
               let work = serverWork, !work.atLeast || work.left > 0 else { return nil }
         if work.left > 0 { return "服务器处理中" }
         return everythingSent ? "已是最新" : "服务器已处理完收到的录音"

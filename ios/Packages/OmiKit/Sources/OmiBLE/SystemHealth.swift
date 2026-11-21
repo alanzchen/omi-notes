@@ -241,7 +241,7 @@ public struct SystemHealth: Equatable, Sendable {
             break
         }
         guard let status, let statusAt else { return step(.unknown, "Checking the server…") }
-        if now.timeIntervalSince(statusAt) > staleAfter {
+        if !ServiceLabel.isCurrent(age: now.timeIntervalSince(statusAt)) {  // the shared rule: future answers too (IT4-04)
             return step(.unknown, "Server last checked \(relative(statusAt, now))", nil, .openServer)
         }
         let q = status.queue
@@ -322,7 +322,9 @@ public struct SystemHealth: Equatable, Sendable {
             return Step(area: .notes, level: .unknown, title: "No notes yet",
                         detail: "A note appears a few minutes after a conversation ends.")
         }
-        return Step(area: .notes, level: .normal, title: "Last note \(relative(last, now))")
+        // an answer outside the shared window says nothing about now: same line, not green (IT4-04)
+        let current = statusAt.map { ServiceLabel.isCurrent(age: now.timeIntervalSince($0)) } ?? false
+        return Step(area: .notes, level: current ? .normal : .unknown, title: "Last note \(relative(last, now))")
     }
 
     public static func relative(_ date: Date, _ now: Date) -> String {
