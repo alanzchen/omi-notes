@@ -121,6 +121,8 @@ public final class AppModel {
     /// Bumped whenever the server (configuration or vault) changes: an answer that was asked for
     /// before then is dropped.
     var dataEpoch = 0
+    /// Bumped by each refreshServer: what an older one heard after a newer one started is dropped.
+    var refreshGeneration = 0
 
     /// Identifies what the shown data belongs to (views reset their own state when it changes).
     public var serverIdentity: String { "\(answeredFor?.generation ?? -1)|\(answeredVault ?? "")" }
@@ -288,6 +290,10 @@ public final class AppModel {
         default: server = .checking
         }
         let data = dataEpoch  // before any await: a reset while we wait makes this answer stale
+        // only the newest refresh applies what it heard: an older one finishing later (a slow timeout after a newer
+        // answer, a Retry overlapping the minute's refresh) changes nothing (ASTRA-20261121-IT1-04)
+        refreshGeneration += 1
+        let mine = refreshGeneration
         let api = APIClient(endpoint: endpoint, session: session)
         let reach: ServerReachability
         var status: ServerStatus?
@@ -303,7 +309,7 @@ public final class AppModel {
         } catch {
             reach = .unreachable(Self.describe(error))
         }
-        guard isCurrent(config), data == dataEpoch else { return }  // the server changed while we were asking
+        guard isCurrent(config), data == dataEpoch, mine == refreshGeneration else { return }  // the server changed while we were asking
         server = reach
         lastRefreshFailed = status == nil
         guard let status else {
@@ -327,20 +333,20 @@ public final class AppModel {
         rememberValueNotesScope(config)
         if status.supportsPhoneLog { uploadPhoneLogIfDue(api: api) }
         let epoch = cacheEpoch
-        guard data == dataEpoch else { return }  // a vault change just reset everything
+        guard data == dataEpoch, mine == refreshGeneration else { return }  // a vault change just reset everything
         async let issuesTask: [ServerIssue]? = status.supportsIssues ? try? api.issues() : []
         async let pageTask = Result { try await api.recentConversations(limit: Self.pageSize) }
         let (newIssues, page) = await (issuesTask, pageTask)
-        guard isCurrent(config), data == dataEpoch else { return }
+        guard isCurrent(config), data == dataEpoch, mine == refreshGeneration else { return }
         if let newIssues { issues = newIssues }
         await settleRetries(api: api, config: config, data: data)
-        guard isCurrent(config), data == dataEpoch else { return }
+        guard isCurrent(config), data == dataEpoch, mine == refreshGeneration else { return }
         switch page {
         case .success(let page):
             mergeFirstPage(page)
             await reloadOpenedShortDays()  // an opened fold follows refreshes: no stale "waiting" or spinner
             await settlePriorities(api: api, data: data)
-            guard isCurrent(config), data == dataEpoch else { return }
+            guard isCurrent(config), data == dataEpoch, mine == refreshGeneration else { return }
             recentError = nil
             recentLoadedAt = Date()
             recentSavedAt = nil
