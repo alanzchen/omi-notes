@@ -141,11 +141,12 @@ public struct WatchSummary: Equatable, Sendable {
             let queue = othersWaiting > 50 ? "Watch audio waiting, in turn after other recordings on this iPhone" : "Watch audio waiting to upload"
             let line: String
             // Transfers' state wins; a full server disk only says why a waiting queue waits (ASTRA-20261121-IT4-02).
-            // Sending is the iPhone's, not proof this Watch audio moves: no claim, the queue (IT4-03)
+            // Sending is the iPhone's: neither proof this Watch audio moves (IT4-03) nor that it waits, since a part
+            // being sent stays pending until the server's ACK (IT6-02). Presence only.
             switch upload {
             case .offline(let why)?: line = why == TransferSummary.rejectedReason ? "Waiting: the server rejected this iPhone" : "Waiting: can't reach your server"
             case .paused?: line = "Waiting: uploads paused"
-            case .sending?: line = queue
+            case .sending?: line = "\(waiting) Watch part\(waiting == 1 ? "" : "s") on this iPhone"
             default: line = serverFull ? "Waiting: server disk is full" : queue
             }
             return [line, aside].compactMap { $0 }.joined(separator: " · ")

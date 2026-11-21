@@ -54,7 +54,9 @@ import OmiWatchKit
         #expect(WatchSummary.uploadLine(waiting: 3, othersWaiting: 0, setAside: 0, inventoryReadable: true, lastUploadedAt: nil,
                                         received: 10, now: now, upload: .retrying, serverFull: true) == "Waiting: server disk is full")
         #expect(WatchSummary.uploadLine(waiting: 3, othersWaiting: 0, setAside: 0, inventoryReadable: true, lastUploadedAt: nil,
-                                        received: 10, now: now, upload: .sending) == "Watch audio waiting to upload")  // IT4-03: no claim
+                                        received: 10, now: now, upload: .sending) == "3 Watch parts on this iPhone")  // IT4-03/IT6-02: presence, no claim either way
+        #expect(WatchSummary.uploadLine(waiting: 1, othersWaiting: 80, setAside: 2, inventoryReadable: true, lastUploadedAt: nil,
+                                        received: 10, now: now, upload: .sending) == "1 Watch part on this iPhone · 2 parts set aside")
     }
 
     /// R4: the Pendant page's phone row said "N files uploading" while the server refused them for lack of disk.
