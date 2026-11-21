@@ -187,7 +187,7 @@ def create_app(
     def disk_status(logs_dir) -> dict | None:
         alert = disk_alert.read(logs_dir)
         if not alert or alert.get("state") != "down":
-            return None
+            return {"full": False}  # said, not implied by absence: it clears an older 507 on the phone (IT3-04)
         since = alert.get("down_since")
         return {"full": True, "since": since if isinstance(since, str) else None}  # only these types go out (IT3-03)
 
@@ -223,7 +223,7 @@ def create_app(
             "vault_dir": str(settings.vault_dir),
             "notes_dir": str(settings.vault_dir),
             "read_only": read_only_reason(db),
-            # the server's disk is too full to take audio (logs/alerts/disk.json, one small file read; absent otherwise):
+            # the server's disk is too full to take audio (logs/alerts/disk.json, one small file read), or explicitly not:
             # the phone says so instead of "uploading" (2026-11-21). Older phones ignore the key.
             "disk": disk_status(settings.logs_dir),
             # the phone only starts a voice enrollment when the server keeps the reading out of notes

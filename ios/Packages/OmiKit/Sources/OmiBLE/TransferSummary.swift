@@ -148,7 +148,7 @@ public struct TransferSummary: Equatable, Sendable {
             queuedFiles: s.outbox.pendingCount, queuedAudioFiles: s.outbox.pendingChunks, queuedBytes: s.outbox.pendingBytes,
             queuedAudioSeconds: s.transfer.pendingAudioSeconds, queuedAudioUnknown: s.transfer.pendingAudioUnknown,
             retryingFiles: s.upload.backingOff, keptAside: s.outbox.quarantineCount,
-            serverFull: SystemHealth.serverDiskFull(s, status: status))
+            serverFull: SystemHealth.serverDiskFull(s, status: status, statusAt: statusAt, now: now))
 
         let reachable: Bool?
         switch server {

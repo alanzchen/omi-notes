@@ -506,6 +506,7 @@ public final class Uploader: @unchecked Sendable {
         launched.removeAll()
         status.pausedReason = nil
         status.attention.removeAll()
+        status.lastResult = nil  // the previous server's answer (e.g. its full disk) says nothing about this one
         reconcile()
     }
 

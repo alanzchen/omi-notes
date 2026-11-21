@@ -134,7 +134,7 @@ def test_no_alert_file_while_the_disk_has_room(client, settings, worker, monkeyp
 
 def test_status_says_the_disk_is_full_only_while_it_is(client, settings, monkeypatch):
     from .conftest import AUTH
-    assert client.get("/v1/status", headers=AUTH).json().get("disk") is None
+    assert client.get("/v1/status", headers=AUTH).json()["disk"] == {"full": False}
     capture = str(uuid.uuid4())
     _free(monkeypatch, 1 * GiB)
     assert put_chunk(client, capture, 0, _envs(capture)[0]).status_code == 507

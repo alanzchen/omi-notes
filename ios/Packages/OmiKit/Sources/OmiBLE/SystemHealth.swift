@@ -74,7 +74,7 @@ public struct SystemHealth: Equatable, Sendable {
         snapshot s: EngineSnapshot, server: ServerReachability, status: ServerStatus?, statusAt: Date?, now: Date,
         issues: [ServerIssue] = [], watchAppInstalled: Bool? = nil
     ) -> SystemHealth {
-        let steps = [pendant(s, watchAppInstalled: watchAppInstalled)] + [watch(s, now: now)].compactMap { $0 } + [phone(s, server: server, status: status),
+        let steps = [pendant(s, watchAppInstalled: watchAppInstalled)] + [watch(s, now: now)].compactMap { $0 } + [phone(s, server: server, status: status, statusAt: statusAt, now: now),
                      self.server(server, status: status, statusAt: statusAt, now: now, issues: issues),
                      notes(status, statusAt: statusAt, now: now)]
         let worst = steps.map(\.level).max() ?? .unknown
@@ -169,12 +169,23 @@ public struct SystemHealth: Equatable, Sendable {
         }
     }
 
-    /// The server refused audio for lack of disk (the latest upload got 507, or its status says the disk is full).
-    public static func serverDiskFull(_ s: EngineSnapshot, status: ServerStatus?) -> Bool {
-        s.upload.lastResult?.status == 507 || status?.disk?.full == true
+    /// The server's disk is too full to take audio, as of now (ASTRA-20261121-IT3-04): a current status answer (the
+    /// -60…300 s rule) that says so decides, and its explicit "not full" clears an upload's 507 older than that answer;
+    /// an old answer says nothing about now. Without a current answer, the latest upload's 507 for this server (the
+    /// uploader forgets results when the server changes).
+    public static func serverDiskFull(_ s: EngineSnapshot, status: ServerStatus?, statusAt: Date? = nil, now: Date = Date()) -> Bool {
+        let statusCurrent = statusAt.map { ServiceLabel.isCurrent(age: now.timeIntervalSince($0)) } ?? true
+        let said = statusCurrent ? status?.disk?.full : nil
+        let refusedAt = s.upload.lastResult.flatMap { $0.status == 507 ? $0.date : nil }
+        if let said {
+            if said { return true }
+            if let refusedAt, let at = statusAt, refusedAt > at { return true }  // a 507 after the "not full" answer
+            return false
+        }
+        return refusedAt != nil
     }
 
-    static func phone(_ s: EngineSnapshot, server: ServerReachability, status: ServerStatus? = nil) -> Step {
+    static func phone(_ s: EngineSnapshot, server: ServerReachability, status: ServerStatus? = nil, statusAt: Date? = nil, now: Date = Date()) -> Step {
         func step(_ level: Level, _ title: String, _ detail: String? = nil, _ fix: Fix? = nil) -> Step {
             Step(area: .phone, level: level, title: title, detail: detail, fix: fix)
         }
@@ -202,7 +213,7 @@ public struct SystemHealth: Equatable, Sendable {
                 return step(.delayed, "Audio is waiting to upload", "\(files) stored safely on this phone; they upload when the server is reachable.", .retryUploads)
             default:
                 // the server answered: its disk is full (507, or its status says so). Not "uploading", not "can't reach"
-                if serverDiskFull(s, status: status) {
+                if serverDiskFull(s, status: status, statusAt: statusAt, now: now) {
                     return step(.delayed, "Server disk is full", "\(files) wait on this phone", .openServer)
                 }
                 return step(.working, "Uploading audio", "\(files) to go")
