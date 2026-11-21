@@ -81,10 +81,11 @@ struct ServerView: View {
 
     @ViewBuilder private var issuesSection: some View {
         if !model.issues.isEmpty {
-            Section("Needs attention") {
+            // an old or unrefreshed list keeps its rows at full contrast and says so once, in words VoiceOver reads
+            // (ASTRA-20261121-IT2-02/04)
+            Section(model.issuesAreCurrent() ? "Needs attention" : "Needs attention · last known") {
                 ForEach(model.issues) { issue in IssueRow(model: model, issue: issue) }
             }
-            .opacity(answerCurrent ? 1 : 0.5)  // as of the last answer (its time is in the status line); its rows set their own colours
         }
     }
 
@@ -117,7 +118,6 @@ struct ServerView: View {
             } header: {
                 Text(answerCurrent ? "Now" : "Last answer")  // never "Now" over an old answer (2026-11-21)
             }
-            .foregroundStyle(answerCurrent ? .primary : .secondary)
         }
     }
 
@@ -133,21 +133,24 @@ struct ServerView: View {
         return Calendar.current.isDateInToday(d) ? Fmt.time(d) : "\(Fmt.day(d)) \(Fmt.time(d))"
     }
 
-    private var processingSection: some View {
+    @ViewBuilder private var processingSection: some View {
         Section {
             LabeledContent("Files waiting to upload", value: "\(s.outbox.pendingCount)")
             // tasks handed to iOS's background session: moving only while the server answers. Otherwise iOS holds them
             // for retry and "Files waiting to upload" (which counts them) is the whole truth
             if s.upload.inFlight > 0, case .reachable = model.server { LabeledContent("Uploading now", value: "\(s.upload.inFlight)") }
             LabeledContent("Last upload", value: Fmt.relative(s.upload.lastSuccessAt))
-            // the server's own counts, as of its last answer: grey while that isn't current (2026-11-21)
-            Group {
+        }
+        // the server's own counts, apart from this phone's: when its answer isn't current the header says so, once
+        // (ASTRA-20261121-IT2-04); this phone's upload rows above are never qualified
+        if status != nil {
+        Section {
             if let q = status?.queue {
                 LabeledContent("In progress", value: "\(q.conversationsOpen ?? 0)")
                 LabeledContent("Being processed", value: "\(q.conversationsPending ?? 0)")
                 if let retrying = q.conversationsRetrying, retrying > 0 { LabeledContent("Retrying", value: "\(retrying)") }
                 let failed = q.conversationsFailed.map { $0 + (q.chunksFailed ?? 0) } ?? q.failed ?? 0
-                LabeledContent("Failed") { Text("\(failed)").foregroundStyle(!answerCurrent ? Color.secondary : failed > 0 ? Color.red : Color.primary) }
+                LabeledContent("Failed") { Text("\(failed)").foregroundStyle(failed > 0 ? .red : .primary) }
                 if let conflicts = q.notesConflicted, conflicts > 0 {
                     LabeledContent("Notes edited elsewhere") { Text("\(conflicts)").foregroundStyle(.orange) }
                 }
@@ -158,10 +161,9 @@ struct ServerView: View {
             if let last = status?.lastNoteAt.flatMap(ISO8601UTC.parse) {
                 LabeledContent("Last note", value: Fmt.relative(last))
             }
-            }
-            .foregroundStyle(answerCurrent ? .primary : .secondary)
         } header: {
-            Text("Processing")
+            Text(answerCurrent ? "Processing" : "Processing · last known")
+        }
         }
     }
 
