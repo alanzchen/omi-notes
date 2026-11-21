@@ -31,7 +31,7 @@ struct WatchDetailView: View {
 
     private func current(_ now: Date) -> (WatchSummary, Flow) {
         let (summary, report, _) = DevicesView.watch(model, now)
-        let uploadPhone = model.transfers(watchInstalled: nil, now: now).phone
+        let uploadPhone = TransferText.summary(model, watchInstalled: nil, now: now).phone  // the same summary Transfers shows
         #if DEBUG
         if let name = UserDefaults.standard.string(forKey: "OmiNotesDebugWatchState"), let f = WatchSummary.debugFixture(name, now: now) {
             let some = f.lastReceivedAt != nil
