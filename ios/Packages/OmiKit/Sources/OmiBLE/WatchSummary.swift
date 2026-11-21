@@ -132,10 +132,17 @@ public struct WatchSummary: Equatable, Sendable {
     /// The Watch page's "Upload to your server" line: the iPhone → server hop only. Watch audio this iPhone set aside
     /// (couldn't upload) is named, and an unreadable outbox is unknown, never "Nothing waiting" (ASTRA-20261112-IT2-01).
     public static func uploadLine(waiting: Int, othersWaiting: Int, setAside: Int, inventoryReadable: Bool,
-                                  lastUploadedAt: Date?, received: Int, now: Date, setAsideUnknown: Int = 0) -> String {
+                                  lastUploadedAt: Date?, received: Int, now: Date, setAsideUnknown: Int = 0,
+                                  server: ServerReachability? = nil) -> String {
         let aside = setAside > 0 ? "\(setAside) part\(setAside == 1 ? "" : "s") set aside" : nil
         if waiting > 0 {
-            let line = othersWaiting > 50 ? "Watch audio waiting, in turn after other recordings on this iPhone" : "Watch audio waiting to upload"
+            // the same verdict the Transfers card shows: a queue that can't move isn't a calm "waiting" (2026-11-21)
+            let line: String
+            switch server {
+            case .unreachable?: line = "Waiting: can't reach your server"
+            case .unauthorized?: line = "Waiting: the server rejected this iPhone"
+            default: line = othersWaiting > 50 ? "Watch audio waiting, in turn after other recordings on this iPhone" : "Watch audio waiting to upload"
+            }
             return [line, aside].compactMap { $0 }.joined(separator: " · ")
         }
         if let aside { return aside }

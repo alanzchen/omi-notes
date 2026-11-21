@@ -193,7 +193,10 @@ public struct PendantSummary: Equatable, Sendable {
         if !s.serverConfigured { return row("No server connected", "Recordings stay on this iPhone", attention: true, fix: .openServer) }
         if n > 0 {
             switch server {
-            case .unreachable: return row("\(files) waiting on iPhone", "Server unreachable right now", attention: true, fix: .retryUploads)
+            // since when, not "right now" (an outage of 38 hours read the same as one of a minute, 2026-11-21)
+            case .unreachable: return row("\(files) waiting on iPhone",
+                                          s.upload.lastSuccessAt.map { "Server unreachable · last upload \(SystemHealth.relative($0, now))" } ?? "Server unreachable",
+                                          attention: true, fix: .retryUploads)
             case .unauthorized: return row("\(files) waiting on iPhone", "The server rejected this iPhone", attention: true, fix: .openServer)
             default: return row("\(files) uploading", "Stored on this iPhone")
             }

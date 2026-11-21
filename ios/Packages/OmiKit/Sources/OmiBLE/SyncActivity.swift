@@ -28,7 +28,9 @@ extension SyncActivityState {
         let watchWaiting = t.watch.inUse == true ? t.watch.waitingSeconds : nil  // re-checks included: not acknowledged
         var detail: String?
         switch p.state {
-        case .offline(let why), .paused(let why): detail = why
+        // the title already says it; a transport error's own text ("The request timed out.") is not for the lock screen
+        case .offline(let why): detail = why == TransferSummary.rejectedReason ? why : nil
+        case .paused(let why): detail = why
         case .keptAside(let n): detail = "\(n) not uploaded; see Devices"
         case .preparing(let n): detail = "\(n) Watch part\(n == 1 ? "" : "s") being prepared"
         case .allSent: detail = t.server.conversationsPending.map { $0 > 0 ? "Your server is processing \($0)" : "Notes appear once your server processes them" }

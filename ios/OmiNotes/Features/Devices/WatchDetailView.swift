@@ -24,6 +24,8 @@ struct WatchDetailView: View {
         var setAside = 0
         var setAsideUnknown = 0
         var inventoryReadable = true
+        /// The server verdict the Transfers card also uses: an upload queue that can't move says why.
+        var server: ServerReachability?
     }
 
     private func current(_ now: Date) -> (WatchSummary, Flow) {
@@ -37,14 +39,16 @@ struct WatchDetailView: View {
             return (summary, Flow(report: f.report, receivedTotal: some ? 214 : 0, lastReceivedAt: f.lastReceivedAt, preparing: 0,
                                   waitingUpload: some && !idle ? 3 : 0, othersWaiting: name == "stale" ? 1_960 : 0,
                                   lastUploadedAt: idle ? f.lastReceivedAt?.addingTimeInterval(60) : some ? now.addingTimeInterval(-4 * 60) : nil,
-                                  setAside: name == "set-aside" ? 1 : 0, setAsideUnknown: name == "unknown-aside" ? 1 : 0))
+                                  setAside: name == "set-aside" ? 1 : 0, setAsideUnknown: name == "unknown-aside" ? 1 : 0,
+                                  server: model.server))
         }
         #endif
         let s = model.snapshot
         return (summary, Flow(report: report, receivedTotal: s.watchReceived, lastReceivedAt: s.watchLastReceivedAt, preparing: s.watchPending,
                               waitingUpload: s.watchWaitingUpload, othersWaiting: max(0, s.outbox.pendingChunks - s.watchWaitingUpload),
                               lastUploadedAt: s.watchLastUploadedAt, setAside: s.outbox.quarantineWatchCount,
-                              setAsideUnknown: s.outbox.quarantineSourceUnknownCount, inventoryReadable: s.outbox.inventoryReadable))
+                              setAsideUnknown: s.outbox.quarantineSourceUnknownCount, inventoryReadable: s.outbox.inventoryReadable,
+                              server: model.server))
     }
 
     /// The build of the Watch in use, as it said (nil: unknown, shows nothing). Only while WatchConnectivity says a
@@ -206,7 +210,7 @@ struct WatchDetailView: View {
         place("arrow.up", "Upload to your server",
               WatchSummary.uploadLine(waiting: f.waitingUpload, othersWaiting: f.othersWaiting, setAside: f.setAside,
                                       inventoryReadable: f.inventoryReadable, lastUploadedAt: f.lastUploadedAt,
-                                      received: f.receivedTotal, now: now, setAsideUnknown: f.setAsideUnknown))
+                                      received: f.receivedTotal, now: now, setAsideUnknown: f.setAsideUnknown, server: f.server))
     }
 
     private func heading(_ text: String) -> some View {
