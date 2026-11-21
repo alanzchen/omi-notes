@@ -10,6 +10,11 @@ public struct SyncActivityState: Codable, Hashable, Sendable {
     public var stage: Stage
     public var title: String
     public var detail: String?
+    /// The server's refusal, the one offline detail that is the app's own sentence (the rest is transport text).
+    public static let rejectedDetail = "the server rejected this phone"
+    /// What a card shows under its title: an offline card carries no raw transport error ("The request timed out."),
+    /// also when it was started by an older build that stored one (2026-11-21).
+    public var displayDetail: String? { stage == .offline && detail != Self.rejectedDetail ? nil : detail }
     /// Bytes per second, only while bytes were actually moving when this was made (never carried over).
     public var rate: Double?
     /// Audio queued on this iPhone for the server, from the chunks' own recorded lengths; nil if unknown.

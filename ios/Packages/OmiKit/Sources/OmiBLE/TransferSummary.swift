@@ -220,7 +220,7 @@ public struct TransferSummary: Equatable, Sendable {
 
 
     /// `.offline` reason when the server answered 401 (this iPhone's token was rejected).
-    public static let rejectedReason = "the server rejected this phone"
+    public static let rejectedReason = SyncActivityState.rejectedDetail
 
     // MARK: main-screen lines (Chinese, no file or part counts: the bars show progress; counts live in Details)
 

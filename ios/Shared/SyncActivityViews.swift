@@ -66,7 +66,7 @@ struct SyncLines: View {
                 Text("Watch: \(SyncWords.duration(Double(w))) waiting\(state.watchReportAt.map { " · reported \($0.formatted(date: .omitted, time: .shortened))" } ?? "")")
                     .font(.caption).foregroundStyle(SyncPalette.secondary).lineLimit(1).minimumScaleFactor(0.75)
             }
-            if let d = state.detail { Text(d).font(.caption).foregroundStyle(SyncPalette.secondary).lineLimit(compact ? 1 : 2) }
+            if let d = state.displayDetail { Text(d).font(.caption).foregroundStyle(SyncPalette.secondary).lineLimit(compact ? 1 : 2) }
             if stale {
                 Text("As of \(state.asOf.formatted(date: .omitted, time: .shortened))\(compact ? "" : " · open Omi Notes to update")")
                     .font(.caption2).foregroundStyle(SyncPalette.secondary).lineLimit(1)
