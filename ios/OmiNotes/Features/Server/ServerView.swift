@@ -49,6 +49,9 @@ struct ServerView: View {
 
     // MARK: Sections
 
+    /// The last answer describes now; otherwise its issues, activity and counts are greyed as of then.
+    private var answerCurrent: Bool { model.serverAnswerIsCurrent() }
+
     private var statusSection: some View {
         Section {
             TimelineView(.periodic(from: .now, by: 30)) { context in
@@ -57,7 +60,8 @@ struct ServerView: View {
                     let server = Self.headline(model.health(now: context.date).steps.first { $0.area == .server }!, listed: !model.issues.isEmpty)
                     // already on the Server page: no "Open Server", and no "Server" caption under the page title
                     StepRow(step: server, onFix: onFix, hiding: .openServer, showsArea: false)
-                    if let at = model.serverStatusAt {
+                    // its age once: "Server last checked …" already says it
+                    if let at = model.serverStatusAt, !server.title.hasPrefix("Server last checked") {
                         Text("Last answered \(SystemHealth.relative(at, context.date))").font(.caption).foregroundStyle(.secondary)
                     }
                     if case .unreachable(let why) = model.server {
@@ -80,6 +84,7 @@ struct ServerView: View {
             Section("Needs attention") {
                 ForEach(model.issues) { issue in IssueRow(model: model, issue: issue) }
             }
+            .foregroundStyle(answerCurrent ? .primary : .secondary)  // as of the last answer (its time is in the status line)
         }
     }
 
@@ -110,8 +115,9 @@ struct ServerView: View {
                 }
                 .font(.subheadline)
             } header: {
-                Text("Now")
+                Text(answerCurrent ? "Now" : "Last answer")  // never "Now" over an old answer (2026-11-21)
             }
+            .foregroundStyle(answerCurrent ? .primary : .secondary)
         }
     }
 
@@ -134,12 +140,14 @@ struct ServerView: View {
             // for retry and "Files waiting to upload" (which counts them) is the whole truth
             if s.upload.inFlight > 0, case .reachable = model.server { LabeledContent("Uploading now", value: "\(s.upload.inFlight)") }
             LabeledContent("Last upload", value: Fmt.relative(s.upload.lastSuccessAt))
+            // the server's own counts, as of its last answer: grey while that isn't current (2026-11-21)
+            Group {
             if let q = status?.queue {
                 LabeledContent("In progress", value: "\(q.conversationsOpen ?? 0)")
                 LabeledContent("Being processed", value: "\(q.conversationsPending ?? 0)")
                 if let retrying = q.conversationsRetrying, retrying > 0 { LabeledContent("Retrying", value: "\(retrying)") }
                 let failed = q.conversationsFailed.map { $0 + (q.chunksFailed ?? 0) } ?? q.failed ?? 0
-                LabeledContent("Failed") { Text("\(failed)").foregroundStyle(failed > 0 ? .red : .primary) }
+                LabeledContent("Failed") { Text("\(failed)").foregroundStyle(!answerCurrent ? Color.secondary : failed > 0 ? Color.red : Color.primary) }
                 if let conflicts = q.notesConflicted, conflicts > 0 {
                     LabeledContent("Notes edited elsewhere") { Text("\(conflicts)").foregroundStyle(.orange) }
                 }
@@ -150,6 +158,8 @@ struct ServerView: View {
             if let last = status?.lastNoteAt.flatMap(ISO8601UTC.parse) {
                 LabeledContent("Last note", value: Fmt.relative(last))
             }
+            }
+            .foregroundStyle(answerCurrent ? .primary : .secondary)
         } header: {
             Text("Processing")
         }

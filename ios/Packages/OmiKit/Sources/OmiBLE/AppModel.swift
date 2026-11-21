@@ -168,6 +168,13 @@ public final class AppModel {
                               watchAppInstalled: watchAppInstalled)
     }
 
+    /// Whether the server's last answer describes now: the latest request worked and the answer is recent. Otherwise
+    /// what it said (issues, activity, queue counts) is as of `serverStatusAt`, not current (2026-11-21).
+    public func serverAnswerIsCurrent(now: Date = Date()) -> Bool {
+        guard let at = serverStatusAt, !lastRefreshFailed else { return false }
+        return now.timeIntervalSince(at) <= SystemHealth.staleAfter
+    }
+
     /// The Server page's service rows as of now: the last answer's names, with a health only while that
     /// answer is current (a failed latest request or an old answer makes it last-known). nil before any answer.
     public func serviceLabels(now: Date = Date()) -> (transcription: ServiceLabel, summaries: ServiceLabel)? {
