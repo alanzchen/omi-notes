@@ -169,21 +169,23 @@ public struct SystemHealth: Equatable, Sendable {
         }
     }
 
-    /// The server's disk is too full to take audio, as of now (ASTRA-20261121-IT3-04): a current status answer (the
-    /// -60…300 s rule) that says so decides, and its explicit "not full" clears an upload's 507 older than that answer;
-    /// an old answer says nothing about now. Without a current answer, the latest upload's 507 for this server (the
-    /// uploader forgets results when the server changes).
+    /// The server's disk is too full to take audio, as of now (ASTRA-20261121-IT3-04, IT5-05): a current status answer
+    /// (the -60…300 s rule) that says so decides, and its explicit "not full" clears a 507 older than that answer; an
+    /// old, future or untimed answer says nothing about now. Without a current answer, a current 507 from this server
+    /// (the uploader forgets results when the server changes); an old or future-dated 507 is last-known, not now.
     public static func serverDiskFull(_ s: EngineSnapshot, status: ServerStatus?, statusAt: Date? = nil, now: Date = Date()) -> Bool {
-        let statusCurrent = statusAt.map { ServiceLabel.isCurrent(age: now.timeIntervalSince($0)) } ?? true
-        let said = statusCurrent ? status?.disk?.full : nil
-        let refusedAt = s.upload.lastResult.flatMap { $0.status == 507 ? $0.date : nil }
+        // every fact under the shared -60…300 s rule; an untimed one is unknown (ASTRA-20261121-IT5-05)
+        func current(_ at: Date?) -> Bool { at.map { ServiceLabel.isCurrent(age: now.timeIntervalSince($0)) } ?? false }
+        let said = current(statusAt) ? status?.disk?.full : nil
+        let refusedAt = s.upload.lastResult.flatMap { $0.status == 507 && current($0.date) ? $0.date : nil }
         if let said {
             if said { return true }
-            if let refusedAt, let at = statusAt, refusedAt > at { return true }  // a 507 after the "not full" answer
+            if let refusedAt, let at = statusAt, refusedAt > at { return true }  // a current 507 after the "not full" answer
             return false
         }
         return refusedAt != nil
     }
+
 
     static func phone(_ s: EngineSnapshot, server: ServerReachability, status: ServerStatus? = nil, statusAt: Date? = nil, now: Date = Date()) -> Step {
         func step(_ level: Level, _ title: String, _ detail: String? = nil, _ fix: Fix? = nil) -> Step {

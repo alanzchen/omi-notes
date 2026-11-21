@@ -29,7 +29,7 @@ import OmiProtocol
 
     @Test func theStatusDiskFieldSaysItBeforeAnUploadFails() throws {
         let status = try JSONDecoder().decode(ServerStatus.self, from: Data(#"{"ok":true,"disk":{"full":true,"since":"2026-11-21T00:00:00Z"}}"#.utf8))
-        #expect(SystemHealth.phone(snapshot(lastStatus: nil), server: .reachable(version: "t", detail: ""), status: status).title == "Server disk is full")
+        #expect(SystemHealth.phone(snapshot(lastStatus: nil), server: .reachable(version: "t", detail: ""), status: status, statusAt: Date()).title == "Server disk is full")  // (IT5-05: a timed answer)
         // an older server (no field) and a null field change nothing
         let old = try JSONDecoder().decode(ServerStatus.self, from: Data(#"{"ok":true,"disk":null}"#.utf8))
         #expect(SystemHealth.phone(snapshot(lastStatus: nil), server: .reachable(version: "t", detail: ""), status: old).title == "Uploading audio")
