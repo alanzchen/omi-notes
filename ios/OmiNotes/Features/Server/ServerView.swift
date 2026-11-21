@@ -84,7 +84,7 @@ struct ServerView: View {
             Section("Needs attention") {
                 ForEach(model.issues) { issue in IssueRow(model: model, issue: issue) }
             }
-            .foregroundStyle(answerCurrent ? .primary : .secondary)  // as of the last answer (its time is in the status line)
+            .opacity(answerCurrent ? 1 : 0.5)  // as of the last answer (its time is in the status line); its rows set their own colours
         }
     }
 
