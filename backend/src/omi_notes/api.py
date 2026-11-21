@@ -188,7 +188,8 @@ def create_app(
         alert = disk_alert.read(logs_dir)
         if not alert or alert.get("state") != "down":
             return None
-        return {"full": True, "since": alert.get("down_since")}
+        since = alert.get("down_since")
+        return {"full": True, "since": since if isinstance(since, str) else None}  # only these types go out (IT3-03)
 
     @app.get("/v1/status")
     def status() -> dict:

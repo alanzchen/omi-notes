@@ -442,6 +442,20 @@ public struct ServerStatus: Decodable, Equatable, Sendable {
     public struct Disk: Decodable, Equatable, Sendable {
         public var full: Bool?
         public var since: String?
+
+        public init(full: Bool? = nil, since: String? = nil) {
+            self.full = full
+            self.since = since
+        }
+
+        /// Tolerant: a badly shaped member is unknown (nil fields), never a failed status, which would make a healthy
+        /// server look unreachable (ASTRA-20261121-IT3-03).
+        public init(from decoder: Decoder) throws {
+            enum K: String, CodingKey { case full, since }
+            guard let c = try? decoder.container(keyedBy: K.self) else { return }
+            full = try? c.decodeIfPresent(Bool.self, forKey: .full)
+            since = try? c.decodeIfPresent(String.self, forKey: .since)
+        }
     }
 
     enum CodingKeys: String, CodingKey {

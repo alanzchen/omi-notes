@@ -140,3 +140,14 @@ def test_status_says_the_disk_is_full_only_while_it_is(client, settings, monkeyp
     assert put_chunk(client, capture, 0, _envs(capture)[0]).status_code == 507
     disk = client.get("/v1/status", headers=AUTH).json()["disk"]
     assert disk["full"] is True and disk["since"]
+
+
+def test_a_malformed_alert_never_reaches_status_with_the_wrong_types(client, settings):
+    """ASTRA-20261121-IT3-03: state=down with a non-string down_since went out as an object, and the phone's decoder
+    then rejected the whole status."""
+    from .conftest import AUTH
+    alert = settings.logs_dir / "alerts" / "disk.json"
+    alert.parent.mkdir(parents=True, exist_ok=True)
+    alert.write_text('{"state": "down", "down_since": {"bad": "type"}}')
+    disk = client.get("/v1/status", headers=AUTH).json()["disk"]
+    assert disk["full"] is True and disk.get("since") is None
