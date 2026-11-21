@@ -254,8 +254,12 @@ class Worker:
                     self.vault.renew_lease(writer_id)
                     renewed = time.time()
                 try:
+                    changes = self.db.conn().total_changes
                     result = self.tick()
-                    self._last_ok_tick = time.time()  # the index wrote: evidence for the disk alert's recovery
+                    # evidence for the disk alert's recovery only when this tick really wrote the index (a read-only or
+                    # idle tick proves nothing about writes; ASTRA-20261121-IT5-03 b)
+                    if self.db.conn().total_changes > changes:
+                        self._last_ok_tick = time.time()
                     busy = result["chunks"] or result["conversations"]
                 except Exception:
                     log.exception("worker tick failed")
