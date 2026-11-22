@@ -167,3 +167,19 @@ extension RetryFlowTests {
         }
     }
 }
+
+extension RetryFlowTests {
+    /// ASTRA-20261122-IT2-04: saved decisions are migrated once per address/vault change, not scanned on every refresh.
+    /// (A cost property: there is no visible behavior to fail first; on 502c082 each refresh ran both migrations.)
+    @MainActor @Suite(.serialized) struct DecisionMigrationCostTests {
+        @Test func decisionsAreMigratedOncePerAddressNotPerRefresh() async throws {
+            let (m, root) = try RetryFlowTests().model()
+            defer { try? FileManager.default.removeItem(at: root) }
+            for _ in 0..<3 { await m.refreshServer() }
+            #expect(m.retryStore.moveCalls == 1 && m.priorityStore.moveCalls == 1)
+            try m.engine.configureServer(url: URL(string: "https://oracle.tailcd4f.ts.net:8446")!, token: "tok")
+            for _ in 0..<3 { await m.refreshServer() }
+            #expect(m.retryStore.moveCalls == 2 && m.priorityStore.moveCalls == 2, "once more for the new address")
+        }
+    }
+}

@@ -133,6 +133,8 @@ public final class AppModel {
     }
     private var provenMove: MoveProof?
     private var probeGeneration = 0
+    /// The address/vault key saved decisions were last moved to.
+    private var decisionsMovedFor: String?
     /// The refresh a save starts (tests wait for it).
     var saveRefresh: Task<Void, Never>?
     /// Bumped whenever the server (configuration or vault) changes: an answer that was asked for
@@ -363,8 +365,11 @@ public final class AppModel {
             // decisions saved for this vault at an earlier address are this address's now (2026-11-22)
             if let url = config.endpoint?.baseURL {
                 let key = RetryStore.serverKey(baseURL: url, vaultId: vault)
-                retryStore.move(vaultId: vault, to: key)
-                priorityStore.move(vaultId: vault, to: key)
+                // once per address/vault, not on every refresh (IT2-04); a failed save is tried at the next refresh
+                if decisionsMovedFor != key {
+                    let moved = retryStore.move(vaultId: vault, to: key)
+                    if priorityStore.move(vaultId: vault, to: key), moved { decisionsMovedFor = key }
+                }
             }
         }
         serverStatus = status

@@ -30,6 +30,8 @@ public final class RetryStore: @unchecked Sendable {
 
     private let url: URL
     private let lock = NSLock()
+    /// Migrations attempted (tests: once per address/vault change, not per refresh; IT2-04).
+    var moveCalls = 0
     private var entries: [Entry]
     /// The file exists but can't be read: it is kept (never overwritten) and nothing new is sent,
     /// since a new request id could start a second retry of something already asked for.
@@ -61,9 +63,11 @@ public final class RetryStore: @unchecked Sendable {
     /// The same vault answered at another address (the server moved): its unsettled requests are this address's now,
     /// with their request ids, so they are sent there instead of stranded under the old key (2026-11-22). A
     /// conversation that already has one under the new key keeps that one; nothing is deleted.
-    public func move(vaultId: String, to server: String) {
+    @discardableResult
+    public func move(vaultId: String, to server: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard !unreadable, VaultIdentity.valid(vaultId) != nil, Self.vault(ofKey: server) == vaultId else { return }
+        guard !unreadable, VaultIdentity.valid(vaultId) != nil, Self.vault(ofKey: server) == vaultId else { return false }
+        moveCalls += 1
         var next = entries
         var changed = false
         var taken = Set(next.filter { $0.server == server }.map(\.conversationId))  // linear, not a search per entry (IT2-04)
@@ -73,7 +77,14 @@ public final class RetryStore: @unchecked Sendable {
             taken.insert(next[i].conversationId)
             changed = true
         }
-        if changed { try? persist(next) }
+        guard changed else { return true }
+        do {
+            try persist(next)
+            return true
+        } catch {
+            OmiLog.shared.log(.warning, "retry", "couldn't move saved decisions to the new address: \(error)")
+            return false
+        }
     }
 
     public func entry(conversationId: String, server: String) -> Entry? {

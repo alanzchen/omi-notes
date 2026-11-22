@@ -22,6 +22,8 @@ public final class PriorityStore: @unchecked Sendable {
 
     private let url: URL
     private let lock = NSLock()
+    /// Migrations attempted (tests: once per address/vault change, not per refresh; IT2-04).
+    var moveCalls = 0
     private var entries: [Entry]
     /// The one scope (server address, pairing generation, vault) whose server last confirmed it
     /// supports value notes, so saved notes of exactly that scope can still be marked offline.
@@ -52,9 +54,11 @@ public final class PriorityStore: @unchecked Sendable {
     /// The same vault answered at another address (the server moved): its unconfirmed choices move to that address,
     /// keeping their request ids and times. A conversation that already has one under the new key keeps that one
     /// (2026-11-22).
-    public func move(vaultId: String, to server: String) {
+    @discardableResult
+    public func move(vaultId: String, to server: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard VaultIdentity.valid(vaultId) != nil, RetryStore.vault(ofKey: server) == vaultId else { return }
+        guard VaultIdentity.valid(vaultId) != nil, RetryStore.vault(ofKey: server) == vaultId else { return false }
+        moveCalls += 1
         var next = entries
         var changed = false
         var taken = Set(next.filter { $0.server == server }.map(\.conversationId))  // linear (IT2-04)
@@ -64,7 +68,14 @@ public final class PriorityStore: @unchecked Sendable {
             taken.insert(next[i].conversationId)
             changed = true
         }
-        if changed { try? persist(next) }
+        guard changed else { return true }
+        do {
+            try persist(next)
+            return true
+        } catch {
+            OmiLog.shared.log(.warning, "priority", "couldn't move saved decisions to the new address: \(error)")
+            return false
+        }
     }
 
     public func entries(server: String) -> [Entry] {
