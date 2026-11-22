@@ -339,6 +339,12 @@ public final class AppModel {
                 noteCache.clear()
             }
             answeredVault = vault
+            // decisions saved for this vault at an earlier address are this address's now (2026-11-22)
+            if let url = config.endpoint?.baseURL {
+                let key = RetryStore.serverKey(baseURL: url, vaultId: vault)
+                retryStore.move(vaultId: vault, to: key)
+                priorityStore.move(vaultId: vault, to: key)
+            }
         }
         serverStatus = status
         serverStatusAt = Date()

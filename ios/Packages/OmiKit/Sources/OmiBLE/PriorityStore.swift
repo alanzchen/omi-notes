@@ -49,6 +49,22 @@ public final class PriorityStore: @unchecked Sendable {
         return capableScope == scope
     }
 
+    /// The same vault answered at another address (the server moved): its unconfirmed choices move to that address,
+    /// keeping their request ids and times. A conversation that already has one under the new key keeps that one
+    /// (2026-11-22).
+    public func move(vaultId: String, to server: String) {
+        lock.lock(); defer { lock.unlock() }
+        guard server.hasSuffix("|\(vaultId)") else { return }
+        var next = entries
+        var changed = false
+        for i in next.indices where next[i].server != server && next[i].server.hasSuffix("|\(vaultId)")
+            && !next.contains(where: { $0.server == server && $0.conversationId == next[i].conversationId }) {
+            next[i].server = server
+            changed = true
+        }
+        if changed { try? persist(next) }
+    }
+
     public func entries(server: String) -> [Entry] {
         lock.lock(); defer { lock.unlock() }
         return entries.filter { $0.server == server }

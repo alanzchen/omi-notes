@@ -52,6 +52,22 @@ public final class RetryStore: @unchecked Sendable {
 
     public static func serverKey(baseURL: URL, vaultId: String) -> String { "\(baseURL.absoluteString)|\(vaultId)" }
 
+    /// The same vault answered at another address (the server moved): its unsettled requests are this address's now,
+    /// with their request ids, so they are sent there instead of stranded under the old key (2026-11-22). A
+    /// conversation that already has one under the new key keeps that one; nothing is deleted.
+    public func move(vaultId: String, to server: String) {
+        lock.lock(); defer { lock.unlock() }
+        guard !unreadable, server.hasSuffix("|\(vaultId)") else { return }
+        var next = entries
+        var changed = false
+        for i in next.indices where next[i].server != server && next[i].server.hasSuffix("|\(vaultId)")
+            && !next.contains(where: { $0.server == server && $0.conversationId == next[i].conversationId }) {
+            next[i].server = server
+            changed = true
+        }
+        if changed { try? persist(next) }
+    }
+
     public func entry(conversationId: String, server: String) -> Entry? {
         lock.lock(); defer { lock.unlock() }
         return entries.first { $0.conversationId == conversationId && $0.server == server }
