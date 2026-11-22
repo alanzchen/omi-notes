@@ -115,6 +115,13 @@ public final class UploadStateStore: @unchecked Sendable {
         persist()
     }
 
+    /// Every file may start at once (a new server, or "Retry now"): one write, whatever the queue length.
+    public func clearBackoff() {
+        guard records.values.contains(where: { $0.nextAttemptAt != nil }) else { return }
+        for name in records.keys where records[name]?.nextAttemptAt != nil { records[name]?.nextAttemptAt = nil }
+        persist()
+    }
+
     public func remove(_ name: String) {
         guard records.removeValue(forKey: name) != nil else { return }
         persist()
@@ -498,9 +505,12 @@ public final class Uploader: @unchecked Sendable {
     }
 
     /// Token or URL changed (the configuration generation was bumped by the settings store):
-    /// cancel everything and start over with the new identity.
+    /// cancel everything and start over with the new identity. Backoff earned against the old address
+    /// says nothing about the new one, so every file is tried there at once (2026-11-22: a 2.5-day outage
+    /// left each part up to 30 min from its next try). Attempt counts stay; nothing leaves the outbox.
     public func serverConfigurationChanged() {
         dispatchPrecondition(condition: .onQueue(queue))
+        state.clearBackoff()
         transport.cancelAll()
         started.removeAll()
         launched.removeAll()
@@ -514,7 +524,7 @@ public final class Uploader: @unchecked Sendable {
     /// slow-to-cancel old tasks can neither block nor acknowledge anything.
     public func retryNow() {
         dispatchPrecondition(condition: .onQueue(queue))
-        for item in outbox.pending() { state.update(item.name) { $0.nextAttemptAt = nil } }
+        state.clearBackoff()
         state.bumpEpoch()
         status.pausedReason = nil
         transport.cancelAll()
