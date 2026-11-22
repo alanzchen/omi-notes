@@ -118,6 +118,10 @@ public final class AppModel {
     /// The vault the current server last said it serves: a different one at the same address is
     /// another server as far as everything shown here is concerned.
     private var answeredVault: String?
+    /// The last "Test connection" that found the connected server's vault at an address (cleared by any save).
+    private var provenMove: (url: URL, vault: String)?
+    /// The refresh a save starts (tests wait for it).
+    var saveRefresh: Task<Void, Never>?
     /// Bumped whenever the server (configuration or vault) changes: an answer that was asked for
     /// before then is dropped.
     var dataEpoch = 0
@@ -201,13 +205,12 @@ public final class AppModel {
     private func adopt(_ config: UploadConfig) {
         guard config != answeredFor else { return }
         answeredVault = nil
-        // Notes saved for another server (or an earlier pairing) are removed, not just hidden.
-        if answeredFor != nil {
-            noteCache.clear()
-        } else if let last = noteCache.lastScope,
-                  last.serverURL != config.endpoint?.baseURL.absoluteString || last.generation != config.generation {
-            noteCache.clear()
-        }
+        // Notes saved for another server (or an earlier pairing) are removed, not just hidden. Those already moved to
+        // exactly this configuration (a proven same-server move, `saveServer`) stay.
+        let savedForThis = noteCache.lastScope.map {
+            $0.serverURL == config.endpoint?.baseURL.absoluteString && $0.generation == config.generation
+        } ?? false
+        if !savedForThis { noteCache.clear() }
         answeredFor = config
         forgetServerData()
     }
@@ -510,6 +513,7 @@ public final class AppModel {
         do {
             let st = try await api.status()
             let same = known.flatMap { k in st.vaultId.map { $0 == k } }
+            provenMove = same == true ? (url, st.vaultId ?? "") : nil
             let what = same.map { $0 ? " Same server as now." : " A different server from the one connected now." } ?? ""
             return ConnectionCheck(ok: true, message: "Connected to server \(st.serverVersion ?? "?"). Transcription \(st.stt?.ready == true ? "configured" : "not configured")"
                 + (st.stt?.engine?.healthy == false ? " (not answering now)" : "") + "; "
@@ -522,8 +526,14 @@ public final class AppModel {
     }
 
     public func saveServer(url: URL, token: String) throws {
+        let proven = provenMove.flatMap { $0.url == url ? $0.vault : nil }
+        provenMove = nil
         try engine.configureServer(url: url, token: token)
-        Task { await refreshServer() }
+        // a passing test found this address to be the same vault: its saved notes stay readable there (R2 2026-11-22)
+        if let proven, let base = engine.settings.serverConfig().endpoint?.baseURL {
+            noteCache.move(to: NoteCache.Scope(serverURL: base.absoluteString, generation: engine.settings.serverConfig().generation, vaultId: proven))
+        }
+        saveRefresh = Task { await refreshServer() }
     }
 
     // MARK: URL scheme

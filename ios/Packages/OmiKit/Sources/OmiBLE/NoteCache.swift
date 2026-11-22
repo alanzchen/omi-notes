@@ -135,6 +135,28 @@ public final class NoteCache: @unchecked Sendable {
         try? FileManager.default.removeItem(at: root)
     }
 
+    /// The same vault at another address (or pairing): the saved copies become that scope's. Only a vault's own
+    /// copies move; false (and nothing changed) when the saved scope is of another vault or nothing is saved.
+    @discardableResult
+    public func move(to next: Scope) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = read(Scope.self, pointerURL), current.vaultId == next.vaultId else { return false }
+        if current == next { return true }
+        do {
+            let e = JSONEncoder()
+            e.dateEncodingStrategy = .secondsSince1970
+            if FileManager.default.fileExists(atPath: dir(current).path) {
+                try? FileManager.default.removeItem(at: dir(next))  // a leftover of the new scope (none expected)
+                try FileManager.default.moveItem(at: dir(current), to: dir(next))
+            }
+            try e.encode(next).write(to: pointerURL, options: Self.writeOptions)
+            return true
+        } catch {
+            OmiLog.shared.log(.warning, "cache", "couldn't keep the saved notes for the new address: \(error)")
+            return false
+        }
+    }
+
     // MARK: Plumbing
 
     private func write<T: Encodable>(_ value: T, to url: URL, scope: Scope) {

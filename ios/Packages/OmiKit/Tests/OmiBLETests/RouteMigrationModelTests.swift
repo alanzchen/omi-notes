@@ -85,3 +85,85 @@ extension RetryFlowTests {
         }
     }
 }
+
+extension RetryFlowTests {
+    /// R2 2026-11-22: moving the same server (proven by a passing same-vault test) keeps the notes saved for offline
+    /// reading, so a new address that doesn't answer yet still shows them. Anything unproven clears them as before.
+    @MainActor @Suite(.serialized) struct OfflineNotesMoveTests {
+        static let new = URL(string: "https://oracle.tailcd4f.ts.net:8446")!
+
+        func savedRow(_ m: AppModel) throws {
+            let scope = try #require(m.cacheScope(m.engine.settings.serverConfig()))
+            m.noteCache.saveRecent([ConversationSummary(id: "conv-saved", status: "done", startedAt: "2026-11-19T15:00:00.000Z", title: "Saved")], scope: scope)
+        }
+
+        @Test func aProvenSameServerMoveKeepsTheSavedNotes() async throws {
+            let (m, root) = try RetryFlowTests().model()
+            defer { try? FileManager.default.removeItem(at: root) }
+            await m.refreshServer()
+            try savedRow(m)
+            let check = await m.checkConnection(url: Self.new, token: "tok")
+            #expect(check.sameServer == true)
+            AppServerStub.offline = true  // the new address stops answering right after the test
+            try m.saveServer(url: Self.new, token: "tok")
+            await m.saveRefresh?.value
+            #expect(m.recent.map(\.id) == ["conv-saved"], "the same vault's saved notes still show at the new address")
+            #expect(m.currentVaultId == "vault-a")
+            #expect(m.noteCache.lastScope?.serverURL == Self.new.absoluteString)
+        }
+
+        @Test func anUnprovenMoveClearsThemAsBefore() async throws {
+            let (m, root) = try RetryFlowTests().model()
+            defer { try? FileManager.default.removeItem(at: root) }
+            await m.refreshServer()
+            try savedRow(m)
+            AppServerStub.offline = true
+            try m.saveServer(url: Self.new, token: "tok")  // no test
+            await m.saveRefresh?.value
+            #expect(m.recent.isEmpty)
+            #expect(m.noteCache.lastScope == nil)
+        }
+
+        @Test func aTestOfAnotherAddressProvesNothingForThisOne() async throws {
+            let (m, root) = try RetryFlowTests().model()
+            defer { try? FileManager.default.removeItem(at: root) }
+            await m.refreshServer()
+            try savedRow(m)
+            _ = await m.checkConnection(url: URL(string: "https://other.tailcd4f.ts.net:8446")!, token: "tok")
+            AppServerStub.offline = true
+            try m.saveServer(url: Self.new, token: "tok")
+            await m.saveRefresh?.value
+            #expect(m.recent.isEmpty && m.noteCache.lastScope == nil)
+        }
+
+        @Test func aDifferentServerClearsThem() async throws {
+            let (m, root) = try RetryFlowTests().model()
+            defer { try? FileManager.default.removeItem(at: root) }
+            await m.refreshServer()
+            try savedRow(m)
+            AppServerStub.routes["/v1/status"] = [(200, RetryFlowTests.status.replacingOccurrences(of: "vault-a", with: "vault-b"))]
+            let check = await m.checkConnection(url: Self.new, token: "tok")
+            #expect(check.sameServer == false)
+            AppServerStub.offline = true
+            try m.saveServer(url: Self.new, token: "tok")
+            await m.saveRefresh?.value
+            #expect(m.recent.isEmpty && m.noteCache.lastScope == nil, "never one vault's notes under another")
+        }
+
+        /// Proven at test time, but the new address then answers with another vault: vault-a's notes go.
+        @Test func aVaultThatChangesAfterTheTestStillClearsThem() async throws {
+            let (m, root) = try RetryFlowTests().model()
+            defer { try? FileManager.default.removeItem(at: root) }
+            await m.refreshServer()
+            try savedRow(m)
+            _ = await m.checkConnection(url: Self.new, token: "tok")
+            AppServerStub.routes["/v1/status"] = [(200, RetryFlowTests.status.replacingOccurrences(of: "vault-a", with: "vault-b"))]
+            try m.saveServer(url: Self.new, token: "tok")
+            await m.saveRefresh?.value
+            #expect(!m.recent.contains { $0.id == "conv-saved" })
+            #expect(m.noteCache.lastScope?.vaultId != "vault-a")
+            let scope = NoteCache.Scope(serverURL: Self.new.absoluteString, generation: m.engine.settings.serverConfig().generation, vaultId: "vault-a")
+            #expect(m.noteCache.recent(scope: scope) == nil, "vault-a's copies are gone, not hidden")
+        }
+    }
+}
