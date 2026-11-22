@@ -198,8 +198,9 @@ struct ServerView: View {
 
     private var connectionSection: some View {
         Section("Connection") {
-            if let host = model.serverURL?.host() {
-                LabeledContent("Server", value: host)
+            if let url = model.serverURL, let host = url.host() {
+                // the port too: the same host can serve more than one address (9443 → 8446, 2026-11-22)
+                LabeledContent("Server", value: url.port.map { "\(host):\($0)" } ?? host)
             }
             NavigationLink(model.serverURL == nil ? "Connect a server" : "Change server", value: Page.connection)
         }

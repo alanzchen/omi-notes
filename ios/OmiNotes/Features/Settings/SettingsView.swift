@@ -124,16 +124,22 @@ struct SavedNotesSection: View {
     }
 }
 
-/// Server URL + token (Keychain) with validation and "Test connection".
+/// Server URL + token (Keychain) with validation and "Test connection". Replacing a saved server needs a passing test
+/// of exactly what is saved, and the test says whether the address answers as the same server (2026-11-22).
 struct ServerSettingsSection: View {
     let model: AppModel
     @State private var urlText = ""
     @State private var token = ""
     @State private var message: String?
     @State private var testing = false
+    /// The last test: of which URL and token, and its answer. Editing either forgets it.
+    @State private var tested: (url: URL, token: String, check: AppModel.ConnectionCheck)?
 
     var body: some View {
         let (url, verdict) = ServerURLPolicy.evaluate(urlText)
+        // a saved server is being replaced (another address, or a new token)
+        let replacing = model.serverURL != nil && (url != model.serverURL || !token.isEmpty)
+        let testPassed = tested.map { $0.url == url && $0.token == effectiveToken && $0.check.ok } ?? false
         Section {
             TextField("https://your-mac.tailnet.ts.net", text: $urlText)
                 .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
@@ -146,12 +152,18 @@ struct ServerSettingsSection: View {
                 case .rejected(let r): Label(r, systemImage: "xmark.octagon").font(.footnote).foregroundStyle(.red)
                 }
             }
+            if replacing, url != nil, url != model.serverURL {
+                // proven by RouteMigrationTests: queued parts are kept and sent to the saved address
+                Label("Audio waiting on this iPhone goes to the new address.", systemImage: "arrow.up.circle").font(.footnote)
+            }
             HStack {
                 Button(testing ? "Testing…" : "Test connection") {
                     guard let url, let t = effectiveToken else { message = "Enter a URL and token first"; return }
                     testing = true
                     Task {
-                        message = await model.testConnection(url: url, token: t)
+                        let check = await model.checkConnection(url: url, token: t)
+                        tested = (url, t, check)
+                        message = check.message
                         testing = false
                     }
                 }
@@ -162,21 +174,44 @@ struct ServerSettingsSection: View {
                     do {
                         try model.saveServer(url: url, token: t)
                         token = ""
+                        tested = nil
                         message = "Saved"
                     } catch {
                         message = "Could not save: \(error.localizedDescription)"
                     }
                 }
-                .disabled(url == nil || !verdict.isAcceptable || effectiveToken == nil)
+                .disabled(url == nil || !verdict.isAcceptable || effectiveToken == nil || (replacing && !testPassed))
             }
             .buttonStyle(.borderless)
-            if let message { Text(message).font(.footnote).foregroundStyle(.secondary) }
+            if let message {
+                Text(message).font(.footnote).foregroundStyle(tested?.check.sameServer == false ? .orange : .secondary)
+            } else if replacing, url != nil, verdict.isAcceptable {
+                Text("Test the new address to save it.").font(.footnote).foregroundStyle(.secondary)
+            }
         } header: {
             Text("Server")
-        } footer: {
-            Text("Easiest: run `omi-notes pair` on your server and scan the QR code with the Camera app. The token is stored in the Keychain.")
         }
-        .onAppear { urlText = model.serverURL?.absoluteString ?? "" }
+        .onAppear {
+            urlText = model.serverURL?.absoluteString ?? ""
+            #if DEBUG
+            // Simulator screenshots only: `-OmiNotesDebugConnectionURL <url>` types a new address,
+            // `-OmiNotesDebugConnectionTest YES` then taps "Test connection".
+            if let typed = UserDefaults.standard.string(forKey: "OmiNotesDebugConnectionURL") {
+                urlText = typed
+                if UserDefaults.standard.bool(forKey: "OmiNotesDebugConnectionTest"), let url = ServerURLPolicy.evaluate(typed).url, let t = effectiveToken {
+                    Task {
+                        try? await Task.sleep(for: .seconds(2))  // after the launch refresh learned the connected vault
+                        let check = await model.checkConnection(url: url, token: t)
+                        tested = (url, t, check)
+                        message = check.message
+                    }
+                }
+            }
+            #endif
+        }
+        // a result for another URL or token says nothing about this one
+        .onChange(of: urlText) { message = nil; tested = nil }
+        .onChange(of: token) { message = nil; tested = nil }
     }
 
     private var effectiveToken: String? {
