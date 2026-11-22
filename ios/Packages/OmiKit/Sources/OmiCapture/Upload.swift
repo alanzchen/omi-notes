@@ -87,18 +87,33 @@ public final class UploadStateStore: @unchecked Sendable {
     private struct Stored: Codable {
         var epoch: Int
         var records: [String: UploadRecord]
+        var backoffGeneration: Int?
     }
 
     private let url: URL
     private var records: [String: UploadRecord]
     /// Upload task epoch (part of every task identity), persisted across relaunches.
     public private(set) var epoch: Int
+    /// The server configuration generation the per-file backoff was earned against (nil: a state file from before
+    /// this was kept). Persisted, so a relaunch before the queued reset still clears it (ASTRA-20261122-IT2-02).
+    public private(set) var backoffGeneration: Int?
 
     public init(url: URL) {
         self.url = url
         let stored = JSONFile.load(Stored.self, from: url)
         records = stored?.records ?? [:]
         epoch = stored?.epoch ?? 1
+        backoffGeneration = stored?.backoffGeneration
+    }
+
+    /// Backoff belongs to one configuration: a different generation clears it once (one write), then records it.
+    public func adoptGeneration(_ generation: Int) {
+        guard backoffGeneration != generation else { return }
+        if backoffGeneration != nil {
+            for name in records.keys where records[name]?.nextAttemptAt != nil { records[name]?.nextAttemptAt = nil }
+        }
+        backoffGeneration = generation
+        persist()
     }
 
     public func bumpEpoch() {
@@ -135,7 +150,7 @@ public final class UploadStateStore: @unchecked Sendable {
     }
 
     private func persist() {
-        do { try JSONFile.save(Stored(epoch: epoch, records: records), to: url) } catch {
+        do { try JSONFile.save(Stored(epoch: epoch, records: records, backoffGeneration: backoffGeneration), to: url) } catch {
             log(.error, "upload", "upload state save failed: \(error)")
         }
     }
@@ -309,6 +324,7 @@ public final class Uploader: @unchecked Sendable {
 
     private func startMissing(active: Set<String>, cfg: UploadConfig) {
         guard let endpoint = cfg.endpoint, status.pausedReason == nil else { return }
+        state.adoptGeneration(cfg.generation)  // before any task starts: no backoff from another configuration
         let currentKey = key(for: cfg)
         if startedKey != currentKey {
             started.removeAll()
@@ -511,6 +527,7 @@ public final class Uploader: @unchecked Sendable {
     public func serverConfigurationChanged() {
         dispatchPrecondition(condition: .onQueue(queue))
         state.clearBackoff()
+        state.adoptGeneration(config().generation)
         transport.cancelAll()
         started.removeAll()
         launched.removeAll()
