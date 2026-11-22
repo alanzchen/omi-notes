@@ -290,7 +290,21 @@ def index_chunk(conn, header: EnvelopeHeader, *, digest: str, size: int, path: s
            VALUES (?,?,?,?,?,?)""",
         [(header.device_id, rs, h, capture_id, header.chunk_sequence, received_at) for rs, h in ring],
     )
+    _add_to_ranges(conn, capture_id, header.chunk_sequence)
     touch_device(conn, header.device_id, received_at, header.device_name, header.model_number, header.firmware_revision)
+
+
+def _add_to_ranges(conn, capture_id: str, seq: int) -> None:
+    """Merge one newly indexed sequence into its capture's disjoint ranges (two indexed lookups)."""
+    left = conn.execute("SELECT start FROM chunk_ranges WHERE capture_id=? AND end=?", (capture_id, seq - 1)).fetchone()
+    right = conn.execute("SELECT end FROM chunk_ranges WHERE capture_id=? AND start=?", (capture_id, seq + 1)).fetchone()
+    end = right[0] if right else seq
+    if right:
+        conn.execute("DELETE FROM chunk_ranges WHERE capture_id=? AND start=?", (capture_id, seq + 1))
+    if left:
+        conn.execute("UPDATE chunk_ranges SET end=? WHERE capture_id=? AND start=?", (end, capture_id, left[0]))
+    else:
+        conn.execute("INSERT INTO chunk_ranges (capture_id, start, end) VALUES (?,?,?)", (capture_id, seq, end))
 
 
 def index_seal(conn, capture_id: str, facts: SealFacts, received_at: float) -> None:
@@ -861,15 +875,10 @@ def capture_status(db: Database, capture_id: str) -> dict | None:
     capture = db.one("SELECT * FROM captures WHERE capture_id=?", (capture_id,))
     if capture is None:
         return None
-    seqs = [r["chunk_sequence"] for r in db.query(
-        "SELECT chunk_sequence FROM chunks WHERE capture_id=? ORDER BY chunk_sequence", (capture_id,)
-    )]
-    ranges: list[list[int]] = []
-    for s in seqs:
-        if ranges and s == ranges[-1][1] + 1:
-            ranges[-1][1] = s
-        else:
-            ranges.append([s, s])
+    # the stored runs: work grows with the ranges the answer lists, not with the capture's chunks (DESIGN-05)
+    ranges = [[r["start"], r["end"]] for r in db.query(
+        "SELECT start, end FROM chunk_ranges WHERE capture_id=? ORDER BY start", (capture_id,)
+    )]  # fmt: skip
     return {
         "capture_id": capture_id,
         "source": capture["source"],
