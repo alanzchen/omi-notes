@@ -183,3 +183,26 @@ def test_the_startup_sweep_indexes_an_orphan_only_once_confirmed(settings, monke
     b.failing = False
     again = fresh(settings)
     assert rows(again, cap, 1) == 1 and path.read_bytes() == bodies[1]
+
+
+@pytest.mark.parametrize("level", ["file", "events", "_omi"])
+def test_an_event_is_acknowledged_only_once_its_day_file_chain_is(settings, monkeypatch, level):
+    """Events too (beyond Astra's table): the day file existing from an earlier attempt proves nothing."""
+    import time as _time
+
+    from .helpers import iso
+
+    c = fresh(settings)
+    vault = c.app.state.vault
+    now = _time.time()
+    path = vault.events_path(now)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()  # left by an earlier attempt whose directory sync failed
+    b = Barrier(monkeypatch, {"file": path, "events": path.parent, "_omi": vault.omi}[level])
+    event_id = str(uuid.uuid4())
+    body = {"device_id": DEVICE, "type": "heartbeat", "at": iso(now)}
+    with pytest.raises(OSError):
+        c.put(f"/v1/events/{event_id}", json=body, headers=AUTH)
+    assert b.hits
+    b.failing = False
+    assert c.put(f"/v1/events/{event_id}", json=body, headers=AUTH).status_code in (200, 201)

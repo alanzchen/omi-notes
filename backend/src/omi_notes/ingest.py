@@ -854,27 +854,31 @@ class Ingest:
         facts = validate_event(raw)
         with _lock:
             existing = self.db.one("SELECT body_json FROM events WHERE event_id=?", (event_id,))
-            if existing is None and event_id in self._pending_events:
-                body, received = self._pending_events[event_id]
-                if body != facts.canonical:
-                    raise ApiError(409, "event_conflict", "a different event is already stored under this id")
-                with self.db.tx() as conn:
-                    index_event(conn, event_id, facts, received)
-                del self._pending_events[event_id]
-                return 200, {"event_id": event_id, "stored": True, "duplicate": True}
             if existing is not None:
                 if existing["body_json"] == facts.canonical:
                     return 200, {"event_id": event_id, "stored": True, "duplicate": True}
                 raise ApiError(409, "event_conflict", "a different event is already stored under this id")
-            self._writable()
-            now = self.clock()
-            Vault.append_jsonl(self.vault.events_path(now), {"event_id": event_id, "received_at": now, "body": raw})
-            try:
-                with self.db.tx() as conn:
-                    index_event(conn, event_id, facts, now)
-            except BaseException:
-                self._pending_events[event_id] = (facts.canonical, now)
-                raise
+            # [canonical body, received time chosen before writing, "chosen" | "appended" | "confirmed"]: a retry
+            # reuses the time and never appends the line twice once it was written (DESIGN-01/03, events too)
+            pending = self._pending_events.get(event_id)
+            if pending is not None and pending[0] != facts.canonical:
+                raise ApiError(409, "event_conflict", "a different event is already stored under this id")
+            again = pending is not None and pending[2] != "chosen"  # an earlier attempt already wrote the line
+            if pending is None:
+                self._writable()
+                pending = self._pending_events[event_id] = [facts.canonical, self.clock(), "chosen"]
+            received, path = pending[1], self.vault.events_path(pending[1])
+            if pending[2] == "chosen":
+                Vault.append_jsonl(path, {"event_id": event_id, "received_at": received, "body": raw})
+                pending[2] = "appended"
+            if pending[2] == "appended":
+                self.vault.confirm(path)  # the day file and its chain, also when an earlier attempt's sync failed
+                pending[2] = "confirmed"
+            with self.db.tx() as conn:
+                index_event(conn, event_id, facts, received)
+            del self._pending_events[event_id]
+        if again:
+            return 200, {"event_id": event_id, "stored": True, "duplicate": True}
         return 201, {"event_id": event_id, "stored": True, "duplicate": False}
 
 
