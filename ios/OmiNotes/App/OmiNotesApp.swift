@@ -131,12 +131,12 @@ struct RootView: View {
 }
 
 extension RootView {
-    /// Simulator automation only (debug builds): `-OmiNotesDebugTab home|devices|people|server|settings|pairing|diagnostics|debug`
+    /// Simulator automation only (debug builds): `-OmiNotesDebugTab home|devices|people|server|settings|pairing|diagnostics|debug|connection`
     /// opens that screen at launch (there is no way to tap in a headless simulator).
     static var initialTab: Tab {
         #if DEBUG
         let raw = UserDefaults.standard.string(forKey: "OmiNotesDebugTab")
-        if raw == "diagnostics" || raw == "debug" { return .server }
+        if raw == "diagnostics" || raw == "debug" || raw == "connection" { return .server }
         if raw == "pendant" { return .devices }  // the tab's earlier name
         if let raw, let tab = Tab(rawValue: raw) { return tab }
         #endif
@@ -148,6 +148,7 @@ extension RootView {
         switch UserDefaults.standard.string(forKey: "OmiNotesDebugTab") {
         case "diagnostics": return NavigationPath([ServerView.Page.diagnostics])
         case "debug": return NavigationPath([ServerView.Page.developer])
+        case "connection": return NavigationPath([ServerView.Page.connection])
         default: return NavigationPath()
         }
         #else
