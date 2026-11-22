@@ -6,7 +6,6 @@ import asyncio
 import hmac
 import json
 import logging
-import shutil
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -186,26 +185,19 @@ def create_app(
                 "engine": {"name": "omi-asr sidecar", "healthy": ok, "self_test": info.get("self_test"), "models": models}}
 
     def disk_status(logs_dir) -> dict | None:
-        """{"full": true} while the alert is down; {"full": false} only from an observation (the alert recovered, or
-        no alert ever and free space measured above the floor); otherwise null: unknown (ASTRA-20261121-IT5-04)."""
-        alert = disk_alert.read(logs_dir)
-        if alert is None:
-            if (logs_dir / "alerts" / "disk.json").exists():
-                return None  # unreadable or malformed: unknown, never "fine"
-            try:
-                free = shutil.disk_usage(settings.vault_dir).free  # one statfs, no scan
-            except OSError:
-                return None
-            return {"full": False} if free >= ingest_floor() else None
-        if alert.get("state") == "recovered":
-            return {"full": False}
-        since = alert.get("down_since")
-        return {"full": True, "since": since if isinstance(since, str) else None}  # only these types go out (IT3-03)
-
-    def ingest_floor() -> int:
-        from .ingest import MIN_FREE_BYTES
-
-        return MIN_FREE_BYTES
+        """{"full": true} while this process's latch or the alert says down; {"full": false} only when this process
+        measured every volume with room after a real publication; otherwise null: unknown (DESIGN-08). A recovered file
+        from an earlier run is history, not an observation. Never raises."""
+        try:
+            alert = disk_alert.read(logs_dir)
+            down = alert is not None and alert.get("state") == "down"
+            if down or ingest.down_latch is not None:
+                since = alert.get("down_since") if down else iso_utc_epoch(ingest.down_latch)
+                return {"full": True, "since": since if isinstance(since, str) else None}  # only these types go out (IT3-03)
+            return {"full": False} if ingest.healthy_at is not None else None
+        except Exception:
+            log.exception("disk status unavailable")
+            return None
 
     @app.get("/v1/status")
     def status() -> dict:

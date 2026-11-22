@@ -121,7 +121,9 @@ def test_the_disk_alert_is_written_on_a_refusal_and_resolved_when_space_returns(
     worker.tick()
     assert json.loads(alert.read_text())["down_since"] == down["down_since"]
     _free(monkeypatch, 50 * GiB)
-    worker.tick()
+    worker.tick()  # the worker is down-only (ASTRA-20261122-DESIGN-07): room alone is not a recovered write
+    assert json.loads(alert.read_text())["state"] == "down"
+    assert put_chunk(client, capture, 0, _envs(capture)[0]).status_code == 201  # a real publication + COMMIT witnesses it
     up = json.loads(alert.read_text())
     assert up["state"] == "recovered" and up["down_since"] == down["down_since"] and up["recovered_at"]
 
@@ -134,6 +136,11 @@ def test_no_alert_file_while_the_disk_has_room(client, settings, worker, monkeyp
 
 def test_status_says_the_disk_is_full_only_while_it_is(client, settings, monkeypatch):
     from .conftest import AUTH
+    # (adapted, DESIGN-08: unknown until this process has observed a real publication with room on every volume)
+    assert client.get("/v1/status", headers=AUTH).json()["disk"] is None
+    _free(monkeypatch, 50 * GiB)
+    first = str(uuid.uuid4())
+    assert put_chunk(client, first, 0, _envs(first)[0]).status_code == 201
     assert client.get("/v1/status", headers=AUTH).json()["disk"] == {"full": False}
     capture = str(uuid.uuid4())
     _free(monkeypatch, 1 * GiB)

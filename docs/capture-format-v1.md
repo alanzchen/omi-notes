@@ -285,10 +285,12 @@ command); it is not proof of progress. `last_note_at` is when the newest kept no
 written (discarded and enrollment rows excluded). `read_only` is the reason the vault stopped
 accepting writes, or null. `disk` is `{"full": true, "since": "…"}` while the server's disk is
 too full to take audio (uploads are answered 507 and stay on the phone; from `logs/alerts/disk.json`), and
-`{"full": false}` only from an observation: the alert recovered, or there is no alert and the vault's free space was
-measured above the upload floor (an explicit answer, so it clears an older 507 on the phone). It is null when the
-server can't tell (the alert file is unreadable or malformed, or there's no alert and the space is below the floor or
-unmeasurable): unknown, which clears nothing. Older servers omit it and older phones ignore it. `activity` says what the pipeline is doing: conversations being worked
+`{"full": false}` only from this server process's own observation: after a real upload was stored (file, directory chain
+and index commit) with every watched volume (the vault's raw storage and the index) measured above the floor. It is
+null when the server can't tell (no such observation yet, an alert file that is unreadable or malformed, a volume that
+can't be measured, or a "recovered" record from an earlier run): unknown, which clears nothing. Recovery of a write
+failure needs such an upload begun after the latest failure; a duplicate 200 or a worker tick is not evidence.
+Older servers omit it and older phones ignore it. `activity` says what the pipeline is doing: conversations being worked
 on now, how many wait or back off after a service error, and when the oldest waiting one *ended*
 (not how long it has been queued). `stt`/`llm` are the last successful and failed *requests* to the
 configured service (cached results don't count, so reuse never looks like a working service; a

@@ -410,6 +410,11 @@ class Ingest:
         # [receipt time chosen before any file was written, whether that receipt line is confirmed]. A retry reuses
         # the time; dropped only after the outer COMMIT (DESIGN-03). Bounded: refuse new work beyond PENDING_MAX.
         self._pending: dict[tuple[str, int, str], list] = {}
+        # Disk evidence for /v1/status (DESIGN-07/08): a local latch set before the alert file is even tried (it may be
+        # unwritable on a full disk), cleared only by a witnessed publication begun after the last local failure.
+        self.down_latch: float | None = None
+        self._failures = 0
+        self.healthy_at: float | None = None  # this process measured every volume with room after a real publication
         self._pending_events: dict[str, tuple[str, float]] = {}
         # (capture_id, seq, sha256 of other bytes) -> same audio as the stored chunk
         self._verdicts: dict[tuple[str, int, str], bool] = {}
@@ -438,6 +443,27 @@ class Ingest:
         with self.db.tx() as conn:
             index_seal(conn, capture_id, facts, received)
         return self.db.one("SELECT * FROM captures WHERE capture_id=?", (capture_id,))
+
+    def _evidence_snapshot(self) -> tuple[int, int]:
+        try:
+            return disk_alert.revision(self.settings.logs_dir), self._failures
+        except Exception:
+            return -1, self._failures
+
+    def _witness(self, snapshot: tuple[int, int]) -> None:
+        """After a durable publication and its outer COMMIT (never a duplicate 200): recovery evidence, if nothing failed
+        since `snapshot`. Never changes the answer."""
+        try:
+            rev, failures = snapshot
+            if rev < 0:
+                return
+            ok = disk_alert.witness(self.settings.logs_dir, [self.vault.raw, self.db.path.parent], floor_bytes=MIN_FREE_BYTES,
+                                    now=self.clock(), since_revision=rev)  # fmt: skip
+            if ok is True and failures == self._failures:
+                self.down_latch = None
+                self.healthy_at = self.clock()
+        except Exception:
+            log.exception("disk evidence after a publication failed")
 
     def _note_high_water(self, capture_id: str, seq: int) -> None:
         from .rebuild import recovery_state
@@ -574,6 +600,7 @@ class Ingest:
                 return ok(*self._adopt_orphan(env, digest, len(body), path, tomb_path))
 
             self._writable()
+            snapshot = self._evidence_snapshot()
             self._ensure_space()
             key = (capture_id, seq, digest)
             if key not in self._pending and len(self._pending) >= PENDING_MAX:
@@ -605,6 +632,7 @@ class Ingest:
                     raise ApiError(507, "storage_full", "server disk is full") from exc
                 raise
             self._pending.pop(key, None)
+            self._witness(snapshot)  # after the outer COMMIT
         return ok(201, False)
 
     @staticmethod
@@ -683,6 +711,7 @@ class Ingest:
         """A durable file for this identity exists without an index row: same bytes → index it
         (200), different bytes → 409. Never overwritten."""
         header = env.header
+        snapshot = self._evidence_snapshot()
         if path.exists():
             data = path.read_bytes()
             if sha256_hex(data) != digest:
@@ -732,6 +761,7 @@ class Ingest:
             if deleted:
                 apply_capture_evidence(conn, self.vault, *ids, only_seq=header.chunk_sequence, evidence=evidence or {})
         self._pending.pop(key, None)
+        self._witness(snapshot)  # a real publication and COMMIT (not the duplicate fast path)
         return 200, True
 
     def _ensure_space(self) -> None:
@@ -742,7 +772,12 @@ class Ingest:
             raise ApiError(507, "storage_full", "server disk is nearly full")
 
     def _disk_full(self, reason: str, free: int | None = None, kind: str = "write") -> None:
-        """Note the alert; never let the alert itself change the answer (ASTRA-20261121-IT1-02)."""
+        """Note the alert; never let the alert itself change the answer (ASTRA-20261121-IT1-02). The local latch first:
+        the alert file may be exactly what can't be written."""
+        self._failures += 1
+        if self.down_latch is None:
+            self.down_latch = self.clock()
+        self.healthy_at = None
         try:
             if free is None:
                 free = shutil.disk_usage(self.vault.raw).free
