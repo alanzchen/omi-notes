@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .spool import atomic_write_bytes, fsync_dir, make_dirs_durable, safe_component
+from .spool import atomic_write_bytes, confirm_chain, fsync_dir, make_dirs_durable, publish_new_bytes, safe_component
 from .util import canonical_json
 
 if TYPE_CHECKING:
@@ -93,6 +93,8 @@ class Vault:
     root: Path
     info: dict = field(default_factory=dict)
     lock_root: Path | None = None  # LOCK_DIR (`lock.locks_dir`)
+    # the vault root's own entry has been synced in its parent (once per process, before the first publication)
+    _root_anchored: bool = field(default=False, init=False, repr=False, compare=False)
 
     # -- layout ----------------------------------------------------------------------------------
 
@@ -249,6 +251,28 @@ class Vault:
             self._update_info(changed)
 
     # -- files -----------------------------------------------------------------------------------
+
+    def _anchor_root(self) -> None:
+        if not self._root_anchored:
+            fsync_dir(self.root.parent)  # the root's name in its parent: syncing the root itself can't publish that
+            self._root_anchored = True
+
+    def confirm(self, path: Path) -> None:
+        """Prove an artifact under the vault is durably published: the file and its whole directory chain up to the
+        vault root (whose own entry is anchored once). Raises OSError (ASTRA-20261122-DESIGN-01/02)."""
+        self._anchor_root()
+        confirm_chain(path, self.root)
+
+    def publish_bytes(self, path: Path, data: bytes) -> None:
+        """A new immutable artifact (never replacing one), published and confirmed to the vault root."""
+        self._anchor_root()
+        publish_new_bytes(path, data, self.root)
+
+    def append_confirmed(self, path: Path, value: object) -> None:
+        """A durable JSONL line (receipts) whose file and chain are confirmed, also when the file already existed from
+        an attempt whose directory sync failed."""
+        Vault.append_jsonl(path, value)
+        self.confirm(path)
 
     @staticmethod
     def write_json(path: Path, value: object, *, pretty: bool = True) -> bytes:

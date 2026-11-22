@@ -41,11 +41,17 @@ from .ingest import (
 )
 from .records import load_records, row_from_record
 from .settings import Settings
+from . import spool
 from .spool import fsync_dir
 from .util import canonical_json, sha256_hex
 from .vault import Vault, index_dir
 
 log = logging.getLogger(__name__)
+
+# The publication rule an index was built under (meta `publication_contract`). An index without it (or older) trusted
+# files by existence; it is rebuilt once, confirming every file and its chain, before any of its rows is trusted
+# (ASTRA-20261122-DESIGN-02). Only a complete build stamps it.
+PUBLICATION_CONTRACT = "1"
 
 
 @dataclass
@@ -57,6 +63,7 @@ class Report:
     conversations: int = 0
     problems: list[str] = field(default_factory=list)  # reported, not fatal
     gaps: list[str] = field(default_factory=list)  # missing dependencies ⇒ read-only
+    unresolved: list[str] = field(default_factory=list)  # captures whose files couldn't be confirmed: not indexed yet
 
     @property
     def read_only_reason(self) -> str | None:
@@ -80,22 +87,41 @@ class _Op:
         self.fn(conn, self.received_at)
 
 
-def _receipts(vault: Vault, device: str, capture: str) -> dict[int, tuple[float, str]]:
-    out: dict[int, tuple[float, str]] = {}
+def _receipts(vault: Vault, device: str, capture: str) -> dict[tuple[int, str], float]:
+    """First receipt time per (sequence, digest): a line for other bytes never supplies a time (DESIGN-03)."""
+    out: dict[tuple[int, str], float] = {}
     for line in Vault.read_jsonl(vault.receipts_path(device, capture)):
-        seq, at = line.get("seq"), line.get("received_at")
-        if isinstance(seq, int) and isinstance(at, (int, float)) and seq not in out:
-            out[seq] = (float(at), str(line.get("sha256")))
+        seq, at, sha = line.get("seq"), line.get("received_at"), line.get("sha256")
+        if isinstance(seq, int) and isinstance(at, (int, float)) and isinstance(sha, str) and (seq, sha) not in out:
+            out[(seq, sha)] = float(at)
     return out
+
+
+class Unconfirmed(OSError):
+    """A capture's files or directories couldn't be confirmed durable: nothing of it is trusted yet."""
 
 
 def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, skip: set[tuple[str, int]] | None = None,
                  skip_seal: bool = False) -> list[_Op]:  # fmt: skip
-    """Index operations for one capture directory's files (`skip`: rows the index already has)."""
+    """Index operations for one capture directory's files (`skip`: rows the index already has). Every file an operation
+    trusts (chunk, tombstone, seal, receipts, capture.json evidence) is synced, then the capture and device directories;
+    any failure raises `Unconfirmed` and nothing of the capture is used (the caller confirms raw → vault root)."""
     cap_dir = vault.capture_dir(device, capture)
     ops: list[_Op] = []
-    receipts = _receipts(vault, device, capture)
     names = {p.name for p in cap_dir.iterdir()} if cap_dir.exists() else set()
+    try:
+        for name in sorted(names):
+            if name.endswith((".omnc", ".gone")) or name in ("seal.json", "receipts.jsonl", "capture.json"):
+                stem = name.partition(".")[0]
+                if stem.isdigit() and skip is not None and (capture, int(stem)) in skip:
+                    continue
+                spool.fsync_file(cap_dir / name)
+        if names:
+            spool.fsync_dir(cap_dir)
+            spool.fsync_dir(cap_dir.parent)
+    except OSError as exc:
+        raise Unconfirmed(exc.errno, f"capture {device}/{capture} can't be confirmed durable now: {exc}") from exc
+    receipts = _receipts(vault, device, capture)
     seqs: dict[int, str] = {}
     for name in names:
         stem, dot, ext = name.partition(".")
@@ -120,9 +146,9 @@ def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, ski
             tomb = json.loads((cap_dir / f"{seq}.gone").read_text())
             digest, size, header, deleted, ring = tomb["sha256"], int(tomb["size"]), tombstone_header(tomb), True, []
             report.tombstones += 1
-        receipt = receipts.get(seq)
-        if receipt is not None and receipt[1] == digest:
-            received = receipt[0]
+        receipt = receipts.get((seq, digest))
+        if receipt is not None:
+            received = receipt
         else:
             # No receipt (a crash before it was appended): the chunk's own end time is the best
             # stable stand-in; the startup sweep appends a real receipt when it adopts the file.
@@ -349,9 +375,16 @@ def build(settings: Settings, vault: Vault, path: Path, *, now: float | None = N
     db = Database(path)
     report = Report()
     ops: list[_Op] = []
-    captures = list(_captures(vault))
-    for device, capture in captures:
-        ops += _capture_ops(vault, device, capture, report)
+    captures = []
+    for device, capture in _captures(vault):
+        try:
+            ops += _capture_ops(vault, device, capture, report)
+            captures.append((device, capture))
+        except Unconfirmed as exc:  # kept on disk and reported; indexed once it can be confirmed (sweep / its own PUT)
+            report.unresolved.append(f"{device}/{capture}")
+            report.problems.append(str(exc))
+    if vault.raw.exists():
+        vault.confirm(vault.raw)  # raw → _omi → vault root (anchored); failing here fails the build, never a weaker index
     ops += _event_ops(vault, report)
     ops.sort(key=lambda op: (op.received_at, op.rank, op.key))
     with db.tx() as conn:
@@ -379,6 +412,8 @@ def build(settings: Settings, vault: Vault, path: Path, *, now: float | None = N
     db.set_meta("read_only", report.read_only_reason)
     db.set_meta("problems", json.dumps(report.problems[:50]) if report.problems else None)
     db.set_meta("built_at", repr(now))
+    db.set_meta("unresolved", json.dumps(report.unresolved[:200]) if report.unresolved else None)
+    db.set_meta("publication_contract", PUBLICATION_CONTRACT)
     db.set_meta("complete", "1")
     db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     db.close()
@@ -436,6 +471,8 @@ def index_is_current(path: Path, vault: Vault) -> str | None:
         return "vault path differs"
     if meta.get("complete") != "1":
         return "incomplete build"
+    if meta.get("publication_contract") != PUBLICATION_CONTRACT:
+        return "built under an older publication rule: every file is confirmed once before its rows are trusted"
     if meta.get("read_only"):
         return "the last build found an incomplete vault"
     return None
@@ -485,25 +522,23 @@ def index_capture_orphans(db: Database, vault: Vault, device: str, capture: str)
     report = Report()
     have = {(capture, r["chunk_sequence"]) for r in db.query("SELECT chunk_sequence FROM chunks WHERE capture_id=?", (capture,))}
     cap = db.one("SELECT seal_json FROM captures WHERE capture_id=?", (capture,))
+    # the capture's files and directories are synced (Unconfirmed otherwise), then its chain up to the vault root
     ops = _capture_ops(vault, device, capture, report, skip=have, skip_seal=cap is not None and cap["seal_json"] is not None)
     if not ops:
         return 0
+    vault.confirm(vault.capture_dir(device, capture))
     receipts = _receipts(vault, device, capture)
     now = time.time()
-    from .ingest import durable_existing
-
     for op in ops:
         seq = op.key[1]
-        if seq >= 0:
-            # a file found without its row is indexed only once it and its directory are synced (ASTRA-20261121-IT3-01)
-            data = vault.chunk_path(device, capture, seq)
-            durable_existing(data if data.exists() else vault.tombstone_path(device, capture, seq))
-        if seq >= 0 and seq not in receipts:
-            # Adopted now: persist a receipt so the next rebuild sees the same time.
-            data = vault.chunk_path(device, capture, seq)
-            digest = sha256_hex(data.read_bytes()) if data.exists() else json.loads(
-                vault.tombstone_path(device, capture, seq).read_text())["sha256"]
-            Vault.append_jsonl(vault.receipts_path(device, capture), {"seq": seq, "sha256": digest, "received_at": now})
+        if seq < 0:
+            continue
+        data = vault.chunk_path(device, capture, seq)
+        digest = sha256_hex(data.read_bytes()) if data.exists() else json.loads(
+            vault.tombstone_path(device, capture, seq).read_text())["sha256"]
+        if (seq, digest) not in receipts:
+            # Adopted now: persist a confirmed receipt so the next rebuild sees the same time.
+            vault.append_confirmed(vault.receipts_path(device, capture), {"seq": seq, "sha256": digest, "received_at": now})
             op.received_at = now
     with db.tx() as conn:
         for op in sorted(ops, key=lambda o: (o.received_at, o.rank, o.key)):

@@ -360,9 +360,10 @@ def touch_device(conn, device_id: str, now: float, name=None, model=None, firmwa
     )
 
 
-def receipt_time(vault: Vault, device_id: str, capture_id: str, seq: int) -> float | None:
+def receipt_time(vault: Vault, device_id: str, capture_id: str, seq: int, digest: str) -> float | None:
+    """The first receipt time for exactly these bytes (a line for other bytes never supplies one; DESIGN-03)."""
     for line in Vault.read_jsonl(vault.receipts_path(device_id, capture_id)):
-        if line.get("seq") == seq and isinstance(line.get("received_at"), (int, float)):
+        if line.get("seq") == seq and line.get("sha256") == digest and isinstance(line.get("received_at"), (int, float)):
             return float(line["received_at"])
     return None
 
@@ -374,16 +375,12 @@ def tombstone_header(tomb: dict) -> EnvelopeHeader:
 # -- ingest ----------------------------------------------------------------------------------------
 
 
-def durable_existing(path) -> None:
-    """A file found on disk counts as stored only once it and its directory are synced now: a matching hash proves its
-    content, not that it was durably published (a crash or a failed directory sync after the rename may have left it
-    only in the page cache; ASTRA-20261121-IT3-01). Raises OSError; nothing is rewritten."""
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    spool.fsync_dir(path.parent)
+def durable_existing(path, vault: Vault) -> None:
+    """A file found on disk counts as stored only once it and its whole directory chain to the vault root are synced
+    now: a matching hash proves its content, not that it was durably published (a crash or a failed directory sync
+    after the rename, on this or an earlier attempt, may have left it only in the page cache; ASTRA-20261121-IT3-01,
+    IT5-01, ASTRA-20261122-DESIGN-01/02). Raises OSError; nothing is rewritten."""
+    vault.confirm(path)
 
 
 def _disk_full_error(exc: BaseException | None) -> bool:
@@ -553,7 +550,7 @@ class Ingest:
             self._writable()
             self._ensure_space()
             try:
-                atomic_write_bytes(path, body)
+                vault.publish_bytes(path, body)  # file + chain to the vault root, never replacing a file
             except OSError as exc:
                 if exc.errno == errno.ENOSPC:
                     self._disk_full("a chunk write hit ENOSPC")
@@ -561,8 +558,8 @@ class Ingest:
                 raise
             now = self.clock()
             try:
-                Vault.append_jsonl(vault.receipts_path(header.device_id, capture_id),
-                                   {"seq": seq, "sha256": digest, "received_at": now})  # fmt: skip
+                vault.append_confirmed(vault.receipts_path(header.device_id, capture_id),
+                                       {"seq": seq, "sha256": digest, "received_at": now})  # fmt: skip
                 with db.tx() as conn:
                     index_chunk(conn, header, digest=digest, size=len(body), path=vault.relpath(path), received_at=now,
                                 ring=ring_record_hashes(env))  # fmt: skip
@@ -604,15 +601,15 @@ class Ingest:
         if alternate.exists() and sha256_hex(alternate.read_bytes()) != digest:  # damaged: these bytes again, durably
             log.warning("chunk %s/%d: alternate copy %s was damaged; writing it again", capture_id, seq, alternate.name)
             self._writable()
-            atomic_write_bytes(alternate, body)
+            atomic_write_bytes(alternate, body)  # a damaged non-canonical copy: replaced, then confirmed below
         if alternate.exists():
-            durable_existing(alternate)  # a copy found on disk is kept only once synced now (IT3-01)
+            durable_existing(alternate, self.vault)  # a copy found on disk is kept only once its chain is synced now
         else:
             self._writable()
             self._ensure_space()
-            atomic_write_bytes(alternate, body)
-            Vault.append_jsonl(self.vault.receipts_path(env.header.device_id, capture_id),
-                               {"alternate_of_seq": seq, "sha256": digest, "received_at": self.clock()})  # fmt: skip
+            self.vault.publish_bytes(alternate, body)
+            self.vault.append_confirmed(self.vault.receipts_path(env.header.device_id, capture_id),
+                                        {"alternate_of_seq": seq, "sha256": digest, "received_at": self.clock()})  # fmt: skip
         if not stored_path.exists():  # audio deleted before 2026-11-08: nothing to compare with
             return False
         if same is COMPARISON_UNAVAILABLE:  # the copy is kept above; the phone keeps its own and sends it again
@@ -657,19 +654,24 @@ class Ingest:
             if sha256_hex(data) != digest:
                 raise ApiError(409, "chunk_conflict", "different content is already stored under this identity")
             deleted = False
-            durable_existing(path)  # before any receipt, row or 2xx (ENOSPC -> 507 in put_chunk)
+            durable_existing(path, self.vault)  # before any receipt, row or 2xx (ENOSPC -> 507 in put_chunk)
         else:
             tomb = json.loads(tomb_path.read_text())
             if tomb.get("sha256") != digest:
                 raise ApiError(409, "chunk_conflict", "different content was stored (and expired) under this identity")
             deleted = True
-            durable_existing(tomb_path)
-        received = receipt_time(self.vault, header.device_id, header.capture_id, header.chunk_sequence)
+            durable_existing(tomb_path, self.vault)  # the actual .gone, not the missing .omnc
+            evidence = self.vault.capture_json_path(header.device_id, header.capture_id)
+            if evidence.exists():
+                durable_existing(evidence, self.vault)  # the legacy coverage facts it brings back
+        receipts = self.vault.receipts_path(header.device_id, header.capture_id)
+        received = receipt_time(self.vault, header.device_id, header.capture_id, header.chunk_sequence, digest)
         if received is None:
             self._writable()
             received = self.clock()
-            Vault.append_jsonl(self.vault.receipts_path(header.device_id, header.capture_id),
-                               {"seq": header.chunk_sequence, "sha256": digest, "received_at": received})  # fmt: skip
+            self.vault.append_confirmed(receipts, {"seq": header.chunk_sequence, "sha256": digest, "received_at": received})
+        else:
+            durable_existing(receipts, self.vault)  # a readable earlier append may have failed its sync
         with self.db.tx() as conn:
             index_chunk(conn, header, digest=digest, size=size, path=self.vault.relpath(path), received_at=received,
                         raw_deleted=deleted, ring=ring_record_hashes(env))  # fmt: skip
@@ -714,9 +716,10 @@ class Ingest:
                 raise ApiError(409, "capture_identity_conflict", "device_id/source differ from this capture")
             path = vault.seal_path(seal.device_id, capture_id)
             stored = Vault.read_json(path)
-            if stored is not None:  # durable seal without an index row
+            if stored is not None:  # a seal file without an index row: trusted once its chain is confirmed
                 if canonical_json(stored.get("body")) != facts.canonical:
                     raise ApiError(409, "seal_conflict", "a different seal is already stored for this capture")
+                durable_existing(path, vault)
                 with db.tx() as conn:
                     index_seal(conn, capture_id, facts, float(stored["received_at"]))
                 return 200, capture_status(db, capture_id)  # type: ignore[return-value]
@@ -726,6 +729,7 @@ class Ingest:
             self._writable()
             now = self.clock()
             Vault.write_json(path, {"body": raw, "received_at": now}, pretty=False)
+            vault.confirm(path)
             try:
                 with db.tx() as conn:
                     index_seal(conn, capture_id, facts, now)
