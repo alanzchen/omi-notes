@@ -119,7 +119,20 @@ public final class AppModel {
     /// another server as far as everything shown here is concerned.
     private var answeredVault: String?
     /// The last "Test connection" that found the connected server's vault at an address (cleared by any save).
-    private var provenMove: (url: URL, vault: String)?
+    /// A same-server proof from the latest "Test connection" (ASTRA-20261122-IT3-01): the exact destination URL and
+    /// token, the configuration and offline-cache scope it was taken against, a valid vault identity seen on both sides,
+    /// and the probe it came from. Any newer probe, a failed one, or a configuration change revokes it; Save consumes
+    /// it only when every field still matches.
+    struct MoveProof: Equatable {
+        var url: URL
+        var token: String
+        var source: UploadConfig
+        var sourceScope: NoteCache.Scope
+        var vault: String
+        var probe: Int
+    }
+    private var provenMove: MoveProof?
+    private var probeGeneration = 0
     /// The refresh a save starts (tests wait for it).
     var saveRefresh: Task<Void, Never>?
     /// Bumped whenever the server (configuration or vault) changes: an answer that was asked for
@@ -204,6 +217,7 @@ public final class AppModel {
     /// Forgets everything a previous server said (another server, or none), people included.
     private func adopt(_ config: UploadConfig) {
         guard config != answeredFor else { return }
+        provenMove = nil  // a proof taken against another configuration proves nothing now
         answeredVault = nil
         // Notes saved for another server (or an earlier pairing) are removed, not just hidden. Those already moved to
         // exactly this configuration (a proven same-server move, `saveServer`) stay.
@@ -509,11 +523,22 @@ public final class AppModel {
     /// server to a new address can be told from pointing the phone at another one (2026-11-22).
     public func checkConnection(url: URL, token: String) async -> ConnectionCheck {
         let api = APIClient(endpoint: ServerEndpoint(baseURL: url, token: token), session: session)
-        let known = currentVaultId
+        probeGeneration += 1
+        let probe = probeGeneration
+        provenMove = nil  // a new probe revokes any earlier proof, whatever it answers
+        let source = engine.settings.serverConfig()
+        let sourceScope = cacheScope(source)
+        // an empty or malformed identity says nothing: no same/different claim from it (IT2-03)
+        let known = currentVaultId.flatMap { VaultIdentity.valid($0) }
         do {
             let st = try await api.status()
-            let same = known.flatMap { k in st.vaultId.map { $0 == k } }
-            provenMove = same == true ? (url, st.vaultId ?? "") : nil
+            let theirs = st.vaultId.flatMap { VaultIdentity.valid($0) }
+            let same = known.flatMap { k in theirs.map { $0 == k } }
+            // only the latest probe, against the configuration and cache it started from, may leave a proof
+            if probe == probeGeneration, same == true, let vault = theirs, let sourceScope, sourceScope.vaultId == vault,
+               isCurrent(source), noteCache.lastScope == sourceScope {
+                provenMove = MoveProof(url: url, token: token, source: source, sourceScope: sourceScope, vault: vault, probe: probe)
+            }
             let what = same.map { $0 ? " Same server as now." : " A different server from the one connected now." } ?? ""
             return ConnectionCheck(ok: true, message: "Connected to server \(st.serverVersion ?? "?"). Transcription \(st.stt?.ready == true ? "configured" : "not configured")"
                 + (st.stt?.engine?.healthy == false ? " (not answering now)" : "") + "; "
@@ -526,7 +551,12 @@ public final class AppModel {
     }
 
     public func saveServer(url: URL, token: String) throws {
-        let proven = provenMove.flatMap { $0.url == url ? $0.vault : nil }
+        // the proof counts only for exactly this destination and token, taken against the configuration and cache that
+        // are still current, from the latest probe; anything else clears the old notes as before (IT3-01)
+        let proven = provenMove.flatMap { p in
+            p.url == url && p.token == token && p.probe == probeGeneration && isCurrent(p.source)
+                && noteCache.lastScope == p.sourceScope ? p.vault : nil
+        }
         provenMove = nil
         try engine.configureServer(url: url, token: token)
         // a passing test found this address to be the same vault: its saved notes stay readable there (R2 2026-11-22)

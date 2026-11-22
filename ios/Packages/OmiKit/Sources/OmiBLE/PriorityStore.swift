@@ -54,12 +54,14 @@ public final class PriorityStore: @unchecked Sendable {
     /// (2026-11-22).
     public func move(vaultId: String, to server: String) {
         lock.lock(); defer { lock.unlock() }
-        guard server.hasSuffix("|\(vaultId)") else { return }
+        guard VaultIdentity.valid(vaultId) != nil, RetryStore.vault(ofKey: server) == vaultId else { return }
         var next = entries
         var changed = false
-        for i in next.indices where next[i].server != server && next[i].server.hasSuffix("|\(vaultId)")
-            && !next.contains(where: { $0.server == server && $0.conversationId == next[i].conversationId }) {
+        var taken = Set(next.filter { $0.server == server }.map(\.conversationId))  // linear (IT2-04)
+        for i in next.indices where next[i].server != server && RetryStore.vault(ofKey: next[i].server) == vaultId
+            && !taken.contains(next[i].conversationId) {
             next[i].server = server
+            taken.insert(next[i].conversationId)
             changed = true
         }
         if changed { try? persist(next) }

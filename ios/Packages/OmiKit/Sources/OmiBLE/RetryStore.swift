@@ -52,17 +52,25 @@ public final class RetryStore: @unchecked Sendable {
 
     public static func serverKey(baseURL: URL, vaultId: String) -> String { "\(baseURL.absoluteString)|\(vaultId)" }
 
+    /// The vault part of a key: everything after the first "|" (a URL's absolute string never holds a raw "|"), so a
+    /// malformed vault id containing "|" can't pass for another's suffix (IT2-03).
+    static func vault(ofKey key: String) -> String? {
+        key.firstIndex(of: "|").map { String(key[key.index(after: $0)...]) }
+    }
+
     /// The same vault answered at another address (the server moved): its unsettled requests are this address's now,
     /// with their request ids, so they are sent there instead of stranded under the old key (2026-11-22). A
     /// conversation that already has one under the new key keeps that one; nothing is deleted.
     public func move(vaultId: String, to server: String) {
         lock.lock(); defer { lock.unlock() }
-        guard !unreadable, server.hasSuffix("|\(vaultId)") else { return }
+        guard !unreadable, VaultIdentity.valid(vaultId) != nil, Self.vault(ofKey: server) == vaultId else { return }
         var next = entries
         var changed = false
-        for i in next.indices where next[i].server != server && next[i].server.hasSuffix("|\(vaultId)")
-            && !next.contains(where: { $0.server == server && $0.conversationId == next[i].conversationId }) {
+        var taken = Set(next.filter { $0.server == server }.map(\.conversationId))  // linear, not a search per entry (IT2-04)
+        for i in next.indices where next[i].server != server && Self.vault(ofKey: next[i].server) == vaultId
+            && !taken.contains(next[i].conversationId) {
             next[i].server = server
+            taken.insert(next[i].conversationId)
             changed = true
         }
         if changed { try? persist(next) }
@@ -114,5 +122,16 @@ public final class RetryStore: @unchecked Sendable {
         try FileIO.ensureDirectory(url.deletingLastPathComponent())
         try JSONFile.save(next, to: url)
         entries = next
+    }
+}
+
+/// A vault identity the app may compare: nonempty, bounded, no "|" (the key separator), no whitespace or control
+/// characters. The server writes UUIDs; anything else is unknown, never "the same server" (ASTRA-20261122-IT2-03).
+public enum VaultIdentity {
+    public static func valid(_ id: String) -> String? {
+        guard !id.isEmpty, id.count <= 128, !id.contains("|"),
+              id.unicodeScalars.allSatisfy({ !CharacterSet.whitespacesAndNewlines.contains($0) && !CharacterSet.controlCharacters.contains($0) })
+        else { return nil }
+        return id
     }
 }
