@@ -48,6 +48,7 @@ _lock = threading.Lock()
 # AAC decodes (ffmpeg runs) at once for checks outside `_lock`: a resend burst can't take every core
 UPLOAD_DECODES = 4
 _decodes = threading.BoundedSemaphore(UPLOAD_DECODES)
+PENDING_MAX = 10_000  # identities published in this process but not yet committed (DESIGN-05: refuse, never evict)
 SAME_AUDIO_VERDICTS = 10_000  # remembered (capture, seq, sha256) comparisons; a stored chunk never changes
 
 
@@ -405,8 +406,10 @@ class Ingest:
         self.settings = settings
         self.read_only = read_only  # () -> reason or None
         self.clock = clock  # receipt times (injectable for tests)
-        # Captures / events with a durable file whose index commit failed in this process.
-        self._dirty: set[tuple[str, str]] = set()
+        # Identities whose publication started in this process and isn't committed yet: (capture, seq, digest) ->
+        # [receipt time chosen before any file was written, whether that receipt line is confirmed]. A retry reuses
+        # the time; dropped only after the outer COMMIT (DESIGN-03). Bounded: refuse new work beyond PENDING_MAX.
+        self._pending: dict[tuple[str, int, str], list] = {}
         self._pending_events: dict[str, tuple[str, float]] = {}
         # (capture_id, seq, sha256 of other bytes) -> same audio as the stored chunk
         self._verdicts: dict[tuple[str, int, str], bool] = {}
@@ -416,12 +419,32 @@ class Ingest:
         if reason:
             raise ApiError(503, "vault_read_only", reason)
 
-    def _recover(self, device_id: str, capture_id: str) -> None:
-        if (device_id, capture_id) in self._dirty:
-            from .rebuild import index_capture_orphans
+    def _resolve_saved_seal(self, header, capture_id: str, capture):
+        """The capture's one saved seal.json, if its index row is missing: authoritative for chunk bounds, so it is
+        validated, confirmed and indexed before this chunk's bounds are decided (DESIGN-04). Unreadable, malformed or
+        unconfirmable is unresolved (retryable), never "no seal"."""
+        path = self.vault.seal_path(header.device_id, capture_id)
+        if not path.exists():  # one stat, only for an unsealed capture
+            return capture
+        try:
+            stored = Vault.read_json(path)
+            facts = validate_seal(stored["body"])
+            received = float(stored["received_at"])
+        except (OSError, ValueError, KeyError, TypeError, ApiError) as exc:
+            raise ApiError(503, "seal_unresolved", f"this capture's saved seal can't be read right now ({exc}); send it again") from exc
+        if facts.seal.device_id != header.device_id or facts.seal.source != header.source:
+            raise ApiError(409, "capture_identity_conflict", "device_id/source differ from this capture's seal")
+        durable_existing(path, self.vault)
+        with self.db.tx() as conn:
+            index_seal(conn, capture_id, facts, received)
+        return self.db.one("SELECT * FROM captures WHERE capture_id=?", (capture_id,))
 
-            index_capture_orphans(self.db, self.vault, device_id, capture_id)
-            self._dirty.discard((device_id, capture_id))
+    def _note_high_water(self, capture_id: str, seq: int) -> None:
+        from .rebuild import recovery_state
+
+        hw = recovery_state(self.vault).high_water
+        if seq > hw.get(capture_id, -1):
+            hw[capture_id] = seq
 
     # -- chunks ----------------------------------------------------------------------------------
 
@@ -540,37 +563,48 @@ class Ingest:
                 if capture["capture_started_at"] is not None and abs(capture["capture_started_at"] - started) > 0.0015:
                     raise ApiError(409, "capture_identity_conflict", "capture_started_at differs from earlier chunks")
 
+            if capture is None or capture["seal_json"] is None:
+                capture = self._resolve_saved_seal(header, capture_id, capture)
+            # the seal bounds every way in, adoption of an existing file included (an orphan above it is kept, not used)
+            if capture is not None and capture["last_chunk_sequence"] is not None and seq > capture["last_chunk_sequence"]:
+                raise ApiError(409, "beyond_seal", "chunk_sequence is above the sealed last_chunk_sequence")
             path = vault.chunk_path(header.device_id, capture_id, seq)
             tomb_path = path.with_suffix(".gone")
             if path.exists() or tomb_path.exists():
                 return ok(*self._adopt_orphan(env, digest, len(body), path, tomb_path))
 
-            if capture is not None and capture["last_chunk_sequence"] is not None and seq > capture["last_chunk_sequence"]:
-                raise ApiError(409, "beyond_seal", "chunk_sequence is above the sealed last_chunk_sequence")
             self._writable()
             self._ensure_space()
+            key = (capture_id, seq, digest)
+            if key not in self._pending and len(self._pending) >= PENDING_MAX:
+                raise ApiError(503, "recovery_backlog", "too many uploads are waiting to be confirmed; send it again later")
+            pending = self._pending.setdefault(key, [self.clock(), False])  # the receipt time, chosen before writing
             try:
                 vault.publish_bytes(path, body)  # file + chain to the vault root, never replacing a file
             except OSError as exc:
+                if path.exists():
+                    self._note_high_water(capture_id, seq)  # on disk, unconfirmed: a seal must not end before it
                 if exc.errno == errno.ENOSPC:
                     self._disk_full("a chunk write hit ENOSPC")
                     raise ApiError(507, "storage_full", "server disk is full") from exc
                 raise
-            now = self.clock()
+            self._note_high_water(capture_id, seq)
+            now = pending[0]
             try:
                 vault.append_confirmed(vault.receipts_path(header.device_id, capture_id),
                                        {"seq": seq, "sha256": digest, "received_at": now})  # fmt: skip
+                pending[1] = True
                 with db.tx() as conn:
                     index_chunk(conn, header, digest=digest, size=len(body), path=vault.relpath(path), received_at=now,
                                 ring=ring_record_hashes(env))  # fmt: skip
             except BaseException as exc:
-                self._dirty.add((header.device_id, capture_id))
-                # the file is durable but not indexed (an orphan a retry with the same bytes adopts): a full disk here
-                # is 507 like any other, so the phone keeps the part and sends it again (2026-11-21)
+                # the file is durable but not indexed (an orphan a retry with the same bytes adopts, with this same
+                # receipt time): a full disk here is 507 like any other, so the phone keeps the part (2026-11-21)
                 if _disk_full_error(exc):
                     self._disk_full(f"storing a chunk's receipt/index failed: {exc}")
                     raise ApiError(507, "storage_full", "server disk is full") from exc
                 raise
+            self._pending.pop(key, None)
         return ok(201, False)
 
     @staticmethod
@@ -664,21 +698,40 @@ class Ingest:
             evidence = self.vault.capture_json_path(header.device_id, header.capture_id)
             if evidence.exists():
                 durable_existing(evidence, self.vault)  # the legacy coverage facts it brings back
-        receipts = self.vault.receipts_path(header.device_id, header.capture_id)
-        received = receipt_time(self.vault, header.device_id, header.capture_id, header.chunk_sequence, digest)
-        if received is None:
-            self._writable()
-            received = self.clock()
-            self.vault.append_confirmed(receipts, {"seq": header.chunk_sequence, "sha256": digest, "received_at": received})
-        else:
+        from .rebuild import UNREADABLE, apply_capture_evidence, recovery_state
+
+        ids = (header.device_id, header.capture_id)
+        key = (header.capture_id, header.chunk_sequence, digest)
+        receipts = self.vault.receipts_path(*ids)
+        state = recovery_state(self.vault)
+        pending = self._pending.get(key)
+        if pending is None:
+            # not published by this process: only the startup sweep's prepared facts may say when it arrived; nothing
+            # here scans the capture's receipts or evidence (DESIGN-03)
+            prepared = state.receipts.get(ids)
+            if prepared is None:
+                raise ApiError(503, "unresolved_identity",
+                               "this part's earlier copy can't be checked by this server process yet; send it again later")
+            line = prepared.get((header.chunk_sequence, digest))
+            pending = self._pending.setdefault(key, [line if line is not None else self.clock(), line is not None])
+        evidence = None
+        if deleted:
+            evidence = state.evidence.get(ids)
+            if evidence is UNREADABLE:
+                raise ApiError(503, "unresolved_identity", "this capture's evidence can't be read right now; send it again later")
+        received = pending[0]
+        if pending[1]:
             durable_existing(receipts, self.vault)  # a readable earlier append may have failed its sync
+        else:
+            self._writable()
+            self.vault.append_confirmed(receipts, {"seq": header.chunk_sequence, "sha256": digest, "received_at": received})
+            pending[1] = True
         with self.db.tx() as conn:
             index_chunk(conn, header, digest=digest, size=size, path=self.vault.relpath(path), received_at=received,
                         raw_deleted=deleted, ring=ring_record_hashes(env))  # fmt: skip
             if deleted:
-                from .rebuild import apply_capture_evidence
-
-                apply_capture_evidence(conn, self.vault, header.device_id, header.capture_id, only_seq=header.chunk_sequence)
+                apply_capture_evidence(conn, self.vault, *ids, only_seq=header.chunk_sequence, evidence=evidence or {})
+        self._pending.pop(key, None)
         return 200, True
 
     def _ensure_space(self) -> None:
@@ -706,7 +759,7 @@ class Ingest:
         seal = facts.seal
         db, vault = self.db, self.vault
         with _lock:
-            self._recover(seal.device_id, capture_id)
+            # no capture sweep here (DESIGN-04): files without rows are bounded by the high-water mark below
             capture = db.one("SELECT * FROM captures WHERE capture_id=?", (capture_id,))
             if capture is not None and capture["seal_json"] is not None:
                 if capture["seal_json"] == facts.canonical:
@@ -723,19 +776,19 @@ class Ingest:
                 with db.tx() as conn:
                     index_seal(conn, capture_id, facts, float(stored["received_at"]))
                 return 200, capture_status(db, capture_id)  # type: ignore[return-value]
-            beyond = db.one("SELECT MAX(chunk_sequence) AS m FROM chunks WHERE capture_id=?", (capture_id,))
-            if beyond["m"] is not None and beyond["m"] > seal.last_chunk_sequence:
+            from .rebuild import recovery_state
+
+            beyond = db.one("SELECT MAX(chunk_sequence) AS m FROM chunks WHERE capture_id=?", (capture_id,))["m"]
+            on_disk = recovery_state(vault).high_water.get(capture_id)  # files without rows (startup + this process)
+            highest = max(x for x in (beyond, on_disk, -1) if x is not None)
+            if highest > seal.last_chunk_sequence:
                 raise ApiError(409, "chunks_beyond_seal", "chunks above last_chunk_sequence are already stored")
             self._writable()
             now = self.clock()
             Vault.write_json(path, {"body": raw, "received_at": now}, pretty=False)
             vault.confirm(path)
-            try:
-                with db.tx() as conn:
-                    index_seal(conn, capture_id, facts, now)
-            except BaseException:
-                self._dirty.add((seal.device_id, capture_id))
-                raise
+            with db.tx() as conn:  # a failure leaves the confirmed seal.json: the next chunk or seal PUT indexes it
+                index_seal(conn, capture_id, facts, now)
         return 200, capture_status(db, capture_id)  # type: ignore[return-value]
 
     # -- events ----------------------------------------------------------------------------------

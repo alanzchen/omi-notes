@@ -97,6 +97,29 @@ def _receipts(vault: Vault, device: str, capture: str) -> dict[tuple[int, str], 
     return out
 
 
+@dataclass
+class RecoveryState:
+    """What the startup sweep learned for this process's requests, so a request never scans history (DESIGN-03/04):
+    - `high_water`: per capture, the highest sequence with a file (.omnc or .gone) on disk, confirmed or not; a new
+      seal can't declare a smaller last chunk. The ingest adds what this process publishes.
+    - for captures the sweep could not resolve (`unresolved`): their receipt times by (sequence, digest) and their
+      parsed capture.json evidence (None: none; `UNREADABLE`: couldn't be read), used by that identity's own retry.
+    Disposable: rebuilt by every sweep, never a vault format."""
+
+    high_water: dict[str, int] = field(default_factory=dict)
+    unresolved: set[tuple[str, str]] = field(default_factory=set)
+    receipts: dict[tuple[str, str], dict[tuple[int, str], float]] = field(default_factory=dict)
+    evidence: dict[tuple[str, str], object] = field(default_factory=dict)
+
+
+UNREADABLE = object()
+_STATES: dict[str, RecoveryState] = {}
+
+
+def recovery_state(vault: Vault) -> RecoveryState:
+    return _STATES.setdefault(os.path.realpath(vault.root), RecoveryState())
+
+
 class Unconfirmed(OSError):
     """A capture's files or directories couldn't be confirmed durable: nothing of it is trusted yet."""
 
@@ -122,6 +145,13 @@ def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, ski
     except OSError as exc:
         raise Unconfirmed(exc.errno, f"capture {device}/{capture} can't be confirmed durable now: {exc}") from exc
     receipts = _receipts(vault, device, capture)
+    # the saved seal bounds the capture here as on a request (DESIGN-04): a chunk above it is kept, never indexed
+    seal_last = None
+    if "seal.json" in names:
+        try:
+            seal_last = validate_seal(json.loads((cap_dir / "seal.json").read_text())["body"]).seal.last_chunk_sequence
+        except (ApiError, KeyError, TypeError, ValueError):
+            seal_last = None  # reported below with the seal itself
     seqs: dict[int, str] = {}
     for name in names:
         stem, dot, ext = name.partition(".")
@@ -131,6 +161,9 @@ def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, ski
                 seqs[seq] = ext
     for seq, ext in sorted(seqs.items()):
         if skip is not None and (capture, seq) in skip:
+            continue
+        if seal_last is not None and seq > seal_last:
+            report.problems.append(f"{vault.relpath(cap_dir / f'{seq}.{ext}')} is above its capture's seal: kept, not indexed")
             continue
         path = cap_dir / f"{seq}.omnc"
         if ext == "omnc":
@@ -215,16 +248,24 @@ def _event_ops(vault: Vault, report: Report, known: dict[str, str] | None = None
 # -- capture.json evidence ---------------------------------------------------------------------------
 
 
-def apply_capture_evidence(conn, vault: Vault, device: str, capture: str, *, only_seq: int | None = None) -> None:
-    """Restore what deleted chunks contributed (from `capture.json`): chunk facts, coverage,
-    losses, ring ownership, tentative speech, continuation checkpoints."""
-    evidence = Vault.read_json(vault.capture_json_path(device, capture))
+def apply_capture_evidence(conn, vault: Vault, device: str, capture: str, *, only_seq: int | None = None,
+                           evidence: dict | None = None) -> None:  # fmt: skip
+    """Restore what deleted chunks contributed (from `capture.json`, or `evidence` already parsed at startup): chunk
+    facts, coverage, losses, ring ownership, tentative speech, continuation checkpoints. With `only_seq` the index is
+    read for that one chunk only (a request's own identity, DESIGN-03)."""
+    if evidence is None:
+        evidence = Vault.read_json(vault.capture_json_path(device, capture))
     if not evidence:
         return
     deleted = {int(k): v for k, v in (evidence.get("deleted") or {}).items()}
-    tombstoned = {r["chunk_sequence"] for r in conn.execute(
-        "SELECT chunk_sequence FROM chunks WHERE capture_id=? AND raw_deleted=1", (capture,)
-    )}  # fmt: skip
+    if only_seq is not None:
+        tombstoned = {r["chunk_sequence"] for r in conn.execute(
+            "SELECT chunk_sequence FROM chunks WHERE capture_id=? AND chunk_sequence=? AND raw_deleted=1", (capture, only_seq)
+        )}  # fmt: skip
+    else:
+        tombstoned = {r["chunk_sequence"] for r in conn.execute(
+            "SELECT chunk_sequence FROM chunks WHERE capture_id=? AND raw_deleted=1", (capture,)
+        )}  # fmt: skip
     seqs = {s for s in deleted if s in tombstoned and (only_seq is None or s == only_seq)}
     for seq in sorted(seqs):
         facts = deleted[seq]
@@ -251,7 +292,8 @@ def apply_capture_evidence(conn, vault: Vault, device: str, capture: str, *, onl
         [(device, rs, h, capture, seq) for seq, rs, h in rows("ring_seen")],
     )
     received = {r["chunk_sequence"]: r["received_at"] for r in conn.execute(
-        "SELECT chunk_sequence, received_at FROM chunks WHERE capture_id=?", (capture,)
+        "SELECT chunk_sequence, received_at FROM chunks WHERE capture_id=?" + (" AND chunk_sequence=?" if only_seq is not None else ""),
+        (capture,) if only_seq is None else (capture, only_seq),
     )}  # fmt: skip
     conn.executemany(
         """INSERT OR IGNORE INTO ring_records (device_id, ring_seq, record_hash, capture_id, chunk_sequence, received_at)
@@ -554,17 +596,32 @@ def sweep(db: Database, vault: Vault) -> dict:
     """Index files a crash left without index rows: raw chunks/tombstones/seals, recent event
     lines, and conversation records newer than their index row."""
     counts = {"raw": 0, "events": 0, "records": 0}
+    state = RecoveryState()
     for device, capture in _captures(vault):
         cap_dir = vault.capture_dir(device, capture)
-        files = sum(1 for p in cap_dir.iterdir() if p.suffix in (".omnc", ".gone"))
+        seqs = [int(p.name.partition(".")[0]) for p in cap_dir.iterdir()
+                if p.suffix in (".omnc", ".gone") and p.name.partition(".")[0].isdigit()]  # fmt: skip
+        if seqs:
+            state.high_water[capture] = max(seqs)
+        files = len(set(seqs))
         cap = db.one("SELECT seal_json FROM captures WHERE capture_id=?", (capture,))
         indexed = db.one("SELECT COUNT(*) AS n FROM chunks WHERE capture_id=?", (capture,))["n"]
         seal_missing = (cap_dir / "seal.json").exists() and (cap is None or cap["seal_json"] is None)
         if files != indexed or seal_missing:
             try:
                 counts["raw"] += index_capture_orphans(db, vault, device, capture)
-            except OSError as exc:  # a file that can't be synced now stays unindexed (a retry adopts it); startup goes on
+            except OSError as exc:  # can't be confirmed now: kept unindexed, its facts prepared for its own retry
                 log.warning("sweep: capture %s not indexed yet: %s", capture, exc)
+                state.unresolved.add((device, capture))
+                state.receipts[(device, capture)] = _receipts(vault, device, capture)
+                try:
+                    state.evidence[(device, capture)] = Vault.read_json(vault.capture_json_path(device, capture))
+                except (OSError, ValueError):
+                    state.evidence[(device, capture)] = UNREADABLE
+    _STATES[os.path.realpath(vault.root)] = state
+    if state.unresolved:
+        log.warning("sweep: %d capture(s) have files that can't be confirmed yet; their own uploads retry them",
+                    len(state.unresolved))
     latest = db.one("SELECT MAX(received_at) AS m FROM events")["m"]
     if vault.events_dir.exists():
         from datetime import UTC, datetime

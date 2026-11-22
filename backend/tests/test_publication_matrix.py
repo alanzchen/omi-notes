@@ -89,11 +89,10 @@ def test_an_orphan_retry_is_adopted_only_once_its_whole_chain_is(settings, monke
     assert put_chunk(c, cap, 0, bodies[0]).status_code == 201
     vault = c.app.state.vault
     path = vault.chunk_path(DEVICE, cap, 1)
-    path.write_bytes(bodies[1])  # a file without its row (a crash before its index commit)
+    path.write_bytes(bodies[1])  # a file without its row: a crash before its index commit ...
     b = Barrier(monkeypatch, target(vault, level, path))
-    if level == "anchor":  # a new process: its startup sweep must not prove the orphan either
-        c = fresh(settings)
-        assert rows(c, cap, 1) == 0
+    c = fresh(settings)  # ... then a restart, whose sweep can't prove it either and prepares its facts
+    assert rows(c, cap, 1) == 0
     assert put_chunk(c, cap, 1, bodies[1]).status_code == 507
     assert b.hits and rows(c, cap, 1) == 0
     b.failing = False
