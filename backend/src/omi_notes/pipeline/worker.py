@@ -107,6 +107,20 @@ class Worker:
 
     # -- loop ------------------------------------------------------------------------------------
 
+    def _drain_unresolved(self, now: float) -> None:
+        """Files on disk that couldn't be confirmed yet (startup or a failed publication): one capture per tick, with
+        backoff, under the ingest lock when the API shares this process. Never fails the tick."""
+        try:
+            from ..ingest import _lock
+            from ..rebuild import drain_unresolved, recovery_state
+
+            if not recovery_state(self.vault).unresolved:
+                return
+            with _lock:
+                drain_unresolved(self.db, self.vault, now=now)
+        except Exception:
+            log.exception("draining unresolved captures failed")
+
     def tick(self, now: float | None = None) -> dict:
         now = self.clock() if now is None else now
         # the disk alert first: it needs no index write, which a full disk may be what stops (2026-11-20 18:05)
@@ -114,6 +128,8 @@ class Worker:
         disk_alert.watch(self.settings.logs_dir, self.settings.vault_dir, floor_bytes=MIN_FREE_BYTES, now=now,
                          other_dirs=[self.db.path.parent])  # fmt: skip
         blocked = read_only_reason(self.db)
+        if not blocked:
+            self._drain_unresolved(now)
         if blocked:
             self._status(now, force=False)
             return {"chunks": 0, "segmentation_changes": 0, "conversations": 0, "read_only": blocked}

@@ -479,6 +479,11 @@ class Ingest:
         except Exception:
             log.exception("disk evidence after a publication failed")
 
+    def _unresolved(self, device_id: str, capture_id: str) -> None:
+        from .rebuild import recovery_state
+
+        recovery_state(self.vault).unresolved.add((device_id, capture_id))
+
     def _note_high_water(self, capture_id: str, seq: int) -> None:
         from .rebuild import recovery_state
 
@@ -625,6 +630,7 @@ class Ingest:
             except OSError as exc:
                 if path.exists():
                     self._note_high_water(capture_id, seq)  # on disk, unconfirmed: a seal must not end before it
+                    self._unresolved(header.device_id, capture_id)
                 if exc.errno == errno.ENOSPC:
                     self._disk_full("a chunk write hit ENOSPC")
                     raise ApiError(507, "storage_full", "server disk is full") from exc
@@ -639,6 +645,7 @@ class Ingest:
                     index_chunk(conn, header, digest=digest, size=len(body), path=vault.relpath(path), received_at=now,
                                 ring=ring_record_hashes(env))  # fmt: skip
             except BaseException as exc:
+                self._unresolved(header.device_id, capture_id)  # its own retry or the worker's drain indexes it
                 # the file is durable but not indexed (an orphan a retry with the same bytes adopts, with this same
                 # receipt time): a full disk here is 507 like any other, so the phone keeps the part (2026-11-21)
                 if _disk_full_error(exc):

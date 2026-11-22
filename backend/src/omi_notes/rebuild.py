@@ -110,9 +110,35 @@ class RecoveryState:
     unresolved: set[tuple[str, str]] = field(default_factory=set)
     receipts: dict[tuple[str, str], dict[tuple[int, str], float]] = field(default_factory=dict)
     evidence: dict[tuple[str, str], object] = field(default_factory=dict)
+    retry_at: dict[tuple[str, str], tuple[float, int]] = field(default_factory=dict)  # (next try, failures so far)
 
 
 UNREADABLE = object()
+
+
+def drain_unresolved(db: Database, vault: Vault, *, now: float, limit: int = 1) -> int:
+    """Off the request path (the worker tick): retry at most `limit` known unresolved captures whose backoff has passed,
+    through the same confirming `index_capture_orphans`. No discovery walk; the identities come from the startup sweep
+    and from publications that failed after their file existed (DESIGN-05, A9). Returns the captures resolved."""
+    state = recovery_state(vault)
+    due = [k for k in sorted(state.unresolved) if state.retry_at.get(k, (0.0, 0))[0] <= now][:limit]
+    resolved = 0
+    for device, capture in due:
+        try:
+            index_capture_orphans(db, vault, device, capture)
+        except OSError as exc:
+            failures = state.retry_at.get((device, capture), (0.0, 0))[1] + 1
+            state.retry_at[(device, capture)] = (now + min(3600.0, 60.0 * 2 ** (failures - 1)), failures)
+            log.warning("capture %s still can't be confirmed (%s); next try in %d s", capture, exc,
+                        int(state.retry_at[(device, capture)][0] - now))  # fmt: skip
+            continue
+        for table in (state.unresolved, state.receipts, state.evidence, state.retry_at):
+            table.discard((device, capture)) if isinstance(table, set) else table.pop((device, capture), None)
+        resolved += 1
+        log.info("capture %s: its files are confirmed and indexed now", capture)
+    if due:
+        db.set_meta("unresolved", json.dumps(sorted(f"{d}/{c}" for d, c in state.unresolved)[:200]) or None)
+    return resolved
 _STATES: dict[str, RecoveryState] = {}
 
 
