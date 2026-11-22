@@ -51,3 +51,37 @@ extension RetryFlowTests {
         }
     }
 }
+
+extension RetryFlowTests {
+    /// The Change-server test says whether the new address answers as the server connected now (same vault).
+    @MainActor @Suite(.serialized) struct ConnectionCheckTests {
+        @Test func theTestSaysWhetherTheNewAddressIsTheSameServer() async throws {
+            let (m, root) = try RetryFlowTests().model()
+            defer { try? FileManager.default.removeItem(at: root) }
+            await m.refreshServer()  // the connected server's vault: vault-a
+            let new = URL(string: "https://oracle.tailcd4f.ts.net:8446")!
+            let same = await m.checkConnection(url: new, token: "tok")
+            #expect(same.ok && same.sameServer == true)
+            #expect(same.message.hasSuffix("Same server as now."))
+            AppServerStub.routes["/v1/status"] = [(200, RetryFlowTests.status.replacingOccurrences(of: "vault-a", with: "vault-b"))]
+            let other = await m.checkConnection(url: new, token: "tok")
+            #expect(other.ok && other.sameServer == false)
+            #expect(other.message.hasSuffix("A different server from the one connected now."))
+            AppServerStub.routes["/v1/status"] = [(401, #"{"error":"unauthorized"}"#)]
+            let refused = await m.checkConnection(url: new, token: "bad")
+            #expect(!refused.ok && refused.sameServer == nil)
+            AppServerStub.offline = true
+            let down = await m.checkConnection(url: new, token: "tok")
+            #expect(!down.ok && down.sameServer == nil && down.message.hasPrefix("Couldn't connect"))
+        }
+
+        /// Nothing connected yet (or the connected server never answered): no same/different claim.
+        @Test func noClaimWithoutAKnownServer() async throws {
+            let (m, root) = try RetryFlowTests().model()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let r = await m.checkConnection(url: URL(string: "https://oracle.tailcd4f.ts.net:8446")!, token: "tok")
+            #expect(r.ok && r.sameServer == nil)
+            #expect(!r.message.contains("server as now") && !r.message.contains("different server"))
+        }
+    }
+}

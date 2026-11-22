@@ -489,18 +489,35 @@ public final class AppModel {
         }
     }
 
+    /// A "Test connection" answer: whether it worked, what to show, and whether the address answers as the server
+    /// connected now (same vault; nil when either side is unknown: no claim).
+    public struct ConnectionCheck: Equatable, Sendable {
+        public var ok: Bool
+        public var message: String
+        public var sameServer: Bool?
+    }
+
     /// Settings "Test connection": probes a URL/token without saving it.
     public func testConnection(url: URL, token: String) async -> String {
-        let api = APIClient(endpoint: ServerEndpoint(baseURL: url, token: token))
+        await checkConnection(url: url, token: token).message
+    }
+
+    /// The probe behind "Test connection". Compares the answer's vault with the connected server's, so moving the same
+    /// server to a new address can be told from pointing the phone at another one (2026-11-22).
+    public func checkConnection(url: URL, token: String) async -> ConnectionCheck {
+        let api = APIClient(endpoint: ServerEndpoint(baseURL: url, token: token), session: session)
+        let known = currentVaultId
         do {
             let st = try await api.status()
-            return "Connected to server \(st.serverVersion ?? "?"). Transcription \(st.stt?.ready == true ? "configured" : "not configured")"
+            let same = known.flatMap { k in st.vaultId.map { $0 == k } }
+            let what = same.map { $0 ? " Same server as now." : " A different server from the one connected now." } ?? ""
+            return ConnectionCheck(ok: true, message: "Connected to server \(st.serverVersion ?? "?"). Transcription \(st.stt?.ready == true ? "configured" : "not configured")"
                 + (st.stt?.engine?.healthy == false ? " (not answering now)" : "") + "; "
-                + "summaries \(st.llm?.ready == true ? "configured" : "not configured")."
+                + "summaries \(st.llm?.ready == true ? "configured" : "not configured")." + what, sameServer: same)
         } catch APIError.http(401, _) {
-            return "Couldn't connect: the server rejected this token."
+            return ConnectionCheck(ok: false, message: "Couldn't connect: the server rejected this token.", sameServer: nil)
         } catch {
-            return "Couldn't connect: \(Self.describe(error))"
+            return ConnectionCheck(ok: false, message: "Couldn't connect: \(Self.describe(error))", sameServer: nil)
         }
     }
 
