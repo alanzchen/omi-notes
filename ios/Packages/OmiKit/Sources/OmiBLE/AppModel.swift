@@ -221,9 +221,13 @@ public final class AppModel {
         answeredVault = nil
         // Notes saved for another server (or an earlier pairing) are removed, not just hidden. Those already moved to
         // exactly this configuration (a proven same-server move, `saveServer`) stay.
-        let savedForThis = noteCache.lastScope.map {
+        var savedForThis = noteCache.lastScope.map {
             $0.serverURL == config.endpoint?.baseURL.absoluteString && $0.generation == config.generation
         } ?? false
+        if !savedForThis, let url = config.endpoint?.baseURL.absoluteString, let last = noteCache.lastScope {
+            // a proven move interrupted between its rename and its pointer: completed, not deleted (IT3-02)
+            savedForThis = noteCache.completeMove(to: NoteCache.Scope(serverURL: url, generation: config.generation, vaultId: last.vaultId))
+        }
         if !savedForThis { noteCache.clear() }
         answeredFor = config
         forgetServerData()
@@ -561,7 +565,9 @@ public final class AppModel {
         try engine.configureServer(url: url, token: token)
         // a passing test found this address to be the same vault: its saved notes stay readable there (R2 2026-11-22)
         if let proven, let base = engine.settings.serverConfig().endpoint?.baseURL {
-            noteCache.move(to: NoteCache.Scope(serverURL: base.absoluteString, generation: engine.settings.serverConfig().generation, vaultId: proven))
+            if !noteCache.move(to: NoteCache.Scope(serverURL: base.absoluteString, generation: engine.settings.serverConfig().generation, vaultId: proven)) {
+                OmiLog.shared.log(.warning, "cache", "the saved notes couldn't be kept for the new address yet; the next refresh retries")
+            }
         }
         saveRefresh = Task { await refreshServer() }
     }
