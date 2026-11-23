@@ -136,25 +136,50 @@ public final class NoteCache: @unchecked Sendable {
     }
 
     /// The same vault at another address (or pairing): the saved copies become that scope's. Only a vault's own
-    /// copies move; false (and nothing changed) when the saved scope is of another vault or nothing is saved.
+    /// copies move. The directory is renamed first, then the scope pointer replaced; false when either step failed
+    /// (nothing is deleted either way). A rename that happened without its pointer is completed by `completeMove`,
+    /// which the next adopt calls (ASTRA-20261122-IT3-02).
     @discardableResult
     public func move(to next: Scope) -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard let current = read(Scope.self, pointerURL), current.vaultId == next.vaultId else { return false }
         if current == next { return true }
         do {
-            let e = JSONEncoder()
-            e.dateEncodingStrategy = .secondsSince1970
-            if FileManager.default.fileExists(atPath: dir(current).path) {
-                try? FileManager.default.removeItem(at: dir(next))  // a leftover of the new scope (none expected)
-                try FileManager.default.moveItem(at: dir(current), to: dir(next))
-            }
-            try e.encode(next).write(to: pointerURL, options: Self.writeOptions)
+            let fm = FileManager.default
+            if fm.fileExists(atPath: dir(current).path), !fm.fileExists(atPath: dir(next).path) {
+                try fm.moveItem(at: dir(current), to: dir(next))
+            }  // a copy already under the new scope (an earlier, interrupted move) is kept as it is: nothing deleted
+            try writePointer(next)
             return true
         } catch {
-            OmiLog.shared.log(.warning, "cache", "couldn't keep the saved notes for the new address: \(error)")
+            OmiLog.shared.log(.warning, "cache", "couldn't finish keeping the saved notes for the new address: \(error)")
             return false
         }
+    }
+
+    /// An interrupted `move` to `next`: the copies were renamed to `next`'s folder but the pointer still names the old
+    /// scope (its folder gone). Point at them and keep them. The folder name hashes address, pairing generation and
+    /// vault, so only a move to exactly this configuration and vault can have made it. True when `next` is current.
+    public func completeMove(to next: Scope) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = read(Scope.self, pointerURL) else { return false }
+        if current == next { return true }
+        let fm = FileManager.default
+        guard current.vaultId == next.vaultId, fm.fileExists(atPath: dir(next).path), !fm.fileExists(atPath: dir(current).path)
+        else { return false }
+        do {
+            try writePointer(next)
+            return true
+        } catch {
+            OmiLog.shared.log(.warning, "cache", "couldn't complete keeping the saved notes: \(error)")
+            return false
+        }
+    }
+
+    private func writePointer(_ scope: Scope) throws {
+        let e = JSONEncoder()
+        e.dateEncodingStrategy = .secondsSince1970
+        try e.encode(scope).write(to: pointerURL, options: Self.writeOptions)
     }
 
     // MARK: Plumbing
