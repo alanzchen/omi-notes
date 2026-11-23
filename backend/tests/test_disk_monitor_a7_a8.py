@@ -35,7 +35,7 @@ def test_another_process_waits_for_the_alert_lock_and_its_failure_wins(client, s
         assert proc.poll() is None, "the other process waits for the lock"
         assert disk_alert.revision(settings.logs_dir) == began
     out, _ = proc.communicate(timeout=10)
-    assert int(out.strip()) == began + 1
+    assert out.strip() not in ("", "None", began)  # a fresh failure token from the other process
     assert disk_alert.witness(settings.logs_dir, [settings.vault_dir], floor_bytes=ingest.MIN_FREE_BYTES, now=300,
                               since_revision=began) is False  # fmt: skip
     assert disk_alert.read(settings.logs_dir)["state"] == "down"
@@ -163,3 +163,19 @@ def test_a_locked_monitor_never_changes_the_upload_answer(client, settings, monk
         t.join(10)
     assert result["code"] == 201
     assert disk_alert.read(settings.logs_dir)["state"] == "down", "an unavailable monitor is no recovery"
+
+
+def test_an_alert_written_by_the_running_release_stays_readable_and_recoverable(client, settings, monkeypatch):
+    """Deploy compatibility: 6da7c1b writes disk.json without a revision token. After the upgrade it still reads as
+    down (never "unknown" or healthy), and a witnessed upload with room recovers it."""
+    path = settings.logs_dir / "alerts" / "disk.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"state": "down", "kind": "write", "down_since": "2026-11-20T18:05:00Z",
+                                "down_since_epoch": 1795140300.0, "reason": "legacy", "check": "df -h"}))  # fmt: skip
+    disk = client.get("/v1/status", headers=AUTH).json()["disk"]
+    assert disk == {"full": True, "since": "2026-11-20T18:05:00Z"}
+    _free(monkeypatch, 50 * GiB)
+    cap = str(uuid.uuid4())
+    assert put_chunk(client, cap, 0, _envs(cap)[0]).status_code == 201
+    assert disk_alert.read(settings.logs_dir)["state"] == "recovered"
+    assert client.get("/v1/status", headers=AUTH).json()["disk"] == {"full": False}

@@ -189,6 +189,8 @@ def create_app(
         measured every volume with room after a real publication; otherwise null: unknown (DESIGN-08). A recovered file
         from an earlier run is history, not an observation. Never raises."""
         try:
+            if disk_alert.revision(logs_dir) == disk_alert.UNREADABLE and ingest.down_latch is None:
+                return None  # a record that exists but can't be read is unknown, never "no alarm" (IT4-07)
             alert = disk_alert.read(logs_dir)
             down = alert is not None and alert.get("state") == "down"
             if down or ingest.down_latch is not None:

@@ -24,6 +24,7 @@ import os
 import shutil
 import threading
 import time
+import uuid
 from collections.abc import Iterable
 from contextlib import contextmanager
 from pathlib import Path
@@ -88,11 +89,26 @@ def read(logs_dir: Path) -> dict | None:
     return value
 
 
-def revision(logs_dir: Path) -> int:
-    """The current failure revision (0 when there was never a readable alert): sampled before a publication."""
+UNREADABLE = "unreadable"  # a snapshot of a record that exists but can't be read: matches no failure ever
+
+
+def revision(logs_dir: Path) -> str:
+    """The current failure token, sampled before a publication: "" when there is no alert file, UNREADABLE when one
+    exists but can't be read, else the token of the latest failure (a fresh random one per failure, never reused,
+    so a corrupt record can't make a newer failure look like an older one; ASTRA-20261122-IT4-08)."""
+    path = _path(logs_dir)
     current = read(logs_dir)
-    rev = current.get("revision") if current else None
-    return rev if isinstance(rev, int) else 0
+    if current is None:
+        try:
+            return UNREADABLE if path.exists() else ""
+        except OSError:
+            return UNREADABLE
+    rev = current.get("revision")
+    if isinstance(rev, str) and rev:
+        return rev
+    # a readable record from an earlier release (no token, or an integer revision): a stable token from its own facts;
+    # the next failure writes a fresh random one
+    return f"legacy:{rev}:{current.get('last_failure_epoch')}:{current.get('down_since')}:{current.get('state')}"
 
 
 def _write(path: Path, value: dict) -> bool:
@@ -105,7 +121,7 @@ def _write(path: Path, value: dict) -> bool:
         return False
 
 
-def note_down(logs_dir: Path, *, free_bytes: int | None, floor_bytes: int, reason: str, now: float, kind: str = "write") -> int | None:
+def note_down(logs_dir: Path, *, free_bytes: int | None, floor_bytes: int, reason: str, now: float, kind: str = "write") -> str | None:
     """The disk is too full to take audio: say so (the first `down_since` stays until it recovers) and raise the
     revision. A write failure during a space alert upgrades it to `write`. Returns the new revision (None: not
     recorded; the caller's own latch still knows)."""
@@ -113,7 +129,7 @@ def note_down(logs_dir: Path, *, free_bytes: int | None, floor_bytes: int, reaso
         path = _path(logs_dir)
         with _locked(logs_dir):
             current = read(logs_dir)
-            rev = revision(logs_dir) + 1
+            rev = uuid.uuid4().hex
             if current and current.get("state") == "down":
                 upgraded = "write" if kind == "write" or current.get("kind") == "write" else current.get("kind", kind)
                 ok = _write(path, {**current, "kind": upgraded, "reason": reason, "last_failure_epoch": now, "revision": rev})
@@ -155,7 +171,7 @@ def watch(logs_dir: Path, data_dir: Path, *, floor_bytes: int, now: float, other
         log.exception("disk alert: watch failed")
 
 
-def witness(logs_dir: Path, dirs: Iterable[Path], *, floor_bytes: int, now: float, since_revision: int) -> bool | None:
+def witness(logs_dir: Path, dirs: Iterable[Path], *, floor_bytes: int, now: float, since_revision: str) -> bool | None:
     """From the API, after a durable publication and its outer COMMIT that began at `since_revision`: True when every
     required volume has room (and a down alert of that same revision is now recovered); False when a volume is low or
     unmeasured, or a newer failure was noted meanwhile; None when the monitor couldn't be read or written."""
@@ -165,6 +181,8 @@ def witness(logs_dir: Path, dirs: Iterable[Path], *, floor_bytes: int, now: floa
     try:
         with _locked(logs_dir):
             current = read(logs_dir)
+            if since_revision == UNREADABLE or (current is None and revision(logs_dir) == UNREADABLE):
+                return None  # unknown monitor state: no evidence either way (IT4-07)
             if current is None or current.get("state") != "down":
                 return True
             if revision(logs_dir) != since_revision:
