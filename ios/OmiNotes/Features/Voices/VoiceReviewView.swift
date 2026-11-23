@@ -145,7 +145,8 @@ struct VoiceReviewView: View {
             case .isThis(_, let name): answers(item, name: name, clip: clipState)
             case .whoIsThis: whoAnswers(item, clip: clipState)
             }
-            bottomLine.frame(height: 50).padding(.bottom, 8)
+            bottomLine(swipe: { if case .isThis = q { return clipState.answerable } else { return false } }())
+                .frame(height: 50).padding(.bottom, 8)
         }
         .padding(.horizontal, 20)
     }
@@ -326,12 +327,13 @@ struct VoiceReviewView: View {
 
     // MARK: Undo and notices (in the hint's place, so they never cover an answer)
 
-    @ViewBuilder private var bottomLine: some View {
+    /// The undo toast, a notice, else the swipe hint: only where swiping answers (a clip Alan can hear).
+    @ViewBuilder private func bottomLine(swipe: Bool) -> some View {
         if let done = queue.undoable {
             undoToast(done)
         } else if let notice = queue.notice {
             noticeToast(notice)
-        } else {
+        } else if swipe {
             Label("左滑 不是 · 右滑 是", systemImage: "hand.draw").font(.footnote).foregroundStyle(.tertiary)
         }
     }
@@ -419,7 +421,7 @@ struct VoiceReviewView: View {
                 .buttonStyle(.borderedProminent).buttonBorderShape(.roundedRectangle(radius: 16))
             }
             Button("完成") { dismiss() }.font(.headline)
-            bottomLine.frame(height: 50).padding(.bottom, 8)
+            bottomLine(swipe: false).frame(height: 50).padding(.bottom, 8)
         }
         .padding(.horizontal, 20)
     }
