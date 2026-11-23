@@ -55,6 +55,15 @@ def note_unknown() -> None:
     last_unknown = next(_observations)
 
 
+last_low = 0
+
+
+def note_low() -> None:
+    """A measured volume below the floor, kept in this process even when disk.json can't be written (IT3-03)."""
+    global last_low
+    last_low = next(_observations)
+
+
 class MonitorUnavailable(Exception):
     """The alert lock couldn't be taken in time: nothing was read or written."""
 
@@ -181,6 +190,7 @@ def watch(logs_dir: Path, data_dir: Path, *, floor_bytes: int, now: float, other
                 note_unknown()  # never recovery evidence, and it outranks an older healthy observation
                 continue
         if frees and min(frees) < floor_bytes:
+            note_low()
             note_down(logs_dir, free_bytes=min(frees), floor_bytes=floor_bytes, reason="free space below the upload floor",
                       now=now, kind="space")  # fmt: skip
     except Exception:

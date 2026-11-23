@@ -474,12 +474,13 @@ class Ingest:
             if rev is None:
                 self.healthy_at = None
                 return
+            seq = disk_alert.observed()  # numbered before measuring: a later observation outranks it (IT3-02)
             ok = disk_alert.witness(self.settings.logs_dir, [self.vault.raw, self.db.path.parent], floor_bytes=MIN_FREE_BYTES,
                                     now=self.clock(), since_revision=rev)  # fmt: skip
             if ok is True and failures == self._failures:
                 self.down_latch = None
                 self.healthy_at = self.clock()
-                self.healthy_seq = disk_alert.observed()
+                self.healthy_seq = seq
             else:
                 self.healthy_at = None  # a newer low, unmeasured or unknown observation: no standing healthy evidence
         except Exception:
@@ -487,7 +488,7 @@ class Ingest:
 
     @property
     def _state(self):
-        """The process's one recovery owner (pending identities, repair queue, prepared facts): shared with repairs."""
+        """The process's recovery facts (pending identities, startup-prepared receipts and evidence) for request adoption."""
         from .rebuild import recovery_state
 
         return recovery_state(self.vault)
@@ -590,7 +591,7 @@ class Ingest:
             existing = db.one("SELECT sha256 FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq))
             if existing is not None:
                 if existing["sha256"] == digest:
-                    self._pending.pop((capture_id, seq, digest), None)  # proven stored: its admission slot is free (IT4-03)
+                    self._pending.pop((capture_id, seq, digest), None)  # proven stored: nothing pending for it any more (IT4-03)
                     return ok(200, True)
                 return ok(200, True) if self._same_audio_again(capture_id, seq, body, digest, same) else self._conflict()
 
@@ -749,17 +750,17 @@ class Ingest:
         if path.exists():
             if sha256_hex(path.read_bytes()) != digest:
                 raise ApiError(409, "chunk_conflict", "different content is already stored under this identity")
-            self._adopt(header, digest, size, path, deleted=False, ring=ring_record_hashes(env), request=True)
+            self._adopt(header, digest, size, path, deleted=False, ring=ring_record_hashes(env))
         else:
             tomb = json.loads(tomb_path.read_text())
             if tomb.get("sha256") != digest:
                 raise ApiError(409, "chunk_conflict", "different content was stored (and expired) under this identity")
-            self._adopt(header, digest, size, tomb_path, deleted=True, ring=[], request=True)
+            self._adopt(header, digest, size, tomb_path, deleted=True, ring=[])
         self._witness(snapshot)  # a real publication and COMMIT (not the duplicate fast path)
         return 200, True
 
-    def _adopt(self, header, digest: str, size: int, artifact, *, deleted: bool, ring, request: bool) -> None:
-        """The one way a file already on disk becomes a stored row (a request's own retry or the worker's repair): this
+    def _adopt(self, header, digest: str, size: int, artifact, *, deleted: bool, ring) -> None:
+        """The one way a file already on disk becomes a stored row on a request (that identity's own retry): this
         identity's artifact and dependencies confirmed to the vault root, its receipt time from this process's pending
         record or the startup lookup (never a scan), its own slice of tombstone evidence, one commit, then its pending
         slot released. Work is bounded by the identity (IT4-02/03). Raises ApiError/OSError; caller holds `_lock`."""
@@ -782,10 +783,8 @@ class Ingest:
         if pending is None:
             prepared = state.receipts.get(ids)
             if prepared is None:
-                if request:
-                    raise ApiError(503, "unresolved_identity",
-                                   "this part's earlier copy can't be checked by this server process yet; send it again later")
-                prepared = {}  # a repair of an identity the sweep queued without receipts: its time is chosen now
+                raise ApiError(503, "unresolved_identity",
+                               "this part's earlier copy can't be checked by this server process yet; send it again later")
             line = prepared.get((seq, digest))
             pending = self._pending.setdefault(key, [line if line is not None else self.clock(), line is not None])
         receipts = self.vault.receipts_path(*ids)

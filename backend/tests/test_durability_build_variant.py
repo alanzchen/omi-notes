@@ -132,7 +132,10 @@ def test_recovery_fsync_cost_scales_with_prior_orphans(client, settings, monkeyp
 def test_a_legacy_complete_index_is_audited_before_its_duplicate_fast_path(client, settings, monkeypatch):
     """A1 (legacy trust): an index built under the old rule (no `publication_contract`) holds a row whose file never
     reached its directory durably. A restart must not answer that identity 200 from the old row: the index is rebuilt
-    once, confirming every file, and the unconfirmable capture stays unindexed until its own retry can prove it."""
+    once, confirming every file. That row was acknowledged, so a rebuild that can't confirm it is refused (2026-11-23
+    R4, IT3-01): the server stays up not ready, the legacy index is left untouched, uploads get a retryable 507, and a
+    retry once storage recovers completes the audit."""
+    from omi_notes import api
     _free(monkeypatch, 50 * GiB)
     cap = str(uuid.uuid4())
     bodies = _envs(cap)
@@ -149,11 +152,16 @@ def test_a_legacy_complete_index_is_audited_before_its_duplicate_fast_path(clien
 
     monkeypatch.setattr(spool, 'fsync_dir', cannot_sync)
     monkeypatch.setattr(vault_module, 'fsync_dir', cannot_sync)
+    restarts = []
+    monkeypatch.setattr(api, '_exit_for_restart', lambda: restarts.append(True))
     restarted = TestClient(create_app(settings, start_worker=False))
-    assert restarted.app.state.db.meta('publication_contract') is not None, 'the legacy index was audited (rebuilt)'
-    assert restarted.app.state.db.one('SELECT 1 FROM chunks WHERE capture_id=?', (cap,)) is None
+    assert restarted.get('/healthz').status_code == 503, 'an audit that would drop an acknowledged row is refused'
+    assert restarted.app.state.db.meta('publication_contract') is None, 'the legacy index is left untouched'
     assert put_chunk(restarted, cap, 0, bodies[0]).status_code == 507, 'no 200 from an unaudited legacy row'
     monkeypatch.setattr(spool, 'fsync_dir', real)
     monkeypatch.setattr(vault_module, 'fsync_dir', real)
-    assert put_chunk(restarted, cap, 0, bodies[0]).status_code == 200  # provable now: adopted, original bytes kept
+    assert restarted.app.state.retry_now() and restarts == [True]
+    ready = TestClient(create_app(settings, start_worker=False))
+    assert ready.app.state.db.meta('publication_contract') is not None, 'the legacy index was audited (rebuilt)'
+    assert put_chunk(ready, cap, 0, bodies[0]).status_code == 200  # provable now, original bytes kept
     assert (folder / '0.omnc').read_bytes() == bodies[0]

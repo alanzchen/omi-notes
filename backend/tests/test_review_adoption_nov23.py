@@ -75,5 +75,5 @@ def test_worker_sqlite_full_keeps_repair_scheduled(client, settings, monkeypatch
     assert put_chunk(client,cap,0,body).status_code==507  # a second SQLITE_FULL on the retry
     assert put_chunk(client,cap,0,body).status_code==200  # space returned: the next retry stores it
     row=client.app.state.db.one('SELECT 1 FROM chunks WHERE capture_id=? AND chunk_sequence=0',(cap,))
-    assert row, 'SQLITE_FULL during a repair must keep the identity scheduled for a later tick'
+    assert row, 'after a second SQLITE_FULL, the identity is stored by its own retry once space returns (no worker repair)'
     assert not any(k[0]==cap for k in client.app.state.ingest._pending)

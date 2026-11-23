@@ -6,10 +6,14 @@ import asyncio
 import hmac
 import json
 import logging
+import os
+import signal
+import sqlite3
 import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from datetime import date, datetime, timedelta
 from datetime import time as dt_time
 
@@ -27,12 +31,12 @@ from .ingest import UPLOAD_DECODES, ApiError, Ingest, NeedsComparison, capture_s
 from .lock import api_lock
 from .pipeline.conversations import ConversationPipeline, Providers, queue_counts
 from .pipeline.worker import Worker, read_only_reason
-from .rebuild import open_index
+from .rebuild import StartupIncomplete, open_index
 from .settings import Settings
 from .speakers.service import SpeakerService
 from . import disk_alert
 from .util import UUID_RE, iso_utc_epoch
-from .vault import LeaseError, Vault, VaultBusy
+from .vault import LeaseError, Vault, VaultBusy, index_dir
 
 log = logging.getLogger(__name__)
 MAX_JSON_BYTES = 64 * 1024
@@ -68,6 +72,110 @@ def acquire_worker_lock(lock, *, wait: float, step: float = 1.0) -> bool:
     return False
 
 
+class _ReadOnlyIndex:
+    """The previous index, read-only (never written or migrated: it is the rollback target)."""
+
+    def __init__(self, path: Path) -> None:
+        self._conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+
+    def one(self, sql: str, params: tuple = ()):
+        return self._conn.execute(sql, params).fetchone()
+
+    def query(self, sql: str, params: tuple = ()):
+        return self._conn.execute(sql, params).fetchall()
+
+    def meta(self, key: str):
+        row = self.one("SELECT value FROM meta WHERE key=?", (key,))
+        return row["value"] if row else None
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+RETRY_FIRST_SECONDS = 60.0
+RETRY_MAX_SECONDS = 1800.0
+
+
+def _exit_for_restart() -> None:
+    """The index is complete now: end this process cleanly; launchd's KeepAlive starts a normal, ready server."""
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+def not_ready_app(settings: Settings, vault: Vault, failure: StartupIncomplete, *, on_ready=None) -> FastAPI:
+    """A server that started but must not serve (ASTRA-20261123-IT3-01): the rebuild couldn't confirm uploads the
+    previous index held. It stays up (no crash loop under KeepAlive): /healthz answers 503 with the reason, every /v1
+    call is refused retryably (507 when the cause is a full disk, else 503) so the phone keeps its audio, the previous
+    index stays untouched for rollback, and the rebuild is retried with backoff (60 s doubling to 30 min). Once one
+    succeeds, `on_ready` runs (by default: exit cleanly so launchd restarts a ready server on the complete index)."""
+    log.error("startup incomplete, not serving: %s", failure.reason)
+    token = settings.omi_notes_token.encode()
+    target = index_dir(settings, vault) / "index.sqlite3"
+    state = {"reason": failure.reason, "disk_full": failure.disk_full, "ready": False, "attempts": 0}
+    serving = api_lock(vault)
+    stop = threading.Event()
+
+    def retry_now() -> bool:
+        state["attempts"] += 1
+        try:
+            open_index(settings, vault).close()
+        except StartupIncomplete as exc:
+            state.update(reason=exc.reason, disk_full=exc.disk_full)
+            log.error("startup still incomplete (attempt %d): %s", state["attempts"], exc.reason)
+            return False
+        except Exception:
+            log.exception("startup retry failed (attempt %d)", state["attempts"])
+            return False
+        state["ready"] = True
+        log.warning("startup complete after %d retries; restarting into a ready server", state["attempts"])
+        (on_ready or _exit_for_restart)()
+        return True
+
+    def retry_loop() -> None:
+        wait = RETRY_FIRST_SECONDS
+        while not stop.wait(wait) and not state["ready"]:
+            if retry_now():
+                return
+            wait = min(RETRY_MAX_SECONDS, wait * 2)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        if not serving.acquire():
+            raise VaultBusy(f"another backend (pid {serving.owner()}) is already serving this vault ({vault.root})")
+        thread = threading.Thread(target=retry_loop, name="omi-notes-startup-retry", daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+            serving.release()
+
+    app = FastAPI(title="omi-notes", version=__version__, lifespan=lifespan)
+    app.state.vault = vault
+    app.state.settings = settings
+    app.state.startup = state
+    app.state.retry_now = retry_now
+    app.state.db = _ReadOnlyIndex(target) if target.exists() else None
+
+    @app.middleware("http")
+    async def _refuse(request: Request, call_next):
+        if request.url.path == "/healthz":
+            return JSONResponse({"ok": False, "startup": "incomplete", "reason": state["reason"]}, status_code=503)
+        if request.url.path.startswith("/v1/"):
+            header = request.headers.get("authorization", "")
+            scheme, _, presented = header.partition(" ")
+            if scheme.lower() != "bearer" or not hmac.compare_digest(presented.strip().encode(), token):
+                return JSONResponse({"error": "unauthorized", "detail": "bad or missing bearer token"}, status_code=401)
+            if state["disk_full"]:
+                return JSONResponse({"error": "storage_full", "detail": "server disk is full; starting once it has room"},
+                                    status_code=507)  # fmt: skip
+            return JSONResponse({"error": "startup_incomplete", "detail": state["reason"]}, status_code=503)
+        return JSONResponse({"error": "not_found"}, status_code=404)
+
+    return app
+
+
 def create_app(
     settings: Settings, *, start_worker: bool = True, worker: Worker | None = None, take_over: bool = False
 ) -> FastAPI:
@@ -85,7 +193,10 @@ def create_app(
             f"{lease.get('host')} (pid {lease.get('pid')}) is writing this vault. Stop it first, or pass "
             "--take-over once it is stopped."
         )
-    db = open_index(settings, vault)
+    try:
+        db = open_index(settings, vault)
+    except StartupIncomplete as exc:
+        return not_ready_app(settings, vault, exc)
     started_at = time.time()
     ingest = Ingest(db, vault, settings, read_only=lambda: read_only_reason(db))
     token = settings.omi_notes_token.encode()
@@ -196,6 +307,8 @@ def create_app(
             if down or ingest.down_latch is not None:
                 since = alert.get("down_since") if down else iso_utc_epoch(ingest.down_latch)
                 return {"full": True, "since": since if isinstance(since, str) else None}  # only these types go out (IT3-03)
+            if disk_alert.last_low > ingest.healthy_seq:
+                return {"full": True, "since": None}  # the worker measured low space after it (IT3-03)
             healthy = ingest.healthy_at is not None and ingest.healthy_seq > disk_alert.last_unknown
             return {"full": False} if healthy else None  # a later unmeasurable volume outranks it (IT1-06)
         except Exception:

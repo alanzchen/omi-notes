@@ -17,6 +17,7 @@ queued for a cache-only re-render.
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import sqlite3
@@ -64,6 +65,8 @@ class Report:
     problems: list[str] = field(default_factory=list)  # reported, not fatal
     gaps: list[str] = field(default_factory=list)  # missing dependencies ⇒ read-only
     unresolved: list[str] = field(default_factory=list)  # captures whose files couldn't be confirmed: not indexed yet
+    unconfirmed_captures: list[tuple[str, str, int | None]] = field(default_factory=list)  # (device, capture, errno)
+    unconfirmed_events: list[tuple[Path, int | None]] = field(default_factory=list)  # (day file, errno)
 
     @property
     def read_only_reason(self) -> str | None:
@@ -141,6 +144,17 @@ _STATES: dict[str, RecoveryState] = {}
 
 def recovery_state(vault: Vault) -> RecoveryState:
     return _STATES.setdefault(os.path.realpath(vault.root), RecoveryState())
+
+
+class StartupIncomplete(Exception):
+    """A rebuild couldn't confirm artifacts the previous index already held (acknowledged uploads the phone may have
+    retired): the new index is not published and the server must not declare itself ready (ASTRA-20261123-IT3-01).
+    The previous index stays in place, untouched. `disk_full`: the cause was ENOSPC (uploads then answer 507)."""
+
+    def __init__(self, reason: str, *, disk_full: bool) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.disk_full = disk_full
 
 
 class Unconfirmed(OSError):
@@ -253,6 +267,7 @@ def _event_ops(vault: Vault, report: Report, known: dict[str, str] | None = None
         except OSError as exc:
             report.problems.append(f"events file {vault.relpath(path)} can't be confirmed durable now: {exc}")
             report.unresolved.append(vault.relpath(path))
+            report.unconfirmed_events.append((path, exc.errno))
             continue
         for line in Vault.read_jsonl(path):
             event_id, body, received = line.get("event_id"), line.get("body"), line.get("received_at")
@@ -438,12 +453,65 @@ def _validate(conn, vault: Vault, record: dict, report: Report) -> None:
 # -- build -------------------------------------------------------------------------------------------
 
 
-def build(settings: Settings, vault: Vault, path: Path, *, now: float | None = None) -> Report:
+def _acknowledged_capture(prior, capture: str) -> bool:
+    if prior is None:
+        return True  # no readable previous index: anything unconfirmed may have been acknowledged
+    try:
+        return bool(prior.execute("SELECT 1 FROM chunks WHERE capture_id=? LIMIT 1", (capture,)).fetchone()
+                    or prior.execute("SELECT 1 FROM captures WHERE capture_id=? AND seal_json IS NOT NULL", (capture,)).fetchone())
+    except sqlite3.Error:
+        return True
+
+
+def _acknowledged_events(prior, path: Path) -> bool:
+    if prior is None:
+        return True
+    try:
+        ids = [x["event_id"] for x in Vault.read_jsonl(path) if isinstance(x.get("event_id"), str)]
+        for i in range(0, len(ids), 500):
+            batch = ids[i:i + 500]
+            if prior.execute(f"SELECT 1 FROM events WHERE event_id IN ({','.join('?' * len(batch))}) LIMIT 1", batch).fetchone():
+                return True
+        return False
+    except (sqlite3.Error, OSError, ValueError):
+        return True
+
+
+def _refuse_if_acknowledged(report: Report, prior) -> None:
+    """Artifacts that couldn't be confirmed are acceptable only if no previous index held them (never acknowledged: the
+    phone still has them and retries). One the previous index held was acknowledged, and its phone copy may be gone:
+    a rebuild without it would stall its capture with nothing to bring it back (IT3-01)."""
+    blocking = [f"{d}/{c}" for d, c, _ in report.unconfirmed_captures if _acknowledged_capture(prior, c)]
+    blocking += [p.name for p, _ in report.unconfirmed_events if _acknowledged_events(prior, p)]
+    if blocking:
+        full = any(e == errno.ENOSPC for _, _, e in report.unconfirmed_captures) or any(
+            e == errno.ENOSPC for _, e in report.unconfirmed_events)
+        more = f" (and {len(blocking) - 5} more)" if len(blocking) > 5 else ""
+        raise StartupIncomplete(f"stored uploads couldn't be confirmed durable: {', '.join(blocking[:5])}{more}",
+                                disk_full=full)  # fmt: skip
+
+
+def _prior_index(path: Path, vault: Vault):
+    """The previous index of this vault, read-only, to tell acknowledged artifacts from never-acknowledged ones."""
+    if not path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+        if meta.get("vault_id") != vault.vault_id:
+            conn.close()
+            return None
+        return conn
+    except sqlite3.Error:
+        return None
+
+
+def build(settings: Settings, vault: Vault, path: Path, *, now: float | None = None, prior=None) -> Report:
     """Build a complete index at `path` from the vault (the file is replaced)."""
     now = time.time() if now is None else now
     for suffix in ("", "-wal", "-shm", "-journal"):
         Path(str(path) + suffix).unlink(missing_ok=True)
-    db = Database(path)
     report = Report()
     ops: list[_Op] = []
     captures = []
@@ -451,12 +519,15 @@ def build(settings: Settings, vault: Vault, path: Path, *, now: float | None = N
         try:
             ops += _capture_ops(vault, device, capture, report)
             captures.append((device, capture))
-        except Unconfirmed as exc:  # kept on disk and reported; indexed once it can be confirmed (sweep / its own PUT)
+        except Unconfirmed as exc:  # kept on disk; decided below: acknowledged before → the rebuild is refused
             report.unresolved.append(f"{device}/{capture}")
+            report.unconfirmed_captures.append((device, capture, exc.errno))
             report.problems.append(str(exc))
     if vault.raw.exists():
         vault.confirm(vault.raw)  # raw → _omi → vault root (anchored); failing here fails the build, never a weaker index
     ops += _event_ops(vault, report)
+    _refuse_if_acknowledged(report, prior)
+    db = Database(path)
     ops.sort(key=lambda op: (op.received_at, op.rank, op.key))
     with db.tx() as conn:
         for op in ops:
@@ -554,7 +625,16 @@ def rebuild(settings: Settings, vault: Vault, *, now: float | None = None) -> Re
     directory = index_dir(settings, vault)
     directory.mkdir(parents=True, exist_ok=True)
     tmp, target = directory / "index.tmp", directory / "index.sqlite3"
-    report = build(settings, vault, tmp, now=now)
+    prior = _prior_index(target, vault)
+    try:
+        report = build(settings, vault, tmp, now=now, prior=prior)
+    except BaseException:
+        for suffix in ("", "-wal", "-shm", "-journal"):  # nothing half-built is left to fill the disk
+            Path(str(tmp) + suffix).unlink(missing_ok=True)
+        raise  # the previous index is untouched
+    finally:
+        if prior is not None:
+            prior.close()
     for suffix in ("-wal", "-shm"):
         Path(str(target) + suffix).unlink(missing_ok=True)
     os.replace(tmp, target)
