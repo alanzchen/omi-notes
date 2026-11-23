@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import itertools
 import json
 import logging
 import os
@@ -38,6 +39,20 @@ CHECK = "df -h ~/OmiNotes; the phone keeps its audio and retries (507) until the
 HYSTERESIS = 256 * 1024 * 1024
 LOCK_WAIT_SECONDS = 2.0
 _thread_lock = threading.Lock()
+# Order of observations in this process (no clock involved): a volume found unmeasurable after the last healthy
+# observation outranks it, so status can't keep saying "not full" from older evidence (ASTRA-20261123-IT1-06).
+_observations = itertools.count(1)
+last_unknown = 0
+
+
+def observed() -> int:
+    """The next observation number (a healthy one is recorded with it)."""
+    return next(_observations)
+
+
+def note_unknown() -> None:
+    global last_unknown
+    last_unknown = next(_observations)
 
 
 class MonitorUnavailable(Exception):
@@ -163,7 +178,8 @@ def watch(logs_dir: Path, data_dir: Path, *, floor_bytes: int, now: float, other
             try:
                 frees.append(shutil.disk_usage(d).free)
             except OSError:
-                continue  # one that can't be measured proves nothing either way
+                note_unknown()  # never recovery evidence, and it outranks an older healthy observation
+                continue
         if frees and min(frees) < floor_bytes:
             note_down(logs_dir, free_bytes=min(frees), floor_bytes=floor_bytes, reason="free space below the upload floor",
                       now=now, kind="space")  # fmt: skip

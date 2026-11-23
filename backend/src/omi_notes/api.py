@@ -196,7 +196,8 @@ def create_app(
             if down or ingest.down_latch is not None:
                 since = alert.get("down_since") if down else iso_utc_epoch(ingest.down_latch)
                 return {"full": True, "since": since if isinstance(since, str) else None}  # only these types go out (IT3-03)
-            return {"full": False} if ingest.healthy_at is not None else None
+            healthy = ingest.healthy_at is not None and ingest.healthy_seq > disk_alert.last_unknown
+            return {"full": False} if healthy else None  # a later unmeasurable volume outranks it (IT1-06)
         except Exception:
             log.exception("disk status unavailable")
             return None

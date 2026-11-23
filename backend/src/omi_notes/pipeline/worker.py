@@ -98,7 +98,6 @@ class Worker:
             hard_max=settings.hard_max_conversation_seconds,
         )
         self.lock = worker_lock(self.vault)
-        self._repairer = None
         self._decoders: OrderedDict[str, tuple[int, CaptureTimeline, VadStream]] = OrderedDict()
         self._last_retention = 0.0
         self._last_class_reconcile = 0.0
@@ -108,21 +107,6 @@ class Worker:
 
     # -- loop ------------------------------------------------------------------------------------
 
-    def _drain_unresolved(self, now: float) -> None:
-        """Files on disk without their rows (startup or a failed publication): a few identities per tick through the
-        ingest's own adoption, each under the ingest lock (IT4-02). Never fails the tick."""
-        try:
-            from ..ingest import Ingest
-            from ..rebuild import recovery_state
-
-            if not recovery_state(self.vault).queued:
-                return
-            if self._repairer is None:
-                self._repairer = Ingest(self.db, self.vault, self.settings, read_only=lambda: read_only_reason(self.db))
-            self._repairer.drain(now)
-        except Exception:
-            log.exception("repairing unindexed files failed")
-
     def tick(self, now: float | None = None) -> dict:
         now = self.clock() if now is None else now
         # the disk alert first: it needs no index write, which a full disk may be what stops (2026-11-20 18:05)
@@ -130,8 +114,6 @@ class Worker:
         disk_alert.watch(self.settings.logs_dir, self.settings.vault_dir, floor_bytes=MIN_FREE_BYTES, now=now,
                          other_dirs=[self.db.path.parent])  # fmt: skip
         blocked = read_only_reason(self.db)
-        if not blocked:
-            self._drain_unresolved(now)
         if blocked:
             self._status(now, force=False)
             return {"chunks": 0, "segmentation_changes": 0, "conversations": 0, "read_only": blocked}

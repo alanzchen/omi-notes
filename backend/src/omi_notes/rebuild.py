@@ -24,7 +24,6 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -100,45 +99,21 @@ def _receipts(vault: Vault, device: str, capture: str) -> dict[tuple[int, str], 
 
 @dataclass
 class RecoveryState:
-    """The one owner of recovery facts for this process's requests and repairs, so neither scans history (DESIGN-03/05,
-    ASTRA-20261122-IT4-02/03):
+    """What this process knows for request adoption, so no request scans history (DESIGN-03/05; reset 2026-11-23 R3):
     - `pending`: identities (capture, seq, digest) whose publication began in this process and isn't committed:
-      [receipt time chosen before any write, whether that receipt line is confirmed]. Released only when that identity's
-      row exists (its own commit, a repair's commit, or a proven same-digest duplicate). Bounded by PENDING_MAX.
-    - `queue`/`queued`: identities (device, capture, seq; -1 = the saved seal) known to be on disk without a row, for
-      the worker's bounded repair; `retry_at` backs each one off.
+      [receipt time chosen before any write, whether that receipt line is confirmed]. Dropped on commit, on a proven
+      duplicate, or when the attempt failed before its file existed.
     - `high_water`: per capture, the highest sequence with a file on disk; a new seal can't end before it.
-    - `receipts`: per unresolved capture, receipt times by (sequence, digest), read once at startup.
-    - `evidence`: per unresolved capture, its capture.json evidence already split by sequence ({seq: partition}), or
-      `UNREADABLE`.
+    - for captures the startup sweep couldn't confirm (`unresolved`): their receipt times by (sequence, digest) and their
+      capture.json evidence split by sequence, used only by that identity's own retry (the phone keeps every part until
+      a 2xx). Anything else waits for the next startup sweep; there is no background repair queue.
     Disposable: rebuilt by every sweep (pending entries are kept), never a vault format."""
 
     pending: dict[tuple[str, int, str], list] = field(default_factory=dict)
-    queue: deque = field(default_factory=deque)
-    queued: set[tuple[str, str, int]] = field(default_factory=set)
-    retry_at: dict[tuple[str, str, int], tuple[float, int]] = field(default_factory=dict)
     high_water: dict[str, int] = field(default_factory=dict)
+    unresolved: set[tuple[str, str]] = field(default_factory=set)
     receipts: dict[tuple[str, str], dict[tuple[int, str], float]] = field(default_factory=dict)
     evidence: dict[tuple[str, str], object] = field(default_factory=dict)
-
-    @property
-    def unresolved(self) -> set[tuple[str, str]]:
-        return {(d, c) for d, c, _ in self.queued}
-
-    def enqueue(self, device: str, capture: str, seq: int) -> None:
-        if (device, capture, seq) not in self.queued:
-            self.queued.add((device, capture, seq))
-            self.queue.append((device, capture, seq))
-
-    def resolved(self, device: str, capture: str, seq: int, digest: str | None = None) -> None:
-        """This identity has its row (or nothing left to index): out of the queue, its pending slot released."""
-        self.queued.discard((device, capture, seq))
-        self.retry_at.pop((device, capture, seq), None)
-        if digest is not None:
-            self.pending.pop((capture, seq, digest), None)
-        elif self.pending:  # a repair that found the row already there: the one identity's slots, whatever digest
-            for key in [k for k in self.pending if k[0] == capture and k[1] == seq]:
-                self.pending.pop(key, None)
 
 
 UNREADABLE = object()
@@ -664,12 +639,9 @@ def sweep(db: Database, vault: Vault) -> dict:
         if seqs - indexed or seal_missing:
             try:
                 counts["raw"] += index_capture_orphans(db, vault, device, capture)
-            except OSError as exc:  # can't be confirmed now: kept unindexed; each identity queued for bounded repair
+            except OSError as exc:  # can't be confirmed now: kept unindexed; its own retry or the next startup indexes it
                 log.warning("sweep: capture %s not indexed yet: %s", capture, exc)
-                for seq in sorted(seqs - indexed):
-                    state.enqueue(device, capture, seq)
-                if seal_missing:
-                    state.enqueue(device, capture, -1)
+                state.unresolved.add((device, capture))
                 state.receipts[(device, capture)] = _receipts(vault, device, capture)
                 try:
                     state.evidence[(device, capture)] = partition_evidence(Vault.read_json(vault.capture_json_path(device, capture)))

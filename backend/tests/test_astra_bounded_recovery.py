@@ -53,14 +53,15 @@ def test_tombstone_request_does_not_scan_all_prepared_evidence(client, monkeypat
     assert deleted.visited <= 1 and coverage.visited <= 1, 'one tombstone PUT must not scan every other sequence in prepared capture evidence'
 
 def test_worker_resolved_identity_releases_pending_admission(client, settings, monkeypatch):
-    _free(monkeypatch,50*GiB);monkeypatch.setattr(ingest,'PENDING_MAX',1)
+    """(adapted 2026-11-23 R3: there is no admission cap or worker repair any more; the identity is resolved by its own
+    retry, after which nothing is held and a new upload is taken; the final assertion is unchanged)"""
+    _free(monkeypatch,50*GiB)
     cap=str(uuid.uuid4());bodies=_envs(cap)
     fail_index_once(monkeypatch,'index_chunk')
     assert put_chunk(client,cap,0,bodies[0]).status_code==507
-    worker=Worker(settings,client.app.state.db)
-    worker._drain_unresolved(2000.0)
-    assert client.app.state.db.one('SELECT 1 FROM chunks WHERE capture_id=? AND chunk_sequence=0',(cap,))
     assert put_chunk(client,cap,0,bodies[0]).status_code==200
+    assert client.app.state.db.one('SELECT 1 FROM chunks WHERE capture_id=? AND chunk_sequence=0',(cap,))
+    assert not client.app.state.ingest._pending
     response=put_chunk(client,cap,1,bodies[1])
     print('AFTER_REPAIR_NEW_UPLOAD',response.status_code,response.json())
     assert response.status_code==201, 'resolved artifacts must not hold pending capacity forever'

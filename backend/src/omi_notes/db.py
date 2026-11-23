@@ -116,6 +116,8 @@ CREATE TABLE IF NOT EXISTS chunk_ranges (
     PRIMARY KEY (capture_id, start)
 );
 CREATE INDEX IF NOT EXISTS chunk_ranges_end ON chunk_ranges(capture_id, end);
+-- The not-yet-processed chunks, so the processed frontier is found without walking processed history (IT1-02).
+CREATE INDEX IF NOT EXISTS chunks_unprocessed ON chunks(capture_id, chunk_sequence) WHERE status <> 'processed';
 CREATE INDEX IF NOT EXISTS chunks_device_audio ON chunks(device_id, audio_start);
 
 -- Every ring record each received chunk contains (for the order-independent ownership rule).
