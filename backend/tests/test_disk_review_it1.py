@@ -90,6 +90,7 @@ def test_recovery_does_not_claim_an_index_full_error_is_resolved_from_vault_spac
     disk_alert.watch(settings.logs_dir,settings.vault_dir,floor_bytes=ingest.MIN_FREE_BYTES,now=100001)
     state=json.loads((settings.logs_dir/'alerts'/'disk.json').read_text())
     assert state['state']=='down'
-    # once the index has written again (after the alert), it is recovered
-    disk_alert.watch(settings.logs_dir,settings.vault_dir,floor_bytes=ingest.MIN_FREE_BYTES,now=100003,last_index_write=100002)
+    # once a publication begun after the alert has committed (the API's witness, DESIGN-07), it is recovered
+    rev = disk_alert.revision(settings.logs_dir)
+    disk_alert.witness(settings.logs_dir,[settings.vault_dir],floor_bytes=ingest.MIN_FREE_BYTES,now=100003,since_revision=rev)
     assert json.loads((settings.logs_dir/'alerts'/'disk.json').read_text())['state']=='recovered'

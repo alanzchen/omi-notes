@@ -17,6 +17,7 @@ queued for a cache-only re-render.
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import sqlite3
@@ -41,11 +42,17 @@ from .ingest import (
 )
 from .records import load_records, row_from_record
 from .settings import Settings
+from . import spool
 from .spool import fsync_dir
 from .util import canonical_json, sha256_hex
 from .vault import Vault, index_dir
 
 log = logging.getLogger(__name__)
+
+# The publication rule an index was built under (meta `publication_contract`). An index without it (or older) trusted
+# files by existence; it is rebuilt once, confirming every file and its chain, before any of its rows is trusted
+# (ASTRA-20261122-DESIGN-02). Only a complete build stamps it.
+PUBLICATION_CONTRACT = "1"
 
 
 @dataclass
@@ -57,6 +64,9 @@ class Report:
     conversations: int = 0
     problems: list[str] = field(default_factory=list)  # reported, not fatal
     gaps: list[str] = field(default_factory=list)  # missing dependencies ⇒ read-only
+    unresolved: list[str] = field(default_factory=list)  # captures whose files couldn't be confirmed: not indexed yet
+    unconfirmed_captures: list[tuple[str, str, int | None]] = field(default_factory=list)  # (device, capture, errno)
+    unconfirmed_events: list[tuple[Path, int | None]] = field(default_factory=list)  # (day file, errno)
 
     @property
     def read_only_reason(self) -> str | None:
@@ -80,22 +90,105 @@ class _Op:
         self.fn(conn, self.received_at)
 
 
-def _receipts(vault: Vault, device: str, capture: str) -> dict[int, tuple[float, str]]:
-    out: dict[int, tuple[float, str]] = {}
+def _receipts(vault: Vault, device: str, capture: str) -> dict[tuple[int, str], float]:
+    """First receipt time per (sequence, digest): a line for other bytes never supplies a time (DESIGN-03)."""
+    out: dict[tuple[int, str], float] = {}
     for line in Vault.read_jsonl(vault.receipts_path(device, capture)):
-        seq, at = line.get("seq"), line.get("received_at")
-        if isinstance(seq, int) and isinstance(at, (int, float)) and seq not in out:
-            out[seq] = (float(at), str(line.get("sha256")))
+        seq, at, sha = line.get("seq"), line.get("received_at"), line.get("sha256")
+        if isinstance(seq, int) and isinstance(at, (int, float)) and isinstance(sha, str) and (seq, sha) not in out:
+            out[(seq, sha)] = float(at)
     return out
+
+
+@dataclass
+class RecoveryState:
+    """What this process knows for request adoption, so no request scans history (DESIGN-03/05; reset 2026-11-23 R3):
+    - `pending`: identities (capture, seq, digest) whose publication began in this process and isn't committed:
+      [receipt time chosen before any write, whether that receipt line is confirmed]. Dropped on commit, on a proven
+      duplicate, or when the attempt failed before its file existed.
+    - `high_water`: per capture, the highest sequence with a file on disk; a new seal can't end before it.
+    - for captures the startup sweep couldn't confirm (`unresolved`): their receipt times by (sequence, digest) and their
+      capture.json evidence split by sequence, used only by that identity's own retry (the phone keeps every part until
+      a 2xx). Anything else waits for the next startup sweep; there is no background repair queue.
+    Disposable: rebuilt by every sweep (pending entries are kept), never a vault format."""
+
+    pending: dict[tuple[str, int, str], list] = field(default_factory=dict)
+    high_water: dict[str, int] = field(default_factory=dict)
+    unresolved: set[tuple[str, str]] = field(default_factory=set)
+    receipts: dict[tuple[str, str], dict[tuple[int, str], float]] = field(default_factory=dict)
+    evidence: dict[tuple[str, str], object] = field(default_factory=dict)
+
+
+UNREADABLE = object()
+_EVIDENCE_LISTS = ("coverage", "losses", "ring_seen", "ring_records", "speech_open")
+
+
+def partition_evidence(evidence: dict | None) -> dict[int, dict]:
+    """A capture.json split once by sequence: {seq: {"deleted": {seq: facts}, "coverage": [...], ...}}, so restoring
+    one tombstone touches only its own facts (IT4-02)."""
+    out: dict[int, dict] = {}
+    if not evidence:
+        return out
+    for key, facts in dict(evidence.get("deleted") or {}).items():
+        out.setdefault(int(key), {"deleted": {}})["deleted"][str(int(key))] = facts
+    for name in _EVIDENCE_LISTS:
+        for row in list(evidence.get(name) or []):
+            part = out.get(int(row[0]))
+            if part is not None:
+                part.setdefault(name, []).append(row)
+    return out
+
+
+_STATES: dict[str, RecoveryState] = {}
+
+
+def recovery_state(vault: Vault) -> RecoveryState:
+    return _STATES.setdefault(os.path.realpath(vault.root), RecoveryState())
+
+
+class StartupIncomplete(Exception):
+    """A rebuild couldn't confirm artifacts the previous index already held (acknowledged uploads the phone may have
+    retired): the new index is not published and the server must not declare itself ready (ASTRA-20261123-IT3-01).
+    The previous index stays in place, untouched. `disk_full`: the cause was ENOSPC (uploads then answer 507)."""
+
+    def __init__(self, reason: str, *, disk_full: bool) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.disk_full = disk_full
+
+
+class Unconfirmed(OSError):
+    """A capture's files or directories couldn't be confirmed durable: nothing of it is trusted yet."""
 
 
 def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, skip: set[tuple[str, int]] | None = None,
                  skip_seal: bool = False) -> list[_Op]:  # fmt: skip
-    """Index operations for one capture directory's files (`skip`: rows the index already has)."""
+    """Index operations for one capture directory's files (`skip`: rows the index already has). Every file an operation
+    trusts (chunk, tombstone, seal, receipts, capture.json evidence) is synced, then the capture and device directories;
+    any failure raises `Unconfirmed` and nothing of the capture is used (the caller confirms raw → vault root)."""
     cap_dir = vault.capture_dir(device, capture)
     ops: list[_Op] = []
-    receipts = _receipts(vault, device, capture)
     names = {p.name for p in cap_dir.iterdir()} if cap_dir.exists() else set()
+    try:
+        for name in sorted(names):
+            if name.endswith((".omnc", ".gone")) or name in ("seal.json", "receipts.jsonl", "capture.json"):
+                stem = name.partition(".")[0]
+                if stem.isdigit() and skip is not None and (capture, int(stem)) in skip:
+                    continue
+                spool.fsync_file(cap_dir / name)
+        if names:
+            spool.fsync_dir(cap_dir)
+            spool.fsync_dir(cap_dir.parent)
+    except OSError as exc:
+        raise Unconfirmed(exc.errno, f"capture {device}/{capture} can't be confirmed durable now: {exc}") from exc
+    receipts = _receipts(vault, device, capture)
+    # the saved seal bounds the capture here as on a request (DESIGN-04): a chunk above it is kept, never indexed
+    seal_last = None
+    if "seal.json" in names:
+        try:
+            seal_last = validate_seal(json.loads((cap_dir / "seal.json").read_text())["body"]).seal.last_chunk_sequence
+        except (ApiError, KeyError, TypeError, ValueError):
+            seal_last = None  # reported below with the seal itself
     seqs: dict[int, str] = {}
     for name in names:
         stem, dot, ext = name.partition(".")
@@ -105,6 +198,9 @@ def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, ski
                 seqs[seq] = ext
     for seq, ext in sorted(seqs.items()):
         if skip is not None and (capture, seq) in skip:
+            continue
+        if seal_last is not None and seq > seal_last:
+            report.problems.append(f"{vault.relpath(cap_dir / f'{seq}.{ext}')} is above its capture's seal: kept, not indexed")
             continue
         path = cap_dir / f"{seq}.omnc"
         if ext == "omnc":
@@ -120,9 +216,9 @@ def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, ski
             tomb = json.loads((cap_dir / f"{seq}.gone").read_text())
             digest, size, header, deleted, ring = tomb["sha256"], int(tomb["size"]), tombstone_header(tomb), True, []
             report.tombstones += 1
-        receipt = receipts.get(seq)
-        if receipt is not None and receipt[1] == digest:
-            received = receipt[0]
+        receipt = receipts.get((seq, digest))
+        if receipt is not None:
+            received = receipt
         else:
             # No receipt (a crash before it was appended): the chunk's own end time is the best
             # stable stand-in; the startup sweep appends a real receipt when it adopts the file.
@@ -166,6 +262,13 @@ def _event_ops(vault: Vault, report: Report, known: dict[str, str] | None = None
     for path in sorted(vault.events_dir.glob("*.jsonl")):
         if since is not None and path.stem < since:
             continue
+        try:
+            vault.confirm(path)  # a day file whose sync can't be confirmed is not trusted yet, on every path (IT4-01)
+        except OSError as exc:
+            report.problems.append(f"events file {vault.relpath(path)} can't be confirmed durable now: {exc}")
+            report.unresolved.append(vault.relpath(path))
+            report.unconfirmed_events.append((path, exc.errno))
+            continue
         for line in Vault.read_jsonl(path):
             event_id, body, received = line.get("event_id"), line.get("body"), line.get("received_at")
             if not isinstance(event_id, str) or not isinstance(received, (int, float)):
@@ -189,16 +292,24 @@ def _event_ops(vault: Vault, report: Report, known: dict[str, str] | None = None
 # -- capture.json evidence ---------------------------------------------------------------------------
 
 
-def apply_capture_evidence(conn, vault: Vault, device: str, capture: str, *, only_seq: int | None = None) -> None:
-    """Restore what deleted chunks contributed (from `capture.json`): chunk facts, coverage,
-    losses, ring ownership, tentative speech, continuation checkpoints."""
-    evidence = Vault.read_json(vault.capture_json_path(device, capture))
+def apply_capture_evidence(conn, vault: Vault, device: str, capture: str, *, only_seq: int | None = None,
+                           evidence: dict | None = None) -> None:  # fmt: skip
+    """Restore what deleted chunks contributed (from `capture.json`, or `evidence` already parsed at startup): chunk
+    facts, coverage, losses, ring ownership, tentative speech, continuation checkpoints. With `only_seq` the index is
+    read for that one chunk only (a request's own identity, DESIGN-03)."""
+    if evidence is None:
+        evidence = Vault.read_json(vault.capture_json_path(device, capture))
     if not evidence:
         return
     deleted = {int(k): v for k, v in (evidence.get("deleted") or {}).items()}
-    tombstoned = {r["chunk_sequence"] for r in conn.execute(
-        "SELECT chunk_sequence FROM chunks WHERE capture_id=? AND raw_deleted=1", (capture,)
-    )}  # fmt: skip
+    if only_seq is not None:
+        tombstoned = {r["chunk_sequence"] for r in conn.execute(
+            "SELECT chunk_sequence FROM chunks WHERE capture_id=? AND chunk_sequence=? AND raw_deleted=1", (capture, only_seq)
+        )}  # fmt: skip
+    else:
+        tombstoned = {r["chunk_sequence"] for r in conn.execute(
+            "SELECT chunk_sequence FROM chunks WHERE capture_id=? AND raw_deleted=1", (capture,)
+        )}  # fmt: skip
     seqs = {s for s in deleted if s in tombstoned and (only_seq is None or s == only_seq)}
     for seq in sorted(seqs):
         facts = deleted[seq]
@@ -225,7 +336,8 @@ def apply_capture_evidence(conn, vault: Vault, device: str, capture: str, *, onl
         [(device, rs, h, capture, seq) for seq, rs, h in rows("ring_seen")],
     )
     received = {r["chunk_sequence"]: r["received_at"] for r in conn.execute(
-        "SELECT chunk_sequence, received_at FROM chunks WHERE capture_id=?", (capture,)
+        "SELECT chunk_sequence, received_at FROM chunks WHERE capture_id=?" + (" AND chunk_sequence=?" if only_seq is not None else ""),
+        (capture,) if only_seq is None else (capture, only_seq),
     )}  # fmt: skip
     conn.executemany(
         """INSERT OR IGNORE INTO ring_records (device_id, ring_seq, record_hash, capture_id, chunk_sequence, received_at)
@@ -341,18 +453,81 @@ def _validate(conn, vault: Vault, record: dict, report: Report) -> None:
 # -- build -------------------------------------------------------------------------------------------
 
 
-def build(settings: Settings, vault: Vault, path: Path, *, now: float | None = None) -> Report:
+def _acknowledged_capture(prior, capture: str) -> bool:
+    if prior is None:
+        return True  # no readable previous index: anything unconfirmed may have been acknowledged
+    try:
+        return bool(prior.execute("SELECT 1 FROM chunks WHERE capture_id=? LIMIT 1", (capture,)).fetchone()
+                    or prior.execute("SELECT 1 FROM captures WHERE capture_id=? AND seal_json IS NOT NULL", (capture,)).fetchone())
+    except sqlite3.Error:
+        return True
+
+
+def _acknowledged_events(prior, path: Path) -> bool:
+    if prior is None:
+        return True
+    try:
+        ids = [x["event_id"] for x in Vault.read_jsonl(path) if isinstance(x.get("event_id"), str)]
+        for i in range(0, len(ids), 500):
+            batch = ids[i:i + 500]
+            if prior.execute(f"SELECT 1 FROM events WHERE event_id IN ({','.join('?' * len(batch))}) LIMIT 1", batch).fetchone():
+                return True
+        return False
+    except (sqlite3.Error, OSError, ValueError):
+        return True
+
+
+def _refuse_if_acknowledged(report: Report, prior) -> None:
+    """Artifacts that couldn't be confirmed are acceptable only if no previous index held them (never acknowledged: the
+    phone still has them and retries). One the previous index held was acknowledged, and its phone copy may be gone:
+    a rebuild without it would stall its capture with nothing to bring it back (IT3-01)."""
+    blocking = [f"{d}/{c}" for d, c, _ in report.unconfirmed_captures if _acknowledged_capture(prior, c)]
+    blocking += [p.name for p, _ in report.unconfirmed_events if _acknowledged_events(prior, p)]
+    if blocking:
+        full = any(e == errno.ENOSPC for _, _, e in report.unconfirmed_captures) or any(
+            e == errno.ENOSPC for _, e in report.unconfirmed_events)
+        more = f" (and {len(blocking) - 5} more)" if len(blocking) > 5 else ""
+        raise StartupIncomplete(f"stored uploads couldn't be confirmed durable: {', '.join(blocking[:5])}{more}",
+                                disk_full=full)  # fmt: skip
+
+
+def _prior_index(path: Path, vault: Vault):
+    """The previous index of this vault, read-only, to tell acknowledged artifacts from never-acknowledged ones."""
+    if not path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+        if meta.get("vault_id") != vault.vault_id:
+            conn.close()
+            return None
+        return conn
+    except sqlite3.Error:
+        return None
+
+
+def build(settings: Settings, vault: Vault, path: Path, *, now: float | None = None, prior=None) -> Report:
     """Build a complete index at `path` from the vault (the file is replaced)."""
     now = time.time() if now is None else now
     for suffix in ("", "-wal", "-shm", "-journal"):
         Path(str(path) + suffix).unlink(missing_ok=True)
-    db = Database(path)
     report = Report()
     ops: list[_Op] = []
-    captures = list(_captures(vault))
-    for device, capture in captures:
-        ops += _capture_ops(vault, device, capture, report)
+    captures = []
+    for device, capture in _captures(vault):
+        try:
+            ops += _capture_ops(vault, device, capture, report)
+            captures.append((device, capture))
+        except Unconfirmed as exc:  # kept on disk; decided below: acknowledged before → the rebuild is refused
+            report.unresolved.append(f"{device}/{capture}")
+            report.unconfirmed_captures.append((device, capture, exc.errno))
+            report.problems.append(str(exc))
+    if vault.raw.exists():
+        vault.confirm(vault.raw)  # raw → _omi → vault root (anchored); failing here fails the build, never a weaker index
     ops += _event_ops(vault, report)
+    _refuse_if_acknowledged(report, prior)
+    db = Database(path)
     ops.sort(key=lambda op: (op.received_at, op.rank, op.key))
     with db.tx() as conn:
         for op in ops:
@@ -379,6 +554,8 @@ def build(settings: Settings, vault: Vault, path: Path, *, now: float | None = N
     db.set_meta("read_only", report.read_only_reason)
     db.set_meta("problems", json.dumps(report.problems[:50]) if report.problems else None)
     db.set_meta("built_at", repr(now))
+    db.set_meta("unresolved", json.dumps(report.unresolved[:200]) if report.unresolved else None)
+    db.set_meta("publication_contract", PUBLICATION_CONTRACT)
     db.set_meta("complete", "1")
     db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     db.close()
@@ -436,6 +613,8 @@ def index_is_current(path: Path, vault: Vault) -> str | None:
         return "vault path differs"
     if meta.get("complete") != "1":
         return "incomplete build"
+    if meta.get("publication_contract") != PUBLICATION_CONTRACT:
+        return "built under an older publication rule: every file is confirmed once before its rows are trusted"
     if meta.get("read_only"):
         return "the last build found an incomplete vault"
     return None
@@ -446,7 +625,16 @@ def rebuild(settings: Settings, vault: Vault, *, now: float | None = None) -> Re
     directory = index_dir(settings, vault)
     directory.mkdir(parents=True, exist_ok=True)
     tmp, target = directory / "index.tmp", directory / "index.sqlite3"
-    report = build(settings, vault, tmp, now=now)
+    prior = _prior_index(target, vault)
+    try:
+        report = build(settings, vault, tmp, now=now, prior=prior)
+    except BaseException:
+        for suffix in ("", "-wal", "-shm", "-journal"):  # nothing half-built is left to fill the disk
+            Path(str(tmp) + suffix).unlink(missing_ok=True)
+        raise  # the previous index is untouched
+    finally:
+        if prior is not None:
+            prior.close()
     for suffix in ("-wal", "-shm"):
         Path(str(target) + suffix).unlink(missing_ok=True)
     os.replace(tmp, target)
@@ -485,25 +673,23 @@ def index_capture_orphans(db: Database, vault: Vault, device: str, capture: str)
     report = Report()
     have = {(capture, r["chunk_sequence"]) for r in db.query("SELECT chunk_sequence FROM chunks WHERE capture_id=?", (capture,))}
     cap = db.one("SELECT seal_json FROM captures WHERE capture_id=?", (capture,))
+    # the capture's files and directories are synced (Unconfirmed otherwise), then its chain up to the vault root
     ops = _capture_ops(vault, device, capture, report, skip=have, skip_seal=cap is not None and cap["seal_json"] is not None)
     if not ops:
         return 0
+    vault.confirm(vault.capture_dir(device, capture))
     receipts = _receipts(vault, device, capture)
     now = time.time()
-    from .ingest import durable_existing
-
     for op in ops:
         seq = op.key[1]
-        if seq >= 0:
-            # a file found without its row is indexed only once it and its directory are synced (ASTRA-20261121-IT3-01)
-            data = vault.chunk_path(device, capture, seq)
-            durable_existing(data if data.exists() else vault.tombstone_path(device, capture, seq))
-        if seq >= 0 and seq not in receipts:
-            # Adopted now: persist a receipt so the next rebuild sees the same time.
-            data = vault.chunk_path(device, capture, seq)
-            digest = sha256_hex(data.read_bytes()) if data.exists() else json.loads(
-                vault.tombstone_path(device, capture, seq).read_text())["sha256"]
-            Vault.append_jsonl(vault.receipts_path(device, capture), {"seq": seq, "sha256": digest, "received_at": now})
+        if seq < 0:
+            continue
+        data = vault.chunk_path(device, capture, seq)
+        digest = sha256_hex(data.read_bytes()) if data.exists() else json.loads(
+            vault.tombstone_path(device, capture, seq).read_text())["sha256"]
+        if (seq, digest) not in receipts:
+            # Adopted now: persist a confirmed receipt so the next rebuild sees the same time.
+            vault.append_confirmed(vault.receipts_path(device, capture), {"seq": seq, "sha256": digest, "received_at": now})
             op.received_at = now
     with db.tx() as conn:
         for op in sorted(ops, key=lambda o: (o.received_at, o.rank, o.key)):
@@ -519,17 +705,32 @@ def sweep(db: Database, vault: Vault) -> dict:
     """Index files a crash left without index rows: raw chunks/tombstones/seals, recent event
     lines, and conversation records newer than their index row."""
     counts = {"raw": 0, "events": 0, "records": 0}
+    previous = _STATES.get(os.path.realpath(vault.root))
+    state = RecoveryState(pending=previous.pending if previous else {})  # in-flight publications outlive a sweep
     for device, capture in _captures(vault):
         cap_dir = vault.capture_dir(device, capture)
-        files = sum(1 for p in cap_dir.iterdir() if p.suffix in (".omnc", ".gone"))
+        seqs = {int(p.name.partition(".")[0]) for p in cap_dir.iterdir()
+                if p.suffix in (".omnc", ".gone") and p.name.partition(".")[0].isdigit()}  # fmt: skip
+        if seqs:
+            state.high_water[capture] = max(seqs)
         cap = db.one("SELECT seal_json FROM captures WHERE capture_id=?", (capture,))
-        indexed = db.one("SELECT COUNT(*) AS n FROM chunks WHERE capture_id=?", (capture,))["n"]
+        indexed = {r["chunk_sequence"] for r in db.query("SELECT chunk_sequence FROM chunks WHERE capture_id=?", (capture,))}
         seal_missing = (cap_dir / "seal.json").exists() and (cap is None or cap["seal_json"] is None)
-        if files != indexed or seal_missing:
+        if seqs - indexed or seal_missing:
             try:
                 counts["raw"] += index_capture_orphans(db, vault, device, capture)
-            except OSError as exc:  # a file that can't be synced now stays unindexed (a retry adopts it); startup goes on
+            except OSError as exc:  # can't be confirmed now: kept unindexed; its own retry or the next startup indexes it
                 log.warning("sweep: capture %s not indexed yet: %s", capture, exc)
+                state.unresolved.add((device, capture))
+                state.receipts[(device, capture)] = _receipts(vault, device, capture)
+                try:
+                    state.evidence[(device, capture)] = partition_evidence(Vault.read_json(vault.capture_json_path(device, capture)))
+                except (OSError, ValueError, TypeError, KeyError):
+                    state.evidence[(device, capture)] = UNREADABLE
+    _STATES[os.path.realpath(vault.root)] = state
+    if state.unresolved:
+        log.warning("sweep: %d capture(s) have files that can't be confirmed yet; their own uploads retry them",
+                    len(state.unresolved))
     latest = db.one("SELECT MAX(received_at) AS m FROM events")["m"]
     if vault.events_dir.exists():
         from datetime import UTC, datetime

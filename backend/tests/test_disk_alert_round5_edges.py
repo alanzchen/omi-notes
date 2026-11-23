@@ -1,6 +1,5 @@
 """Astra's IT5 monitoring checks (omi-notes-reviews/nightly-2026-11-21-it5/python/test_disk_alert_round5_edges.py), adopted.
-The concurrent-recovery check (IT5-03 a) is marked xfail: it needs a versioned compare-and-write, left for
-DURABILITY-DESIGN.md."""
+The concurrent-recovery check (IT5-03 a) now runs with real threads against the revision protocol (no longer xfail)."""
 from __future__ import annotations
 
 import errno
@@ -17,28 +16,37 @@ from .conftest import AUTH, put_chunk
 from .test_disk_full import GiB, _envs, _free
 
 
-@pytest.mark.xfail(strict=True, reason="IT5-03 (a): needs a versioned compare-and-write; see DURABILITY-DESIGN.md")
 def test_newer_failure_between_recovery_read_and_write_is_not_lost(client, settings, monkeypatch):
+    """(2026-11-22: Astra's recursive `_write` injection replaced with real thread concurrency, as IT1 §6/A7 asks; the
+    final assertion is unchanged and no longer xfail.) A recovery witness measures while another request's write fails;
+    the newer failure wins."""
     _free(monkeypatch, 50 * GiB)
     disk_alert.note_down(settings.logs_dir, free_bytes=None, floor_bytes=ingest.MIN_FREE_BYTES,
                          reason="first write failed", now=100, kind="write")
-    real_write = disk_alert._write
-    injected = []
+    began = disk_alert.revision(settings.logs_dir)
+    measuring, proceed = threading.Event(), threading.Event()
+    real_usage = disk_alert.shutil.disk_usage
 
-    def another_put_fails_before_publication(path, value):
-        if value.get("state") == "recovered" and not injected:
-            injected.append(True)
-            disk_alert.note_down(settings.logs_dir, free_bytes=None, floor_bytes=ingest.MIN_FREE_BYTES,
-                                 reason="concurrent newer write failed", now=120, kind="write")
-        return real_write(path, value)
+    def slow_usage(path):
+        measuring.set()
+        assert proceed.wait(5)
+        return real_usage(path)
 
-    monkeypatch.setattr(disk_alert, "_write", another_put_fails_before_publication)
-    disk_alert.watch(settings.logs_dir, settings.vault_dir, other_dirs=[settings.db_path.parent],
-                     floor_bytes=ingest.MIN_FREE_BYTES, now=121, last_index_write=110)
-    result = disk_alert.read(settings.logs_dir)
-    print("CONCURRENT_ALERT", result)
-    assert injected
-    assert result["state"] == "down", "recovery based on failure@100 cannot overwrite new failure@120"
+    monkeypatch.setattr(disk_alert.shutil, "disk_usage", slow_usage)
+    result = {}
+    t = threading.Thread(target=lambda: result.setdefault("ok", disk_alert.witness(
+        settings.logs_dir, [settings.vault_dir, settings.db_path.parent], floor_bytes=ingest.MIN_FREE_BYTES, now=121,
+        since_revision=began)))  # fmt: skip
+    t.start()
+    assert measuring.wait(5)
+    injected = disk_alert.note_down(settings.logs_dir, free_bytes=None, floor_bytes=ingest.MIN_FREE_BYTES,
+                                    reason="concurrent newer write failed", now=120, kind="write")
+    proceed.set()
+    t.join(5)
+    assert injected and result.get("ok") is False
+    state = disk_alert.read(settings.logs_dir)
+    print("CONCURRENT_ALERT", state)
+    assert state["state"] == "down", "recovery based on failure@100 cannot overwrite new failure@120"
 
 
 def test_successful_read_only_tick_is_not_index_write_evidence(client, settings, worker, monkeypatch):
@@ -65,13 +73,10 @@ def test_successful_read_only_tick_is_not_index_write_evidence(client, settings,
     assert len(observed) == 1
     failure, changes, result = observed[0]
     assert changes == 0 and result.get("read_only"), observed
-    # adapted from Astra's characterization (which asserted the defect, a witness newer than the failure): a tick that
-    # wrote nothing leaves no witness
-    assert worker._last_ok_tick is None or worker._last_ok_tick <= failure
-    disk_alert.watch(settings.logs_dir, settings.vault_dir, other_dirs=[settings.db_path.parent],
-                     floor_bytes=ingest.MIN_FREE_BYTES, now=time.time(), last_index_write=worker._last_ok_tick)
+    # (2026-11-22: the worker no longer witnesses anything, DESIGN-07: it is down-only; the final assertion is Astra's)
+    assert not hasattr(worker, "_last_ok_tick")
     alert = disk_alert.read(settings.logs_dir)
-    print("READ_ONLY_TICK_EVIDENCE", changes, result, worker._last_ok_tick, alert)
+    print("READ_ONLY_TICK_EVIDENCE", changes, result, alert)
     assert alert["state"] == "down", "a tick with no DB write cannot prove recovery of writes"
 
 

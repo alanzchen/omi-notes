@@ -289,7 +289,21 @@ def index_chunk(conn, header: EnvelopeHeader, *, digest: str, size: int, path: s
            VALUES (?,?,?,?,?,?)""",
         [(header.device_id, rs, h, capture_id, header.chunk_sequence, received_at) for rs, h in ring],
     )
+    _add_to_ranges(conn, capture_id, header.chunk_sequence)
     touch_device(conn, header.device_id, received_at, header.device_name, header.model_number, header.firmware_revision)
+
+
+def _add_to_ranges(conn, capture_id: str, seq: int) -> None:
+    """Merge one newly indexed sequence into its capture's disjoint ranges (two indexed lookups)."""
+    left = conn.execute("SELECT start FROM chunk_ranges WHERE capture_id=? AND end=?", (capture_id, seq - 1)).fetchone()
+    right = conn.execute("SELECT end FROM chunk_ranges WHERE capture_id=? AND start=?", (capture_id, seq + 1)).fetchone()
+    end = right[0] if right else seq
+    if right:
+        conn.execute("DELETE FROM chunk_ranges WHERE capture_id=? AND start=?", (capture_id, seq + 1))
+    if left:
+        conn.execute("UPDATE chunk_ranges SET end=? WHERE capture_id=? AND start=?", (end, capture_id, left[0]))
+    else:
+        conn.execute("INSERT INTO chunk_ranges (capture_id, start, end) VALUES (?,?,?)", (capture_id, seq, end))
 
 
 def index_seal(conn, capture_id: str, facts: SealFacts, received_at: float) -> None:
@@ -360,9 +374,10 @@ def touch_device(conn, device_id: str, now: float, name=None, model=None, firmwa
     )
 
 
-def receipt_time(vault: Vault, device_id: str, capture_id: str, seq: int) -> float | None:
+def receipt_time(vault: Vault, device_id: str, capture_id: str, seq: int, digest: str) -> float | None:
+    """The first receipt time for exactly these bytes (a line for other bytes never supplies one; DESIGN-03)."""
     for line in Vault.read_jsonl(vault.receipts_path(device_id, capture_id)):
-        if line.get("seq") == seq and isinstance(line.get("received_at"), (int, float)):
+        if line.get("seq") == seq and line.get("sha256") == digest and isinstance(line.get("received_at"), (int, float)):
             return float(line["received_at"])
     return None
 
@@ -374,16 +389,12 @@ def tombstone_header(tomb: dict) -> EnvelopeHeader:
 # -- ingest ----------------------------------------------------------------------------------------
 
 
-def durable_existing(path) -> None:
-    """A file found on disk counts as stored only once it and its directory are synced now: a matching hash proves its
-    content, not that it was durably published (a crash or a failed directory sync after the rename may have left it
-    only in the page cache; ASTRA-20261121-IT3-01). Raises OSError; nothing is rewritten."""
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    spool.fsync_dir(path.parent)
+def durable_existing(path, vault: Vault) -> None:
+    """A file found on disk counts as stored only once it and its whole directory chain to the vault root are synced
+    now: a matching hash proves its content, not that it was durably published (a crash or a failed directory sync
+    after the rename, on this or an earlier attempt, may have left it only in the page cache; ASTRA-20261121-IT3-01,
+    IT5-01, ASTRA-20261122-DESIGN-01/02). Raises OSError; nothing is rewritten."""
+    vault.confirm(path)
 
 
 def _disk_full_error(exc: BaseException | None) -> bool:
@@ -408,23 +419,90 @@ class Ingest:
         self.settings = settings
         self.read_only = read_only  # () -> reason or None
         self.clock = clock  # receipt times (injectable for tests)
-        # Captures / events with a durable file whose index commit failed in this process.
-        self._dirty: set[tuple[str, str]] = set()
+        # Disk evidence for /v1/status (DESIGN-07/08): a local latch set before the alert file is even tried (it may be
+        # unwritable on a full disk), cleared only by a witnessed publication begun after the last local failure.
+        self.down_latch: float | None = None
+        self._failures = 0
+        self.healthy_at: float | None = None  # this process measured every volume with room after a real publication
+        self.healthy_seq = 0  # its observation number (disk_alert.observed)
         self._pending_events: dict[str, tuple[str, float]] = {}
         # (capture_id, seq, sha256 of other bytes) -> same audio as the stored chunk
         self._verdicts: dict[tuple[str, int, str], bool] = {}
+
+    def _own_transaction(self) -> None:
+        """Publication owns its commit: called inside a caller's open transaction, a 2xx, a released slot or a recovery
+        witness could come before the real COMMIT (the outer one may still roll back). Refused (ASTRA-20261122-IT4-09)."""
+        if self.db.conn().in_transaction:
+            raise RuntimeError("uploads are stored in their own transaction, not inside an open one")
 
     def _writable(self) -> None:
         reason = self.read_only()
         if reason:
             raise ApiError(503, "vault_read_only", reason)
 
-    def _recover(self, device_id: str, capture_id: str) -> None:
-        if (device_id, capture_id) in self._dirty:
-            from .rebuild import index_capture_orphans
+    def _resolve_saved_seal(self, header, capture_id: str, capture):
+        """The capture's one saved seal.json, if its index row is missing: authoritative for chunk bounds, so it is
+        validated, confirmed and indexed before this chunk's bounds are decided (DESIGN-04). Unreadable, malformed or
+        unconfirmable is unresolved (retryable), never "no seal"."""
+        path = self.vault.seal_path(header.device_id, capture_id)
+        if not path.exists():  # one stat, only for an unsealed capture
+            return capture
+        try:
+            stored = Vault.read_json(path)
+            facts = validate_seal(stored["body"])
+            received = float(stored["received_at"])
+        except (OSError, ValueError, KeyError, TypeError, ApiError) as exc:
+            raise ApiError(503, "seal_unresolved", f"this capture's saved seal can't be read right now ({exc}); send it again") from exc
+        if facts.seal.device_id != header.device_id or facts.seal.source != header.source:
+            raise ApiError(409, "capture_identity_conflict", "device_id/source differ from this capture's seal")
+        durable_existing(path, self.vault)
+        with self.db.tx() as conn:
+            index_seal(conn, capture_id, facts, received)
+        return self.db.one("SELECT * FROM captures WHERE capture_id=?", (capture_id,))
 
-            index_capture_orphans(self.db, self.vault, device_id, capture_id)
-            self._dirty.discard((device_id, capture_id))
+    def _evidence_snapshot(self) -> tuple[str | None, int]:
+        try:
+            return disk_alert.revision(self.settings.logs_dir), self._failures
+        except Exception:
+            return None, self._failures
+
+    def _witness(self, snapshot: tuple[int, int]) -> None:
+        """After a durable publication and its outer COMMIT (never a duplicate 200): recovery evidence, if nothing failed
+        since `snapshot`. Never changes the answer."""
+        try:
+            rev, failures = snapshot
+            if rev is None:
+                self.healthy_at = None
+                return
+            seq = disk_alert.observed()  # numbered before measuring: a later observation outranks it (IT3-02)
+            ok = disk_alert.witness(self.settings.logs_dir, [self.vault.raw, self.db.path.parent], floor_bytes=MIN_FREE_BYTES,
+                                    now=self.clock(), since_revision=rev)  # fmt: skip
+            if ok is True and failures == self._failures:
+                self.down_latch = None
+                self.healthy_at = self.clock()
+                self.healthy_seq = seq
+            else:
+                self.healthy_at = None  # a newer low, unmeasured or unknown observation: no standing healthy evidence
+        except Exception:
+            log.exception("disk evidence after a publication failed")
+
+    @property
+    def _state(self):
+        """The process's recovery facts (pending identities, startup-prepared receipts and evidence) for request adoption."""
+        from .rebuild import recovery_state
+
+        return recovery_state(self.vault)
+
+    @property
+    def _pending(self) -> dict:
+        return self._state.pending
+
+    def _note_high_water(self, capture_id: str, seq: int) -> None:
+        from .rebuild import recovery_state
+
+        hw = recovery_state(self.vault).high_water
+        if seq > hw.get(capture_id, -1):
+            hw[capture_id] = seq
 
     # -- chunks ----------------------------------------------------------------------------------
 
@@ -449,6 +527,7 @@ class Ingest:
 
     def put_chunk(self, capture_id: str, seq: int, body: bytes, sha_header: str | None,
                   plan: ChunkPlan | None = None) -> tuple[int, dict]:  # fmt: skip
+        self._own_transaction()
         _check_uuid(capture_id, "capture_id")
         if seq < 0:
             raise ApiError(422, "invalid_chunk_sequence", "chunk_sequence must be >= 0")
@@ -512,6 +591,7 @@ class Ingest:
             existing = db.one("SELECT sha256 FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq))
             if existing is not None:
                 if existing["sha256"] == digest:
+                    self._pending.pop((capture_id, seq, digest), None)  # proven stored: nothing pending for it any more (IT4-03)
                     return ok(200, True)
                 return ok(200, True) if self._same_audio_again(capture_id, seq, body, digest, same) else self._conflict()
 
@@ -543,37 +623,51 @@ class Ingest:
                 if capture["capture_started_at"] is not None and abs(capture["capture_started_at"] - started) > 0.0015:
                     raise ApiError(409, "capture_identity_conflict", "capture_started_at differs from earlier chunks")
 
+            if capture is None or capture["seal_json"] is None:
+                capture = self._resolve_saved_seal(header, capture_id, capture)
+            # the seal bounds every way in, adoption of an existing file included (an orphan above it is kept, not used)
+            if capture is not None and capture["last_chunk_sequence"] is not None and seq > capture["last_chunk_sequence"]:
+                raise ApiError(409, "beyond_seal", "chunk_sequence is above the sealed last_chunk_sequence")
             path = vault.chunk_path(header.device_id, capture_id, seq)
             tomb_path = path.with_suffix(".gone")
             if path.exists() or tomb_path.exists():
                 return ok(*self._adopt_orphan(env, digest, len(body), path, tomb_path))
 
-            if capture is not None and capture["last_chunk_sequence"] is not None and seq > capture["last_chunk_sequence"]:
-                raise ApiError(409, "beyond_seal", "chunk_sequence is above the sealed last_chunk_sequence")
             self._writable()
+            snapshot = self._evidence_snapshot()
             self._ensure_space()
+            key = (capture_id, seq, digest)
+            pending = self._pending.setdefault(key, [self.clock(), False])  # the receipt time, chosen before writing
             try:
-                atomic_write_bytes(path, body)
+                vault.publish_bytes(path, body)  # file + chain to the vault root, never replacing a file
             except OSError as exc:
+                if path.exists():
+                    self._note_high_water(capture_id, seq)  # on disk, unconfirmed: a seal must not end before it
+                else:
+                    self._pending.pop(key, None)  # nothing was written: nothing to remember (IT1-01)
                 if exc.errno == errno.ENOSPC:
                     self._disk_full("a chunk write hit ENOSPC")
                     raise ApiError(507, "storage_full", "server disk is full") from exc
                 raise
-            now = self.clock()
+            self._note_high_water(capture_id, seq)
+            now = pending[0]
             try:
-                Vault.append_jsonl(vault.receipts_path(header.device_id, capture_id),
-                                   {"seq": seq, "sha256": digest, "received_at": now})  # fmt: skip
+                vault.append_confirmed(vault.receipts_path(header.device_id, capture_id),
+                                       {"seq": seq, "sha256": digest, "received_at": now})  # fmt: skip
+                pending[1] = True
                 with db.tx() as conn:
                     index_chunk(conn, header, digest=digest, size=len(body), path=vault.relpath(path), received_at=now,
                                 ring=ring_record_hashes(env))  # fmt: skip
             except BaseException as exc:
-                self._dirty.add((header.device_id, capture_id))
-                # the file is durable but not indexed (an orphan a retry with the same bytes adopts): a full disk here
-                # is 507 like any other, so the phone keeps the part and sends it again (2026-11-21)
+                # the file is durable but not indexed: the phone's retry of this identity adopts it with this same
+                # receipt time (or the next startup does); a full disk here is 507 like any other, so the phone keeps
+                # the part (2026-11-21)
                 if _disk_full_error(exc):
                     self._disk_full(f"storing a chunk's receipt/index failed: {exc}")
                     raise ApiError(507, "storage_full", "server disk is full") from exc
                 raise
+            self._pending.pop(key, None)
+            self._witness(snapshot)  # after the outer COMMIT
         return ok(201, False)
 
     @staticmethod
@@ -604,15 +698,15 @@ class Ingest:
         if alternate.exists() and sha256_hex(alternate.read_bytes()) != digest:  # damaged: these bytes again, durably
             log.warning("chunk %s/%d: alternate copy %s was damaged; writing it again", capture_id, seq, alternate.name)
             self._writable()
-            atomic_write_bytes(alternate, body)
+            atomic_write_bytes(alternate, body)  # a damaged non-canonical copy: replaced, then confirmed below
         if alternate.exists():
-            durable_existing(alternate)  # a copy found on disk is kept only once synced now (IT3-01)
+            durable_existing(alternate, self.vault)  # a copy found on disk is kept only once its chain is synced now
         else:
             self._writable()
             self._ensure_space()
-            atomic_write_bytes(alternate, body)
-            Vault.append_jsonl(self.vault.receipts_path(env.header.device_id, capture_id),
-                               {"alternate_of_seq": seq, "sha256": digest, "received_at": self.clock()})  # fmt: skip
+            self.vault.publish_bytes(alternate, body)
+            self.vault.append_confirmed(self.vault.receipts_path(env.header.device_id, capture_id),
+                                        {"alternate_of_seq": seq, "sha256": digest, "received_at": self.clock()})  # fmt: skip
         if not stored_path.exists():  # audio deleted before 2026-11-08: nothing to compare with
             return False
         if same is COMPARISON_UNAVAILABLE:  # the copy is kept above; the phone keeps its own and sends it again
@@ -652,32 +746,61 @@ class Ingest:
         """A durable file for this identity exists without an index row: same bytes → index it
         (200), different bytes → 409. Never overwritten."""
         header = env.header
+        snapshot = self._evidence_snapshot()
         if path.exists():
-            data = path.read_bytes()
-            if sha256_hex(data) != digest:
+            if sha256_hex(path.read_bytes()) != digest:
                 raise ApiError(409, "chunk_conflict", "different content is already stored under this identity")
-            deleted = False
-            durable_existing(path)  # before any receipt, row or 2xx (ENOSPC -> 507 in put_chunk)
+            self._adopt(header, digest, size, path, deleted=False, ring=ring_record_hashes(env))
         else:
             tomb = json.loads(tomb_path.read_text())
             if tomb.get("sha256") != digest:
                 raise ApiError(409, "chunk_conflict", "different content was stored (and expired) under this identity")
-            deleted = True
-            durable_existing(tomb_path)
-        received = receipt_time(self.vault, header.device_id, header.capture_id, header.chunk_sequence)
-        if received is None:
-            self._writable()
-            received = self.clock()
-            Vault.append_jsonl(self.vault.receipts_path(header.device_id, header.capture_id),
-                               {"seq": header.chunk_sequence, "sha256": digest, "received_at": received})  # fmt: skip
-        with self.db.tx() as conn:
-            index_chunk(conn, header, digest=digest, size=size, path=self.vault.relpath(path), received_at=received,
-                        raw_deleted=deleted, ring=ring_record_hashes(env))  # fmt: skip
-            if deleted:
-                from .rebuild import apply_capture_evidence
-
-                apply_capture_evidence(conn, self.vault, header.device_id, header.capture_id, only_seq=header.chunk_sequence)
+            self._adopt(header, digest, size, tomb_path, deleted=True, ring=[])
+        self._witness(snapshot)  # a real publication and COMMIT (not the duplicate fast path)
         return 200, True
+
+    def _adopt(self, header, digest: str, size: int, artifact, *, deleted: bool, ring) -> None:
+        """The one way a file already on disk becomes a stored row on a request (that identity's own retry): this
+        identity's artifact and dependencies confirmed to the vault root, its receipt time from this process's pending
+        record or the startup lookup (never a scan), its own slice of tombstone evidence, one commit, then its pending
+        slot released. Work is bounded by the identity (IT4-02/03). Raises ApiError/OSError; caller holds `_lock`."""
+        from .rebuild import UNREADABLE, apply_capture_evidence
+
+        ids = (header.device_id, header.capture_id)
+        seq = header.chunk_sequence
+        key = (header.capture_id, seq, digest)
+        state = self._state
+        durable_existing(artifact, self.vault)  # the actual .omnc or .gone, before any receipt, row or 2xx
+        partition = {}
+        if deleted:
+            prepared = state.evidence.get(ids)
+            if prepared is UNREADABLE:
+                raise ApiError(503, "unresolved_identity", "this capture's evidence can't be read right now; send it again later")
+            partition = (prepared or {}).get(seq, {})
+            if partition:
+                durable_existing(self.vault.capture_json_path(*ids), self.vault)  # the facts it brings back
+        pending = self._pending.get(key)
+        if pending is None:
+            prepared = state.receipts.get(ids)
+            if prepared is None:
+                raise ApiError(503, "unresolved_identity",
+                               "this part's earlier copy can't be checked by this server process yet; send it again later")
+            line = prepared.get((seq, digest))
+            pending = self._pending.setdefault(key, [line if line is not None else self.clock(), line is not None])
+        receipts = self.vault.receipts_path(*ids)
+        if pending[1]:
+            durable_existing(receipts, self.vault)  # a readable earlier append may have failed its sync
+        else:
+            self._writable()
+            self.vault.append_confirmed(receipts, {"seq": seq, "sha256": digest, "received_at": pending[0]})
+            pending[1] = True
+        with self.db.tx() as conn:
+            index_chunk(conn, header, digest=digest, size=size, path=self.vault.relpath(artifact.with_suffix(".omnc")),
+                        received_at=pending[0], raw_deleted=deleted, ring=ring)  # fmt: skip
+            if deleted:
+                apply_capture_evidence(conn, self.vault, *ids, only_seq=seq, evidence=partition)
+                advance_frontier(conn, header.capture_id, seq)  # bounded: a restored processed chunk extends it (IT4-04)
+        state.pending.pop(key, None)
 
     def _ensure_space(self) -> None:
         make_dirs_durable(self.vault.raw)
@@ -687,7 +810,12 @@ class Ingest:
             raise ApiError(507, "storage_full", "server disk is nearly full")
 
     def _disk_full(self, reason: str, free: int | None = None, kind: str = "write") -> None:
-        """Note the alert; never let the alert itself change the answer (ASTRA-20261121-IT1-02)."""
+        """Note the alert; never let the alert itself change the answer (ASTRA-20261121-IT1-02). The local latch first:
+        the alert file may be exactly what can't be written."""
+        self._failures += 1
+        if self.down_latch is None:
+            self.down_latch = self.clock()
+        self.healthy_at = None
         try:
             if free is None:
                 free = shutil.disk_usage(self.vault.raw).free
@@ -699,12 +827,13 @@ class Ingest:
     # -- seals -----------------------------------------------------------------------------------
 
     def put_seal(self, capture_id: str, raw: Any) -> tuple[int, dict]:
+        self._own_transaction()
         _check_uuid(capture_id, "capture_id")
         facts = validate_seal(raw)
         seal = facts.seal
         db, vault = self.db, self.vault
         with _lock:
-            self._recover(seal.device_id, capture_id)
+            # no capture sweep here (DESIGN-04): files without rows are bounded by the high-water mark below
             capture = db.one("SELECT * FROM captures WHERE capture_id=?", (capture_id,))
             if capture is not None and capture["seal_json"] is not None:
                 if capture["seal_json"] == facts.canonical:
@@ -714,70 +843,109 @@ class Ingest:
                 raise ApiError(409, "capture_identity_conflict", "device_id/source differ from this capture")
             path = vault.seal_path(seal.device_id, capture_id)
             stored = Vault.read_json(path)
-            if stored is not None:  # durable seal without an index row
+            if stored is not None:  # a seal file without an index row: trusted once its chain is confirmed
                 if canonical_json(stored.get("body")) != facts.canonical:
                     raise ApiError(409, "seal_conflict", "a different seal is already stored for this capture")
+                durable_existing(path, vault)
                 with db.tx() as conn:
                     index_seal(conn, capture_id, facts, float(stored["received_at"]))
                 return 200, capture_status(db, capture_id)  # type: ignore[return-value]
-            beyond = db.one("SELECT MAX(chunk_sequence) AS m FROM chunks WHERE capture_id=?", (capture_id,))
-            if beyond["m"] is not None and beyond["m"] > seal.last_chunk_sequence:
+            from .rebuild import recovery_state
+
+            beyond = db.one("SELECT MAX(chunk_sequence) AS m FROM chunks WHERE capture_id=?", (capture_id,))["m"]
+            on_disk = recovery_state(vault).high_water.get(capture_id)  # files without rows (startup + this process)
+            highest = max(x for x in (beyond, on_disk, -1) if x is not None)
+            if highest > seal.last_chunk_sequence:
                 raise ApiError(409, "chunks_beyond_seal", "chunks above last_chunk_sequence are already stored")
             self._writable()
             now = self.clock()
             Vault.write_json(path, {"body": raw, "received_at": now}, pretty=False)
-            try:
-                with db.tx() as conn:
-                    index_seal(conn, capture_id, facts, now)
-            except BaseException:
-                self._dirty.add((seal.device_id, capture_id))
-                raise
+            vault.confirm(path)
+            with db.tx() as conn:  # a failure leaves the confirmed seal.json: the next chunk or seal PUT indexes it
+                index_seal(conn, capture_id, facts, now)
         return 200, capture_status(db, capture_id)  # type: ignore[return-value]
 
     # -- events ----------------------------------------------------------------------------------
 
     def put_event(self, event_id: str, raw: Any) -> tuple[int, dict]:
+        self._own_transaction()
         _check_uuid(event_id, "event_id")
         facts = validate_event(raw)
         with _lock:
             existing = self.db.one("SELECT body_json FROM events WHERE event_id=?", (event_id,))
-            if existing is None and event_id in self._pending_events:
-                body, received = self._pending_events[event_id]
-                if body != facts.canonical:
-                    raise ApiError(409, "event_conflict", "a different event is already stored under this id")
-                with self.db.tx() as conn:
-                    index_event(conn, event_id, facts, received)
-                del self._pending_events[event_id]
-                return 200, {"event_id": event_id, "stored": True, "duplicate": True}
             if existing is not None:
                 if existing["body_json"] == facts.canonical:
                     return 200, {"event_id": event_id, "stored": True, "duplicate": True}
                 raise ApiError(409, "event_conflict", "a different event is already stored under this id")
-            self._writable()
-            now = self.clock()
-            Vault.append_jsonl(self.vault.events_path(now), {"event_id": event_id, "received_at": now, "body": raw})
-            try:
-                with self.db.tx() as conn:
-                    index_event(conn, event_id, facts, now)
-            except BaseException:
-                self._pending_events[event_id] = (facts.canonical, now)
-                raise
+            # [canonical body, received time chosen before writing, state, file offset before the append, the line's
+            # bytes]. States:
+            # "chosen" (nothing written), "uncertain" (the append was attempted: the line may or may not be there),
+            # "appended", "confirmed". A retry reuses the time and never writes the line twice (DESIGN-01/03, IT4-06).
+            pending = self._pending_events.get(event_id)
+            if pending is not None and pending[0] != facts.canonical:
+                raise ApiError(409, "event_conflict", "a different event is already stored under this id")
+            if pending is None:
+                self._writable()
+                pending = self._pending_events[event_id] = [facts.canonical, self.clock(), "chosen", None, None]
+            received, path = pending[1], self.vault.events_path(pending[1])
+            if pending[2] == "uncertain":
+                # only this event's own line, at its own offset, is read: is it there? (IT1-03)
+                pending[2] = "appended" if _own_line_at(path, pending[3], pending[4]) else "chosen"
+            again = pending[2] != "chosen"  # an earlier attempt already wrote the line
+            if pending[2] == "chosen":
+                pending[3] = path.stat().st_size if path.exists() else 0
+                record = {"event_id": event_id, "received_at": received, "body": raw}
+                pending[4] = (canonical_json(record) + "\n").encode()
+                pending[2] = "uncertain"
+                Vault.append_jsonl(path, record)
+                pending[2] = "appended"
+            if pending[2] == "appended":
+                self.vault.confirm(path)  # the day file and its chain, also when an earlier attempt's sync failed
+                pending[2] = "confirmed"
+            with self.db.tx() as conn:
+                index_event(conn, event_id, facts, received)
+            del self._pending_events[event_id]
+        if again:
+            return 200, {"event_id": event_id, "stored": True, "duplicate": True}
         return 201, {"event_id": event_id, "stored": True, "duplicate": False}
+
+
+def _own_line_at(path, offset: int | None, line: bytes | None) -> bool:
+    """Whether this event's own line was written at `offset` (all event appends happen under `_lock`, so the offset is
+    exact; a torn previous line may have put one newline first). Reads at most len(line) + 1 bytes."""
+    if offset is None or line is None or not path.exists():
+        return False
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        got = fh.read(len(line) + 1)
+    return got.startswith(line) or got.startswith(b"\n" + line)
+
+
+def advance_frontier(conn, capture: str, seq: int) -> None:
+    """A processed chunk just indexed at `seq`: move `processed_through` to the end of the processed run it continues,
+    with three indexed lookups however long that run is (no walk; ASTRA-20261123-IT1-02). The run ends at the first
+    missing sequence (from `chunk_ranges`) or the first not-yet-processed one (the `chunks_unprocessed` index)."""
+    cap = conn.execute("SELECT processed_through FROM captures WHERE capture_id=?", (capture,)).fetchone()
+    if cap is None or cap["processed_through"] != seq - 1:
+        return
+    run = conn.execute("SELECT end FROM chunk_ranges WHERE capture_id=? AND start<=? ORDER BY start DESC LIMIT 1",
+                       (capture, seq)).fetchone()  # fmt: skip
+    end = run["end"] if run is not None and run["end"] >= seq else seq
+    waiting = conn.execute("SELECT MIN(chunk_sequence) AS m FROM chunks WHERE capture_id=? AND chunk_sequence>? "
+                           "AND status<>'processed'", (capture, seq)).fetchone()["m"]  # fmt: skip
+    if waiting is not None:
+        end = min(end, waiting - 1)
+    conn.execute("UPDATE captures SET processed_through=? WHERE capture_id=?", (end, capture))
 
 
 def capture_status(db: Database, capture_id: str) -> dict | None:
     capture = db.one("SELECT * FROM captures WHERE capture_id=?", (capture_id,))
     if capture is None:
         return None
-    seqs = [r["chunk_sequence"] for r in db.query(
-        "SELECT chunk_sequence FROM chunks WHERE capture_id=? ORDER BY chunk_sequence", (capture_id,)
-    )]
-    ranges: list[list[int]] = []
-    for s in seqs:
-        if ranges and s == ranges[-1][1] + 1:
-            ranges[-1][1] = s
-        else:
-            ranges.append([s, s])
+    # the stored runs: work grows with the ranges the answer lists, not with the capture's chunks (DESIGN-05)
+    ranges = [[r["start"], r["end"]] for r in db.query(
+        "SELECT start, end FROM chunk_ranges WHERE capture_id=? ORDER BY start", (capture_id,)
+    )]  # fmt: skip
     return {
         "capture_id": capture_id,
         "source": capture["source"],

@@ -45,6 +45,11 @@ def hermetic_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Ignore the developer's shell environment and backend/.env, and never reach the live ASR sidecar."""
     scrub_env(monkeypatch, tmp_path)
     block_live_sidecar(monkeypatch)
+    # the disk monitor's in-process observations belong to one server process: each test starts fresh
+    from omi_notes import disk_alert
+
+    monkeypatch.setattr(disk_alert, "last_unknown", 0)
+    monkeypatch.setattr(disk_alert, "last_low", 0)
 
 
 LIVE_SIDECAR_PORT = 18793  # the deployed omi-asr sidecar on this Mac (AGENTS.md)

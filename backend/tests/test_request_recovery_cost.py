@@ -56,12 +56,13 @@ def test_one_put_syncs_only_its_own_identity(client, settings, monkeypatch, orph
     checked = []
     real_check = ingest.durable_existing
 
-    def check(path):
+    def check(path, *rest):
         checked.append(path)
-        return real_check(path)
+        return real_check(path, *rest)
 
     monkeypatch.setattr(ingest, 'durable_existing', check)
     assert put_chunk(client, cap, seq, bodies[seq]).status_code == 200
     print('REQUEST_RECOVERY_COST', orphan_count, 'prior_orphans', len(checked), 'file_dir_sync_pairs')
     # (adapted to the fix: the request syncs only its own identity, whatever the number of other orphans)
-    assert len(checked) == 1, (orphan_count, len(checked))
+    # this identity only (its chunk and its receipt file, both confirmed to the vault root), whatever the orphan count
+    assert [p.name for p in checked] == [f'{seq}.omnc', 'receipts.jsonl'], (orphan_count, checked)

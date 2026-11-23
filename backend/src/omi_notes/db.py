@@ -22,7 +22,7 @@ from pathlib import Path
 
 from .spool import make_dirs_durable
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # Rows the app lists: voice-enrollment readings are never conversations; set-aside recordings (under 1.5 s of
 # speech) are kept with their audio but listed nowhere. The listing indexes are partial on exactly this text, so
@@ -106,6 +106,18 @@ CREATE TABLE IF NOT EXISTS chunks (
     PRIMARY KEY (capture_id, chunk_sequence)
 );
 CREATE INDEX IF NOT EXISTS chunks_status ON chunks(status);
+
+-- Disjoint runs of received chunk sequences per capture, kept as chunks are indexed, so a capture's
+-- `received_ranges` costs its number of ranges, not its number of chunks (ASTRA-20261122-DESIGN-05).
+CREATE TABLE IF NOT EXISTS chunk_ranges (
+    capture_id TEXT NOT NULL,
+    start INTEGER NOT NULL,
+    end INTEGER NOT NULL,
+    PRIMARY KEY (capture_id, start)
+);
+CREATE INDEX IF NOT EXISTS chunk_ranges_end ON chunk_ranges(capture_id, end);
+-- The not-yet-processed chunks, so the processed frontier is found without walking processed history (IT1-02).
+CREATE INDEX IF NOT EXISTS chunks_unprocessed ON chunks(capture_id, chunk_sequence) WHERE status <> 'processed';
 CREATE INDEX IF NOT EXISTS chunks_device_audio ON chunks(device_id, audio_start);
 
 -- Every ring record each received chunk contains (for the order-independent ownership rule).
@@ -447,6 +459,8 @@ COLUMN_SOURCES: dict[str, dict[str, str]] = {
         "key": "operational — written by the rebuild (schema_version, vault_id, vault_path, complete, replay_pending, read_only)",
         "value": "operational — see key",
     },
+    "chunk_ranges": {c: "operational — derived from chunks rows as they are indexed (`ingest.index_chunk`)"
+                     for c in ("capture_id", "start", "end")},
     "captures": {
         "capture_id": "raw/<dev>/<cap>/ directory name",
         "device_id": "raw/<dev>/ directory (= envelope header / seal device_id)",

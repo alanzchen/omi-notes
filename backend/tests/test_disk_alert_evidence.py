@@ -1,4 +1,6 @@
-"""Astra's IT3 alert-evidence repros (omi-notes-reviews/nightly-2026-11-21-it3/python/test_round3_checks.py), adopted unchanged
+"""(2026-11-22: translated to the revision protocol, ASTRA-20261122-IT1 DESIGN-06/07: the witness's "index write at t"
+became "a publication begun at revision r"; every final assertion is unchanged.)
+Astra's IT3 alert-evidence repros (omi-notes-reviews/nightly-2026-11-21-it3/python/test_round3_checks.py), adopted unchanged
 (ASTRA-20261121-IT3-02; one bad-alert check adapted, see there): recovery needs a successful index write after the latest write failure, and a successful
 measurement of every watched volume."""
 from __future__ import annotations
@@ -13,8 +15,9 @@ from .test_disk_full import _free, GiB, Usage
 def test_write_evidence_must_follow_the_latest_write_failure(client, settings, monkeypatch):
     _free(monkeypatch,50*GiB)
     disk_alert.note_down(settings.logs_dir,free_bytes=GiB,floor_bytes=ingest.MIN_FREE_BYTES,reason='space',now=100,kind='space')
+    began = disk_alert.revision(settings.logs_dir)  # a publication begins (the old "write at 110")
     disk_alert.note_down(settings.logs_dir,free_bytes=None,floor_bytes=ingest.MIN_FREE_BYTES,reason='new write failure',now=120,kind='write')
-    disk_alert.watch(settings.logs_dir,settings.vault_dir,other_dirs=[settings.db_path.parent],floor_bytes=ingest.MIN_FREE_BYTES,now=121,last_index_write=110)
+    disk_alert.witness(settings.logs_dir,[settings.vault_dir,settings.db_path.parent],floor_bytes=ingest.MIN_FREE_BYTES,now=121,since_revision=began)
     state=disk_alert.read(settings.logs_dir)
     print('OLD_WRITE_EVIDENCE',state)
     assert state['state']=='down', 'a write at110 cannot prove recovery from the failure at120'
@@ -26,7 +29,7 @@ def test_unmeasurable_index_volume_is_not_proof_of_recovery(client, settings, mo
         if path == settings.db_path.parent: raise OSError(errno.EACCES,'synthetic cannot stat index volume')
         return Usage(100*GiB,50*GiB,50*GiB)
     monkeypatch.setattr(disk_alert.shutil,'disk_usage',free)
-    disk_alert.watch(settings.logs_dir,settings.vault_dir,other_dirs=[settings.db_path.parent],floor_bytes=ingest.MIN_FREE_BYTES,now=121,last_index_write=120)
+    disk_alert.witness(settings.logs_dir,[settings.vault_dir,settings.db_path.parent],floor_bytes=ingest.MIN_FREE_BYTES,now=121,since_revision=disk_alert.revision(settings.logs_dir))
     state=disk_alert.read(settings.logs_dir)
     print('UNKNOWN_INDEX_VOLUME',state)
     assert state['state']=='down'
@@ -51,5 +54,5 @@ def test_other_io_failures_are_not_disk_full(code):
 def test_hysteresis_and_fresh_evidence_clear_control(client, settings,monkeypatch):
     _free(monkeypatch,ingest.MIN_FREE_BYTES+disk_alert.HYSTERESIS)
     disk_alert.note_down(settings.logs_dir,free_bytes=None,floor_bytes=ingest.MIN_FREE_BYTES,reason='write',now=100)
-    disk_alert.watch(settings.logs_dir,settings.vault_dir,other_dirs=[settings.db_path.parent],floor_bytes=ingest.MIN_FREE_BYTES,now=102,last_index_write=101)
+    disk_alert.witness(settings.logs_dir,[settings.vault_dir,settings.db_path.parent],floor_bytes=ingest.MIN_FREE_BYTES,now=102,since_revision=disk_alert.revision(settings.logs_dir))
     assert disk_alert.read(settings.logs_dir)['state']=='recovered'

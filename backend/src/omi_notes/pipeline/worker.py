@@ -77,7 +77,6 @@ class Worker:
     ) -> None:
         self.settings = settings
         self.db = db
-        self._last_ok_tick: float | None = None
         self.vault = Vault.open(settings)
         self.clock = clock
         self.take_over = False
@@ -111,8 +110,9 @@ class Worker:
     def tick(self, now: float | None = None) -> dict:
         now = self.clock() if now is None else now
         # the disk alert first: it needs no index write, which a full disk may be what stops (2026-11-20 18:05)
+        # down only: recovery is witnessed by the API after a real publication (ASTRA-20261122-DESIGN-07)
         disk_alert.watch(self.settings.logs_dir, self.settings.vault_dir, floor_bytes=MIN_FREE_BYTES, now=now,
-                         other_dirs=[self.db.path.parent], last_index_write=self._last_ok_tick)  # fmt: skip
+                         other_dirs=[self.db.path.parent])  # fmt: skip
         blocked = read_only_reason(self.db)
         if blocked:
             self._status(now, force=False)
@@ -254,12 +254,7 @@ class Worker:
                     self.vault.renew_lease(writer_id)
                     renewed = time.time()
                 try:
-                    changes = self.db.conn().total_changes
                     result = self.tick()
-                    # evidence for the disk alert's recovery only when this tick really wrote the index (a read-only or
-                    # idle tick proves nothing about writes; ASTRA-20261121-IT5-03 b)
-                    if self.db.conn().total_changes > changes:
-                        self._last_ok_tick = time.time()
                     busy = result["chunks"] or result["conversations"]
                 except Exception:
                     log.exception("worker tick failed")
