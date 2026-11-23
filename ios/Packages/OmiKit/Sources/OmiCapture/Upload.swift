@@ -106,12 +106,12 @@ public final class UploadStateStore: @unchecked Sendable {
         backoffGeneration = stored?.backoffGeneration
     }
 
-    /// Backoff belongs to one configuration: a different generation clears it once (one write), then records it.
+    /// Backoff belongs to one configuration: a different generation clears it once (one write), then records it. A
+    /// state file from before this was kept (build 62) has no generation: its waits may be another address's, so they
+    /// are cleared too, once (ASTRA-20261122-IT5-02). Attempts and queued files are untouched.
     public func adoptGeneration(_ generation: Int) {
         guard backoffGeneration != generation else { return }
-        if backoffGeneration != nil {
-            for name in records.keys where records[name]?.nextAttemptAt != nil { records[name]?.nextAttemptAt = nil }
-        }
+        for name in records.keys where records[name]?.nextAttemptAt != nil { records[name]?.nextAttemptAt = nil }
         backoffGeneration = generation
         persist()
     }
