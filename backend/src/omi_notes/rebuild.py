@@ -24,6 +24,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -99,46 +100,67 @@ def _receipts(vault: Vault, device: str, capture: str) -> dict[tuple[int, str], 
 
 @dataclass
 class RecoveryState:
-    """What the startup sweep learned for this process's requests, so a request never scans history (DESIGN-03/04):
-    - `high_water`: per capture, the highest sequence with a file (.omnc or .gone) on disk, confirmed or not; a new
-      seal can't declare a smaller last chunk. The ingest adds what this process publishes.
-    - for captures the sweep could not resolve (`unresolved`): their receipt times by (sequence, digest) and their
-      parsed capture.json evidence (None: none; `UNREADABLE`: couldn't be read), used by that identity's own retry.
-    Disposable: rebuilt by every sweep, never a vault format."""
+    """The one owner of recovery facts for this process's requests and repairs, so neither scans history (DESIGN-03/05,
+    ASTRA-20261122-IT4-02/03):
+    - `pending`: identities (capture, seq, digest) whose publication began in this process and isn't committed:
+      [receipt time chosen before any write, whether that receipt line is confirmed]. Released only when that identity's
+      row exists (its own commit, a repair's commit, or a proven same-digest duplicate). Bounded by PENDING_MAX.
+    - `queue`/`queued`: identities (device, capture, seq; -1 = the saved seal) known to be on disk without a row, for
+      the worker's bounded repair; `retry_at` backs each one off.
+    - `high_water`: per capture, the highest sequence with a file on disk; a new seal can't end before it.
+    - `receipts`: per unresolved capture, receipt times by (sequence, digest), read once at startup.
+    - `evidence`: per unresolved capture, its capture.json evidence already split by sequence ({seq: partition}), or
+      `UNREADABLE`.
+    Disposable: rebuilt by every sweep (pending entries are kept), never a vault format."""
 
+    pending: dict[tuple[str, int, str], list] = field(default_factory=dict)
+    queue: deque = field(default_factory=deque)
+    queued: set[tuple[str, str, int]] = field(default_factory=set)
+    retry_at: dict[tuple[str, str, int], tuple[float, int]] = field(default_factory=dict)
     high_water: dict[str, int] = field(default_factory=dict)
-    unresolved: set[tuple[str, str]] = field(default_factory=set)
     receipts: dict[tuple[str, str], dict[tuple[int, str], float]] = field(default_factory=dict)
     evidence: dict[tuple[str, str], object] = field(default_factory=dict)
-    retry_at: dict[tuple[str, str], tuple[float, int]] = field(default_factory=dict)  # (next try, failures so far)
+
+    @property
+    def unresolved(self) -> set[tuple[str, str]]:
+        return {(d, c) for d, c, _ in self.queued}
+
+    def enqueue(self, device: str, capture: str, seq: int) -> None:
+        if (device, capture, seq) not in self.queued:
+            self.queued.add((device, capture, seq))
+            self.queue.append((device, capture, seq))
+
+    def resolved(self, device: str, capture: str, seq: int, digest: str | None = None) -> None:
+        """This identity has its row (or nothing left to index): out of the queue, its pending slot released."""
+        self.queued.discard((device, capture, seq))
+        self.retry_at.pop((device, capture, seq), None)
+        if digest is not None:
+            self.pending.pop((capture, seq, digest), None)
+        elif self.pending:  # a repair that found the row already there: the one identity's slots, whatever digest
+            for key in [k for k in self.pending if k[0] == capture and k[1] == seq]:
+                self.pending.pop(key, None)
 
 
 UNREADABLE = object()
+_EVIDENCE_LISTS = ("coverage", "losses", "ring_seen", "ring_records", "speech_open")
 
 
-def drain_unresolved(db: Database, vault: Vault, *, now: float, limit: int = 1) -> int:
-    """Off the request path (the worker tick): retry at most `limit` known unresolved captures whose backoff has passed,
-    through the same confirming `index_capture_orphans`. No discovery walk; the identities come from the startup sweep
-    and from publications that failed after their file existed (DESIGN-05, A9). Returns the captures resolved."""
-    state = recovery_state(vault)
-    due = [k for k in sorted(state.unresolved) if state.retry_at.get(k, (0.0, 0))[0] <= now][:limit]
-    resolved = 0
-    for device, capture in due:
-        try:
-            index_capture_orphans(db, vault, device, capture)
-        except OSError as exc:
-            failures = state.retry_at.get((device, capture), (0.0, 0))[1] + 1
-            state.retry_at[(device, capture)] = (now + min(3600.0, 60.0 * 2 ** (failures - 1)), failures)
-            log.warning("capture %s still can't be confirmed (%s); next try in %d s", capture, exc,
-                        int(state.retry_at[(device, capture)][0] - now))  # fmt: skip
-            continue
-        for table in (state.unresolved, state.receipts, state.evidence, state.retry_at):
-            table.discard((device, capture)) if isinstance(table, set) else table.pop((device, capture), None)
-        resolved += 1
-        log.info("capture %s: its files are confirmed and indexed now", capture)
-    if due:
-        db.set_meta("unresolved", json.dumps(sorted(f"{d}/{c}" for d, c in state.unresolved)[:200]) or None)
-    return resolved
+def partition_evidence(evidence: dict | None) -> dict[int, dict]:
+    """A capture.json split once by sequence: {seq: {"deleted": {seq: facts}, "coverage": [...], ...}}, so restoring
+    one tombstone touches only its own facts (IT4-02)."""
+    out: dict[int, dict] = {}
+    if not evidence:
+        return out
+    for key, facts in dict(evidence.get("deleted") or {}).items():
+        out.setdefault(int(key), {"deleted": {}})["deleted"][str(int(key))] = facts
+    for name in _EVIDENCE_LISTS:
+        for row in list(evidence.get(name) or []):
+            part = out.get(int(row[0]))
+            if part is not None:
+                part.setdefault(name, []).append(row)
+    return out
+
+
 _STATES: dict[str, RecoveryState] = {}
 
 
@@ -250,6 +272,12 @@ def _event_ops(vault: Vault, report: Report, known: dict[str, str] | None = None
         return ops
     for path in sorted(vault.events_dir.glob("*.jsonl")):
         if since is not None and path.stem < since:
+            continue
+        try:
+            vault.confirm(path)  # a day file whose sync can't be confirmed is not trusted yet, on every path (IT4-01)
+        except OSError as exc:
+            report.problems.append(f"events file {vault.relpath(path)} can't be confirmed durable now: {exc}")
+            report.unresolved.append(vault.relpath(path))
             continue
         for line in Vault.read_jsonl(path):
             event_id, body, received = line.get("event_id"), line.get("body"), line.get("received_at")
@@ -622,27 +650,30 @@ def sweep(db: Database, vault: Vault) -> dict:
     """Index files a crash left without index rows: raw chunks/tombstones/seals, recent event
     lines, and conversation records newer than their index row."""
     counts = {"raw": 0, "events": 0, "records": 0}
-    state = RecoveryState()
+    previous = _STATES.get(os.path.realpath(vault.root))
+    state = RecoveryState(pending=previous.pending if previous else {})  # in-flight publications outlive a sweep
     for device, capture in _captures(vault):
         cap_dir = vault.capture_dir(device, capture)
-        seqs = [int(p.name.partition(".")[0]) for p in cap_dir.iterdir()
-                if p.suffix in (".omnc", ".gone") and p.name.partition(".")[0].isdigit()]  # fmt: skip
+        seqs = {int(p.name.partition(".")[0]) for p in cap_dir.iterdir()
+                if p.suffix in (".omnc", ".gone") and p.name.partition(".")[0].isdigit()}  # fmt: skip
         if seqs:
             state.high_water[capture] = max(seqs)
-        files = len(set(seqs))
         cap = db.one("SELECT seal_json FROM captures WHERE capture_id=?", (capture,))
-        indexed = db.one("SELECT COUNT(*) AS n FROM chunks WHERE capture_id=?", (capture,))["n"]
+        indexed = {r["chunk_sequence"] for r in db.query("SELECT chunk_sequence FROM chunks WHERE capture_id=?", (capture,))}
         seal_missing = (cap_dir / "seal.json").exists() and (cap is None or cap["seal_json"] is None)
-        if files != indexed or seal_missing:
+        if seqs - indexed or seal_missing:
             try:
                 counts["raw"] += index_capture_orphans(db, vault, device, capture)
-            except OSError as exc:  # can't be confirmed now: kept unindexed, its facts prepared for its own retry
+            except OSError as exc:  # can't be confirmed now: kept unindexed; each identity queued for bounded repair
                 log.warning("sweep: capture %s not indexed yet: %s", capture, exc)
-                state.unresolved.add((device, capture))
+                for seq in sorted(seqs - indexed):
+                    state.enqueue(device, capture, seq)
+                if seal_missing:
+                    state.enqueue(device, capture, -1)
                 state.receipts[(device, capture)] = _receipts(vault, device, capture)
                 try:
-                    state.evidence[(device, capture)] = Vault.read_json(vault.capture_json_path(device, capture))
-                except (OSError, ValueError):
+                    state.evidence[(device, capture)] = partition_evidence(Vault.read_json(vault.capture_json_path(device, capture)))
+                except (OSError, ValueError, TypeError, KeyError):
                     state.evidence[(device, capture)] = UNREADABLE
     _STATES[os.path.realpath(vault.root)] = state
     if state.unresolved:

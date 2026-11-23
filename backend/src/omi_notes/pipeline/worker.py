@@ -98,6 +98,7 @@ class Worker:
             hard_max=settings.hard_max_conversation_seconds,
         )
         self.lock = worker_lock(self.vault)
+        self._repairer = None
         self._decoders: OrderedDict[str, tuple[int, CaptureTimeline, VadStream]] = OrderedDict()
         self._last_retention = 0.0
         self._last_class_reconcile = 0.0
@@ -108,18 +109,19 @@ class Worker:
     # -- loop ------------------------------------------------------------------------------------
 
     def _drain_unresolved(self, now: float) -> None:
-        """Files on disk that couldn't be confirmed yet (startup or a failed publication): one capture per tick, with
-        backoff, under the ingest lock when the API shares this process. Never fails the tick."""
+        """Files on disk without their rows (startup or a failed publication): a few identities per tick through the
+        ingest's own adoption, each under the ingest lock (IT4-02). Never fails the tick."""
         try:
-            from ..ingest import _lock
-            from ..rebuild import drain_unresolved, recovery_state
+            from ..ingest import Ingest
+            from ..rebuild import recovery_state
 
-            if not recovery_state(self.vault).unresolved:
+            if not recovery_state(self.vault).queued:
                 return
-            with _lock:
-                drain_unresolved(self.db, self.vault, now=now)
+            if self._repairer is None:
+                self._repairer = Ingest(self.db, self.vault, self.settings, read_only=lambda: read_only_reason(self.db))
+            self._repairer.drain(now)
         except Exception:
-            log.exception("draining unresolved captures failed")
+            log.exception("repairing unindexed files failed")
 
     def tick(self, now: float | None = None) -> dict:
         now = self.clock() if now is None else now

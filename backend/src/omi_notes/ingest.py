@@ -420,10 +420,6 @@ class Ingest:
         self.settings = settings
         self.read_only = read_only  # () -> reason or None
         self.clock = clock  # receipt times (injectable for tests)
-        # Identities whose publication started in this process and isn't committed yet: (capture, seq, digest) ->
-        # [receipt time chosen before any file was written, whether that receipt line is confirmed]. A retry reuses
-        # the time; dropped only after the outer COMMIT (DESIGN-03). Bounded: refuse new work beyond PENDING_MAX.
-        self._pending: dict[tuple[str, int, str], list] = {}
         # Disk evidence for /v1/status (DESIGN-07/08): a local latch set before the alert file is even tried (it may be
         # unwritable on a full disk), cleared only by a witnessed publication begun after the last local failure.
         self.down_latch: float | None = None
@@ -432,6 +428,12 @@ class Ingest:
         self._pending_events: dict[str, tuple[str, float]] = {}
         # (capture_id, seq, sha256 of other bytes) -> same audio as the stored chunk
         self._verdicts: dict[tuple[str, int, str], bool] = {}
+
+    def _own_transaction(self) -> None:
+        """Publication owns its commit: called inside a caller's open transaction, a 2xx, a released slot or a recovery
+        witness could come before the real COMMIT (the outer one may still roll back). Refused (ASTRA-20261122-IT4-09)."""
+        if self.db.conn().in_transaction:
+            raise RuntimeError("uploads are stored in their own transaction, not inside an open one")
 
     def _writable(self) -> None:
         reason = self.read_only()
@@ -458,31 +460,43 @@ class Ingest:
             index_seal(conn, capture_id, facts, received)
         return self.db.one("SELECT * FROM captures WHERE capture_id=?", (capture_id,))
 
-    def _evidence_snapshot(self) -> tuple[int, int]:
+    def _evidence_snapshot(self) -> tuple[str | None, int]:
         try:
             return disk_alert.revision(self.settings.logs_dir), self._failures
         except Exception:
-            return -1, self._failures
+            return None, self._failures
 
     def _witness(self, snapshot: tuple[int, int]) -> None:
         """After a durable publication and its outer COMMIT (never a duplicate 200): recovery evidence, if nothing failed
         since `snapshot`. Never changes the answer."""
         try:
             rev, failures = snapshot
-            if rev < 0:
+            if rev is None:
+                self.healthy_at = None
                 return
             ok = disk_alert.witness(self.settings.logs_dir, [self.vault.raw, self.db.path.parent], floor_bytes=MIN_FREE_BYTES,
                                     now=self.clock(), since_revision=rev)  # fmt: skip
             if ok is True and failures == self._failures:
                 self.down_latch = None
                 self.healthy_at = self.clock()
+            else:
+                self.healthy_at = None  # a newer low, unmeasured or unknown observation: no standing healthy evidence
         except Exception:
             log.exception("disk evidence after a publication failed")
 
-    def _unresolved(self, device_id: str, capture_id: str) -> None:
+    @property
+    def _state(self):
+        """The process's one recovery owner (pending identities, repair queue, prepared facts): shared with repairs."""
         from .rebuild import recovery_state
 
-        recovery_state(self.vault).unresolved.add((device_id, capture_id))
+        return recovery_state(self.vault)
+
+    @property
+    def _pending(self) -> dict:
+        return self._state.pending
+
+    def _unresolved(self, device_id: str, capture_id: str, seq: int) -> None:
+        self._state.enqueue(device_id, capture_id, seq)
 
     def _note_high_water(self, capture_id: str, seq: int) -> None:
         from .rebuild import recovery_state
@@ -514,6 +528,7 @@ class Ingest:
 
     def put_chunk(self, capture_id: str, seq: int, body: bytes, sha_header: str | None,
                   plan: ChunkPlan | None = None) -> tuple[int, dict]:  # fmt: skip
+        self._own_transaction()
         _check_uuid(capture_id, "capture_id")
         if seq < 0:
             raise ApiError(422, "invalid_chunk_sequence", "chunk_sequence must be >= 0")
@@ -577,6 +592,7 @@ class Ingest:
             existing = db.one("SELECT sha256 FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq))
             if existing is not None:
                 if existing["sha256"] == digest:
+                    self._pending.pop((capture_id, seq, digest), None)  # proven stored: its admission slot is free (IT4-03)
                     return ok(200, True)
                 return ok(200, True) if self._same_audio_again(capture_id, seq, body, digest, same) else self._conflict()
 
@@ -630,7 +646,7 @@ class Ingest:
             except OSError as exc:
                 if path.exists():
                     self._note_high_water(capture_id, seq)  # on disk, unconfirmed: a seal must not end before it
-                    self._unresolved(header.device_id, capture_id)
+                    self._unresolved(header.device_id, capture_id, seq)
                 if exc.errno == errno.ENOSPC:
                     self._disk_full("a chunk write hit ENOSPC")
                     raise ApiError(507, "storage_full", "server disk is full") from exc
@@ -645,7 +661,7 @@ class Ingest:
                     index_chunk(conn, header, digest=digest, size=len(body), path=vault.relpath(path), received_at=now,
                                 ring=ring_record_hashes(env))  # fmt: skip
             except BaseException as exc:
-                self._unresolved(header.device_id, capture_id)  # its own retry or the worker's drain indexes it
+                self._unresolved(header.device_id, capture_id, seq)  # its own retry or the worker's repair indexes it
                 # the file is durable but not indexed (an orphan a retry with the same bytes adopts, with this same
                 # receipt time): a full disk here is 507 like any other, so the phone keeps the part (2026-11-21)
                 if _disk_full_error(exc):
@@ -734,56 +750,128 @@ class Ingest:
         header = env.header
         snapshot = self._evidence_snapshot()
         if path.exists():
-            data = path.read_bytes()
-            if sha256_hex(data) != digest:
+            if sha256_hex(path.read_bytes()) != digest:
                 raise ApiError(409, "chunk_conflict", "different content is already stored under this identity")
-            deleted = False
-            durable_existing(path, self.vault)  # before any receipt, row or 2xx (ENOSPC -> 507 in put_chunk)
+            self._adopt(header, digest, size, path, deleted=False, ring=ring_record_hashes(env), request=True)
         else:
             tomb = json.loads(tomb_path.read_text())
             if tomb.get("sha256") != digest:
                 raise ApiError(409, "chunk_conflict", "different content was stored (and expired) under this identity")
-            deleted = True
-            durable_existing(tomb_path, self.vault)  # the actual .gone, not the missing .omnc
-            evidence = self.vault.capture_json_path(header.device_id, header.capture_id)
-            if evidence.exists():
-                durable_existing(evidence, self.vault)  # the legacy coverage facts it brings back
-        from .rebuild import UNREADABLE, apply_capture_evidence, recovery_state
+            self._adopt(header, digest, size, tomb_path, deleted=True, ring=[], request=True)
+        self._witness(snapshot)  # a real publication and COMMIT (not the duplicate fast path)
+        return 200, True
+
+    def _adopt(self, header, digest: str, size: int, artifact, *, deleted: bool, ring, request: bool) -> None:
+        """The one way a file already on disk becomes a stored row (a request's own retry or the worker's repair): this
+        identity's artifact and dependencies confirmed to the vault root, its receipt time from this process's pending
+        record or the startup lookup (never a scan), its own slice of tombstone evidence, one commit, then its pending
+        slot released. Work is bounded by the identity (IT4-02/03). Raises ApiError/OSError; caller holds `_lock`."""
+        from .rebuild import UNREADABLE, advance_processed, apply_capture_evidence
 
         ids = (header.device_id, header.capture_id)
-        key = (header.capture_id, header.chunk_sequence, digest)
-        receipts = self.vault.receipts_path(*ids)
-        state = recovery_state(self.vault)
+        seq = header.chunk_sequence
+        key = (header.capture_id, seq, digest)
+        state = self._state
+        durable_existing(artifact, self.vault)  # the actual .omnc or .gone, before any receipt, row or 2xx
+        partition = {}
+        if deleted:
+            prepared = state.evidence.get(ids)
+            if prepared is UNREADABLE:
+                raise ApiError(503, "unresolved_identity", "this capture's evidence can't be read right now; send it again later")
+            partition = (prepared or {}).get(seq, {})
+            if partition:
+                durable_existing(self.vault.capture_json_path(*ids), self.vault)  # the facts it brings back
         pending = self._pending.get(key)
         if pending is None:
-            # not published by this process: only the startup sweep's prepared facts may say when it arrived; nothing
-            # here scans the capture's receipts or evidence (DESIGN-03)
             prepared = state.receipts.get(ids)
             if prepared is None:
-                raise ApiError(503, "unresolved_identity",
-                               "this part's earlier copy can't be checked by this server process yet; send it again later")
-            line = prepared.get((header.chunk_sequence, digest))
+                if request:
+                    raise ApiError(503, "unresolved_identity",
+                                   "this part's earlier copy can't be checked by this server process yet; send it again later")
+                prepared = {}  # a repair of an identity the sweep queued without receipts: its time is chosen now
+            line = prepared.get((seq, digest))
             pending = self._pending.setdefault(key, [line if line is not None else self.clock(), line is not None])
-        evidence = None
-        if deleted:
-            evidence = state.evidence.get(ids)
-            if evidence is UNREADABLE:
-                raise ApiError(503, "unresolved_identity", "this capture's evidence can't be read right now; send it again later")
-        received = pending[0]
+        receipts = self.vault.receipts_path(*ids)
         if pending[1]:
             durable_existing(receipts, self.vault)  # a readable earlier append may have failed its sync
         else:
             self._writable()
-            self.vault.append_confirmed(receipts, {"seq": header.chunk_sequence, "sha256": digest, "received_at": received})
+            self.vault.append_confirmed(receipts, {"seq": seq, "sha256": digest, "received_at": pending[0]})
             pending[1] = True
         with self.db.tx() as conn:
-            index_chunk(conn, header, digest=digest, size=size, path=self.vault.relpath(path), received_at=received,
-                        raw_deleted=deleted, ring=ring_record_hashes(env))  # fmt: skip
+            index_chunk(conn, header, digest=digest, size=size, path=self.vault.relpath(artifact.with_suffix(".omnc")),
+                        received_at=pending[0], raw_deleted=deleted, ring=ring)  # fmt: skip
             if deleted:
-                apply_capture_evidence(conn, self.vault, *ids, only_seq=header.chunk_sequence, evidence=evidence or {})
-        self._pending.pop(key, None)
-        self._witness(snapshot)  # a real publication and COMMIT (not the duplicate fast path)
-        return 200, True
+                apply_capture_evidence(conn, self.vault, *ids, only_seq=seq, evidence=partition)
+                advance_processed(conn, header.capture_id)  # a restored processed chunk extends the frontier (IT4-04)
+        state.resolved(header.device_id, header.capture_id, seq, digest)
+
+    def repair(self, device_id: str, capture_id: str, seq: int) -> bool:
+        """The worker's bounded repair of one queued identity, through the same `_adopt` (or the saved seal). Reads only
+        that identity's file. True when it is resolved (indexed, or nothing left to index); raises OSError to retry."""
+        state = self._state
+        if seq < 0:
+            capture = self.db.one("SELECT * FROM captures WHERE capture_id=?", (capture_id,))
+            if capture is None or capture["seal_json"] is None:
+                path = self.vault.seal_path(device_id, capture_id)
+                stored = Vault.read_json(path)
+                if stored is not None:
+                    facts = validate_seal(stored["body"])
+                    durable_existing(path, self.vault)
+                    with self.db.tx() as conn:
+                        index_seal(conn, capture_id, facts, float(stored["received_at"]))
+            state.resolved(device_id, capture_id, seq)
+            return True
+        if self.db.one("SELECT 1 FROM chunks WHERE capture_id=? AND chunk_sequence=?", (capture_id, seq)):
+            state.resolved(device_id, capture_id, seq)
+            return True
+        path = self.vault.chunk_path(device_id, capture_id, seq)
+        tomb = path.with_suffix(".gone")
+        capture = self.db.one("SELECT last_chunk_sequence FROM captures WHERE capture_id=?", (capture_id,))
+        if capture is not None and capture["last_chunk_sequence"] is not None and seq > capture["last_chunk_sequence"]:
+            log.warning("chunk %s/%d is above its seal: kept, not indexed", capture_id, seq)
+            state.resolved(device_id, capture_id, seq)
+            return True
+        try:
+            if path.exists():
+                data = path.read_bytes()
+                env = parse_envelope(data, capture_id=capture_id, chunk_sequence=seq)
+                self._adopt(env.header, sha256_hex(data), len(data), path, deleted=False, ring=ring_record_hashes(env), request=False)
+            elif tomb.exists():
+                t = json.loads(tomb.read_text())
+                self._adopt(tombstone_header(t), t["sha256"], int(t["size"]), tomb, deleted=True, ring=[], request=False)
+            else:
+                state.resolved(device_id, capture_id, seq)
+        except (EnvelopeError, ValueError, KeyError) as exc:
+            log.warning("chunk %s/%d can't be indexed (%s): kept on disk, not retried", capture_id, seq, exc)
+            state.resolved(device_id, capture_id, seq)
+        except ApiError as exc:
+            raise OSError(errno.EAGAIN, exc.detail) from exc
+        return True
+
+    def drain(self, now: float, *, limit: int = 8) -> int:
+        """Off the request path (the worker tick): at most `limit` due identities, each under `_lock` on its own so
+        uploads interleave, each one identity's work. Failures back off 60 s doubling to an hour; nothing is evicted."""
+        state = self._state
+        done = 0
+        for _ in range(min(limit, len(state.queue))):
+            device, capture, seq = ident = state.queue.popleft()
+            if ident not in state.queued:
+                continue
+            if state.retry_at.get(ident, (0.0, 0))[0] > now:
+                state.queue.append(ident)
+                continue
+            try:
+                with _lock:
+                    self.repair(device, capture, seq)
+                done += 1
+            except OSError as exc:
+                failures = state.retry_at.get(ident, (0.0, 0))[1] + 1
+                state.retry_at[ident] = (now + min(3600.0, 60.0 * 2 ** (failures - 1)), failures)
+                state.queue.append(ident)
+                log.warning("chunk %s/%d still can't be confirmed (%s); next try in %d s", capture, seq, exc,
+                            int(state.retry_at[ident][0] - now))  # fmt: skip
+        return done
 
     def _ensure_space(self) -> None:
         make_dirs_durable(self.vault.raw)
@@ -810,6 +898,7 @@ class Ingest:
     # -- seals -----------------------------------------------------------------------------------
 
     def put_seal(self, capture_id: str, raw: Any) -> tuple[int, dict]:
+        self._own_transaction()
         _check_uuid(capture_id, "capture_id")
         facts = validate_seal(raw)
         seal = facts.seal
@@ -850,6 +939,7 @@ class Ingest:
     # -- events ----------------------------------------------------------------------------------
 
     def put_event(self, event_id: str, raw: Any) -> tuple[int, dict]:
+        self._own_transaction()
         _check_uuid(event_id, "event_id")
         facts = validate_event(raw)
         with _lock:
@@ -858,17 +948,23 @@ class Ingest:
                 if existing["body_json"] == facts.canonical:
                     return 200, {"event_id": event_id, "stored": True, "duplicate": True}
                 raise ApiError(409, "event_conflict", "a different event is already stored under this id")
-            # [canonical body, received time chosen before writing, "chosen" | "appended" | "confirmed"]: a retry
-            # reuses the time and never appends the line twice once it was written (DESIGN-01/03, events too)
+            # [canonical body, received time chosen before writing, state, file offset before the append]. States:
+            # "chosen" (nothing written), "uncertain" (the append was attempted: the line may or may not be there),
+            # "appended", "confirmed". A retry reuses the time and never writes the line twice (DESIGN-01/03, IT4-06).
             pending = self._pending_events.get(event_id)
             if pending is not None and pending[0] != facts.canonical:
                 raise ApiError(409, "event_conflict", "a different event is already stored under this id")
-            again = pending is not None and pending[2] != "chosen"  # an earlier attempt already wrote the line
             if pending is None:
                 self._writable()
-                pending = self._pending_events[event_id] = [facts.canonical, self.clock(), "chosen"]
+                pending = self._pending_events[event_id] = [facts.canonical, self.clock(), "chosen", None]
             received, path = pending[1], self.vault.events_path(pending[1])
+            if pending[2] == "uncertain":
+                # only the bytes written since this event's own attempt are read: is its line there?
+                pending[2] = "appended" if _line_since(path, pending[3], event_id, received) else "chosen"
+            again = pending[2] != "chosen"  # an earlier attempt already wrote the line
             if pending[2] == "chosen":
+                pending[3] = path.stat().st_size if path.exists() else 0
+                pending[2] = "uncertain"
                 Vault.append_jsonl(path, {"event_id": event_id, "received_at": received, "body": raw})
                 pending[2] = "appended"
             if pending[2] == "appended":
@@ -880,6 +976,22 @@ class Ingest:
         if again:
             return 200, {"event_id": event_id, "stored": True, "duplicate": True}
         return 201, {"event_id": event_id, "stored": True, "duplicate": False}
+
+
+def _line_since(path, offset: int | None, event_id: str, received: float) -> bool:
+    """Whether this event's own line is in `path` after `offset` (the size before its append): bytes since then only."""
+    if offset is None or not path.exists():
+        return False
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        for raw in fh.read().splitlines():
+            try:
+                line = json.loads(raw)
+            except ValueError:
+                continue  # a torn line is not this event's record
+            if isinstance(line, dict) and line.get("event_id") == event_id and line.get("received_at") == received:
+                return True
+    return False
 
 
 def capture_status(db: Database, capture_id: str) -> dict | None:
