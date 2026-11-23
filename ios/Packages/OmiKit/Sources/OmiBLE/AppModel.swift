@@ -133,6 +133,8 @@ public final class AppModel {
     }
     private var provenMove: MoveProof?
     private var probeGeneration = 0
+    /// An interrupted cache move whose pointer couldn't be written yet (retried by each refresh).
+    private var cacheMoveAwaitingPointer: NoteCache.Scope?
     /// The address/vault key saved decisions were last moved to.
     private var decisionsMovedFor: String?
     /// The refresh a save starts (tests wait for it).
@@ -218,7 +220,12 @@ public final class AppModel {
 
     /// Forgets everything a previous server said (another server, or none), people included.
     private func adopt(_ config: UploadConfig) {
-        guard config != answeredFor else { return }
+        guard config != answeredFor else {
+            // a moved cache still waiting for its pointer: retried on every refresh until it is written (IT5-01)
+            if let pending = cacheMoveAwaitingPointer, noteCache.completeMove(to: pending) { cacheMoveAwaitingPointer = nil }
+            return
+        }
+        cacheMoveAwaitingPointer = nil
         provenMove = nil  // a proof taken against another configuration proves nothing now
         answeredVault = nil
         // Notes saved for another server (or an earlier pairing) are removed, not just hidden. Those already moved to
@@ -228,9 +235,13 @@ public final class AppModel {
         } ?? false
         if !savedForThis, let url = config.endpoint?.baseURL.absoluteString, let last = noteCache.lastScope {
             // a proven move interrupted between its rename and its pointer: completed, not deleted (IT3-02)
-            savedForThis = noteCache.completeMove(to: NoteCache.Scope(serverURL: url, generation: config.generation, vaultId: last.vaultId))
+            let candidate = NoteCache.Scope(serverURL: url, generation: config.generation, vaultId: last.vaultId)
+            savedForThis = noteCache.completeMove(to: candidate)
+            if !savedForThis, noteCache.awaitsPointer(to: candidate) {
+                cacheMoveAwaitingPointer = candidate  // kept, never cleared: only the pointer write is missing
+            }
         }
-        if !savedForThis { noteCache.clear() }
+        if !savedForThis, cacheMoveAwaitingPointer == nil { noteCache.clear() }
         answeredFor = config
         forgetServerData()
     }

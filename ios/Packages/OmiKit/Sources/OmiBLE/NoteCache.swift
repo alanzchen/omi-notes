@@ -176,6 +176,15 @@ public final class NoteCache: @unchecked Sendable {
         }
     }
 
+    /// `completeMove(to:)` found exactly that interrupted move but couldn't write the pointer yet: the copies are kept
+    /// and the completion is retried (ASTRA-20261122-IT5-01).
+    public func awaitsPointer(to next: Scope) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = read(Scope.self, pointerURL), current != next, current.vaultId == next.vaultId else { return false }
+        let fm = FileManager.default
+        return fm.fileExists(atPath: dir(next).path) && !fm.fileExists(atPath: dir(current).path)
+    }
+
     private func writePointer(_ scope: Scope) throws {
         let e = JSONEncoder()
         e.dateEncodingStrategy = .secondsSince1970
