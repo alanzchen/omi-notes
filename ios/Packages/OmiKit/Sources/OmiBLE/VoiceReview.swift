@@ -10,6 +10,16 @@ public enum ReviewClipState: Equatable, Sendable {
     case ready, loading, noAudio
     case retry(String)
 
+    /// Alan answers only about a clip he can hear (TestFlight 2026-11-12, "我都无法试听我怎么选？"): a clip that is
+    /// still loading can't be judged yet, and one that couldn't load (gone, or a network failure) asks nothing but
+    /// skip until it plays.
+    public var answerable: Bool { self == .ready }
+    /// The clip couldn't load: the card offers only skip (and play again, for a network failure).
+    public var unavailable: Bool {
+        if case .retry = self { return true }
+        return self == .noAudio
+    }
+
     public static func of(_ item: ReviewItem, loading: Bool, failure: ClipFailure?) -> ReviewClipState {
         guard item.canPlay else { return .noAudio }
         if loading { return .loading }  // a load in progress is about this clip, whatever failed before

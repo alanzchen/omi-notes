@@ -115,6 +115,7 @@ struct VoiceReviewView: View {
 
     private func card(_ item: ReviewItem) -> some View {
         let q = question(item)
+        let clipState = ReviewClipState.of(item, loading: player.loading, failure: player.failure)
         return VStack(spacing: 18) {
             Spacer(minLength: 0)
             Group {
@@ -124,7 +125,7 @@ struct VoiceReviewView: View {
                 }
             }
             .font(.largeTitle.bold()).lineLimit(1).minimumScaleFactor(0.6)
-            if case .isThis = q {
+            if case .isThis = q, clipState.answerable {  // no swipe answer about a clip that can't be heard
                 listenCard(item)
                     .offset(x: drag.width)
                     .rotationEffect(.degrees(Double(drag.width) / 22))
@@ -141,8 +142,8 @@ struct VoiceReviewView: View {
             errorLine
             Spacer(minLength: 0)
             switch q {
-            case .isThis(_, let name): answers(item, name: name)
-            case .whoIsThis: whoAnswers(item)
+            case .isThis(_, let name): answers(item, name: name, clip: clipState)
+            case .whoIsThis: whoAnswers(item, clip: clipState)
             }
             bottomLine.frame(height: 50).padding(.bottom, 8)
         }
@@ -151,8 +152,20 @@ struct VoiceReviewView: View {
 
     /// "这是谁？": someone you know (picked), a new person (the naming flow, which asks consent), or
     /// 不认识 (skipped here; the voice stays unnamed).
-    private func whoAnswers(_ item: ReviewItem) -> some View {
+    private func whoAnswers(_ item: ReviewItem, clip: ReviewClipState) -> some View {
         HStack(spacing: 12) {
+            if !clip.unavailable { whoChoices(item, clip: clip) }
+            Button { withAnimation(.snappy) { queue.skip() } } label: {
+                bigLabel("不认识", symbol: "questionmark", color: .gray)
+            }
+            .buttonStyle(.plain)
+        }
+        .disabled(queue.busy)
+    }
+
+    /// Someone known or a new person: only about a clip Alan can hear.
+    @ViewBuilder private func whoChoices(_ item: ReviewItem, clip: ReviewClipState) -> some View {
+        Group {
             Menu {
                 ForEach(VoicesHub.cards(speakers.people)) { p in
                     Button(p.name) { player.stop(); Task { await queue.choose(p.id) } }
@@ -167,12 +180,8 @@ struct VoiceReviewView: View {
                 }
                 .buttonStyle(.plain)
             }
-            Button { withAnimation(.snappy) { queue.skip() } } label: {
-                bigLabel("不认识", symbol: "questionmark", color: .gray)
-            }
-            .buttonStyle(.plain)
         }
-        .disabled(queue.busy)
+        .disabled(!clip.answerable)
     }
 
     /// A conversation's speaker, for the naming flow (it adds a person and asks consent). It carries
@@ -264,16 +273,19 @@ struct VoiceReviewView: View {
         }
     }
 
-    private func answers(_ item: ReviewItem, name: String) -> some View {
+    private func answers(_ item: ReviewItem, name: String, clip: ReviewClipState) -> some View {
         let others = speakers.people.filter { $0.id != item.personId }
         return HStack(spacing: 12) {
-            bigButton("不是", symbol: "xmark", color: .red) { answer(.reject) }
-                // someone else's voice: move it to them (press and hold)
-                .contextMenu {
-                    ForEach(others) { p in
-                        Button("是 \(p.name)", systemImage: "arrow.right.circle") { answer(.move, personId: p.id) }
+            if !clip.unavailable {
+                bigButton("不是", symbol: "xmark", color: .red) { answer(.reject) }
+                    // someone else's voice: move it to them (press and hold)
+                    .contextMenu {
+                        ForEach(others) { p in
+                            Button("是 \(p.name)", systemImage: "arrow.right.circle") { answer(.move, personId: p.id) }
+                        }
                     }
-                }
+                    .disabled(!clip.answerable)
+            }
             Button { withAnimation(.snappy) { queue.skip() } } label: {
                 VStack(spacing: 4) {
                     Image(systemName: "arrow.uturn.forward").font(.title3.weight(.semibold))
@@ -284,7 +296,10 @@ struct VoiceReviewView: View {
                 .background(Color(.tertiarySystemFill), in: .rect(cornerRadius: 20))
             }
             .buttonStyle(.plain)
-            bigButton("是 \(name)", symbol: "checkmark", color: .green) { answer(.confirm) }
+            if !clip.unavailable {
+                bigButton("是 \(name)", symbol: "checkmark", color: .green) { answer(.confirm) }
+                    .disabled(!clip.answerable)
+            }
         }
         .disabled(queue.busy)
     }

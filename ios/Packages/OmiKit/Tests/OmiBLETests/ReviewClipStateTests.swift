@@ -34,3 +34,15 @@ import OmiProtocol
         #expect(batch.map(\.id) == ["s.a.0"], "unplayable and clip-less items are left out")
     }
 }
+
+/// 2026-11-23: a clip the server listed as playable can still fail to load (404/410, or the network). The card then asks
+/// nothing but skip until it plays; Alan answers only about a clip he can hear.
+@Suite struct ReviewAnswerGateTests {
+    @Test func onlyALoadedClipCanBeAnswered() {
+        #expect(ReviewClipState.ready.answerable && !ReviewClipState.ready.unavailable)
+        #expect(!ReviewClipState.loading.answerable && !ReviewClipState.loading.unavailable)
+        #expect(!ReviewClipState.noAudio.answerable && ReviewClipState.noAudio.unavailable)
+        let retry = ReviewClipState.retry("连不上服务器，点播放重试")
+        #expect(!retry.answerable && retry.unavailable)
+    }
+}
