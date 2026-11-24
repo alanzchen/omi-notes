@@ -166,6 +166,11 @@ public struct TransferSummary: Equatable, Sendable {
     /// Simulator screenshots only (debug builds): SYNTHETIC values, labelled as such on screen.
     /// `-OmiNotesDebugTransferState backlog|sending|waiting|offline|retrying|kept-aside|all-sent|unknown-watch|watch-stalled`
     public static func debugFixture(_ name: String, now: Date) -> TransferSummary? {
+        if name == "watch-stale" {  // the backlog while an idle Watch's last report is 3 hours old
+            guard var t = debugFixture("backlog", now: now) else { return nil }
+            t.watch.reportFresh = false; t.watch.reportAt = now.addingTimeInterval(-3 * 3600)
+            return t
+        }
         var watch = Watch(inUse: true, reportAt: now.addingTimeInterval(-120), reportFresh: true, waitingParts: 4, waitingSeconds: 230,
                           receivedOnPhone: 266, lastReceivedAt: now.addingTimeInterval(-95), converting: 0, waitingForServer: 3)
         var phone = Phone(state: .waiting, rate: nil, networkBytes: 0, since: now.addingTimeInterval(-300), inFlightUploads: 0,
