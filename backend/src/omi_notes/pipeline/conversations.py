@@ -1019,7 +1019,10 @@ class ConversationPipeline:
                     queued += 1
             except Exception:
                 log.exception("conversation %s: its class choice could not be checked", conv_id)
-        self.db.set_meta("class_unreadable", json.dumps(sorted(unreadable)) if unreadable else None)
+        names = sorted(unreadable)
+        self.db.set_meta("class_unreadable", json.dumps(names) if names else None)  # the full list, for diagnostics
+        # what /v1/issues shows (a count and five examples), so a request never parses the whole list (Astra IT5)
+        self.db.set_meta("class_unreadable_summary", json.dumps({"count": len(names), "examples": names[:5]}) if names else None)
         return queued
 
     def _class_rewrite(self, row) -> bool:

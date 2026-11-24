@@ -607,14 +607,22 @@ def server_issues(db, *, read_only: str | None, worker: bool, limit: int = ISSUE
                     "next_step": "This needs a fix on the server.",
                     "server_step": "Check the omi-asr service on the server (`sidecar/asr/scripts/launchagent.sh status`, "
                                    "log `~/Library/Logs/omi-notes-asr.log`)."})  # fmt: skip
-    unreadable = json.loads(db.meta("class_unreadable") or "[]")
-    if unreadable:  # the last applied class stands for these until the file is fixed
-        out.append({"code": "class_choice_unreadable", "severity": "action", "count": len(unreadable),
-                    "message": f"Your recording-kind choice for {len(unreadable)} conversation{'s' if len(unreadable) != 1 else ''} "
+    # the worker's count and five examples (a bounded read); an index whose worker hasn't written one since the upgrade
+    # still has the full list, read once until it does
+    summary = db.meta("class_unreadable_summary")
+    if summary is not None:
+        unreadable = json.loads(summary)
+        count, examples = unreadable["count"], unreadable["examples"]
+    else:
+        names = json.loads(db.meta("class_unreadable") or "[]")
+        count, examples = len(names), names[:5]
+    if count:  # the last applied class stands for these until the file is fixed
+        out.append({"code": "class_choice_unreadable", "severity": "action", "count": count,
+                    "message": f"Your recording-kind choice for {count} conversation{'s' if count != 1 else ''} "
                                "can't be read on the server; their notes keep the kind they were made with.",
                     "next_step": "This needs a fix on the server.",
                     "server_step": "Fix or remove class.json in those conversations' _omi folders: "
-                                   + ", ".join(unreadable[:5])})  # fmt: skip
+                                   + ", ".join(examples)})  # fmt: skip
     if read_only:
         out.append({"code": "read_only", "severity": "action", "message": "The server stopped writing to the vault.",
                     "detail": read_only, "next_step": "This needs a fix on the server.",
