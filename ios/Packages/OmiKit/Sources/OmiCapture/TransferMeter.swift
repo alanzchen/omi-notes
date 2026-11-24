@@ -43,6 +43,10 @@ public struct TransferMeter: Equatable, Sendable {
     private var samples: [Sample] = []
     private var lastReportMono: UInt64?
     private var delivered: Set<String> = []
+    /// The server configuration (task key's generation) the counted evidence belongs to: another one resets the window
+    /// (ASTRA-20261124-IT4-CLIENT-02), so a new address never inherits the old one's rate or acknowledgements.
+    private var generation: Substring?
+    private var lastAckMono: UInt64?
 
     /// Every byte the upload tasks reported sending in this window (audio, metadata and retries).
     public private(set) var networkBytes: Int64 = 0
@@ -56,11 +60,37 @@ public struct TransferMeter: Equatable, Sendable {
 
     public init() {}
 
-    public mutating func start(atMono: UInt64, wall: Date) {
-        since = wall
-        sinceMono = atMono
+    /// When the server last acknowledged a file in this window (wall clock): the only upload evidence that the server
+    /// answers. Bytes leaving the phone alone don't prove that (a proxy or a dead socket takes them too).
+    public var lastAckAt: Date? {
+        guard let since, let ack = lastAckMono, ack >= sinceMono else { return nil }
+        return since.addingTimeInterval(Double(ack - sinceMono) / 1e9)
+    }
+
+    /// Whether the server acknowledged a file within `seconds` before `now` (monotonic).
+    public func acknowledged(within seconds: Double, atMono now: UInt64) -> Bool {
+        guard since != nil, let ack = lastAckMono else { return false }
+        return now < ack || Double(now - ack) / 1e9 <= seconds
+    }
+
+    /// The configuration generation of a task identity `"<generation>.<epoch>|<file>"`; nil for anything else.
+    private static func generation(of id: String) -> Substring? {
+        guard let bar = id.firstIndex(of: "|") else { return nil }
+        return id[..<bar].split(separator: ".", maxSplits: 1).first
+    }
+
+    /// Evidence of a configuration other than the counted one: start counting afresh (the window's totals, rate and
+    /// acknowledgements are the previous server's).
+    private mutating func note(_ id: String) {
+        guard let g = Self.generation(of: id) else { return }
+        if let current = generation, current != g { resetCounts() }
+        generation = g
+    }
+
+    private mutating func resetCounts() {
         samples = []
         lastReportMono = nil
+        lastAckMono = nil
         delivered = []
         networkBytes = 0
         deliveredAudioFiles = 0
@@ -68,6 +98,12 @@ public struct TransferMeter: Equatable, Sendable {
         deliveredOtherFiles = 0
         retryingAttempts = 0
         heldAttempts = 0
+    }
+
+    public mutating func start(atMono: UInt64, wall: Date) {
+        since = wall
+        sinceMono = atMono
+        resetCounts()
         // an upload last seen while not counting (before activation, or across a suspension) may have
         // sent bytes nobody reported: its next report becomes its baseline
         for (id, u) in uploads where !u.current { uploads[id]?.sent = nil }
@@ -75,12 +111,14 @@ public struct TransferMeter: Equatable, Sendable {
 
     /// The uploader started a new attempt: it begins at 0 bytes.
     public mutating func began(id: String, audio: Bool, expected: Int64?) {
+        note(id)
         uploads[id] = Upload(sent: 0, expected: expected.flatMap { $0 > 0 ? $0 : nil }, audio: audio, current: since != nil)
     }
 
     /// Drops uploads of any other configuration or epoch (their callbacks no longer count).
     public mutating func retain(key: String) {
         uploads = uploads.filter { $0.key.split(separator: "|", maxSplits: 1).first.map(String.init) == key }
+        note(key + "|")  // a new configuration's key: the old one's counts go
     }
 
     public mutating func suspend() {
@@ -92,6 +130,7 @@ public struct TransferMeter: Equatable, Sendable {
 
     public mutating func progress(id name: String, audio: Bool, sent: Int64, expected: Int64?, atMono: UInt64) {
         let total = expected.flatMap { $0 > 0 ? $0 : nil }
+        note(name)
         let previous = uploads[name]
         uploads[name] = Upload(sent: sent, expected: total ?? previous?.expected, audio: audio, current: since != nil)
         guard since != nil, let base = previous?.sent else { return }  // no baseline yet: this report becomes it
@@ -105,11 +144,13 @@ public struct TransferMeter: Equatable, Sendable {
     }
 
     public mutating func finished(id name: String, audio: Bool, bytes: Int64?, outcome: Outcome, atMono: UInt64) {
+        note(name)
         uploads[name] = nil
         guard since != nil else { return }
         switch outcome {
         case .delivered:
             guard delivered.insert(name).inserted else { return }
+            lastAckMono = atMono
             if audio {
                 deliveredAudioFiles += 1
                 deliveredAudioBytes += bytes ?? 0

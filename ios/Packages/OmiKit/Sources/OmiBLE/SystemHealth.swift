@@ -219,8 +219,13 @@ public struct SystemHealth: Equatable, Sendable {
                 if serverDiskFull(s, status: status, statusAt: statusAt, now: now) {
                     return step(.delayed, "Server disk is full", "\(files) wait on this phone", .openServer)
                 }
-                if server == .checking || server == .unknown {  // no answer yet (a new server, a cold launch): not a claim
-                    return step(.unknown, "Audio is waiting to upload")
+                if server == .checking || server == .unknown {
+                    // no status answer yet (a new server, a cold launch): only the server acknowledging this
+                    // configuration's files in the last minute shows uploads going (ASTRA-20261124-IT4-CLIENT-04; the
+                    // meter starts afresh on a configuration change)
+                    guard let ack = s.transfer.meter.lastAckAt, abs(now.timeIntervalSince(ack)) <= 60 else {
+                        return step(.unknown, "Audio is waiting to upload")
+                    }
                 }
                 return step(.working, "Uploading audio", "\(files) to go")
             }

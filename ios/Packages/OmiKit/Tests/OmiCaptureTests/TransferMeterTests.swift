@@ -118,4 +118,23 @@ import Testing
         m.finished(id: "a", audio: true, bytes: 1_000, outcome: .delivered, atMono: 3 * s)
         #expect(m.inFlight.uploads == 1 && m.inFlight.total == 0)
     }
+
+    /// ASTRA-20261124-IT4-CLIENT-02: a server configuration change starts the counts afresh; the new server's own
+    /// uploads then count as usual, and an epoch bump of the same configuration keeps them.
+    @Test func aNewConfigurationCountsAfreshAndItsOwnUploadsCount() {
+        var m = meter()
+        m.began(id: "1.1|a.omnc", audio: true, expected: 1_000)
+        m.progress(id: "1.1|a.omnc", audio: true, sent: 1_000, expected: 1_000, atMono: 2 * s)
+        m.finished(id: "1.1|a.omnc", audio: true, bytes: 1_000, outcome: .delivered, atMono: 2 * s)
+        #expect(m.deliveredAudioFiles == 1 && m.lastAckAt != nil && m.acknowledged(within: 10, atMono: 3 * s))
+        m.retain(key: "1.2")  // an epoch bump of the same server: nothing to forget
+        #expect(m.deliveredAudioFiles == 1)
+        m.retain(key: "2.1")  // a new server configuration
+        #expect(m.deliveredAudioFiles == 0 && m.networkBytes == 0 && m.rate(atMono: 2 * s) == nil && m.lastAckAt == nil)
+        m.began(id: "2.1|b.omnc", audio: true, expected: 500)
+        m.progress(id: "2.1|b.omnc", audio: true, sent: 500, expected: 500, atMono: 4 * s)
+        m.finished(id: "2.1|b.omnc", audio: true, bytes: 500, outcome: .delivered, atMono: 4 * s)
+        #expect(m.deliveredAudioFiles == 1 && m.deliveredAudioBytes == 500 && m.acknowledged(within: 10, atMono: 5 * s))
+        #expect(!m.acknowledged(within: 10, atMono: 20 * s), "an acknowledgement goes stale")
+    }
 }

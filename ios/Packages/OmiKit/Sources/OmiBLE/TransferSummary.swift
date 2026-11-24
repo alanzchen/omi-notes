@@ -82,7 +82,11 @@ public struct TransferSummary: Equatable, Sendable {
         public var keptAside: Int
         /// The server refused audio for lack of disk (507, or its status): said instead of a generic retry (2026-11-21).
         public var serverFull = false
+        /// The server acknowledged a file of the current configuration in the last `ackFreshSeconds`: the upload
+        /// evidence that it answers now. Outbound bytes alone are not (ASTRA-20261124-IT4-CLIENT-01).
+        public var ackedRecently = false
     }
+    public static let ackFreshSeconds = 10.0
 
     // MARK: server
     public struct Server: Equatable, Sendable {
@@ -148,7 +152,8 @@ public struct TransferSummary: Equatable, Sendable {
             queuedFiles: s.outbox.pendingCount, queuedAudioFiles: s.outbox.pendingChunks, queuedBytes: s.outbox.pendingBytes,
             queuedAudioSeconds: s.transfer.pendingAudioSeconds, queuedAudioUnknown: s.transfer.pendingAudioUnknown,
             retryingFiles: s.upload.backingOff, keptAside: s.outbox.quarantineCount,
-            serverFull: SystemHealth.serverDiskFull(s, status: status, statusAt: statusAt, now: now))
+            serverFull: SystemHealth.serverDiskFull(s, status: status, statusAt: statusAt, now: now),
+            ackedRecently: m.acknowledged(within: Self.ackFreshSeconds, atMono: nowMono))
 
         let reachable: Bool?
         switch server {
@@ -195,10 +200,12 @@ public struct TransferSummary: Equatable, Sendable {
                             lastNoteAt: now.addingTimeInterval(-1_500))
         switch name {
         case "sending":
+            phone.ackedRecently = true
             phone.state = .sending; phone.rate = 1_240_000; phone.networkBytes = 24_100_000; phone.inFlightUploads = 32
             phone.inFlightSent = 3_900_000; phone.inFlightTotal = 8_100_000; phone.deliveredAudioFiles = 12
             phone.deliveredAudioBytes = 5_200_000; phone.deliveredOtherFiles = 3
         case "backlog":  // the numbers of the build-41 feedback screenshot (2026-11-08 04:31Z)
+            phone.ackedRecently = true
             phone.state = .sending; phone.rate = 111_700; phone.networkBytes = 12_600_000; phone.inFlightUploads = 40
             phone.inFlightSent = 781_000; phone.inFlightTotal = 4_200_000; phone.deliveredAudioFiles = 295
             phone.deliveredAudioBytes = 46_600_000; phone.deliveredOtherFiles = 1; phone.queuedFiles = 5_135
@@ -282,9 +289,9 @@ public struct TransferSummary: Equatable, Sendable {
         case .waiting where phone.serverFull: out.append("服务器磁盘已满")
         case .sending, .waiting, .preparing, .allSent, .unknown: break
         }
-        // bytes the server acknowledged in the last seconds are newer proof of reach than a status answer that timed out
-        // under the same upload burst (2026-11-24 UX inventory)
-        if server.reachable == false, out.isEmpty, phone.state != .sending { out.append("连不上服务器") }
+        // files the server acknowledged in the last seconds (this configuration's) are newer proof of reach than a status
+        // answer that timed out under the same upload burst; bytes merely leaving the phone are not (IT4-CLIENT-01)
+        if server.reachable == false, out.isEmpty, !(phone.state == .sending && phone.ackedRecently) { out.append("连不上服务器") }
         if phone.keptAside > 0, phone.state != .keptAside(phone.keptAside) { out.append("有文件被搁置，未上传") }
         let w = watch
         if w.inUse == true, let at = w.reportAt {
@@ -360,7 +367,9 @@ public struct TransferSummary: Equatable, Sendable {
         // the time left then (the page still says it; 2026-11-24 UX inventory)
         let staleReportOnly = problemLine(now: now) == "手表报告已过时"
         if let problem = problemLine(now: now), !(staleReportOnly && phoneTimeLeft != nil) { return (problem, true) }
-        if let left = phoneTimeLeft { return (Self.estimateText(left) + "传完", false) }
+        // with the Watch's backlog unknown, the estimate covers only what this iPhone holds: it says so
+        // (ASTRA-20261124-IT4-CLIENT-03)
+        if let left = phoneTimeLeft { return ((staleReportOnly ? "iPhone " : "") + Self.estimateText(left) + "传完", false) }
         return everythingSent ? ("全部已发送", false) : nil
     }
 

@@ -46,6 +46,9 @@ import Testing
         t.server.reachable = false
         #expect(t.problemLine(now: now) == nil)
         #expect(t.cardLine(now: now)?.text == "约 13 小时传完")
+        t.phone.ackedRecently = false  // bytes leaving the phone with no acknowledgement prove nothing (IT4-CLIENT-01)
+        #expect(t.problemLine(now: now) == "连不上服务器")
+        t.phone.ackedRecently = true
         t.phone.state = .waiting
         #expect(t.problemLine(now: now) == "连不上服务器", "without bytes moving, the status answer decides")
     }
@@ -59,7 +62,7 @@ import Testing
         t.watch.reportAt = now.addingTimeInterval(-3 * 3600)
         #expect(t.problemLine(now: now) == "手表报告已过时")
         let card = try #require(t.cardLine(now: now))
-        #expect(card.text == "约 13 小时传完" && !card.attention)
+        #expect(card.text == "iPhone 约 13 小时传完" && !card.attention, "the estimate covers only this iPhone (IT4-CLIENT-03)")
         t.watch.reportAt = now.addingTimeInterval(3600)
         #expect(t.cardLine(now: now)?.text == "手表时间与 iPhone 不一致", "a clock problem is a real problem")
         t.watch.reportAt = now.addingTimeInterval(-3 * 3600)
