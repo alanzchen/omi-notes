@@ -42,3 +42,10 @@ def test_load_kickstarts_the_agent_after_bootstrapping_it():
     boot, kick = body.find("launchctl bootstrap"), body.find("launchctl kickstart")
     assert boot != -1 and kick > boot, "a bootstrapped agent can stay pended (2026-11-23: 11 min); start it explicitly"
     assert "kickstart -k" not in body, "never kill a process that is already running"
+
+
+def test_the_release_names_archives_and_records_one_revision():
+    """ASTRA-20261124-IT2-03: HEAD is read once; a commit landing during the tests can't relabel the archive."""
+    text = BUILD.read_text()
+    assert text.count("rev-parse") == 1
+    assert 'git archive "$REV"' in text and '"$REV" <<' in text and "rev = sys.argv[7]" in text
