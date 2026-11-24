@@ -3,9 +3,9 @@
 Not notes data: plain lines kept beside the server's own log (`Settings.logs_dir / "phone"`, outside
 the vault), so a person can read why a phone stalled without a TestFlight log export. The phone
 sends only selected categories and warnings/errors, with tokens redacted, in bounded batches; this
-side bounds them again and keeps at most `MAX_FILE_BYTES` per phone plus one rotated file, and at
-most `MAX_TOTAL_BYTES` (and nothing older than `MAX_AGE_DAYS`) for all phones together: the oldest
-other phones' files go first. These are disposable diagnostics, not notes data.
+side bounds them again and keeps at most `MAX_FILE_BYTES` per phone plus one rotated file (on append),
+and the worker's hourly `retain` keeps at most `MAX_TOTAL_BYTES` (and nothing older than
+`MAX_AGE_DAYS`) for all phones together: the oldest phones' files go first. These are disposable diagnostics, not notes data.
 
 Read them with: `tail -n 200 "<logs_dir>/phone/<device id>.log"` (production:
 `~/Library/Application Support/omi-notes/index/logs/phone/`).
@@ -74,14 +74,24 @@ def append(logs_dir: Path, body: object) -> int:
             path.replace(path.with_suffix(".log.1"))
         with path.open("a", encoding="utf-8") as fh:
             fh.writelines(out)
-        _retain(folder, keep=device)
+    # the folder's total and age limits are the worker's periodic `retain`: a request touches only its own
+    # phone's file, never an inventory of the others (ASTRA-20261124-IT1-04)
     return len(out)
 
 
-def _retain(folder: Path, keep: str) -> None:
-    """Drops files past the age limit, then the oldest other phones' files while the folder is over
-    its total; the phone that just wrote keeps its log."""
-    cutoff = time.time() - MAX_AGE_DAYS * 86_400
+def retain(logs_dir: Path, now: float | None = None) -> int:
+    """Drops files past the age limit, then the oldest files while the folder is over its total; the
+    most recently written phone keeps its log. Periodic maintenance, off the request path; returns how
+    many files went."""
+    folder = logs_dir / "phone"
+    if not folder.is_dir():
+        return 0
+    with _lock:
+        return _retain(folder, time.time() if now is None else now)
+
+
+def _retain(folder: Path, now: float) -> int:
+    cutoff = now - MAX_AGE_DAYS * 86_400
     files = []
     for f in folder.iterdir():
         try:
@@ -90,15 +100,24 @@ def _retain(folder: Path, keep: str) -> None:
             continue
         if not f.is_file():
             continue
-        if st.st_mtime < cutoff and not f.name.startswith(keep + "."):
-            f.unlink(missing_ok=True)
-            continue
         files.append((st.st_mtime, st.st_size, f))
-    total = sum(size for _, size, _ in files)
-    for _, size, f in sorted(files, key=lambda t: t[0]):
+    removed = 0
+    newest = max((t[0] for t in files), default=0.0)
+    keep = next((f.name.split(".", 1)[0] for m, _, f in files if m == newest), None)
+    kept = []
+    for m, size, f in files:
+        if m < cutoff and f.name.split(".", 1)[0] != keep:
+            f.unlink(missing_ok=True)
+            removed += 1
+        else:
+            kept.append((m, size, f))
+    total = sum(size for _, size, _ in kept)
+    for _, size, f in sorted(kept, key=lambda t: t[0]):
         if total <= MAX_TOTAL_BYTES:
             break
-        if f.name.startswith(keep + "."):
+        if f.name.split(".", 1)[0] == keep:
             continue
         f.unlink(missing_ok=True)
+        removed += 1
         total -= size
+    return removed

@@ -8,7 +8,7 @@ Each `tick(now)`:
    create/update/delete open conversations, finalize closed ones;
 5. advance closed conversations through STT → LLM → markdown;
 6. refresh in-progress stubs, daily indexes and `_status.md`;
-7. hourly raw-retention cleanup.
+7. hourly raw-retention cleanup (raw audio is kept) and the phone-log folder's limits.
 `now` is injectable so tests can drive time. `run_forever` holds the host lock (index dir) and the
 vault's writer lease, renews the lease and stops writing if another writer takes it (fencing).
 """
@@ -21,7 +21,7 @@ import threading
 import time
 from collections import OrderedDict
 
-from .. import __version__, deferral, disk_alert, home, operations, priority, search
+from .. import __version__, deferral, disk_alert, home, operations, phone_log, priority, search
 from .. import recording_class as rclass
 from ..audio.timeline import RING_RECORD_SECONDS, CaptureTimeline, ChunkDecode
 from ..audio.vad import MIN_SPEECH, VadChoice, VadStream, make_vad
@@ -100,6 +100,7 @@ class Worker:
         self.lock = worker_lock(self.vault)
         self._decoders: OrderedDict[str, tuple[int, CaptureTimeline, VadStream]] = OrderedDict()
         self._last_retention = 0.0
+        self._last_phone_log = 0.0
         self._last_class_reconcile = 0.0
         self._reconciled = False
         self.operations = operations.Sweeper()
@@ -193,6 +194,12 @@ class Worker:
             self.pipeline.render_stubs(now)
             self.pipeline.render_dailies()
         self._status(now)
+        if now - self._last_phone_log >= RETENTION_INTERVAL:
+            self._last_phone_log = now
+            try:
+                phone_log.retain(self.settings.logs_dir)  # the folder's total and age limits, off the request path
+            except Exception:
+                log.exception("could not trim the phone logs")
         if not self.replaying and now - self._last_retention >= RETENTION_INTERVAL:
             self.check_divergence()
             self.retention(now)

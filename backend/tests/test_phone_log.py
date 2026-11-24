@@ -72,6 +72,8 @@ def test_the_phone_log_folder_is_bounded_in_total(tmp_path, monkeypatch):
         for _ in range(3):
             phone_log.append(tmp_path, {"device_id": device, "lines": [{"message": f"{n} " + "m" * 120}]})
         os.utime(folder / f"{device}.log", (1_000 + n, 1_000 + n))  # deterministic age order
+    assert len(list(folder.iterdir())) == 60, "an append trims only its own phone's file (IT1-04)"
+    phone_log.retain(tmp_path, now=1_100)  # the worker's periodic maintenance
     files = list(folder.iterdir())
     assert sum(f.stat().st_size for f in files) <= phone_log.MAX_TOTAL_BYTES + phone_log.MAX_FILE_BYTES * 2
     assert len(files) < 20
@@ -82,6 +84,32 @@ def test_the_phone_log_folder_is_bounded_in_total(tmp_path, monkeypatch):
     stale.write_text("old\n")
     os.utime(stale, (1, 1))  # far beyond the age limit
     phone_log.append(tmp_path, {"device_id": ids[-1], "lines": [{"message": "m"}]})
+    assert stale.exists()
+    phone_log.retain(tmp_path)
+    assert not stale.exists()
+    assert (folder / f"{ids[-1]}.log").exists(), "the most recently written phone keeps its log"
+
+
+def test_the_worker_trims_the_phone_log_folder_hourly(worker, settings):
+    """IT1-04: the folder's age and total limits run as the worker's periodic maintenance, not per request."""
+    import os
+    import time
+    import uuid
+
+    folder = settings.logs_dir / "phone"
+    folder.mkdir(parents=True, exist_ok=True)
+    fresh, stale = folder / f"phone-{uuid.uuid4()}.log", folder / f"phone-{uuid.uuid4()}.log"
+    fresh.write_text("new\n")
+    stale.write_text("old\n")
+    os.utime(stale, (1, 1))
+    now = time.time()
+    worker.tick(now)
+    assert not stale.exists() and fresh.exists()
+    stale.write_text("old\n")
+    os.utime(stale, (1, 1))
+    worker.tick(now + 60)
+    assert stale.exists(), "hourly, not every tick"
+    worker.tick(now + 3_601)
     assert not stale.exists()
 
 
