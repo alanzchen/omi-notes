@@ -164,11 +164,25 @@ public struct TransferSummary: Equatable, Sendable {
 
     #if DEBUG
     /// Simulator screenshots only (debug builds): SYNTHETIC values, labelled as such on screen.
-    /// `-OmiNotesDebugTransferState backlog|sending|waiting|offline|retrying|kept-aside|all-sent|unknown-watch|watch-stalled`
+    /// `-OmiNotesDebugTransferState backlog|sending|waiting|offline|retrying|kept-aside|all-sent|unknown-watch|watch-stalled|watch-stale|backlog-reopened|backlog-kept`
     public static func debugFixture(_ name: String, now: Date) -> TransferSummary? {
         if name == "watch-stale" {  // the backlog while an idle Watch's last report is 3 hours old
             guard var t = debugFixture("backlog", now: now) else { return nil }
             t.watch.reportFresh = false; t.watch.reportAt = now.addingTimeInterval(-3 * 3600)
+            return t
+        }
+        // the morning proposal of 2026-11-24 (not implemented): the iPhone → server bar after reopening the app mid-backlog,
+        // as now (the meter restarts at every foreground: "待上传", an empty bar) and as proposed (counted from the backlog's
+        // start: 2.05 GB of 5.44 GB sent)
+        if name == "backlog-reopened" || name == "backlog-kept" {
+            guard var t = debugFixture("backlog", now: now) else { return nil }
+            t.phone.queuedBytes = 3_390_000_000; t.phone.queuedAudioSeconds = 126_700
+            if name == "backlog-reopened" {
+                t.phone.since = nil; t.phone.deliveredAudioBytes = 0; t.phone.deliveredAudioFiles = 0; t.phone.rate = nil
+                t.phone.state = .waiting
+            } else {
+                t.phone.since = now.addingTimeInterval(-5 * 3600); t.phone.deliveredAudioBytes = 2_050_000_000
+            }
             return t
         }
         var watch = Watch(inUse: true, reportAt: now.addingTimeInterval(-120), reportFresh: true, waitingParts: 4, waitingSeconds: 230,
