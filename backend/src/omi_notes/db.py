@@ -800,6 +800,22 @@ class Database:
         return conn
 
     @contextmanager
+    def snapshot(self) -> Iterator[sqlite3.Connection]:
+        """One read transaction (deferred `BEGIN` … `COMMIT`): every read inside sees the same committed state, so
+        figures read in several statements can't mix states a writer committed in between (WAL: the writer isn't
+        blocked). Nested use joins the outer transaction."""
+        conn = self.conn()
+        if conn.in_transaction:
+            yield conn
+            return
+        conn.execute("BEGIN")
+        try:
+            yield conn
+        finally:
+            if conn.in_transaction:
+                conn.execute("COMMIT")  # read-only: nothing to keep or undo
+
+    @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
         """`BEGIN IMMEDIATE` … `COMMIT` (rolled back on exception). Nested use joins the outer one."""
         conn = self.conn()

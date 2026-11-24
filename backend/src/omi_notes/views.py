@@ -675,6 +675,11 @@ def activity(db, settings, now: float) -> dict:
     from . import telemetry
 
     queue = ACTIVE_LISTED
+    with db.snapshot():  # one read state for every figure below: waiting = total - parts must add up (IT5 race)
+        return _activity(db, settings, now, queue, telemetry)
+
+
+def _activity(db, settings, now: float, queue: str, telemetry) -> dict:
     running = [{"conversation_id": r["id"], "stage": "summarizing" if r["status"] == "summarizing" else "transcribing",
                 "started_at": iso_utc_epoch(r["start"])}
                for r in db.query(f"SELECT id, status, start FROM conversations INDEXED BY conversations_claimed "
