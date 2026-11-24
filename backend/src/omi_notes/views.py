@@ -21,6 +21,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from .db import ACTIVE_LISTED, ISSUE_CONFLICT, ISSUE_FAILED, ISSUE_RETRYING
 from .db import LISTED as _LISTED
 from .db import NOT_DISMISSED as _NOT_DISMISSED
 
@@ -635,7 +636,8 @@ def server_issues(db, *, read_only: str | None, worker: bool, limit: int = ISSUE
                 "conversation_id": r["id"], "started_at": iso_utc_epoch(r["start"]),
                 "title": r["title"] if r["note_path"] else None}  # fmt: skip
 
-    for r in db.query(f"SELECT * FROM conversations WHERE status='failed' AND {LISTED} AND {NOT_DISMISSED} "
+    # each list walks its own ordered partial index newest first and stops at `limit` (ASTRA-20261124-IT3-01)
+    for r in db.query(f"SELECT * FROM conversations INDEXED BY conversations_issue_failed WHERE {ISSUE_FAILED} "
                       "ORDER BY start DESC LIMIT ?", (limit,)):  # fmt: skip
         if r["note_path"] and r["failed_stage"] == "summarizing":
             message = "Transcript ready; summary unavailable. " + failure_message(r["error_kind"], "summarizing")
@@ -644,33 +646,57 @@ def server_issues(db, *, read_only: str | None, worker: bool, limit: int = ISSUE
         out.append(conv(r, "conversation_failed", "action", message, next_step(r["error_kind"], r["failed_stage"], retrying=False),
                         server_step(r["error_kind"], r["failed_stage"], retrying=False), retryable(r["error_kind"]),
                         keepable(r["error_kind"]) and not r["retry_op"], not r["retry_op"]))  # fmt: skip
-    for r in db.query(f"SELECT * FROM conversations WHERE edited=1 AND frozen=0 AND note_path IS NOT NULL AND {LISTED} "
+    for r in db.query(f"SELECT * FROM conversations INDEXED BY conversations_issue_conflict WHERE {ISSUE_CONFLICT} "
                       "ORDER BY start DESC LIMIT ?", (limit,)):  # fmt: skip
         out.append(conv(r, "note_conflict", "action", "The note was changed outside My Notes; the server stopped updating it.",
                         "The server keeps your edited version and stops updating it until this is settled on the server.",
                         f"On the server, run {command('note overwrite ' + r['id'])} to replace it (your version is kept "
                         f"aside), or {command('note freeze ' + r['id'])} to keep your version.", False))  # fmt: skip
-    for r in db.query(f"SELECT * FROM conversations WHERE status IN ('closed','transcribing','summarizing') AND error IS NOT NULL "
-                      f"AND next_attempt_at IS NOT NULL AND {LISTED} ORDER BY start DESC LIMIT ?", (limit,)):  # fmt: skip
+    for r in db.query(f"SELECT * FROM conversations INDEXED BY conversations_issue_retrying WHERE {ISSUE_RETRYING} "
+                      "ORDER BY start DESC LIMIT ?", (limit,)):  # fmt: skip
         stage = _stage(r["status"])
         out.append(conv(r, "conversation_retrying", "delayed", failure_message(r["error_kind"], stage) + " Retrying.",
                         next_step(r["error_kind"], stage, retrying=True), server_step(r["error_kind"], stage, retrying=True), False))  # fmt: skip
     return out[:limit]
 
 
+# Above this many conversations backing off (or claimed), `/v1/status` reports their split as unknown (null) rather than
+# count further on a request (ASTRA-20261124-IT3-01). The worker claims a handful; a 5-day reconnect makes ~100.
+ACTIVITY_CAP = 500
+
+
 def activity(db, settings, now: float) -> dict:
-    """What the pipeline is doing now, for `/v1/status` (cheap: a few indexed queries)."""
+    """What the pipeline is doing now, for `/v1/status`. Bounded whatever the history or queue size
+    (ASTRA-20261124-IT3-01): the queued total is a maintained counter (`queue_totals.active_listed`); only the rows
+    whose state depends on the clock are counted, through their own indexes and at most `ACTIVITY_CAP` of each: those
+    backing off (a retry time ahead) and those claimed now. waiting = queued - backing off - claimed (not backing off),
+    exact as of this request. Past the cap the server can't back the split cheaply, so `waiting`, `backing_off` and
+    `oldest_waiting_ended_at` are null (unknown), never a guess; build 64 reads them as optional."""
     from . import telemetry
 
-    queue = f"status IN ('closed','transcribing','summarizing') AND {LISTED}"
+    queue = ACTIVE_LISTED
     running = [{"conversation_id": r["id"], "stage": "summarizing" if r["status"] == "summarizing" else "transcribing",
                 "started_at": iso_utc_epoch(r["start"])}
-               for r in db.query(f"SELECT id, status, start FROM conversations WHERE {queue} AND claim_token IS NOT NULL "
-                                 "AND claim_expires > ? ORDER BY start LIMIT 5", (now,))]  # fmt: skip
-    waiting = db.one(f"SELECT COUNT(*) AS n, MIN(\"end\") AS oldest FROM conversations WHERE {queue} "
-                     "AND (next_attempt_at IS NULL OR next_attempt_at <= ?) "
-                     "AND NOT (claim_token IS NOT NULL AND claim_expires > ?)", (now, now))  # fmt: skip
-    backing_off = db.one(f"SELECT COUNT(*) AS n FROM conversations WHERE {queue} AND next_attempt_at > ?", (now,))["n"]
+               for r in db.query(f"SELECT id, status, start FROM conversations INDEXED BY conversations_claimed "
+                                 f"WHERE claim_token IS NOT NULL AND {queue} AND claim_expires > ? ORDER BY start LIMIT 5",
+                                 (now,))]  # fmt: skip
+    cap = ACTIVITY_CAP + 1
+    backing_off = db.one(f"SELECT COUNT(*) AS n FROM (SELECT 1 FROM conversations INDEXED BY conversations_active_retry_at "
+                         f"WHERE {queue} AND next_attempt_at IS NOT NULL AND next_attempt_at > ? LIMIT ?)", (now, cap))["n"]  # fmt: skip
+    claimed = db.one(f"SELECT COUNT(*) AS n FROM (SELECT 1 FROM conversations INDEXED BY conversations_claimed "
+                     # an expiry of NULL counts as claimed, as the old NOT (... AND claim_expires > ?) excluded it from waiting
+                     f"WHERE claim_token IS NOT NULL AND {queue} AND (claim_expires > ? OR claim_expires IS NULL) "
+                     "AND NOT (next_attempt_at IS NOT NULL AND next_attempt_at > ?) LIMIT ?)", (now, now, cap))["n"]  # fmt: skip
+    waiting = oldest = None
+    if backing_off <= ACTIVITY_CAP and claimed <= ACTIVITY_CAP:
+        waiting = db.queue_total("active_listed") - backing_off - claimed
+        if waiting > 0:  # the first waiting row by end: the walk skips at most the rows counted above
+            row = db.one(f'SELECT "end" FROM conversations INDEXED BY conversations_active_end WHERE {queue} '
+                         'AND "end" IS NOT NULL AND (next_attempt_at IS NULL OR next_attempt_at <= ?) '
+                         'AND NOT (claim_token IS NOT NULL AND claim_expires > ?) ORDER BY "end" LIMIT 1', (now, now))  # fmt: skip
+            oldest = row["end"] if row else None
+    else:
+        backing_off = None
     chunk = db.one("SELECT MIN(received_at) AS t FROM chunks WHERE status='pending'")
 
     def provider(kind: str) -> dict | None:
@@ -683,10 +709,10 @@ def activity(db, settings, now: float) -> dict:
 
     return {
         "running": running,
-        "waiting": waiting["n"],
+        "waiting": waiting,
         "backing_off": backing_off,
         # when the oldest waiting conversation ended (not how long it has been queued)
-        "oldest_waiting_ended_at": iso_utc_epoch(waiting["oldest"]) if waiting["oldest"] else None,
+        "oldest_waiting_ended_at": iso_utc_epoch(oldest) if oldest else None,
         "oldest_pending_chunk_received_at": iso_utc_epoch(chunk["t"]) if chunk and chunk["t"] else None,
         "stt": provider("stt"),
         "llm": None if settings.llm_provider == "none" else provider("llm"),

@@ -2012,10 +2012,8 @@ def queue_counts(db: Database) -> dict:
 
 
 def notes_conflicted(db: Database) -> int:
-    """Notes changed outside My Notes that the server stopped updating: a count over a partial index of just them."""
-    from ..db import CONFLICTED
-
-    return db.one(f"SELECT COUNT(*) AS n FROM conversations WHERE {CONFLICTED}")["n"]
+    """Notes changed outside My Notes that the server stopped updating: a maintained counter (ASTRA-20261124-IT3-01)."""
+    return db.queue_total("conflicted")
 
 
 def ring_seen_check(db: Database, device_id: str, capture_id: str, chunk_sequence: int):

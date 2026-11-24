@@ -478,9 +478,17 @@ QUEUE = {
     "deferred": WAITING,
     "failed": f"status = 'failed' AND {NOT_DISMISSED}",
     "retrying": f"{_ACTIVE} AND error IS NOT NULL AND next_attempt_at IS NOT NULL",
+    # `notes_conflicted` and the activity totals (`views.activity`): the listed queue, and the part of it with a retry
+    # time (the only rows whose waiting/backing-off split depends on the clock) (ASTRA-20261124-IT3-01)
+    "conflicted": CONFLICTED,
+    "active_listed": f"{_ACTIVE} AND {LISTED}",
+    "scheduled_listed": f"{_ACTIVE} AND {LISTED} AND next_attempt_at IS NOT NULL",
 }
 _QUEUE_COLUMNS = ("status", "resolution", "failure_id", "deferral", "note_path", "retry_op", "transcribe_op", "error",
-                  "next_attempt_at")
+                  "next_attempt_at", "edited", "frozen", "enrollment_id", "waiting_for", "relevance")
+# Bumped whenever QUEUE or its triggers change: an index recorded with another version gets the triggers re-created and
+# the totals recounted, in one transaction (an index of 405a2fe has the version-1 triggers without the IT3-01 totals).
+COUNTERS_VERSION = "2"
 
 
 def _of(row: str, predicate: str) -> str:
@@ -497,20 +505,42 @@ def _queue_delta(sign_rows: tuple[tuple[str, str], ...]) -> str:
 
 
 _CHANGED = " OR ".join(f"OLD.{c} IS NOT NEW.{c}" for c in _QUEUE_COLUMNS)
-SCHEMA += f"""
+QUEUE_TRIGGERS = {
+    "conversations_queue_insert": f"""CREATE TRIGGER IF NOT EXISTS conversations_queue_insert AFTER INSERT ON conversations BEGIN
+    {_queue_delta((("+", "NEW"),))}
+END""",
+    "conversations_queue_update": f"""CREATE TRIGGER IF NOT EXISTS conversations_queue_update AFTER UPDATE ON conversations
+WHEN {_CHANGED} BEGIN
+    {_queue_delta((("+", "NEW"), ("-", "OLD")))}
+END""",
+    "conversations_queue_delete": f"""CREATE TRIGGER IF NOT EXISTS conversations_queue_delete AFTER DELETE ON conversations BEGIN
+    {_queue_delta((("-", "OLD"),))}
+END""",
+}
+SCHEMA += """
 CREATE TABLE IF NOT EXISTS queue_totals (
     name TEXT PRIMARY KEY,
     n INTEGER NOT NULL DEFAULT 0
 );
-CREATE TRIGGER IF NOT EXISTS conversations_queue_insert AFTER INSERT ON conversations BEGIN
-    {_queue_delta((("+", "NEW"),))}
-END;
-CREATE TRIGGER IF NOT EXISTS conversations_queue_update AFTER UPDATE ON conversations WHEN {_CHANGED} BEGIN
-    {_queue_delta((("+", "NEW"), ("-", "OLD")))}
-END;
-CREATE TRIGGER IF NOT EXISTS conversations_queue_delete AFTER DELETE ON conversations BEGIN
-    {_queue_delta((("-", "OLD"),))}
-END;
+""" + "".join(t + ";\n" for t in QUEUE_TRIGGERS.values())
+
+# Ordered partial indexes for the fixed-size pages `/v1/status` and `/v1/issues` read (ASTRA-20261124-IT3-01): each
+# matches its query's WHERE exactly and is ordered like its ORDER BY, so LIMIT stops after its rows (no scan, no sort).
+# Queries name them with INDEXED BY, so a predicate drifting from its index fails loudly instead of scanning.
+ISSUE_FAILED = f"status = 'failed' AND {LISTED} AND {NOT_DISMISSED}"
+ISSUE_CONFLICT = f"{CONFLICTED} AND {LISTED}"
+ISSUE_RETRYING = f"{_ACTIVE} AND error IS NOT NULL AND next_attempt_at IS NOT NULL AND {LISTED}"
+ACTIVE_LISTED = f"{_ACTIVE} AND {LISTED}"
+SCHEMA += f"""
+CREATE INDEX IF NOT EXISTS conversations_issue_failed ON conversations(start) WHERE {ISSUE_FAILED};
+CREATE INDEX IF NOT EXISTS conversations_issue_conflict ON conversations(start) WHERE {ISSUE_CONFLICT};
+CREATE INDEX IF NOT EXISTS conversations_issue_retrying ON conversations(start) WHERE {ISSUE_RETRYING};
+-- activity: the claimed rows (at most the worker's in-flight claims; cleared on finish and at startup), the queued rows
+-- with a retry time by that time, and the queued rows by end (the oldest waiting one)
+CREATE INDEX IF NOT EXISTS conversations_claimed ON conversations(start) WHERE claim_token IS NOT NULL;
+CREATE INDEX IF NOT EXISTS conversations_active_retry_at ON conversations(next_attempt_at)
+    WHERE {ACTIVE_LISTED} AND next_attempt_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS conversations_active_end ON conversations("end") WHERE {ACTIVE_LISTED};
 """
 
 _SEAL = "raw/<dev>/<cap>/seal.json"
@@ -725,22 +755,26 @@ class Database:
         conn = self.conn()
         conn.executescript(SCHEMA)
         conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
-        if self.meta("counters") != "1":
+        if self.meta("counters") != COUNTERS_VERSION:
             self._counters()
 
     def _counters(self) -> None:
-        """`chunk_counts` and `queue_totals` from the rows, once for an index that has none recorded (an index written
-        before they existed); the triggers keep them after that. One transaction: a row change between the triggers'
-        creation and this count is counted once, by the count."""
+        """`chunk_counts` and `queue_totals` from the rows, once for an index that has none recorded at this
+        `COUNTERS_VERSION` (written before they existed, or by an older version); the triggers keep them after that.
+        One transaction re-creates the conversation triggers (so they match `QUEUE`) and recounts: a row change before
+        it is counted once, by the count."""
         with self.tx() as conn:
+            for name, create in QUEUE_TRIGGERS.items():
+                conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+                conn.execute(create)
             conn.execute("DELETE FROM chunk_counts")
             conn.execute("INSERT INTO chunk_counts (status, n) SELECT status, COUNT(*) FROM chunks GROUP BY status")
             conn.execute("DELETE FROM queue_totals")
             for name, predicate in QUEUE.items():
                 conn.execute(f"INSERT INTO queue_totals (name, n) SELECT ?, COUNT(*) FROM conversations WHERE {predicate}",
                              (name,))  # fmt: skip
-            conn.execute("INSERT INTO meta (key, value) VALUES ('counters', '1') "
-                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+            conn.execute("INSERT INTO meta (key, value) VALUES ('counters', ?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (COUNTERS_VERSION,))
 
     def queue_total(self, name: str) -> int:
         """How many conversation rows match `QUEUE[name]` (a maintained counter, not a COUNT over the rows)."""
