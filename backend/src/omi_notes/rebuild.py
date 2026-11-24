@@ -213,8 +213,14 @@ def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, ski
             digest, size, header, deleted, ring = sha256_hex(data), len(data), env.header, False, ring_record_hashes(env)
             report.chunks += 1
         else:
-            tomb = json.loads((cap_dir / f"{seq}.gone").read_text())
-            digest, size, header, deleted, ring = tomb["sha256"], int(tomb["size"]), tombstone_header(tomb), True, []
+            # a torn or misshapen tombstone is a problem like an unreadable chunk: not indexed, so an acknowledged one
+            # refuses the rebuild (`_refuse_if_missing`) instead of crashing it (ASTRA-20261124-IT2-02)
+            try:
+                tomb = json.loads((cap_dir / f"{seq}.gone").read_text())
+                digest, size, header, deleted, ring = tomb["sha256"], int(tomb["size"]), tombstone_header(tomb), True, []
+            except (KeyError, TypeError, ValueError) as exc:
+                report.problems.append(f"unreadable tombstone {vault.relpath(cap_dir / f'{seq}.gone')}: {exc!r}")
+                continue
             report.tombstones += 1
         receipt = receipts.get((seq, digest))
         if receipt is not None:
@@ -231,13 +237,15 @@ def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, ski
 
         ops.append(_Op(received, 0, (capture, seq), fn))
     if "seal.json" in names and not skip_seal:
-        stored = json.loads((cap_dir / "seal.json").read_text())
+        # torn JSON or the wrong shape is an invalid seal too: not indexed, so an acknowledged one refuses the rebuild
+        # (not ready, retried) instead of crashing startup (ASTRA-20261124-IT2-02)
         try:
+            stored = json.loads((cap_dir / "seal.json").read_text())
             facts = validate_seal(stored["body"])
-        except (ApiError, KeyError) as exc:
-            report.problems.append(f"invalid seal {vault.relpath(cap_dir / 'seal.json')}: {exc}")
-        else:
             received = float(stored["received_at"])
+        except (ApiError, KeyError, TypeError, ValueError) as exc:
+            report.problems.append(f"invalid seal {vault.relpath(cap_dir / 'seal.json')}: {exc!r}")
+        else:
             ops.append(_Op(received, 1, (capture, -1), lambda conn, r, f=facts: index_seal(conn, capture, f, r)))
             report.seals += 1
     return ops

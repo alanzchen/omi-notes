@@ -93,3 +93,33 @@ def test_an_acknowledged_chunk_that_no_longer_parses_blocks_promotion(settings, 
         assert "missing" in reason and f"{cap}/0" in reason
     finally:
         path.write_bytes(kept)
+
+
+@pytest.mark.parametrize("damage", [b"{torn", b"[]", b'{"sha256": "x"}'])
+def test_a_damaged_acknowledged_tombstone_stays_not_ready(settings, monkeypatch, damage):
+    """ASTRA-20261124-IT2-02: a torn or misshapen tombstone of an acknowledged chunk refuses the rebuild like a
+    torn seal (503 with the bounded retry, previous index untouched), never a crash at startup."""
+    import hashlib
+
+    from omi_notes.envelope import parse_envelope
+
+    _free(monkeypatch, 50 * GiB)
+    monkeypatch.setattr(api, "_exit_for_restart", lambda: None)
+    c = fresh(settings)
+    cap = str(uuid.uuid4())
+    raw = _envs(cap)[0]
+    assert put_chunk(c, cap, 0, raw).status_code == 201
+    v = c.app.state.vault
+    tomb = {"sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw),
+            "header": parse_envelope(raw).header.model_dump(mode="json"), "deleted_at": 1}  # fmt: skip
+    v.write_json(v.tombstone_path(DEVICE, cap, 0), tomb)  # a synthetic vault's pre-rule tombstone
+    v.chunk_path(DEVICE, cap, 0).unlink()
+    c.app.state.db.execute("UPDATE chunks SET raw_deleted=1 WHERE capture_id=?", (cap,))
+    c.app.state.db.set_meta("schema_version", "11")
+    c.app.state.db.close()
+    index = index_dir(settings, v) / "index.sqlite3"
+    before = index.read_bytes()
+    v.tombstone_path(DEVICE, cap, 0).write_bytes(damage)
+    r = fresh(settings).get("/healthz")
+    assert r.status_code == 503 and r.json()["startup"] == "incomplete", r.text
+    assert index.read_bytes() == before
