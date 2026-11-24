@@ -113,6 +113,9 @@ stop_current() {  # stop our job if loaded; 0 when confirmed gone
 load() {  # $1 plist: install as the agent and bootstrap it in Alan's GUI domain
     cp "$1" "$AGENT.tmp" && chmod 600 "$AGENT.tmp" && mv "$AGENT.tmp" "$AGENT" || { say "cannot install $AGENT"; return 1; }
     launchctl bootstrap "$DOMAIN" "$AGENT" || { say "bootstrap in $DOMAIN failed"; return 1; }
+    # 2026-11-23: launchd accepted the job but left its RunAtLoad spawn pended ("speculative") for ~11 minutes. Start
+    # the just-loaded job explicitly; without -k it never kills a running process.
+    launchctl kickstart "$DOMAIN/$LABEL" || { say "kickstart $DOMAIN/$LABEL failed"; return 1; }
 }
 
 switch() {  # $1 new plist, $2 fallback plist (may be empty); both are copied first (they may be state files)
