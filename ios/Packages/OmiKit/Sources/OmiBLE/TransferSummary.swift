@@ -268,7 +268,9 @@ public struct TransferSummary: Equatable, Sendable {
         case .waiting where phone.serverFull: out.append("服务器磁盘已满")
         case .sending, .waiting, .preparing, .allSent, .unknown: break
         }
-        if server.reachable == false, out.isEmpty { out.append("连不上服务器") }
+        // bytes the server acknowledged in the last seconds are newer proof of reach than a status answer that timed out
+        // under the same upload burst (2026-11-24 UX inventory)
+        if server.reachable == false, out.isEmpty, phone.state != .sending { out.append("连不上服务器") }
         if phone.keptAside > 0, phone.state != .keptAside(phone.keptAside) { out.append("有文件被搁置，未上传") }
         let w = watch
         if w.inUse == true, let at = w.reportAt {
@@ -340,7 +342,10 @@ public struct TransferSummary: Equatable, Sendable {
 
     /// The Devices card's line: a problem, else the estimate, else "全部已发送" with evidence; else nothing.
     public func cardLine(now: Date) -> (text: String, attention: Bool)? {
-        if let problem = problemLine(now: now) { return (problem, true) }
+        // an idle Watch reports only on change, so its report going stale isn't a fault of this upload: the card keeps
+        // the time left then (the page still says it; 2026-11-24 UX inventory)
+        let staleReportOnly = problemLine(now: now) == "手表报告已过时"
+        if let problem = problemLine(now: now), !(staleReportOnly && phoneTimeLeft != nil) { return (problem, true) }
         if let left = phoneTimeLeft { return (Self.estimateText(left) + "传完", false) }
         return everythingSent ? ("全部已发送", false) : nil
     }

@@ -152,7 +152,7 @@ struct ServerSettingsSection: View {
                 case .rejected(let r): Label(r, systemImage: "xmark.octagon").font(.footnote).foregroundStyle(.red)
                 }
             }
-            if replacing, url != nil, url != model.serverURL {
+            if replacing, url != nil, url != model.serverURL, model.snapshot.outbox.pendingCount > 0 {  // only when something waits
                 // proven by RouteMigrationTests: queued parts are kept and sent to the saved address
                 Label("Audio waiting on this iPhone goes to the new address.", systemImage: "arrow.up.circle").font(.footnote)
             }

@@ -563,7 +563,7 @@ public final class AppModel {
             return ConnectionCheck(ok: true, message: "Connected to server \(st.serverVersion ?? "?"). Transcription \(st.stt?.ready == true ? "configured" : "not configured")"
                 + (st.stt?.engine?.healthy == false ? " (not answering now)" : "") + "; "
                 + "summaries \(st.llm?.ready == true ? "configured" : "not configured")." + what, sameServer: same)
-        } catch APIError.http(401, _) {
+        } catch APIError.unauthorized, APIError.http(401, _) {  // the client throws `.unauthorized` for a 401
             return ConnectionCheck(ok: false, message: "Couldn't connect: the server rejected this token.", sameServer: nil)
         } catch {
             return ConnectionCheck(ok: false, message: "Couldn't connect: \(Self.describe(error))", sameServer: nil)

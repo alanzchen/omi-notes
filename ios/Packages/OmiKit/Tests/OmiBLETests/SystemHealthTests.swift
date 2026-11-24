@@ -51,7 +51,7 @@ import OmiWatchKit
         s.outbox.pendingCount = 3
         let h = health(s, .unreachable("offline"), nil)
         #expect(h.level == .delayed)
-        #expect(step(h, .phone).level == .delayed && step(h, .phone).title == "Audio is waiting to upload" && step(h, .phone).detail?.hasPrefix("3 files") == true)
+        #expect(step(h, .phone).level == .delayed && step(h, .phone).title == "Audio is waiting to upload" && step(h, .phone).detail == "Stored safely on this phone.")
         #expect(step(h, .server).level == .delayed && step(h, .server).fix == .openServer)
     }
 

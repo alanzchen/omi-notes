@@ -212,11 +212,15 @@ public struct SystemHealth: Equatable, Sendable {
             let files = "\(waiting) file\(waiting == 1 ? "" : "s")"
             switch server {
             case .unreachable, .unauthorized:
-                return step(.delayed, "Audio is waiting to upload", "\(files) stored safely on this phone; they upload when the server is reachable.", .retryUploads)
+                // the count is in Details; why it waits is the server step's line
+                return step(.delayed, "Audio is waiting to upload", "Stored safely on this phone.", .retryUploads)
             default:
                 // the server answered: its disk is full (507, or its status says so). Not "uploading", not "can't reach"
                 if serverDiskFull(s, status: status, statusAt: statusAt, now: now) {
                     return step(.delayed, "Server disk is full", "\(files) wait on this phone", .openServer)
+                }
+                if server == .checking || server == .unknown {  // no answer yet (a new server, a cold launch): not a claim
+                    return step(.unknown, "Audio is waiting to upload")
                 }
                 return step(.working, "Uploading audio", "\(files) to go")
             }
