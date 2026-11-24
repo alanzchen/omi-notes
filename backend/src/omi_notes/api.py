@@ -156,7 +156,10 @@ def not_ready_app(settings: Settings, vault: Vault, failure: StartupIncomplete, 
     app.state.settings = settings
     app.state.startup = state
     app.state.retry_now = retry_now
-    app.state.db = _ReadOnlyIndex(target) if target.exists() else None
+    try:  # diagnostic only: refusals don't need it, and an unreadable old index must not escape the not-ready mode
+        app.state.db = _ReadOnlyIndex(target) if target.exists() else None
+    except sqlite3.Error:
+        app.state.db = None
 
     @app.middleware("http")
     async def _refuse(request: Request, call_next):

@@ -168,8 +168,8 @@ def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, ski
     any failure raises `Unconfirmed` and nothing of the capture is used (the caller confirms raw → vault root)."""
     cap_dir = vault.capture_dir(device, capture)
     ops: list[_Op] = []
-    names = {p.name for p in cap_dir.iterdir()} if cap_dir.exists() else set()
     try:
+        names = {p.name for p in cap_dir.iterdir()} if cap_dir.exists() else set()  # a listing failure is unconfirmed too
         for name in sorted(names):
             if name.endswith((".omnc", ".gone")) or name in ("seal.json", "receipts.jsonl", "capture.json"):
                 stem = name.partition(".")[0]
@@ -243,12 +243,20 @@ def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, ski
     return ops
 
 
+def _list(directory: Path) -> list[Path]:
+    """A startup listing: a directory that can't be listed means startup can't know what it holds (IT4-01)."""
+    try:
+        return sorted(directory.iterdir())
+    except OSError as exc:
+        raise StartupIncomplete(f"can't list {directory.name}: {exc}", disk_full=exc.errno == errno.ENOSPC) from exc
+
+
 def _captures(vault: Vault):
     if not vault.raw.exists():
         return
-    for device_dir in sorted(vault.raw.iterdir()):
+    for device_dir in _list(vault.raw):
         if device_dir.is_dir():
-            for cap_dir in sorted(device_dir.iterdir()):
+            for cap_dir in _list(device_dir):
                 if cap_dir.is_dir():
                     yield device_dir.name, cap_dir.name
 
@@ -259,17 +267,18 @@ def _event_ops(vault: Vault, report: Report, known: dict[str, str] | None = None
     seen: dict[str, str] = dict(known or {})
     if not vault.events_dir.exists():
         return ops
-    for path in sorted(vault.events_dir.glob("*.jsonl")):
+    for path in [p for p in _list(vault.events_dir) if p.suffix == ".jsonl"]:
         if since is not None and path.stem < since:
             continue
         try:
             vault.confirm(path)  # a day file whose sync can't be confirmed is not trusted yet, on every path (IT4-01)
+            lines = Vault.read_jsonl(path)
         except OSError as exc:
-            report.problems.append(f"events file {vault.relpath(path)} can't be confirmed durable now: {exc}")
+            report.problems.append(f"events file {vault.relpath(path)} can't be confirmed or read now: {exc}")
             report.unresolved.append(vault.relpath(path))
             report.unconfirmed_events.append((path, exc.errno))
             continue
-        for line in Vault.read_jsonl(path):
+        for line in lines:
             event_id, body, received = line.get("event_id"), line.get("body"), line.get("received_at")
             if not isinstance(event_id, str) or not isinstance(received, (int, float)):
                 continue
@@ -491,6 +500,29 @@ def _refuse_if_acknowledged(report: Report, prior) -> None:
                                 disk_full=full)  # fmt: skip
 
 
+def _refuse_if_missing(prior, ops: list[_Op], excluded: set[str]) -> None:
+    """Every chunk, seal and event the previous index held must be in the rebuilt set (IT4-02): an acknowledged file
+    deleted without a tombstone, or one skipped as unreadable, would otherwise vanish from the index without a trace.
+    One pass over the previous index's identities, at startup only."""
+    if prior is None:
+        return
+    chunks = {op.key for op in ops if op.rank == 0}
+    seals = {op.key[0] for op in ops if op.rank == 1}
+    events = {op.key[0] for op in ops if op.rank == 2}
+    try:
+        missing = [f"{c}/{q}" for c, q in prior.execute("SELECT capture_id, chunk_sequence FROM chunks")
+                   if c not in excluded and (c, q) not in chunks]  # fmt: skip
+        missing += [f"seal {c}" for (c,) in prior.execute("SELECT capture_id FROM captures WHERE seal_json IS NOT NULL")
+                    if c not in excluded and c not in seals]  # fmt: skip
+        missing += [f"event {e}" for (e,) in prior.execute("SELECT event_id FROM events") if e not in events]
+    except sqlite3.Error:
+        return  # an unreadable previous index proves nothing either way (the confirmation rule above still applies)
+    if missing:
+        more = f" (and {len(missing) - 5} more)" if len(missing) > 5 else ""
+        raise StartupIncomplete(f"{len(missing)} stored uploads are missing from the vault: {', '.join(missing[:5])}{more}",
+                                disk_full=False)  # fmt: skip
+
+
 def _prior_index(path: Path, vault: Vault):
     """The previous index of this vault, read-only, to tell acknowledged artifacts from never-acknowledged ones."""
     if not path.exists():
@@ -527,6 +559,7 @@ def build(settings: Settings, vault: Vault, path: Path, *, now: float | None = N
         vault.confirm(vault.raw)  # raw → _omi → vault root (anchored); failing here fails the build, never a weaker index
     ops += _event_ops(vault, report)
     _refuse_if_acknowledged(report, prior)
+    _refuse_if_missing(prior, ops, {c for _, c, _ in report.unconfirmed_captures})
     db = Database(path)
     ops.sort(key=lambda op: (op.received_at, op.rank, op.key))
     with db.tx() as conn:
@@ -709,7 +742,7 @@ def sweep(db: Database, vault: Vault) -> dict:
     state = RecoveryState(pending=previous.pending if previous else {})  # in-flight publications outlive a sweep
     for device, capture in _captures(vault):
         cap_dir = vault.capture_dir(device, capture)
-        seqs = {int(p.name.partition(".")[0]) for p in cap_dir.iterdir()
+        seqs = {int(p.name.partition(".")[0]) for p in _list(cap_dir)
                 if p.suffix in (".omnc", ".gone") and p.name.partition(".")[0].isdigit()}  # fmt: skip
         if seqs:
             state.high_water[capture] = max(seqs)
