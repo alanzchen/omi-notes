@@ -226,7 +226,10 @@ def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, ski
                     raise ValueError("sha256 is not a hex digest")
                 if not isinstance(size, int) or isinstance(size, bool) or size < 0:
                     raise ValueError("size is not a byte count")
-                if (header.device_id, header.capture_id, header.chunk_sequence) != (device, capture, seq):
+                # the directory holds the device id as a safe path component (`Vault.capture_dir`): an id the API
+                # accepted with punctuation ("Watch:example") is stored as "Watch_example" (Astra IT5); capture and
+                # sequence are compared exactly
+                if (spool.safe_component(header.device_id), header.capture_id, header.chunk_sequence) != (device, capture, seq):
                     raise ValueError(f"header names {header.device_id}/{header.capture_id}/{header.chunk_sequence}")
             except (KeyError, TypeError, ValueError) as exc:
                 report.problems.append(f"unreadable tombstone {vault.relpath(cap_dir / f'{seq}.gone')}: {exc!r}")
