@@ -20,6 +20,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import json
+import re
 import sqlite3
 import logging
 import os
@@ -215,9 +216,18 @@ def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, ski
         else:
             # a torn or misshapen tombstone is a problem like an unreadable chunk: not indexed, so an acknowledged one
             # refuses the rebuild (`_refuse_if_missing`) instead of crashing it (ASTRA-20261124-IT2-02)
+            # It must also name this very file: a digest and a size of the right types, and a header for this device,
+            # capture and sequence. Else the index would hold another identity than the one the previous index had
+            # acknowledged here, and the inventory check would compare the wrong row (ASTRA-20261124-IT3-02).
             try:
                 tomb = json.loads((cap_dir / f"{seq}.gone").read_text())
-                digest, size, header, deleted, ring = tomb["sha256"], int(tomb["size"]), tombstone_header(tomb), True, []
+                digest, size, header, deleted, ring = tomb["sha256"], tomb["size"], tombstone_header(tomb), True, []
+                if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                    raise ValueError("sha256 is not a hex digest")
+                if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                    raise ValueError("size is not a byte count")
+                if (header.device_id, header.capture_id, header.chunk_sequence) != (device, capture, seq):
+                    raise ValueError(f"header names {header.device_id}/{header.capture_id}/{header.chunk_sequence}")
             except (KeyError, TypeError, ValueError) as exc:
                 report.problems.append(f"unreadable tombstone {vault.relpath(cap_dir / f'{seq}.gone')}: {exc!r}")
                 continue
