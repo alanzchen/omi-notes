@@ -6,7 +6,8 @@ half-built index left on disk, and a bounded retry. A never-acknowledged file do
 from __future__ import annotations
 
 import errno
-import hashlib
+import gc
+import sqlite3
 import time
 import uuid
 
@@ -20,6 +21,17 @@ from .conftest import AUTH, DEVICE, put_chunk
 from .helpers import iso
 from .test_disk_full import GiB, _envs, _free
 from .test_publication_matrix import Barrier, fresh
+
+
+def _logical(target) -> list[str]:
+    """The index's content as SQL, read-only (WAL included). Not the main file's bytes: a TestClient-thread connection
+    finalized later checkpoints its WAL into the main file without changing any row (ASTRA-20261124-IT3-03)."""
+    gc.collect()  # finalize lingering fixture connections now, not in the middle of the comparison
+    conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True)
+    try:
+        return list(conn.iterdump())
+    finally:
+        conn.close()
 
 
 def _force_rebuild(client):
@@ -36,7 +48,7 @@ def test_a_refused_rebuild_stays_up_not_ready_without_a_crash_loop(settings, mon
     vault = first.app.state.vault
     target = index_dir(settings, vault) / "index.sqlite3"
     _force_rebuild(first)
-    before = hashlib.sha256(target.read_bytes()).hexdigest()
+    before = _logical(target)
     b = Barrier(monkeypatch, vault.chunk_path(DEVICE, cap, 0).parent)
     restarts = []
     monkeypatch.setattr(api, "_exit_for_restart", lambda: restarts.append(True))
@@ -48,7 +60,7 @@ def test_a_refused_rebuild_stays_up_not_ready_without_a_crash_loop(settings, mon
     r = c.get("/v1/status", headers=AUTH)
     assert r.status_code == 507 and r.json()["error"] == "storage_full"  # ENOSPC cause: the phone keeps its audio
     assert not (target.parent / "index.tmp").exists(), "a refused rebuild leaves nothing half-built"
-    assert hashlib.sha256(target.read_bytes()).hexdigest() == before, "the previous index is untouched"
+    assert _logical(target) == before, "the previous index is untouched"
     assert api.RETRY_FIRST_SECONDS == 60 and api.RETRY_MAX_SECONDS == 1800  # bounded, no hot loop
     assert not app.state.retry_now() and not restarts
     b.failing = False
