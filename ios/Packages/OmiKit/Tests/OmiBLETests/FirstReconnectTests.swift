@@ -44,11 +44,17 @@ import Testing
     @Test func bytesFlowingAreNotUnreachable() throws {
         var t = try fixture("backlog")
         t.server.reachable = false
+        t.server.failedAt = now.addingTimeInterval(-5)  // the fixture's last acknowledgement is 2 s ago: newer
         #expect(t.problemLine(now: now) == nil)
         #expect(t.cardLine(now: now)?.text == "约 13 小时传完")
         t.phone.ackedRecently = false  // bytes leaving the phone with no acknowledgement prove nothing (IT4-CLIENT-01)
         #expect(t.problemLine(now: now) == "连不上服务器")
         t.phone.ackedRecently = true
+        t.server.failedAt = now  // a failure heard after the last acknowledgement stands (IT5 ordering)
+        #expect(t.problemLine(now: now) == "连不上服务器")
+        t.server.failedAt = nil  // a failure of unknown time stands too
+        #expect(t.problemLine(now: now) == "连不上服务器")
+        t.server.failedAt = now.addingTimeInterval(-5)
         t.phone.state = .waiting
         #expect(t.problemLine(now: now) == "连不上服务器", "without bytes moving, the status answer decides")
     }

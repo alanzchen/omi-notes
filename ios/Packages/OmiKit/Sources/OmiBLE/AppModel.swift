@@ -32,6 +32,9 @@ public final class AppModel {
     public private(set) var serverStatus: ServerStatus?
     /// When `serverStatus` was received (a failed refresh leaves it alone).
     public private(set) var serverStatusAt: Date?
+    /// When the current `server` verdict was heard (success or failure): a failure is newer than any acknowledgement
+    /// before it (`TransferSummary.ackSupersedesFailure`).
+    public private(set) var serverVerdictAt: Date?
     /// The last completed refresh got no status answer (unreachable, refused, or no server). A refresh
     /// still in flight doesn't change it; only a successful answer clears it, and a change of server forgets it.
     public private(set) var lastRefreshFailed = false
@@ -187,7 +190,7 @@ public final class AppModel {
     /// The three transfer stages as of now (Watch → iPhone, iPhone → server, server).
     public func transfers(watchInstalled: Bool?, now: Date = Date()) -> TransferSummary {
         TransferSummary.evaluate(snapshot: snapshot, server: server, status: serverStatus, statusAt: serverStatusAt,
-                                 watchInstalled: watchInstalled, nowMono: monotonicNow(), now: now)
+                                 watchInstalled: watchInstalled, nowMono: monotonicNow(), now: now, verdictAt: serverVerdictAt)
     }
 
     public func health(now: Date = Date()) -> SystemHealth {
@@ -252,6 +255,7 @@ public final class AppModel {
         speakers.serverChanged()
         serverStatus = nil
         serverStatusAt = nil
+        serverVerdictAt = nil
         lastRefreshFailed = false
         issues = []
         issuesStale = false
@@ -358,6 +362,7 @@ public final class AppModel {
         }
         guard isCurrent(config), data == dataEpoch, mine == refreshGeneration else { return }  // the server changed while we were asking
         server = reach
+        serverVerdictAt = Date()
         lastRefreshFailed = status == nil
         guard let status else {
             issuesStale = true  // the issues list is last-known until /issues itself answers again (IT4-01)

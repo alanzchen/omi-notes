@@ -85,6 +85,8 @@ public struct TransferSummary: Equatable, Sendable {
         /// The server acknowledged a file of the current configuration in the last `ackFreshSeconds`: the upload
         /// evidence that it answers now. Outbound bytes alone are not (ASTRA-20261124-IT4-CLIENT-01).
         public var ackedRecently = false
+        /// When the server last acknowledged one of this configuration's files (this foreground window).
+        public var lastAckAt: Date? = nil
     }
     public static let ackFreshSeconds = 10.0
 
@@ -95,6 +97,8 @@ public struct TransferSummary: Equatable, Sendable {
         public var chunksPending: Int?
         public var conversationsPending: Int?
         public var lastNoteAt: Date?
+        /// When the failed verdict (`reachable == false`) was observed; nil when not failed or not known.
+        public var failedAt: Date? = nil
     }
 
     public var watch: Watch
@@ -102,7 +106,7 @@ public struct TransferSummary: Equatable, Sendable {
     public var server: Server
 
     public static func evaluate(snapshot s: EngineSnapshot, server: ServerReachability, status: ServerStatus?, statusAt: Date?,
-                                watchInstalled: Bool?, nowMono: UInt64, now: Date) -> TransferSummary {
+                                watchInstalled: Bool?, nowMono: UInt64, now: Date, verdictAt: Date? = nil) -> TransferSummary {
         let report = s.watchReport
         let watch = Watch(
             inUse: watchInstalled == true || report != nil || s.watchLastReceivedAt != nil || s.watchReceived > 0
@@ -153,7 +157,7 @@ public struct TransferSummary: Equatable, Sendable {
             queuedAudioSeconds: s.transfer.pendingAudioSeconds, queuedAudioUnknown: s.transfer.pendingAudioUnknown,
             retryingFiles: s.upload.backingOff, keptAside: s.outbox.quarantineCount,
             serverFull: SystemHealth.serverDiskFull(s, status: status, statusAt: statusAt, now: now),
-            ackedRecently: m.acknowledged(within: Self.ackFreshSeconds, atMono: nowMono))
+            ackedRecently: m.acknowledged(within: Self.ackFreshSeconds, atMono: nowMono), lastAckAt: m.lastAckAt)
 
         let reachable: Bool?
         switch server {
@@ -161,9 +165,11 @@ public struct TransferSummary: Equatable, Sendable {
         case .unreachable, .unauthorized: reachable = false
         default: reachable = nil
         }
+        // a failure is at least as new as the last answer: with no verdict time, that's its lower bound
         let srv = Server(reachable: reachable, checkedAt: statusAt, chunksPending: status?.queue?.chunksPending,
                          conversationsPending: status?.queue?.conversationsPending,
-                         lastNoteAt: status?.lastNoteAt.flatMap(ISO8601UTC.parse))
+                         lastNoteAt: status?.lastNoteAt.flatMap(ISO8601UTC.parse),
+                         failedAt: reachable == false ? (verdictAt ?? statusAt) : nil)
         return TransferSummary(watch: watch, phone: phone, server: srv)
     }
 
@@ -200,12 +206,12 @@ public struct TransferSummary: Equatable, Sendable {
                             lastNoteAt: now.addingTimeInterval(-1_500))
         switch name {
         case "sending":
-            phone.ackedRecently = true
+            phone.ackedRecently = true; phone.lastAckAt = now.addingTimeInterval(-2)
             phone.state = .sending; phone.rate = 1_240_000; phone.networkBytes = 24_100_000; phone.inFlightUploads = 32
             phone.inFlightSent = 3_900_000; phone.inFlightTotal = 8_100_000; phone.deliveredAudioFiles = 12
             phone.deliveredAudioBytes = 5_200_000; phone.deliveredOtherFiles = 3
         case "backlog":  // the numbers of the build-41 feedback screenshot (2026-11-08 04:31Z)
-            phone.ackedRecently = true
+            phone.ackedRecently = true; phone.lastAckAt = now.addingTimeInterval(-2)
             phone.state = .sending; phone.rate = 111_700; phone.networkBytes = 12_600_000; phone.inFlightUploads = 40
             phone.inFlightSent = 781_000; phone.inFlightTotal = 4_200_000; phone.deliveredAudioFiles = 295
             phone.deliveredAudioBytes = 46_600_000; phone.deliveredOtherFiles = 1; phone.queuedFiles = 5_135
@@ -276,6 +282,14 @@ public struct TransferSummary: Equatable, Sendable {
         return "\(Int(s / 86_400)) 天前"
     }
 
+    /// A failed status is superseded only by newer success: bytes moving now, and an acknowledgement from the server
+    /// (this configuration's) after the failure was observed, within the freshness window. An older acknowledgement,
+    /// or a failure of unknown time, leaves the failure standing (ASTRA-20261124-IT4-CLIENT-01, IT5 ordering).
+    public var ackSupersedesFailure: Bool {
+        guard phone.state == .sending, phone.ackedRecently, let ack = phone.lastAckAt, let failed = server.failedAt else { return false }
+        return ack > failed
+    }
+
     /// What is wrong right now, or nil when nothing is: shown only then, without counts.
     public func problemLine(now: Date) -> String? {
         var out: [String] = []
@@ -291,7 +305,7 @@ public struct TransferSummary: Equatable, Sendable {
         }
         // files the server acknowledged in the last seconds (this configuration's) are newer proof of reach than a status
         // answer that timed out under the same upload burst; bytes merely leaving the phone are not (IT4-CLIENT-01)
-        if server.reachable == false, out.isEmpty, !(phone.state == .sending && phone.ackedRecently) { out.append("连不上服务器") }
+        if server.reachable == false, out.isEmpty, !ackSupersedesFailure { out.append("连不上服务器") }
         if phone.keptAside > 0, phone.state != .keptAside(phone.keptAside) { out.append("有文件被搁置，未上传") }
         let w = watch
         if w.inUse == true, let at = w.reportAt {
