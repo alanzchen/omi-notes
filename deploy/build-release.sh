@@ -2,6 +2,15 @@
 # Build a backend release from HEAD (git archive), same Python, hard-linked models; test, doctor,
 # manifest and plist. Prints the plist path. Usage: build-release.sh "<adds text>"
 set -euo pipefail
+# The release gate: tests passed and none failed ("xfailed" is an expected failure, not a failure; 2026-11-23 the old
+# check `!= *failed*` stopped a green release on that word).
+tests_ok() { [[ $1 == *passed* ]] && ! [[ $1 =~ (^|[^x])[0-9]+\ failed ]]; }
+# The disposable index schema the shipped code builds (the manifest used to say 8 whatever the code said).
+index_schema() { sed -nE 's/^SCHEMA_VERSION = ([0-9]+).*/\1/p' "$1/src/omi_notes/db.py"; }
+case "${1:-}" in  # checks without building anything (backend/tests/test_deploy_scripts.py)
+    --check-summary) tests_ok "$2"; exit ;;
+    --index-schema) index_schema "$2"; exit ;;
+esac
 cd /Users/alan/Developer/omi-notes
 [[ -z $(git status --porcelain -- backend contracts) ]] || { echo "backend has uncommitted changes" >&2; exit 1; }
 R=~/.local/share/omi-notes/releases
@@ -14,12 +23,14 @@ UV_PYTHON=/opt/homebrew/opt/python@3.13/bin/python3.13 uv sync --frozen --extra 
 [[ $(.venv/bin/python --version) == "Python 3.13.18" ]] || { echo "wrong python" >&2; exit 1; }
 SUMMARY=$(env -u OMI_NOTES_ENV_FILE uv run --frozen --extra diarization pytest -o addopts="" -q -p no:cacheprovider 2>&1 | tail -1)
 echo "tests: $SUMMARY" >&2
-[[ $SUMMARY == *passed* && $SUMMARY != *failed* ]] || exit 1
+tests_ok "$SUMMARY" || exit 1
 FAILS=$(OMI_NOTES_ENV_FILE=$HOME/.config/omi-notes/server.env .venv/bin/omi-notes doctor 2>&1 | grep -cE "✗|FAIL" || true)
 [[ $FAILS == 0 ]] || { echo "doctor failures: $FAILS" >&2; exit 1; }
-python3 - "$NEW" "$NAME" "$CUR" "$SUMMARY" "$1" <<'PY'
+SCHEMA=$(index_schema "$NEW/backend")
+python3 - "$NEW" "$NAME" "$CUR" "$SUMMARY" "$1" "$SCHEMA" <<'PY'
 import hashlib, json, sys, pathlib, datetime, subprocess
 new, name, cur, summary, adds = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3]), sys.argv[4], sys.argv[5]
+schema = int(sys.argv[6])
 old = json.load(open(cur / "release.json"))
 src = {p.relative_to(new).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((new / "backend").rglob("*"))
        if p.is_file() and not {".venv", "__pycache__", "models", ".pytest_cache"} & set(p.parts)}
@@ -27,8 +38,10 @@ rev = subprocess.check_output(["git", "-C", "/Users/alan/Developer/omi-notes", "
 json.dump({"release": str(new), "backend": str(new / "backend"), "git_revision": rev,
            "built_from": "git archive of the committed revision (no local changes)",
            "built_at": datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ"), "replaces": cur.name,
-           "python": "Homebrew python@3.13 3.13.18", "index_schema": 8, "vault_format": "reads 1-4 (unchanged)", "prompt_version": 3,
-           "adds": [adds], "rollback": f"safe to {cur.name} (no vault or index change)",
+           "python": "Homebrew python@3.13 3.13.18", "index_schema": schema, "vault_format": "reads 1-4 (unchanged)", "prompt_version": 3,
+           "adds": [adds], "rollback": (f"safe to {cur.name} (no vault or index change)" if old.get("index_schema") == schema else
+                        f"to {cur.name} (index schema {old.get('index_schema')}): no vault format change; it rebuilds its own index "
+                        f"from the vault (this release builds schema {schema})"),
            "backend_tests": {"summary": f"{summary} (release venv, diarization extras)"}, "models": old["models"], "source_sha256": src},
           open(new / "release.json", "w"), indent=1)
 PY
