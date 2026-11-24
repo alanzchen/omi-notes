@@ -621,7 +621,7 @@ def server_issues(db, *, read_only: str | None, worker: bool, limit: int = ISSUE
     if not worker:
         out.append({"code": "worker_stopped", "severity": "action", "message": "The processing worker isn't running.",
                     "next_step": "This needs a fix on the server.", "server_step": "Restart the Omi Notes service on the server."})  # fmt: skip
-    chunks = db.one("SELECT COUNT(*) AS n FROM chunks WHERE status='failed'")["n"]
+    chunks = db.chunk_count("failed")
     if chunks:
         out.append({"code": "chunks_failed", "severity": "action", "count": chunks,
                     "message": f"{chunks} uploaded audio file{'s' if chunks != 1 else ''} couldn't be processed.",

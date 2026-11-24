@@ -14,6 +14,7 @@ cached) stage.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -119,6 +120,25 @@ CREATE INDEX IF NOT EXISTS chunk_ranges_end ON chunk_ranges(capture_id, end);
 -- The not-yet-processed chunks, so the processed frontier is found without walking processed history (IT1-02).
 CREATE INDEX IF NOT EXISTS chunks_unprocessed ON chunks(capture_id, chunk_sequence) WHERE status <> 'processed';
 CREATE INDEX IF NOT EXISTS chunks_device_audio ON chunks(device_id, audio_start);
+-- Chunk counts by status, kept by these triggers in the same transaction as every chunk row change, so the status
+-- and issues reads cost a primary-key lookup, not a walk of the backlog (ASTRA-20261124-IT1-02). Recomputed from
+-- the rows once for an index that has none recorded (`Database._counters`).
+CREATE TABLE IF NOT EXISTS chunk_counts (
+    status TEXT PRIMARY KEY,
+    n INTEGER NOT NULL DEFAULT 0
+);
+CREATE TRIGGER IF NOT EXISTS chunks_count_insert AFTER INSERT ON chunks BEGIN
+    INSERT INTO chunk_counts (status, n) VALUES (NEW.status, 1) ON CONFLICT(status) DO UPDATE SET n = n + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_count_update AFTER UPDATE OF status ON chunks WHEN OLD.status IS NOT NEW.status BEGIN
+    UPDATE chunk_counts SET n = n - 1 WHERE status = OLD.status;
+    INSERT INTO chunk_counts (status, n) VALUES (NEW.status, 1) ON CONFLICT(status) DO UPDATE SET n = n + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_count_delete AFTER DELETE ON chunks BEGIN
+    UPDATE chunk_counts SET n = n - 1 WHERE status = OLD.status;
+END;
+-- the oldest pending chunk by arrival (`views.activity`): one seek, whatever the backlog
+CREATE INDEX IF NOT EXISTS chunks_status_received ON chunks(status, received_at);
 
 -- Every ring record each received chunk contains (for the order-independent ownership rule).
 CREATE TABLE IF NOT EXISTS ring_records (
@@ -448,6 +468,51 @@ CREATE VIEW IF NOT EXISTS event_times AS
 SCHEMA = (SCHEMA.replace("@LISTED@", LISTED).replace("@WAITING@", WAITING).replace("@REQUESTED@", REQUESTED)
           .replace("@ISSUE@", ISSUE).replace("@CONFLICTED@", CONFLICTED).replace("@LAST_NOTE@", LAST_NOTE))
 
+# The status card's conversation counts (`queue_counts`), each a predicate over one row. `queue_totals` holds how
+# many rows match each, kept by triggers in the same transaction as every conversation row change, so a status or
+# issues read costs a lookup, not a walk of the failed or queued population (ASTRA-20261124-IT1-02).
+_ACTIVE = "status IN ('closed','transcribing','summarizing')"
+QUEUE = {
+    "open": "status = 'open'",
+    "pending": f"{_ACTIVE} AND NOT {WAITING}",
+    "deferred": WAITING,
+    "failed": f"status = 'failed' AND {NOT_DISMISSED}",
+    "retrying": f"{_ACTIVE} AND error IS NOT NULL AND next_attempt_at IS NOT NULL",
+}
+_QUEUE_COLUMNS = ("status", "resolution", "failure_id", "deferral", "note_path", "retry_op", "transcribe_op", "error",
+                  "next_attempt_at")
+
+
+def _of(row: str, predicate: str) -> str:
+    """The predicate over `NEW` or `OLD` (column names qualified; quoted JSON paths untouched), as 0 or 1."""
+    names = "|".join(_QUEUE_COLUMNS)
+    qualified = re.sub(rf"(?<![.'$\w])({names})\b", rf"{row}.\1", predicate)
+    return f"COALESCE(({qualified}), 0)"
+
+
+def _queue_delta(sign_rows: tuple[tuple[str, str], ...]) -> str:
+    cases = " ".join(f"WHEN '{name}' THEN " + " ".join(f"{sign} {_of(row, pred)}" for sign, row in sign_rows)
+                     for name, pred in QUEUE.items())
+    return f"UPDATE queue_totals SET n = n + (CASE name {cases} ELSE 0 END);"
+
+
+_CHANGED = " OR ".join(f"OLD.{c} IS NOT NEW.{c}" for c in _QUEUE_COLUMNS)
+SCHEMA += f"""
+CREATE TABLE IF NOT EXISTS queue_totals (
+    name TEXT PRIMARY KEY,
+    n INTEGER NOT NULL DEFAULT 0
+);
+CREATE TRIGGER IF NOT EXISTS conversations_queue_insert AFTER INSERT ON conversations BEGIN
+    {_queue_delta((("+", "NEW"),))}
+END;
+CREATE TRIGGER IF NOT EXISTS conversations_queue_update AFTER UPDATE ON conversations WHEN {_CHANGED} BEGIN
+    {_queue_delta((("+", "NEW"), ("-", "OLD")))}
+END;
+CREATE TRIGGER IF NOT EXISTS conversations_queue_delete AFTER DELETE ON conversations BEGIN
+    {_queue_delta((("-", "OLD"),))}
+END;
+"""
+
 _SEAL = "raw/<dev>/<cap>/seal.json"
 _HEADER = "chunk envelope header (or <seq>.gone tombstone header)"
 _REPLAY = "operational — rebuilt by replaying surviving raw chunks"
@@ -462,6 +527,10 @@ COLUMN_SOURCES: dict[str, dict[str, str]] = {
         "key": "operational — written by the rebuild (schema_version, vault_id, vault_path, complete, replay_pending, read_only)",
         "value": "operational — see key",
     },
+    "queue_totals": {c: "operational — derived from conversations rows by triggers (`Database._counters`)"
+                     for c in ("name", "n")},
+    "chunk_counts": {c: "operational — derived from chunks rows by triggers (`Database._counters`)"
+                     for c in ("status", "n")},
     "chunk_ranges": {c: "operational — derived from chunks rows as they are indexed (`ingest.index_chunk`)"
                      for c in ("capture_id", "start", "end")},
     "captures": {
@@ -656,6 +725,32 @@ class Database:
         conn = self.conn()
         conn.executescript(SCHEMA)
         conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
+        if self.meta("counters") != "1":
+            self._counters()
+
+    def _counters(self) -> None:
+        """`chunk_counts` and `queue_totals` from the rows, once for an index that has none recorded (an index written
+        before they existed); the triggers keep them after that. One transaction: a row change between the triggers'
+        creation and this count is counted once, by the count."""
+        with self.tx() as conn:
+            conn.execute("DELETE FROM chunk_counts")
+            conn.execute("INSERT INTO chunk_counts (status, n) SELECT status, COUNT(*) FROM chunks GROUP BY status")
+            conn.execute("DELETE FROM queue_totals")
+            for name, predicate in QUEUE.items():
+                conn.execute(f"INSERT INTO queue_totals (name, n) SELECT ?, COUNT(*) FROM conversations WHERE {predicate}",
+                             (name,))  # fmt: skip
+            conn.execute("INSERT INTO meta (key, value) VALUES ('counters', '1') "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+
+    def queue_total(self, name: str) -> int:
+        """How many conversation rows match `QUEUE[name]` (a maintained counter, not a COUNT over the rows)."""
+        row = self.one("SELECT n FROM queue_totals WHERE name=?", (name,))
+        return int(row["n"]) if row else 0
+
+    def chunk_count(self, status: str) -> int:
+        """How many chunk rows have this status (a maintained counter, not a COUNT over the rows)."""
+        row = self.one("SELECT n FROM chunk_counts WHERE status=?", (status,))
+        return int(row["n"]) if row else 0
 
     def conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)

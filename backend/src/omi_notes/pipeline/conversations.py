@@ -1993,29 +1993,20 @@ def processed_ring_ranges(db: Database, device_id: str) -> dict[int | None, list
 
 
 def queue_counts(db: Database) -> dict:
-    def count(sql: str) -> int:
-        return db.one(sql)["n"]
-
-    from ..views import NOT_DISMISSED
-
-    conversations_failed = count(f"SELECT COUNT(*) AS n FROM conversations WHERE status='failed' AND {NOT_DISMISSED}")
-    chunks_failed = count("SELECT COUNT(*) AS n FROM chunks WHERE status='failed'")
+    """The status card's counts: maintained counters (`db.QUEUE`, `chunk_counts`), so a reconnect backlog or a long
+    failure history costs nothing here (ASTRA-20261124-IT1-02)."""
+    conversations_failed = db.queue_total("failed")
+    chunks_failed = db.chunk_count("failed")
     return {
-        "chunks_pending": count("SELECT COUNT(*) AS n FROM chunks WHERE status='pending'"),
-        "conversations_open": count("SELECT COUNT(*) AS n FROM conversations WHERE status='open'"),
+        "chunks_pending": db.chunk_count("pending"),
+        "conversations_open": db.queue_total("open"),
         # work the server will do on its own soon: deferred short sessions wait for an idle moment or the owner
-        "conversations_pending": count(
-            "SELECT COUNT(*) AS n FROM conversations WHERE status IN ('closed','transcribing','summarizing') "
-            f"AND NOT {deferral.WAITING_SQL}"
-        ),
-        "conversations_deferred": count(f"SELECT COUNT(*) AS n FROM conversations WHERE {deferral.WAITING_SQL}"),
+        "conversations_pending": db.queue_total("pending"),
+        "conversations_deferred": db.queue_total("deferred"),
         "failed": conversations_failed + chunks_failed,  # older phones read only this sum
         "conversations_failed": conversations_failed,
         "chunks_failed": chunks_failed,
-        "conversations_retrying": count(
-            "SELECT COUNT(*) AS n FROM conversations WHERE status IN ('closed','transcribing','summarizing') "
-            "AND error IS NOT NULL AND next_attempt_at IS NOT NULL"
-        ),
+        "conversations_retrying": db.queue_total("retrying"),
         "notes_conflicted": notes_conflicted(db),
     }
 
