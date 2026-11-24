@@ -175,6 +175,9 @@ CREATE TABLE IF NOT EXISTS events (
     applied INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS events_device ON events(device_id, type);
+-- The Watch page's window and the latest phone heartbeats seek by type and time (ASTRA-20261124-IT1-03); created
+-- on open, so an existing index gains it without a rebuild.
+CREATE INDEX IF NOT EXISTS events_type_at ON events(type, at);
 
 CREATE TABLE IF NOT EXISTS devices (
     device_id TEXT PRIMARY KEY,
