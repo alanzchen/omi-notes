@@ -752,6 +752,11 @@ class Database:
         self.path = path
         make_dirs_durable(path.parent)
         self._local = threading.local()
+        # every connection this object opened, on any thread, so `close` closes them all: a connection left open on
+        # another thread (a request worker) would otherwise checkpoint its WAL into the file whenever it's finalized
+        self._opened: list[sqlite3.Connection] = []
+        self._opened_lock = threading.Lock()
+        self._generation = 0
         conn = self.conn()
         conn.executescript(SCHEMA)
         conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
@@ -788,6 +793,8 @@ class Database:
 
     def conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
+        if conn is not None and getattr(self._local, "generation", None) != self._generation:
+            conn = None  # closed by `close` from another thread: open a new one
         if conn is None:
             conn = sqlite3.connect(self.path, isolation_level=None, timeout=30.0, check_same_thread=False)
             conn.row_factory = sqlite3.Row
@@ -797,6 +804,9 @@ class Database:
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=30000")
             self._local.conn = conn
+            self._local.generation = self._generation
+            with self._opened_lock:
+                self._opened.append(conn)
         return conn
 
     @contextmanager
@@ -854,7 +864,11 @@ class Database:
                          (key, value))  # fmt: skip
 
     def close(self) -> None:
-        conn = getattr(self._local, "conn", None)
-        if conn is not None:
+        """Closes every connection this object opened, on every thread (each thread opens a new one if it's used
+        again). For an owner done with the index (a rebuild, a migration, a test), not while other threads query it."""
+        with self._opened_lock:
+            opened, self._opened = self._opened, []
+            self._generation += 1
+        for conn in opened:
             conn.close()
-            self._local.conn = None
+        self._local.conn = None

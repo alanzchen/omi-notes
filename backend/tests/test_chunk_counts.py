@@ -153,3 +153,21 @@ def test_status_cost_does_not_grow_with_failed_or_queued_conversations(client):
     b = measure(db, lambda: queue_counts(db))
     assert b[2]["conversations_failed"] == 5_000 and b[2]["conversations_pending"] == 5_000
     assert b[0] <= a[0] * 2, (a[:2], b[:2])
+
+
+def test_close_closes_the_connections_of_every_thread(tmp_path):
+    """A connection opened on another thread (a TestClient or request worker) is closed too, so its WAL is
+    checkpointed at close, not later when it happens to be finalized; that thread reopens if it's used again."""
+    import threading
+
+    db = Database(tmp_path / "index.sqlite3")
+    other: list = []
+    t = threading.Thread(target=lambda: other.append(db.conn()))
+    t.start(); t.join()
+    db.close()
+    with pytest.raises(sqlite3.ProgrammingError):
+        other[0].execute("SELECT 1")
+    again: list = []
+    t = threading.Thread(target=lambda: again.append(db.one("SELECT 1 AS n")["n"]))
+    t.start(); t.join()
+    assert again == [1] and db.one("SELECT 1 AS n")["n"] == 1
