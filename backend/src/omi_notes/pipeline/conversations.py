@@ -962,6 +962,16 @@ class ConversationPipeline:
             known = {r["id"] for r in self.speakers.people()}
             states = {label: (st if st.get("person_id") in known or not st.get("person_id") else
                               st | {"person_id": None, "source": None}) for label, st in states.items()}  # fmt: skip
+            # a person with a sample file that can't be read is judged on part of their evidence: their automatic names
+            # are neither dropped nor given until it can be read again (C5-02; the reload then marks a relabel)
+            deferred = self.speakers.deferred_people()
+            if deferred:
+                for label, st in list(states.items()):
+                    cur = current.get(label) or {}
+                    was = cur.get("source") == "auto" and cur.get("person_id") in deferred
+                    now_auto = st.get("source") == "auto" and st.get("person_id") in deferred
+                    if (was or now_auto) and st != cur:
+                        states[label] = cur if cur else st | {"person_id": None, "source": None}
             differs = self.speakers.persisted(states) != self.speakers.persisted(current)
             if differs:
                 self.speakers.write_labels(conv_id, states)  # still tagged with the transcript they were made for

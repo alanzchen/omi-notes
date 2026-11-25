@@ -227,9 +227,7 @@ class SpeakerStore:
         for person in found.values():
             path = self.person_dir(person["id"]) / "consent.json"
             try:
-                consent = Vault.read_json(path) or {}
-                if not isinstance(consent, dict):
-                    raise ValueError("not an object")
+                consent = self.read_consent(person["id"])
                 consent_bad.pop(person["id"], None)
             except (OSError, ValueError) as exc:  # the last-known consent stands (none known: unknown), and reported
                 consent, consent_bad[person["id"]] = {"attested_at": known_consent.get(person["id"])}, self.vault.relpath(path)
@@ -282,6 +280,7 @@ class SpeakerStore:
         on and its raw audio still there; never a forgotten one), plus the eligible samples of consented people that
         aren't one of those voices already (a named label's sample is its voice: counted once)."""
         prefs, people = self.settings(), {r["id"]: r for r in self.people()}
+        memo: dict[str, bool] = {}  # consent_unreadable, once per person in this pass
         by_conv: dict[str, dict[str, bytes]] = {}
         for r in self.db.query("SELECT conversation_id, label, vector FROM voices WHERE vector IS NOT NULL AND model=? AND model_sha=?",
                                (model, model_sha)):  # fmt: skip
@@ -290,11 +289,11 @@ class SpeakerStore:
         kept: dict[str, set[bytes]] = {}  # conversation → its allowed voices (a sample from one of them is that voice)
         for conv_id, stored in sorted(by_conv.items()):
             states = self.labels(conv_id)
-            keep = self.vector_labels(states, set(stored), raw=False, prefs=prefs, people=people)
+            keep = self.vector_labels(states, set(stored), raw=False, prefs=prefs, people=people, memo=memo)
             if set(stored) - keep and prefs["unknown_voices_enabled"]:
                 row = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
                 if row is not None and self.raw_available(row):
-                    keep = self.vector_labels(states, set(stored), raw=True, prefs=prefs, people=people)
+                    keep = self.vector_labels(states, set(stored), raw=True, prefs=prefs, people=people, memo=memo)
             kept[conv_id] = {stored[label] for label in keep}
             population += [(conv_id, stored[label]) for label in sorted(keep)]
         for s in self.samples(model, model_sha):
@@ -715,12 +714,31 @@ class SpeakerStore:
                 except (OSError, ValueError, TypeError, binascii.Error) as exc:
                     skipped[path.stem] = (self.vault.relpath(path), _stat_key(path), True)
                     log.warning("speaker file unreadable, skipped: %s (%s)", self.vault.relpath(path), exc)
+        before: dict[str, set[str]] = {}
+        for r in self.db.query("SELECT id, person_id FROM samples"):
+            before.setdefault(r["person_id"], set()).add(r["id"])
+        after: dict[str, set[str]] = {}
+        for data in readable:
+            after.setdefault(data.get("person_id"), set()).add(data.get("sample_id"))
         with self.db.tx():
             self.db.execute("DELETE FROM samples")
             for data in readable:
                 self._index_sample(data)
+            if before != after:  # someone's usable samples changed (a file unreadable, or readable again): their
+                self.db.set_meta("relabel_pending", "1")  # automatic names are evaluated again (C5-02)
         self.skipped_samples = skipped
         return len(readable)
+
+    def deferred_people(self) -> set[str]:
+        """People with a sample file that can't be read right now: their model is missing evidence, so relabel leaves
+        their automatic names as they are until it can be read (C5-02). A file that is readable but not a voiceprint
+        never fed a model, so it defers nobody."""
+        out = set()
+        for rel, _, unreadable in self.skipped_samples.values():
+            parts = Path(rel).parts
+            if unreadable and len(parts) >= 3 and parts[-2] == "samples":
+                out.add(parts[-3])
+        return out
 
     def samples(self, model: str, model_sha: str, *, every_state: bool = False) -> list[Sample]:
         """This model's samples that may teach anything (`sample_eligible`); `every_state`: removed and moved ones too.
@@ -880,7 +898,7 @@ class SpeakerStore:
         return changed
 
     def vector_labels(self, states: dict[str, dict], labels: set[str], *, raw: bool, prefs: dict | None = None,
-                      people: dict | None = None) -> set[str]:  # fmt: skip
+                      people: dict | None = None, memo: dict | None = None) -> set[str]:  # fmt: skip
         """Labels whose voice vector may be stored (docs/speaker-learning.md, "Privacy"): named for
         me, or for someone with consent (acknowledged and attested); any other label only while
         unknown voices are on and its raw audio exists. A forgotten label never."""
@@ -896,22 +914,40 @@ class SpeakerStore:
                 continue  # their forget hasn't finished: nothing of their voice is kept
             if consent_ok(person, prefs):
                 keep.add(label)
-            elif person is not None and self.consent_unreadable(person["id"]):
-                keep.add(label)  # an unreadable file is never a reason to delete (C4-01): kept until it can be read
+            elif person is not None and prefs["acknowledged_at"] and self.consent_unreadable(person["id"], memo):
+                # an unreadable consent.json is never a reason to delete (C4-01): it stands in for that file only, so
+                # every condition outside it (the owner's acknowledgment) must still hold (C5-01)
+                keep.add(label)
             elif raw and prefs["unknown_voices_enabled"]:
                 keep.add(label)
         return keep
 
-    def consent_unreadable(self, person_id: str) -> bool:
-        """The person's consent.json exists but can't be read as an object: their consent is unknown, not withdrawn
-        (a forget or an opt-out removes the file or the person; it never leaves a torn one)."""
-        path = self.person_dir(person_id) / "consent.json"
+    def read_consent(self, person_id: str) -> dict:
+        """The person's consent.json: {} when there is none (no consent). Raises ValueError when it exists but isn't a
+        JSON object: [], null, 0, "" and false are unreadable, not an empty consent (C5-01)."""
         try:
-            return not isinstance(Vault.read_json(path) or {}, dict)
+            text = (self.person_dir(person_id) / "consent.json").read_text()
         except FileNotFoundError:
-            return False
+            return {}
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("consent.json is not a JSON object")
+        return data
+
+    def consent_unreadable(self, person_id: str, memo: dict | None = None) -> bool:
+        """The person's consent.json exists but can't be read as an object: their consent is unknown, not withdrawn
+        (a forget or an opt-out removes the file or the person; it never leaves a torn one). `memo`: one answer per
+        person within one pass (C5-03)."""
+        if memo is not None and person_id in memo:
+            return memo[person_id]
+        try:
+            self.read_consent(person_id)
+            unreadable = False
         except (OSError, ValueError):
-            return True
+            unreadable = True
+        if memo is not None:
+            memo[person_id] = unreadable
+        return unreadable
 
     def raw_available(self, row) -> bool:
         """All raw audio under the conversation's speech still exists."""
@@ -929,13 +965,14 @@ class SpeakerStore:
         """Drop every stored vector the rule no longer allows. Idempotent and independent of how
         we got here (a setting change, raw deletion, forgetting, or a crash in the middle of one)."""
         pruned = 0
+        memo: dict[str, bool] = {}  # consent_unreadable, once per person in this pass
         with self.lock:  # never publish a voices file read before a concurrent forget
             for r in self.db.query("SELECT DISTINCT conversation_id FROM voices WHERE vector IS NOT NULL"):
                 conv_id = r["conversation_id"]
                 row = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
                 stored = {v["label"] for v in self.db.query(
                     "SELECT label FROM voices WHERE conversation_id=? AND vector IS NOT NULL", (conv_id,))}  # fmt: skip
-                keep = self.vector_labels(self.labels(conv_id), stored, raw=row is not None and self.raw_available(row))
+                keep = self.vector_labels(self.labels(conv_id), stored, raw=row is not None and self.raw_available(row), memo=memo)
                 if stored - keep:
                     self.prune_vectors(conv_id, keep)
                     pruned += 1

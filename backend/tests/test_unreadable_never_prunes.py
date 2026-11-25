@@ -122,3 +122,59 @@ def test_turning_unknown_voices_off_still_prunes_unnamed_vectors(tmp_path):
     assert client.put("/v1/speakers/settings", json={"unknown_voices_enabled": False}, headers=AUTH).status_code == 200
     store.reconcile_vectors()
     assert _stored(vfile) == {"S1"}, "the unnamed voice goes; the consented one stays"
+
+
+# -- Carbon IT5 (2026-11-25): the unreadable stand-in covers only the person's own consent.json; a skipped sample file
+# never costs a person their automatic names or stored vectors.
+
+
+def test_c5_01_withdrawing_the_global_acknowledgment_prunes_even_with_a_torn_consent_file(tmp_path):
+    """Carbon's compound edge, outcome fixed: the acknowledgment is a global condition, not part of consent.json."""
+    client, svc, store, gigi, conv_id, vfile = _gigi_named_automatically(tmp_path)
+    (store.person_dir(gigi) / "consent.json").write_text("{torn")
+    assert client.put("/v1/speakers/settings", json={"acknowledged_at": None}, headers=AUTH).status_code == 200
+    store.reconcile_vectors()
+    assert "S1" not in _stored(vfile)
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("content", ["[]", "null", "0", '""', "false"])
+def test_c5_01_consent_content_that_isnt_an_object_is_unreadable_not_empty(tmp_path, content):
+    client, svc, store, gigi, conv_id, vfile = _gigi_named_automatically(tmp_path)
+    (store.person_dir(gigi) / "consent.json").write_text(content)
+    svc.warm(now=2100.0)
+    assert store.consent_unreadable(gigi) and gigi in store.unreadable_consent
+    assert store.reconcile_vectors() == 0 and _stored(vfile) == {"S1"}
+
+
+def test_c5_01_a_missing_or_empty_object_consent_file_is_read_as_given(tmp_path):
+    client, svc, store, gigi, conv_id, vfile = _gigi_named_automatically(tmp_path)
+    path = store.person_dir(gigi) / "consent.json"
+    path.write_text("{}")  # readable: no attestation
+    assert store.consent_unreadable(gigi) is False
+    path.unlink()  # missing: no consent
+    assert store.consent_unreadable(gigi) is False
+
+
+def test_c5_02_a_skipped_sample_file_keeps_the_persons_automatic_names_and_vectors(tmp_path):
+    """Carbon's reproducer (test_c5_03_skipped_sample_...), outcome fixed: while one of Gigi's samples can't be read,
+    relabel defers her (her automatic name stays), so retention has nothing unnamed to prune; once the file is readable
+    again the reload marks a relabel and her name is evaluated with all her samples."""
+    client, svc, store, gigi, conv_id, vfile = _gigi_named_automatically(tmp_path)
+    samples = sorted((store.person_dir(gigi) / "samples").glob("*.json"))
+    saved = samples[0].read_text()
+    samples[0].write_text("{torn sample")
+    store.load_samples()
+    svc.refresh_people(now=2100.0)
+    store.db.set_meta("relabel_pending", "1")
+    svc.pipeline.relabel(2150.0)
+    assert store.labels(conv_id)["S1"]["person_id"] == gigi and store.labels(conv_id)["S1"]["source"] == "auto"
+    assert store.reconcile_vectors() == 0 and _stored(vfile) == {"S1"}
+    samples[0].write_text(saved)
+    store.db.set_meta("relabel_pending", None)
+    store.sync_samples()  # the reload brings the file back
+    assert store.db.meta("relabel_pending") == "1", "a changed readable set re-evaluates the names"
+    svc.pipeline.relabel(2510.0)
+    assert store.labels(conv_id)["S1"]["person_id"] == gigi
