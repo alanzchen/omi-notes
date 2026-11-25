@@ -68,6 +68,7 @@ class Report:
     unresolved: list[str] = field(default_factory=list)  # captures whose files couldn't be confirmed: not indexed yet
     unconfirmed_captures: list[tuple[str, str, int | None]] = field(default_factory=list)  # (device, capture, errno)
     unconfirmed_events: list[tuple[Path, int | None]] = field(default_factory=list)  # (day file, errno)
+    devices: dict[str, str] = field(default_factory=dict)  # capture -> its device id (`_CaptureDevice`), for every row
 
     @property
     def read_only_reason(self) -> str | None:
@@ -158,6 +159,43 @@ class StartupIncomplete(Exception):
         self.disk_full = disk_full
 
 
+def _recorded_device(vault: Vault, folder: str, capture: str) -> str | None:
+    """The device id capture.json recorded for the capture (written from its captures row), if it has one."""
+    try:
+        data = Vault.read_json(vault.capture_json_path(folder, capture))
+    except (OSError, ValueError):
+        return None
+    device = data.get("device_id") if isinstance(data, dict) else None
+    return device if isinstance(device, str) and device else None
+
+
+class _CaptureDevice:
+    """The one rule for a capture's device during a rebuild (C1-01, 2026-11-25). The device is the id recorded for the
+    capture: capture.json's device_id, else the header of its first readable chunk or tombstone. Every header must
+    name exactly that id (safe_component isn't one-to-one: "Watch/example" and "Watch:example" share a folder), and
+    the folder must be the vault's folder for it: safe_component(id), compared case-insensitively because APFS folds
+    case (a lowercase id lands in the folder an uppercase one created). That id, never the folder name, is what the
+    rebuild writes into every row (chunks and the capture.json evidence alike)."""
+
+    def __init__(self, folder: str, recorded: str | None) -> None:
+        self.folder = folder
+        self.id = recorded
+
+    def refusal(self, named: str) -> str | None:
+        """Why an artifact naming `named` doesn't belong to this capture, or None (and the id is settled)."""
+        if spool.safe_component(named).casefold() != self.folder.casefold():
+            return f"names device {named}, not its folder {self.folder}"
+        if self.id is None:
+            self.id = named
+        elif named != self.id:
+            return f"names device {named}, but its capture is {self.id}'s"
+        return None
+
+    @property
+    def value(self) -> str:
+        return self.id if self.id is not None else self.folder
+
+
 class Unconfirmed(OSError):
     """A capture's files or directories couldn't be confirmed durable: nothing of it is trusted yet."""
 
@@ -183,6 +221,7 @@ def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, ski
     except OSError as exc:
         raise Unconfirmed(exc.errno, f"capture {device}/{capture} can't be confirmed durable now: {exc}") from exc
     receipts = _receipts(vault, device, capture)
+    owner = _CaptureDevice(device, _recorded_device(vault, device, capture))
     # the saved seal bounds the capture here as on a request (DESIGN-04): a chunk above it is kept, never indexed
     seal_last = None
     if "seal.json" in names:
@@ -211,10 +250,10 @@ def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, ski
             except EnvelopeError as exc:
                 report.problems.append(f"unreadable chunk {vault.relpath(path)}: {exc}")
                 continue
-            # its folder is the device as the vault names it (`safe_component`): a chunk naming another device is in
-            # the wrong place and isn't indexed (an acknowledged one refuses the rebuild; the file stays where it is)
-            if spool.safe_component(env.header.device_id) != device:
-                report.problems.append(f"chunk {vault.relpath(path)} names device {env.header.device_id}, not its folder")
+            # a chunk of another device is in the wrong place and isn't indexed (an acknowledged one refuses the
+            # rebuild; the file stays where it is)
+            if why := owner.refusal(env.header.device_id):
+                report.problems.append(f"chunk {vault.relpath(path)} {why}")
                 continue
             digest, size, header, deleted, ring = sha256_hex(data), len(data), env.header, False, ring_record_hashes(env)
             report.chunks += 1
@@ -231,11 +270,11 @@ def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, ski
                     raise ValueError("sha256 is not a hex digest")
                 if not isinstance(size, int) or isinstance(size, bool) or size < 0:
                     raise ValueError("size is not a byte count")
-                # the directory holds the device id as a safe path component (`Vault.capture_dir`): an id the API
-                # accepted with punctuation ("Watch:example") is stored as "Watch_example" (Astra IT5); capture and
-                # sequence are compared exactly
-                if (spool.safe_component(header.device_id), header.capture_id, header.chunk_sequence) != (device, capture, seq):
+                # capture and sequence exactly; the device by the capture's one rule (`_CaptureDevice`)
+                if (header.capture_id, header.chunk_sequence) != (capture, seq):
                     raise ValueError(f"header names {header.device_id}/{header.capture_id}/{header.chunk_sequence}")
+                if why := owner.refusal(header.device_id):
+                    raise ValueError(why)
             except (KeyError, TypeError, ValueError) as exc:
                 report.problems.append(f"unreadable tombstone {vault.relpath(cap_dir / f'{seq}.gone')}: {exc!r}")
                 continue
@@ -266,6 +305,7 @@ def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, ski
         else:
             ops.append(_Op(received, 1, (capture, -1), lambda conn, r, f=facts: index_seal(conn, capture, f, r)))
             report.seals += 1
+    report.devices[capture] = owner.value
     return ops
 
 
@@ -526,7 +566,7 @@ def _refuse_if_acknowledged(report: Report, prior) -> None:
                                 disk_full=full)  # fmt: skip
 
 
-def _refuse_if_missing(prior, ops: list[_Op], excluded: set[str]) -> None:
+def _refuse_if_missing(prior, ops: list[_Op], excluded: set[str], devices: dict[str, str] | None = None) -> None:
     """Every chunk, seal and event the previous index held must be in the rebuilt set (IT4-02): an acknowledged file
     deleted without a tombstone, or one skipped as unreadable, would otherwise vanish from the index without a trace.
     One pass over the previous index's identities, at startup only."""
@@ -536,8 +576,10 @@ def _refuse_if_missing(prior, ops: list[_Op], excluded: set[str]) -> None:
     seals = {op.key[0] for op in ops if op.rank == 1}
     events = {op.key[0] for op in ops if op.rank == 2}
     try:
-        missing = [f"{c}/{q}" for c, q in prior.execute("SELECT capture_id, chunk_sequence FROM chunks")
-                   if c not in excluded and (c, q) not in chunks]  # fmt: skip
+        # a chunk rebuilt under another device than the previous index held is not that upload either (C1-01)
+        devices = devices or {}
+        missing = [f"{c}/{q}" for c, q, d in prior.execute("SELECT capture_id, chunk_sequence, device_id FROM chunks")
+                   if c not in excluded and ((c, q) not in chunks or devices.get(c, d) != d)]  # fmt: skip
         missing += [f"seal {c}" for (c,) in prior.execute("SELECT capture_id FROM captures WHERE seal_json IS NOT NULL")
                     if c not in excluded and c not in seals]  # fmt: skip
         missing += [f"event {e}" for (e,) in prior.execute("SELECT event_id FROM events") if e not in events]
@@ -585,14 +627,14 @@ def build(settings: Settings, vault: Vault, path: Path, *, now: float | None = N
         vault.confirm(vault.raw)  # raw → _omi → vault root (anchored); failing here fails the build, never a weaker index
     ops += _event_ops(vault, report)
     _refuse_if_acknowledged(report, prior)
-    _refuse_if_missing(prior, ops, {c for _, c, _ in report.unconfirmed_captures})
+    _refuse_if_missing(prior, ops, {c for _, c, _ in report.unconfirmed_captures}, report.devices)
     db = Database(path)
     ops.sort(key=lambda op: (op.received_at, op.rank, op.key))
     with db.tx() as conn:
         for op in ops:
             op.apply(conn)
         for device, capture in captures:
-            apply_capture_evidence(conn, vault, device, capture)
+            apply_capture_evidence(conn, vault, report.devices.get(capture, device), capture)
             if conn.execute("SELECT 1 FROM captures WHERE capture_id=?", (capture,)).fetchone():
                 advance_processed(conn, capture)
         for record_path, record, sha in load_records(vault):
@@ -756,7 +798,7 @@ def index_capture_orphans(db: Database, vault: Vault, device: str, capture: str)
                 op.apply(conn)
             except sqlite3.IntegrityError:  # a concurrent process indexed it first
                 pass
-        apply_capture_evidence(conn, vault, device, capture)
+        apply_capture_evidence(conn, vault, report.devices.get(capture, device), capture)
     return len(ops)
 
 
@@ -780,12 +822,14 @@ def sweep(db: Database, vault: Vault) -> dict:
                 counts["raw"] += index_capture_orphans(db, vault, device, capture)
             except OSError as exc:  # can't be confirmed now: kept unindexed; its own retry or the next startup indexes it
                 log.warning("sweep: capture %s not indexed yet: %s", capture, exc)
-                state.unresolved.add((device, capture))
-                state.receipts[(device, capture)] = _receipts(vault, device, capture)
+                # keyed as a request looks them up, by its header's device: the recorded id, not the folder name
+                ids = (_recorded_device(vault, device, capture) or device, capture)
+                state.unresolved.add(ids)
+                state.receipts[ids] = _receipts(vault, device, capture)
                 try:
-                    state.evidence[(device, capture)] = partition_evidence(Vault.read_json(vault.capture_json_path(device, capture)))
+                    state.evidence[ids] = partition_evidence(Vault.read_json(vault.capture_json_path(device, capture)))
                 except (OSError, ValueError, TypeError, KeyError):
-                    state.evidence[(device, capture)] = UNREADABLE
+                    state.evidence[ids] = UNREADABLE
     _STATES[os.path.realpath(vault.root)] = state
     if state.unresolved:
         log.warning("sweep: %d capture(s) have files that can't be confirmed yet; their own uploads retry them",

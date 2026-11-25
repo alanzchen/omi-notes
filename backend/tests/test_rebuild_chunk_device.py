@@ -28,7 +28,8 @@ def _stored(settings, monkeypatch, device: str):
     return c, cap, raw
 
 
-@pytest.mark.parametrize("device", ["11111111-2222-4333-8444-555555555555", "Watch:example"])
+@pytest.mark.parametrize("device", ["11111111-2222-4333-8444-555555555555", "watch-11111111-2222-4333-8444-555555555555",
+                                    "Watch:example"])  # the shipped Pendant and Watch shapes, and a punctuated id
 def test_a_chunk_in_its_own_device_folder_rebuilds(settings, monkeypatch, device):
     c, cap, raw = _stored(settings, monkeypatch, device)
     c.app.state.db.set_meta("schema_version", "11")
