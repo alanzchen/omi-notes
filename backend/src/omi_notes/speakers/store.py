@@ -14,6 +14,8 @@ Vault files (the index tables `people`, `samples`, `voices`, `speaker_labels` ar
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -77,6 +79,14 @@ def flag_open(flag: dict | None) -> bool:
         return False
     resolved = flag.get("resolved") or {}
     return resolved.get("fingerprint") != flag.get("evidence_fingerprint")
+
+
+def _stat_key(path: Path) -> tuple | None:
+    try:
+        st = path.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
 
 
 @dataclass
@@ -154,6 +164,11 @@ class SpeakerStore:
         self.auto_assign_default = auto_assign_default
         # every read-modify-write of label states, in the API and in the worker (any process)
         self.lock = SpeakerLock(vault)
+        # files the last read couldn't use (C2-02, 2026-11-25): skipped and counted, never a reason to stop. Samples by
+        # file stem -> (vault path, (mtime_ns, size), unreadable?) so an unchanged one isn't re-read on every check;
+        # consent files by person, from the last People scan
+        self.skipped_samples: dict[str, tuple[str, tuple | None, bool]] = {}
+        self.unreadable_consent: dict[str, str] = {}
         # (evidence_key, voice space): `rm_space` once per change, shared by renders, relabel and requests
         self._space_cache: tuple | None = None
         self._space_cache_lock = threading.Lock()
@@ -188,6 +203,7 @@ class SpeakerStore:
         """Refresh the `people` cache from People notes and voice folders; True when anything
         that rendering depends on (names, me) changed."""
         found: dict[str, dict] = {}
+        consent_bad: dict[str, str] = {}
         people_root = self.vault.root / PEOPLE_DIR
         if people_root.exists():
             for path in sorted(people_root.rglob("*.md")):
@@ -207,8 +223,17 @@ class SpeakerStore:
                     name = self._name_from_samples(folder) or "Unnamed person"
                     found[folder.name] = {"id": folder.name, "name": name, "me": 0, "note_path": None, "aliases_json": "[]"}
         for person in found.values():
-            consent = Vault.read_json(self.person_dir(person["id"]) / "consent.json") or {}
+            path = self.person_dir(person["id"]) / "consent.json"
+            try:
+                consent = Vault.read_json(path) or {}
+                if not isinstance(consent, dict):
+                    raise ValueError("not an object")
+                consent_bad.pop(person["id"], None)
+            except (OSError, ValueError) as exc:  # read as no consent (the conservative answer), and reported
+                consent, consent_bad[person["id"]] = {}, self.vault.relpath(path)
+                log.warning("speaker file unreadable, skipped: %s (%s)", self.vault.relpath(path), exc)
             person["attested_at"] = consent.get("attested_at")
+        self.unreadable_consent = consent_bad
         before = {r["id"]: (r["name"], r["me"], r["note_path"]) for r in self.db.query("SELECT * FROM people")}
         after = {p["id"]: (p["name"], p["me"], p["note_path"]) for p in found.values()}
         if before != after or len(before) != len(found):
@@ -671,16 +696,29 @@ class SpeakerStore:
         self.db.set_meta("calibrate_pending", repr(time.time() if now is None else now))
 
     def load_samples(self) -> int:
-        """Rebuild the `samples` cache from the vault."""
-        self.db.execute("DELETE FROM samples")
-        count = 0
+        """Rebuild the `samples` cache from the vault. Every file is read first; then one transaction replaces the
+        rows, so a failure leaves the previous rows, never an emptied index (C2-02). A file that can't be read or
+        decoded is skipped and recorded (`skipped_samples`), not a reason to stop."""
+        readable: list[dict] = []
+        skipped: dict[str, tuple[str, tuple | None, bool]] = {}
         if self.vault.people.exists():
             for path in sorted(self.vault.people.glob("*/samples/*.json")):
-                data = Vault.read_json(path)
-                if data and data.get("vector_b64"):
-                    self._index_sample(data)
-                    count += 1
-        return count
+                try:
+                    data = Vault.read_json(path)
+                    if not isinstance(data, dict) or not data.get("vector_b64"):
+                        skipped[path.stem] = (self.vault.relpath(path), _stat_key(path), False)  # not a voiceprint
+                        continue
+                    base64.b64decode(data["vector_b64"], validate=True)
+                    readable.append(data)
+                except (OSError, ValueError, TypeError, binascii.Error) as exc:
+                    skipped[path.stem] = (self.vault.relpath(path), _stat_key(path), True)
+                    log.warning("speaker file unreadable, skipped: %s (%s)", self.vault.relpath(path), exc)
+        with self.db.tx():
+            self.db.execute("DELETE FROM samples")
+            for data in readable:
+                self._index_sample(data)
+        self.skipped_samples = skipped
+        return len(readable)
 
     def samples(self, model: str, model_sha: str, *, every_state: bool = False) -> list[Sample]:
         """This model's samples that may teach anything (`sample_eligible`); `every_state`: removed and moved ones too.
@@ -1006,10 +1044,13 @@ class SpeakerStore:
 
     def _samples_stale(self) -> tuple[bool, list[str]] | None:
         """(True, dirty markers) when the samples index is behind the sample files, else None."""
-        files = {p.stem for p in self.vault.people.glob("*/samples/*.json")} if self.vault.people.exists() else set()
+        paths = {p.stem: p for p in self.vault.people.glob("*/samples/*.json")} if self.vault.people.exists() else {}
         indexed = {r["id"] for r in self.db.query("SELECT id FROM samples")}
         dirty = [r["key"] for r in self.db.query("SELECT key FROM meta WHERE key LIKE 'samples_dirty:%'")]
-        return (True, dirty) if files != indexed or dirty else None
+        # a file the last reload skipped stays out of the index until it changes (or goes): not a reason to reload
+        known = {stem for stem, (_, st, _) in self.skipped_samples.items() if stem in paths and _stat_key(paths[stem]) == st}
+        changed = len(known) != len(self.skipped_samples)
+        return (True, dirty) if set(paths) - known != indexed or dirty or changed else None
 
     def reference_voices(self, conv_id: str, name: str) -> None:
         """Record which voices file the (unchanged) label states now go with."""
