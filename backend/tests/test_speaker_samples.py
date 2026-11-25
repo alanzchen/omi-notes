@@ -43,6 +43,9 @@ def sample_file(settings, person_id: str, sample_id: str) -> dict:
 
 
 def people(client) -> dict[str, dict]:
+    """GET /v1/people after the worker's next reconcile: these tests change the store directly (no API mutation), which
+    the people snapshot picks up at the worker's tick (IT1-01, 2026-11-25)."""
+    client.app.state.speakers.warm()
     return {p["name"]: p for p in client.get("/v1/people", headers=AUTH).json()["people"]}
 
 
@@ -108,6 +111,7 @@ def test_sample_states_survive_an_index_rebuild(env):
     fresh = Worker(settings, app.state.db)
     fresh.providers._embedder = FakeEmbedder()
     app.state.speakers = SpeakerService(fresh.pipeline)
+    fresh.warm = app.state.speakers.warm  # as create_app wires its worker
     assert {s.id for s in fresh.pipeline.speakers.samples(*MODEL)} == {ids[0], ids[2]}
     row = fresh.db.one("SELECT state, revision FROM samples WHERE id=?", (ids[1],))
     assert (row["state"], row["revision"]) == ("removed", 1)
@@ -675,6 +679,7 @@ def test_calibration_measures_held_out_conversations_and_never_changes_activatio
     me, priya, rows = two_people(client, worker)
     before = {p["name"]: p["auto_active"] for p in client.get("/v1/people", headers=AUTH).json()["people"]}
     assert worker.calibrator.run(T0 + 10_000, force=True)
+    client.app.state.speakers.warm()  # a calibration run outside a tick: the people snapshot follows at the warm (IT1-01)
     data = calibration_file(settings)
     assert data["version"] == cal.VERSION and data["fingerprint"] and data["computed_at"]
     alan = data["people"][me]
@@ -1091,6 +1096,7 @@ def populated(client, worker, n: int):
         store._index_sample(d)
         ids.append(d["sample_id"])
     client.app.state.speakers = SpeakerService(worker.pipeline)
+    worker.warm = client.app.state.speakers.warm  # as create_app wires its worker
     return me, rows, ids, store, client.app.state.speakers
 
 

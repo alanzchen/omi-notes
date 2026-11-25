@@ -193,6 +193,11 @@ class Worker:
                 log.exception("could not update the search index")
             self.pipeline.render_stubs(now)
             self.pipeline.render_dailies()
+            if self.warm is not None:  # again after this tick's conversations: their voices and labels (IT1-01)
+                try:
+                    self.warm()
+                except Exception:
+                    log.exception("could not warm the voice review queue")
         self._status(now)
         if now - self._last_phone_log >= RETENTION_INTERVAL:
             self._last_phone_log = now

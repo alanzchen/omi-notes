@@ -53,9 +53,9 @@ def test_recent_issues_historical_cost_controls(client):
     print('READS_DONE_HISTORY',{k:{'100':a[k][:2],'10000':b[k][:2]} for k in functions})
     for k in functions: assert b[k][0]<=a[k][0]*3,(k,a[k][:2],b[k][:2])
 
-@pytest.mark.xfail(strict=True, reason='ASTRA-20261124-IT1-01 open: GET /v1/people still reconciles every sample file '
-                   '(design: build/deployment/nightly/2026-11-24/r2/IT1-01-DESIGN.md)')
 def test_people_request_does_not_enumerate_all_sample_files(client,monkeypatch):
+    # 2026-11-25 (IT1-01 fixed): the person and samples are written into the vault directly, so the worker's reconcile
+    # (`warm`) runs after each seed, as in production; the glob count covers only the GET. Astra's assertions unchanged.
     db=client.app.state.db; vault=client.app.state.vault
     pid=str(uuid.uuid4()); notes=vault.root/'People'; notes.mkdir(exist_ok=True)
     (notes/'Tester.md').write_text('---\nomi_person_id: '+pid+'\n---\n')
@@ -76,8 +76,8 @@ def test_people_request_does_not_enumerate_all_sample_files(client,monkeypatch):
     # endpoint's request argument only supplies app.state, no network.
     from types import SimpleNamespace
     req=SimpleNamespace(app=client.app)
-    seed(0,100); result=f(req); a=len(visited); visited.clear()
-    seed(100,1000); result=f(req); b=len(visited)
+    seed(0,100); client.app.state.speakers.warm(); visited.clear(); result=f(req); a=len(visited); visited.clear()
+    seed(100,1000); client.app.state.speakers.warm(); visited.clear(); result=f(req); b=len(visited)
     print('PEOPLE_SAMPLE_ENUMERATION',{'100_samples':a,'1000_samples':b,'people_returned':len(result['people'])})
     assert len(result['people'])==1
     assert b<=a+5,'Home appearance enumerates all samples despite returning the same one-person response'

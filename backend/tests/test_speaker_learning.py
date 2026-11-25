@@ -90,6 +90,7 @@ def env(tmp_path):
     worker.providers._embedder = FakeEmbedder()
     worker.providers._llm = CountingLlm()
     app.state.speakers = SpeakerService(worker.pipeline)
+    worker.warm = app.state.speakers.warm  # as create_app wires its worker: the API's snapshots each tick
     return settings, client, worker
 
 
@@ -533,6 +534,7 @@ def test_rebuild_restores_people_samples_and_assignments(env):
     fresh.providers._stt = fresh.providers._llm = Exploding()
     fresh.providers._embedder = FakeEmbedder()
     app.state.speakers = SpeakerService(fresh.pipeline)
+    fresh.warm = app.state.speakers.warm  # as create_app wires its worker
     for t in (T0 + 1200, T0 + 1300):
         fresh.tick(t)
     after = {p.relative_to(settings.vault_dir).as_posix(): p.read_bytes() for p in settings.vault_dir.rglob("*")

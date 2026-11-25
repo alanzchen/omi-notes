@@ -8,9 +8,12 @@ vectors are kept only with the separate opt-in, and only while the conversation'
 
 from __future__ import annotations
 
+import functools
 import io
 import json
 import logging
+import os
+import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -34,6 +37,10 @@ from .voices import Clip, embed_voices
 log = logging.getLogger(__name__)
 
 MAX_CLIP_SECONDS = 10.0
+# The worker re-reads People notes at least this often (an edit inside a note doesn't change its folder's mtime).
+PEOPLE_RECONCILE_SECONDS = 300.0
+# legacy suggestions kept in the snapshot: the endpoint's largest page
+SUGGESTIONS_KEPT = 20
 EXCERPT_CHARS = 140
 CLIP_TEXT_CHARS = 240
 
@@ -46,6 +53,44 @@ class Outcome:
     sample: str  # created | exists | not_acknowledged | not_attested | no_audio | none
 
 
+def _rebuilds_people(method):
+    """A mutation that can change what GET /v1/people (or the legacy suggestions) shows: once it returns or raises, the
+    snapshot is rebuilt in the same request (a write may pay the cost; a GET may not). Nested mutations rebuild once."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        depth = getattr(self._people_depth, "n", 0)
+        self._people_depth.n = depth + 1
+        try:
+            result = method(self, *args, **kwargs)
+        except BaseException:
+            # it may have changed something before failing (a journaled operation finishes later): the snapshot
+            # can't be called current, and no build runs inside a failed request; the worker rebuilds it
+            if depth == 0:
+                self._mark_people_stale()
+            raise
+        finally:
+            self._people_depth.n = depth
+        if depth == 0:
+            self.refresh_people()
+        return result
+
+    return wrapper
+
+
+@dataclass(frozen=True)
+class PeopleSnapshot:
+    """What GET /v1/people and GET /v1/speakers/suggestions serve. `generation` is taken when its build started."""
+
+    people: list
+    suggestions: list | None
+    generation: int
+    built_at: float | None
+    inputs: tuple | None
+    ready: bool
+    stale: bool = False
+
+
 class SpeakerService:
     def __init__(self, pipeline) -> None:
         self.pipeline = pipeline
@@ -54,10 +99,124 @@ class SpeakerService:
         self.vault = pipeline.vault
         self.review = Review(self)
         self._set_aside_key = None
+        # the people snapshot (IT1-01): built only by the worker (`warm`) and by mutations, read by GETs
+        self._people_lock = threading.Lock()
+        self._people_seq = 0  # the last generation handed to a build
+        self._people_floor = 0  # builds that started at or before a failed post-mutation build can't publish
+        self._people_depth = threading.local()
+        self._people_reconciled_at: float | None = None
+        self._people_cache = self.db.path.parent / "people.json"  # operational cache beside the index, never vault data
+        self._people = self._load_people_cache()
 
     # -- people ----------------------------------------------------------------------------------
 
     def people(self) -> list[dict]:
+        return self.people_answer()["people"]
+
+    def people_answer(self) -> dict:
+        """GET /v1/people: the published snapshot, never a scan. `ready` false: no build in this process yet (the
+        stored copy, or nothing) or the last post-mutation build failed (`stale`: the worker rebuilds it next tick).
+        Older clients read only `people`."""
+        with self._people_lock:
+            snap = self._people
+        out = {"people": snap.people, "ready": snap.ready and not snap.stale, "generation": snap.generation,
+               "as_of": iso_utc_epoch(snap.built_at) if snap.built_at else None}  # fmt: skip
+        if snap.stale:
+            out["stale"] = True
+        return out
+
+    def _load_people_cache(self) -> PeopleSnapshot:
+        try:
+            data = json.loads(self._people_cache.read_text())
+            return PeopleSnapshot(people=list(data["people"]), suggestions=data.get("suggestions"), generation=0,
+                                  built_at=float(data["built_at"]), inputs=None, ready=False)  # fmt: skip
+        except (OSError, ValueError, KeyError, TypeError):
+            return PeopleSnapshot(people=[], suggestions=None, generation=0, built_at=None, inputs=None, ready=False)
+
+    def _people_inputs(self) -> tuple:
+        """What the snapshot depends on, cheaply (worker only): the evidence digest (samples, labels, people, consent,
+        speaker settings), the calibration file and the People folders' own mtimes (a note added, removed or renamed)."""
+        embedder = self.pipeline.providers.embedder
+        key = self.store.evidence_key(embedder.model if embedder else "", embedder.model_sha if embedder else "")
+
+        def stat(path):
+            try:
+                st = path.stat()
+                return (st.st_mtime_ns, st.st_size)
+            except OSError:
+                return None
+
+        from .store import PEOPLE_DIR
+
+        return (key, stat(self.vault.speakers / "calibration.json"), stat(self.vault.root / PEOPLE_DIR),
+                stat(self.vault.people))  # fmt: skip
+
+    def refresh_people(self, now: float | None = None) -> bool:
+        """Build and publish the snapshot; never raises. The generation is taken before any input is read, so a build
+        that started later saw every change committed before it, and a slower, earlier build finishing afterwards is
+        dropped. A failure marks the served snapshot stale (not ready) and bars every build that started before it,
+        so a build that can't contain the change that just committed never publishes; the worker retries."""
+        with self._people_lock:
+            self._people_seq += 1
+            gen = self._people_seq
+        try:
+            self.store.scan_people()
+            self.store.sync_samples()
+            inputs = self._people_inputs()
+            people = self._compute_people()
+            suggestions = self._compute_suggestions(time.time() if now is None else now)
+        except Exception:
+            log.exception("could not build the people snapshot (generation %s)", gen)
+            self._mark_people_stale(gen)
+            return False
+        built = PeopleSnapshot(people=people, suggestions=suggestions, generation=gen, built_at=time.time(),
+                               inputs=inputs, ready=True)  # fmt: skip
+        with self._people_lock:  # the file is written under the lock too, so it never goes back to an older build
+            if gen <= self._people.generation or gen <= self._people_floor:
+                return False
+            self._people = built
+            try:
+                self._write_people_cache(built)
+            except OSError:
+                log.exception("could not write %s (cache only: the snapshot in memory is current)", self._people_cache)
+        return True
+
+    def _mark_people_stale(self, gen: int | None = None) -> None:
+        """The served snapshot may hide a change: not ready until a build that started after this point publishes
+        (every build that started before it is barred: it may predate the change)."""
+        with self._people_lock:
+            if gen is None:
+                self._people_seq += 1
+                gen = self._people_seq
+            self._people_floor = max(self._people_floor, gen)
+            if not self._people.stale:
+                self._people = PeopleSnapshot(**{**self._people.__dict__, "stale": True})
+
+    def _write_people_cache(self, snap: PeopleSnapshot) -> None:
+        """Temp file and rename: a reader or a crash sees the old copy or the new one, never part of one."""
+        tmp = self._people_cache.with_name(f"people.json.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            tmp.write_text(json.dumps({"generation": snap.generation, "built_at": snap.built_at, "people": snap.people,
+                                       "suggestions": snap.suggestions}))  # fmt: skip
+            os.replace(tmp, self._people_cache)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def warm_people(self, now: float | None = None) -> None:
+        """The worker's part (each tick): rebuild when there's no current snapshot, it's stale, its inputs changed, or
+        the reconcile interval passed (a note's content edited in Obsidian)."""
+        now = time.time() if now is None else now
+        with self._people_lock:
+            snap = self._people
+        due = self._people_reconciled_at is None or now - self._people_reconciled_at >= PEOPLE_RECONCILE_SECONDS
+        if snap.ready and not snap.stale and not due and snap.inputs == self._people_inputs():
+            return
+        if due:
+            self._people_reconciled_at = now
+        self.refresh_people(now)
+
+    def _compute_people(self) -> list[dict]:
+        """Today's answer, computed (a build or a mutation; never a GET)."""
         self.store.scan_people()
         self.store.sync_samples()
         embedder = self.pipeline.providers.embedder
@@ -81,6 +240,7 @@ class SpeakerService:
             })  # fmt: skip
         return out
 
+    @_rebuilds_people
     def import_enrollment(self, person_id: str, fields: dict, upload) -> tuple[int, dict]:
         """`POST /v1/people/{id}/enrollments/import` (`speakers.imports`)."""
         from .imports import Importer
@@ -103,7 +263,7 @@ class SpeakerService:
 
     # -- review and samples (`speakers.review`) ---------------------------------------------------
 
-    def warm(self) -> None:
+    def warm(self, now: float | None = None) -> None:
         """Rebuild what changed since the last request (the review queue's order and, through it, the voice
         space) so requests only slice cached results; a no-op when nothing changed. Called by the worker."""
         embedder = self.pipeline.providers.embedder
@@ -113,16 +273,19 @@ class SpeakerService:
                 self.review.set_aside_unplayable()
                 self._set_aside_key = self.store.evidence_key(embedder.model, embedder.model_sha)
             self.review.entries()
+        self.warm_people(now)
 
     def review_items(self, limit: int, offset: int = 0) -> dict:
         return self.review.page(limit, offset)
 
+    @_rebuilds_people
     def review_decide(self, item_id: str, body: dict) -> dict:
         return self.review.decide(item_id, body)
 
     def person_samples(self, person_id: str, state: str | None) -> list[dict]:
         return self.review.person_samples(person_id, state)
 
+    @_rebuilds_people
     def sample_action(self, sample_id: str, action: str, body: dict) -> dict:
         if not UUID_RE.match(sample_id):
             raise ApiError(404, "not_found", "unknown sample")
@@ -138,6 +301,7 @@ class SpeakerService:
         result = self.review.sample_decision(sample_id, action, request_id, expected_revision=expected, person_id=person_id)
         return result | {"request_id": request_id, "undo_token": request_id}
 
+    @_rebuilds_people
     def put_person(self, person_id: str, body: dict) -> tuple[int, dict]:
         if not UUID_RE.match(person_id):
             raise ApiError(422, "invalid_person_id", "person id must be a lowercase UUID")
@@ -154,9 +318,10 @@ class SpeakerService:
             created = self.store.put_person(person_id, name.strip(), me=me, attest=attest)
             self.db.set_meta("relabel_pending", "1")  # names/me shape rendering and prompts
             self.store.samples_changed()  # consent or the wearer may have changed: recalibrate
-        person = next(p for p in self.people() if p["id"] == person_id)
+        person = next(p for p in self._compute_people() if p["id"] == person_id)
         return (201 if created else 200), person
 
+    @_rebuilds_people
     def forget(self, person_id: str, *, delete_note: bool) -> list[str]:
         with self.store.lock:
             if self.store.person(person_id) is None and not self.store.person_dir(person_id).exists():
@@ -289,6 +454,7 @@ class SpeakerService:
                         "text": text[:CLIP_TEXT_CHARS] + ("…" if len(text) > CLIP_TEXT_CHARS else "")})  # fmt: skip
         return out
 
+    @_rebuilds_people
     def assign(self, conv_id: str, label: str, body: dict) -> Outcome:
         person_id = body.get("person_id")
         not_person = body.get("not_person_id")
@@ -485,7 +651,12 @@ class SpeakerService:
         return found, prefs
 
     def suggestions(self, limit: int, now: float | None = None) -> list[dict]:
-        now = time.time() if now is None else now
+        """GET /v1/speakers/suggestions: a slice of the snapshot's list (built with the people snapshot)."""
+        with self._people_lock:
+            kept = self._people.suggestions
+        return list(kept or [])[:limit]
+
+    def _compute_suggestions(self, now: float, limit: int = SUGGESTIONS_KEPT) -> list[dict]:
         found, _ = self._suggestions(now)
         out = []
         for s in found[:limit]:
@@ -521,6 +692,7 @@ class SpeakerService:
                 return clips[0] | {"conversation_id": m.conversation_id, "conversation": self._context(m.conversation_id)}
         return None
 
+    @_rebuilds_people
     def dismiss(self, suggestion_id: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
         prefs = self.store.settings()
@@ -528,6 +700,7 @@ class SpeakerService:
         dismissed[suggestion_id] = now + speaker_suggest.COOLDOWN
         self.store.update_settings(dismissed=dismissed)
 
+    @_rebuilds_people
     def assign_suggestion(self, suggestion_id: str, body: dict, now: float | None = None) -> list[str]:
         now = time.time() if now is None else now
         person_id, request_id = body.get("person_id"), body.get("request_id")
@@ -551,6 +724,7 @@ class SpeakerService:
                 touched.append(member.conversation_id)
             return sorted(set(touched) | set(self._relabel()))
 
+    @_rebuilds_people
     def keep_unknown_suggestion(self, suggestion_id: str, body: dict, now: float | None = None) -> list[str]:
         """The owner keeps this recurring voice unknown, in every conversation it covers: durable
         (speakers.json), unlike the 7-day `dismiss`."""
@@ -570,6 +744,7 @@ class SpeakerService:
                              "request_id": f"{request_id}:{member.conversation_id}:{member.label}"})  # fmt: skip
             return sorted({m.conversation_id for m in suggestion.members})
 
+    @_rebuilds_people
     def undo(self, body: dict) -> dict:
         """Put back what one naming request (a label, or every label of a suggestion) changed, label
         by label, only where that change still stands; voiceprints it created are removed, the
@@ -650,6 +825,7 @@ class SpeakerService:
         return {"acknowledged_at": prefs["acknowledged_at"], "unknown_voices_enabled": prefs["unknown_voices_enabled"],
                 "auto_assign": prefs["auto_assign"]}  # fmt: skip
 
+    @_rebuilds_people
     def put_settings(self, body: dict) -> dict:
         changes: dict = {}
         if "acknowledged_at" in body:

@@ -960,6 +960,7 @@ def mixed_then_reprocessed(client, worker, later_turns):
     worker.providers._diarizer = TurnsDiarizer([(0.0, 10.0, 0)])  # one voice heard over all of it: [0.25, 9.75]
     worker.providers._embedder = FakeEmbedder()
     client.app.state.speakers = SpeakerService(worker.pipeline)
+    worker.warm = client.app.state.speakers.warm  # as create_app wires its worker
     replay(client, np.concatenate([np.zeros(SR, np.int16), voice(6, ALAN, 7), voice(14, PRIYA, 8), np.zeros(2 * SR, np.int16)]))
     worker.tick(T0 + 400)
     (row,) = convs(worker)
@@ -1000,6 +1001,7 @@ def test_an_interrupted_clip_only_reprocess_never_serves_or_confirms_the_old_mix
     worker.providers._diarizer = TurnsDiarizer([(0.0, 10.0, 0)])  # the old evidence: one voice over all of it
     worker.providers._embedder = FakeEmbedder()
     client.app.state.speakers = SpeakerService(worker.pipeline)
+    worker.warm = client.app.state.speakers.warm  # as create_app wires its worker
     replay(client, np.concatenate([np.zeros(SR, np.int16), voice(6, ALAN, 7), voice(14, PRIYA, 8), np.zeros(2 * SR, np.int16)]))
     worker.tick(T0 + 400)
     (row,) = convs(worker)

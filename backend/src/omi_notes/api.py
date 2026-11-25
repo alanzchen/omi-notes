@@ -643,7 +643,7 @@ def create_app(
 
     @app.get("/v1/people")
     def list_people(request: Request) -> dict:
-        return {"people": speakers(request).people()}
+        return speakers(request).people_answer()  # the snapshot (`people`, plus ready/generation/as_of): no scan (IT1-01)
 
     @app.put("/v1/people/{person_id}")
     async def put_person(person_id: str, request: Request) -> JSONResponse:

@@ -50,6 +50,7 @@ def env(tmp_path):
     CountingStt.calls = 0
     worker.providers._stt = CountingStt()
     app.state.speakers = SpeakerService(worker.pipeline)
+    worker.warm = app.state.speakers.warm  # as create_app wires its worker: the API's snapshots each tick
     return settings, client, worker
 
 

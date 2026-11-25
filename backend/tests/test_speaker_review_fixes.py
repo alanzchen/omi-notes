@@ -35,6 +35,7 @@ def test_a_state_written_to_the_file_but_not_the_index_is_reconciled(env, monkey
     assert sample_file(settings, me, ids[0])["state"] == "removed"
     # the next model build reads the file's truth, not the stale index
     assert ids[0] not in {s.id for s in store.samples(*MODEL)}
+    client.app.state.speakers.warm()  # a direct store change: the snapshot follows at the worker's tick (IT1-01)
     assert people(client)["Alan"]["samples_removed"] == 1
 
 

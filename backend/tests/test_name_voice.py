@@ -105,6 +105,7 @@ def test_keep_unknown_is_durable_and_is_not_the_seven_day_dismissal(env):
     worker = Worker(settings, Database(settings.db_path))
     worker.providers._embedder = FakeEmbedder()
     client.app.state.speakers = SpeakerService(worker.pipeline)
+    worker.warm = client.app.state.speakers.warm  # as create_app wires its worker
     for t in range(4):
         worker.tick(10**10 + t)
     assert all(labels(client, row["id"])["S2"]["kept_unknown"] for row in rows)

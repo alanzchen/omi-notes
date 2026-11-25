@@ -111,7 +111,9 @@ def client(settings: Settings) -> TestClient:
 
 @pytest.fixture
 def worker(settings: Settings, client: TestClient) -> Worker:  # client first: opens the vault and index
-    return Worker(settings, Database(settings.db_path))
+    w = Worker(settings, Database(settings.db_path))
+    w.warm = client.app.state.speakers.warm  # as `create_app` wires its own worker: the API's snapshots, each tick
+    return w
 
 
 def put_chunk(client: TestClient, capture_id: str, seq: int, body: bytes, *, sha: str | None = None):
