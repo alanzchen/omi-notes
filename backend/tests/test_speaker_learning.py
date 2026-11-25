@@ -446,7 +446,7 @@ def test_unknown_voices_suggestions_and_pruning(env):
     me = new_person(client, "Alan", me=True)
     seed = talk(client, worker, dialogue(ALAN, PRIYA), day=9)
     name_label(client, seed["id"], "S1", me)  # recognition is no longer inert
-    assert client.get("/v1/speakers/suggestions", headers=AUTH).json() == {"suggestions": []}
+    assert client.get("/v1/speakers/suggestions", headers=AUTH).json()["suggestions"] == []  # (plus ready/stale, C2-02)
     assert client.put("/v1/speakers/settings", json={"unknown_voices_enabled": True}, headers=AUTH).json()[
         "unknown_voices_enabled"] is True  # fmt: skip
     rows = [talk(client, worker, dialogue(ALAN, RAVI, turns=6, seconds=5.0, seed=day), day=day) for day in (3, 2, 2)]

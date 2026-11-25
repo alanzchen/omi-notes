@@ -683,7 +683,7 @@ def create_app(
 
     @app.get("/v1/speakers/suggestions")
     def suggestions(request: Request, limit: int = 5) -> dict:
-        return {"suggestions": speakers(request).suggestions(max(1, min(limit, 20)))}
+        return speakers(request).suggestions_answer(max(1, min(limit, 20)))  # the snapshot's slice, with ready/stale
 
     @app.post("/v1/speakers/suggestions/{suggestion_id}/dismiss")
     def dismiss(suggestion_id: str, request: Request) -> Response:

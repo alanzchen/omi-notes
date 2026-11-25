@@ -103,15 +103,16 @@ def test_no_snapshot_at_all_is_empty_and_not_ready(client):
 
 
 def test_an_older_build_never_overwrites_a_newer_snapshot(client, monkeypatch):
-    """Generations are taken when a build starts; a slower build that started earlier is dropped when it finishes."""
+    """Builds run under the speaker lock (C2-01), so a mutation that arrives while an earlier build is running waits for
+    it, and its own build, a newer generation, is what's served."""
     speakers = client.app.state.speakers
     pid = str(uuid.uuid4())
     assert client.put(f"/v1/people/{pid}", json={"name": "Hal"}, headers=AUTH).status_code == 201
     started, release = threading.Event(), threading.Event()
     real = speakers._compute_people
 
-    def slow():
-        out = real()  # reads "Hal"
+    def slow(*a):
+        out = real(*a)  # reads "Hal"
         started.set()
         assert release.wait(5)
         return out
@@ -121,12 +122,15 @@ def test_an_older_build_never_overwrites_a_newer_snapshot(client, monkeypatch):
     old.start()
     assert started.wait(5)
     monkeypatch.setattr(speakers, "_compute_people", real)
-    assert client.put(f"/v1/people/{pid}", json={"name": "Hal Ito"}, headers=AUTH).status_code == 200
-    newer = _people(client)
+    put: list = []
+    newer = threading.Thread(target=lambda: put.append(
+        client.put(f"/v1/people/{pid}", json={"name": "Hal Ito"}, headers=AUTH).status_code))
+    newer.start()  # waits for the speaker lock the older build holds
     release.set()
-    old.join()
+    old.join(5)
+    newer.join(5)
     after = _people(client)
-    assert [p["name"] for p in after["people"]] == ["Hal Ito"] and after["generation"] == newer["generation"]
+    assert put == [200] and [p["name"] for p in after["people"]] == ["Hal Ito"] and after["ready"] is True
 
 
 def test_a_failed_rebuild_after_a_committed_mutation_is_not_ready_until_the_worker_rebuilds(client, monkeypatch):
@@ -168,5 +172,5 @@ def test_suggestions_are_sliced_from_the_snapshot(client, monkeypatch):
     calls = []
     monkeypatch.setattr(speakers, "_suggestions", lambda *a, **k: calls.append(1) or ([], {}))
     r = client.get("/v1/speakers/suggestions?limit=3", headers=AUTH)
-    assert r.status_code == 200 and r.json() == {"suggestions": []}
+    assert r.status_code == 200 and r.json()["suggestions"] == [] and r.json()["ready"] is True
     assert not calls and not seen, "a GET only slices the worker's list"

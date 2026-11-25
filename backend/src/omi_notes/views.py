@@ -623,6 +623,15 @@ def server_issues(db, *, read_only: str | None, worker: bool, limit: int = ISSUE
                     "next_step": "This needs a fix on the server.",
                     "server_step": "Fix or remove class.json in those conversations' _omi folders: "
                                    + ", ".join(examples)})  # fmt: skip
+    speaker_files = db.meta("speaker_files_unreadable")  # the people snapshot's skipped files (C2-02): one PK read
+    if speaker_files:
+        bad = json.loads(speaker_files)
+        n = bad["count"]
+        out.append({"code": "speaker_files_unreadable", "severity": "action", "count": n,
+                    "message": f"{n} voice file{'s' if n != 1 else ''} on the server can't be read; "
+                               f"{'they are' if n != 1 else 'it is'} skipped until fixed.",
+                    "next_step": "This needs a fix on the server.",
+                    "server_step": "Fix or remove these files in the vault: " + ", ".join(bad["examples"])})  # fmt: skip
     if read_only:
         out.append({"code": "read_only", "severity": "action", "message": "The server stopped writing to the vault.",
                     "detail": read_only, "next_step": "This needs a fix on the server.",

@@ -128,6 +128,8 @@ class SpeakerService:
     def _load_people_cache(self) -> PeopleSnapshot:
         try:
             data = json.loads(self._people_cache.read_text())
+            if not isinstance(data["people"], list) or not isinstance(data.get("suggestions") or [], list):
+                raise ValueError("people.json: people is not a list")  # C2-04
             return PeopleSnapshot(people=list(data["people"]), suggestions=data.get("suggestions"), generation=0,
                                   built_at=float(data["built_at"]), inputs=None, ready=False)  # fmt: skip
         except (OSError, ValueError, KeyError, TypeError):
@@ -156,30 +158,47 @@ class SpeakerService:
         that started later saw every change committed before it, and a slower, earlier build finishing afterwards is
         dropped. A failure marks the served snapshot stale (not ready) and bars every build that started before it,
         so a build that can't contain the change that just committed never publishes; the worker retries."""
-        with self._people_lock:
-            self._people_seq += 1
-            gen = self._people_seq
-        try:
-            self.store.scan_people()
-            self.store.sync_samples()
-            inputs = self._people_inputs()
-            people = self._compute_people()
-            suggestions = self._compute_suggestions(time.time() if now is None else now)
-        except Exception:
-            log.exception("could not build the people snapshot (generation %s)", gen)
-            self._mark_people_stale(gen)
-            return False
-        built = PeopleSnapshot(people=people, suggestions=suggestions, generation=gen, built_at=time.time(),
-                               inputs=inputs, ready=True)  # fmt: skip
-        with self._people_lock:  # the file is written under the lock too, so it never goes back to an older build
-            if gen <= self._people.generation or gen <= self._people_floor:
-                return False
-            self._people = built
+        # Under the speaker lock, which every mutation holds while it writes (C2-01): the generation is taken, the
+        # People notes scanned and the answer computed with no mutation in between, so generation N reflects every
+        # mutation that finished before N was taken, and no earlier build's index write can land inside this one.
+        with self.store.lock:
+            with self._people_lock:
+                self._people_seq += 1
+                gen = self._people_seq
+            problems: list[str] = []
             try:
-                self._write_people_cache(built)
-            except OSError:
-                log.exception("could not write %s (cache only: the snapshot in memory is current)", self._people_cache)
+                self.store.scan_people()
+                self.store.sync_samples()
+                inputs = self._people_inputs()
+                people = self._compute_people(problems)
+                suggestions = self._compute_suggestions(time.time() if now is None else now, problems=problems)
+                self._publish_problems(problems)
+            except Exception:
+                log.exception("could not build the people snapshot (generation %s)", gen)
+                self._mark_people_stale(gen)
+                return False
+            built = PeopleSnapshot(people=people, suggestions=suggestions, generation=gen, built_at=time.time(),
+                                   inputs=inputs, ready=True)  # fmt: skip
+            with self._people_lock:  # the file is written under the lock too, so it never goes back to an older build
+                if gen <= self._people.generation or gen <= self._people_floor:
+                    return False
+                self._people = built
+                try:
+                    self._write_people_cache(built)
+                except OSError:
+                    log.exception("could not write %s (cache only: the snapshot in memory is current)", self._people_cache)
         return True
+
+    def _publish_problems(self, extra: list[str]) -> None:
+        """The speaker files this build skipped (C2-02), as a count and five examples for /v1/issues: a sample, consent,
+        calibration or transcript file that can't be read never stops People, and is never silent."""
+        bad = sorted({rel for rel, _, unreadable in self.store.skipped_samples.values() if unreadable}
+                     | set(self.store.unreadable_consent.values()) | set(extra))  # fmt: skip
+        value = json.dumps({"count": len(bad), "examples": bad[:5]}) if bad else None
+        if self.db.meta("speaker_files_unreadable") != value:
+            self.db.set_meta("speaker_files_unreadable", value)
+            if bad:
+                log.warning("speaker files unreadable, skipped: %d (%s)", len(bad), ", ".join(bad[:5]))
 
     def _mark_people_stale(self, gen: int | None = None) -> None:
         """The served snapshot may hide a change: not ready until a build that started after this point publishes
@@ -215,15 +234,13 @@ class SpeakerService:
             self._people_reconciled_at = now
         self.refresh_people(now)
 
-    def _compute_people(self) -> list[dict]:
-        """Today's answer, computed (a build or a mutation; never a GET)."""
-        self.store.scan_people()
-        self.store.sync_samples()
+    def _compute_people(self, problems: list[str] | None = None) -> list[dict]:
+        """Today's answer, computed (a build; never a GET). `problems` collects files it skipped."""
         embedder = self.pipeline.providers.embedder
         key = (embedder.model, embedder.model_sha) if embedder else None
         models = self.store.models(*key, self.pipeline.operating) if key else {}
         auto_assign = self.store.settings()["auto_assign"]
-        calibration = self.calibration_people()
+        calibration = self.calibration_people(problems)
         out = []
         for p in self.store.people():
             rows = [r for r in self.db.query("SELECT * FROM samples WHERE person_id=?", (p["id"],)) if sample_eligible(r)]
@@ -247,9 +264,21 @@ class SpeakerService:
 
         return Importer(self).run(person_id, fields, upload)
 
-    def calibration_people(self) -> dict:
-        """The last published calibration (`speakers.calibration`), {} before the first."""
-        return Vault.read_json(self.vault.speakers / "calibration.json") or {}
+    def calibration_people(self, problems: list[str] | None = None) -> dict:
+        """The last published calibration (`speakers.calibration`), {} before the first, or when it can't be read (then
+        recorded in `problems`: the people list doesn't wait for it)."""
+        path = self.vault.speakers / "calibration.json"
+        try:
+            data = Vault.read_json(path) or {}
+            if not isinstance(data, dict):
+                raise ValueError("not an object")
+            return data
+        except (OSError, ValueError) as exc:
+            if problems is None:
+                raise
+            log.warning("speaker file unreadable, skipped: %s (%s)", self.vault.relpath(path), exc)
+            problems.append(self.vault.relpath(path))
+            return {}
 
     def calibration(self) -> dict:
         """`GET /v1/speakers/calibration`: the last published calibration and whether its inputs changed since."""
@@ -268,11 +297,14 @@ class SpeakerService:
         space) so requests only slice cached results; a no-op when nothing changed. Called by the worker."""
         embedder = self.pipeline.providers.embedder
         if embedder is not None:
-            key = self.store.evidence_key(embedder.model, embedder.model_sha)
-            if key != self._set_aside_key:  # flagged samples nobody can listen to leave the queue (once per change)
-                self.review.set_aside_unplayable()
-                self._set_aside_key = self.store.evidence_key(embedder.model, embedder.model_sha)
-            self.review.entries()
+            try:
+                key = self.store.evidence_key(embedder.model, embedder.model_sha)
+                if key != self._set_aside_key:  # flagged samples nobody can listen to leave the queue (once per change)
+                    self.review.set_aside_unplayable()
+                    self._set_aside_key = self.store.evidence_key(embedder.model, embedder.model_sha)
+                self.review.entries()
+            except Exception:  # the review queue failing doesn't hold People back (C2-02)
+                log.exception("could not warm the voice review queue")
         self.warm_people(now)
 
     def review_items(self, limit: int, offset: int = 0) -> dict:
@@ -301,8 +333,22 @@ class SpeakerService:
         result = self.review.sample_decision(sample_id, action, request_id, expected_revision=expected, person_id=person_id)
         return result | {"request_id": request_id, "undo_token": request_id}
 
-    @_rebuilds_people
     def put_person(self, person_id: str, body: dict) -> tuple[int, dict]:
+        """The person as the snapshot rebuilt after the write shows them (computed once, C2-05). If that rebuild failed,
+        the write still stands: the answer is the stored row, marked stale (C2-02), never a 500."""
+        created = self._put_person_write(person_id, body)
+        with self._people_lock:
+            snap = self._people
+        person = None if snap.stale else next((p for p in snap.people if p["id"] == person_id), None)
+        if person is None:
+            row = self.store.person(person_id)
+            person = {"id": person_id, "name": row["name"] if row else body["name"].strip(),
+                      "me": bool(row["me"]) if row else bool(body.get("me")), "note_path": row["note_path"] if row else None,
+                      "stale": True}  # fmt: skip
+        return (201 if created else 200), person
+
+    @_rebuilds_people
+    def _put_person_write(self, person_id: str, body: dict) -> bool:
         if not UUID_RE.match(person_id):
             raise ApiError(422, "invalid_person_id", "person id must be a lowercase UUID")
         name = body.get("name")
@@ -318,8 +364,7 @@ class SpeakerService:
             created = self.store.put_person(person_id, name.strip(), me=me, attest=attest)
             self.db.set_meta("relabel_pending", "1")  # names/me shape rendering and prompts
             self.store.samples_changed()  # consent or the wearer may have changed: recalibrate
-        person = next(p for p in self._compute_people() if p["id"] == person_id)
-        return (201 if created else 200), person
+        return created
 
     @_rebuilds_people
     def forget(self, person_id: str, *, delete_note: bool) -> list[str]:
@@ -651,17 +696,32 @@ class SpeakerService:
         return found, prefs
 
     def suggestions(self, limit: int, now: float | None = None) -> list[dict]:
-        """GET /v1/speakers/suggestions: a slice of the snapshot's list (built with the people snapshot)."""
-        with self._people_lock:
-            kept = self._people.suggestions
-        return list(kept or [])[:limit]
+        """A slice of the snapshot's list (built with the people snapshot)."""
+        return self.suggestions_answer(limit)["suggestions"]
 
-    def _compute_suggestions(self, now: float, limit: int = SUGGESTIONS_KEPT) -> list[dict]:
+    def suggestions_answer(self, limit: int) -> dict:
+        """GET /v1/speakers/suggestions: the slice plus the snapshot's ready/stale/generation/as_of, as /v1/people."""
+        with self._people_lock:
+            snap = self._people
+        out = {"suggestions": list(snap.suggestions or [])[:limit], "ready": snap.ready and not snap.stale,
+               "generation": snap.generation, "as_of": iso_utc_epoch(snap.built_at) if snap.built_at else None}  # fmt: skip
+        if snap.stale:
+            out["stale"] = True
+        return out
+
+    def _compute_suggestions(self, now: float, limit: int = SUGGESTIONS_KEPT, problems: list[str] | None = None) -> list[dict]:
         found, _ = self._suggestions(now)
         out = []
         for s in found[:limit]:
             rep = s.representative
-            transcript = self._transcript(rep.conversation_id)
+            try:  # a conversation whose transcript can't be read drops its suggestion, not the list (C2-02)
+                transcript = self._transcript(rep.conversation_id)
+            except (ApiError, OSError, ValueError) as exc:
+                rel = f"conversations/{rep.conversation_id}/transcript.json"
+                log.warning("speaker file unreadable, skipped: %s (%s)", rel, exc)
+                if problems is not None:
+                    problems.append(rel)
+                continue
             excerpt = next((seg["text"] for seg in transcript.get("segments") or [] if seg["speaker"] == rep.label), "")
             clips = self._clip_list(rep.conversation_id, transcript, rep.label,
                                     self._clips(rep.conversation_id, transcript).get(rep.label) or [])  # fmt: skip
