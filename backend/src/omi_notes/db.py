@@ -803,10 +803,12 @@ class Database:
             conn.execute("PRAGMA synchronous=FULL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=30000")
-            self._local.conn = conn
-            self._local.generation = self._generation
+            # registered and stamped in one step under the lock (C1-02): a close() either sees this connection (and
+            # closes it) or happened before it (and this one carries the new generation), never in between
             with self._opened_lock:
                 self._opened.append(conn)
+                self._local.conn = conn
+                self._local.generation = self._generation
         return conn
 
     @contextmanager
@@ -821,9 +823,12 @@ class Database:
         conn.execute("BEGIN")
         try:
             yield conn
-        finally:
+        except BaseException:
             if conn.in_transaction:
-                conn.execute("COMMIT")  # read-only: nothing to keep or undo
+                conn.execute("ROLLBACK")  # never commit after an error, should a caller have written (C1-05)
+            raise
+        if conn.in_transaction:
+            conn.execute("COMMIT")  # read-only: nothing to keep
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -865,8 +870,15 @@ class Database:
 
     def close(self) -> None:
         """Closes every connection this object opened, on every thread (each thread opens a new one if it's used
-        again). For an owner done with the index (a rebuild, a migration, a test), not while other threads query it."""
+        again). The contract: one owner done with the index (a rebuild, a migration, a test), not while other threads
+        use it. Best-effort guard (C1-02): if another connection is inside a transaction, nothing is closed and this
+        raises, instead of rolling the writer back under it. A transaction that starts after the check isn't seen:
+        concurrent use stays outside the contract."""
         with self._opened_lock:
+            mine = getattr(self._local, "conn", None)
+            busy = [c for c in self._opened if c is not mine and c.in_transaction]
+            if busy:
+                raise RuntimeError(f"Database.close() while {len(busy)} other connection(s) are inside a transaction")
             opened, self._opened = self._opened, []
             self._generation += 1
         for conn in opened:
