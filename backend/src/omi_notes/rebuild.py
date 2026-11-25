@@ -211,6 +211,11 @@ def _capture_ops(vault: Vault, device: str, capture: str, report: Report, *, ski
             except EnvelopeError as exc:
                 report.problems.append(f"unreadable chunk {vault.relpath(path)}: {exc}")
                 continue
+            # its folder is the device as the vault names it (`safe_component`): a chunk naming another device is in
+            # the wrong place and isn't indexed (an acknowledged one refuses the rebuild; the file stays where it is)
+            if spool.safe_component(env.header.device_id) != device:
+                report.problems.append(f"chunk {vault.relpath(path)} names device {env.header.device_id}, not its folder")
+                continue
             digest, size, header, deleted, ring = sha256_hex(data), len(data), env.header, False, ring_record_hashes(env)
             report.chunks += 1
         else:
