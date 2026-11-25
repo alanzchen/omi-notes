@@ -204,6 +204,8 @@ class SpeakerStore:
         that rendering depends on (names, me) changed."""
         found: dict[str, dict] = {}
         consent_bad: dict[str, str] = {}
+        # an unreadable consent file is no evidence either way (C4-01): the person keeps the consent last read for them
+        known_consent = {r["id"]: r["attested_at"] for r in self.db.query("SELECT id, attested_at FROM people")}
         people_root = self.vault.root / PEOPLE_DIR
         if people_root.exists():
             for path in sorted(people_root.rglob("*.md")):
@@ -229,8 +231,8 @@ class SpeakerStore:
                 if not isinstance(consent, dict):
                     raise ValueError("not an object")
                 consent_bad.pop(person["id"], None)
-            except (OSError, ValueError) as exc:  # read as no consent (the conservative answer), and reported
-                consent, consent_bad[person["id"]] = {}, self.vault.relpath(path)
+            except (OSError, ValueError) as exc:  # the last-known consent stands (none known: unknown), and reported
+                consent, consent_bad[person["id"]] = {"attested_at": known_consent.get(person["id"])}, self.vault.relpath(path)
                 log.warning("speaker file unreadable, skipped: %s (%s)", self.vault.relpath(path), exc)
             person["attested_at"] = consent.get("attested_at")
         self.unreadable_consent = consent_bad
@@ -894,9 +896,22 @@ class SpeakerStore:
                 continue  # their forget hasn't finished: nothing of their voice is kept
             if consent_ok(person, prefs):
                 keep.add(label)
+            elif person is not None and self.consent_unreadable(person["id"]):
+                keep.add(label)  # an unreadable file is never a reason to delete (C4-01): kept until it can be read
             elif raw and prefs["unknown_voices_enabled"]:
                 keep.add(label)
         return keep
+
+    def consent_unreadable(self, person_id: str) -> bool:
+        """The person's consent.json exists but can't be read as an object: their consent is unknown, not withdrawn
+        (a forget or an opt-out removes the file or the person; it never leaves a torn one)."""
+        path = self.person_dir(person_id) / "consent.json"
+        try:
+            return not isinstance(Vault.read_json(path) or {}, dict)
+        except FileNotFoundError:
+            return False
+        except (OSError, ValueError):
+            return True
 
     def raw_available(self, row) -> bool:
         """All raw audio under the conversation's speech still exists."""
