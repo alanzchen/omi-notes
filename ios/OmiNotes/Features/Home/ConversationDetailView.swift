@@ -204,8 +204,11 @@ struct ConversationDetailView: View {
         } else if retryOffered(d) {
             Section {
                 // the failure once, with its actual cause, beside what can be done about it (F4); the header says
-                // which step failed. A transcription failure's cause is already the header's line.
-                if d.summaryState == "failed", let cause = d.summaryError { Text(cause).font(.subheadline) }
+                // which step failed. When the header's line already carries the cause (a transcription failure, or a
+                // summary failure with no note rendered), it isn't repeated here (ASTRA-20261126-IT2A-03)
+                if d.summaryState == "failed", let cause = d.summaryError, !entry.displayState.message.contains(cause) {
+                    Text(cause).font(.subheadline)
+                }
                 RetryControl(model: model, conversationId: d.id)
                 if model.canDismiss, issue?.canDismissFromPhone == true { DismissControl(model: model, conversationId: d.id) }
             }
