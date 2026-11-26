@@ -32,7 +32,7 @@ from . import journal
 from .review import Review, status_line
 from .store import same_clips, sample_eligible, voices_name
 from ..vault import Vault
-from .voices import Clip, embed_voices
+from .voices import Clip, LabelVoice, embed_voices
 
 log = logging.getLogger(__name__)
 
@@ -154,8 +154,9 @@ class SpeakerService:
         from .store import PEOPLE_DIR
 
         skipped = tuple(sorted((stem, bad) for stem, (_, _, bad) in self.store.skipped_samples.items()))  # D1-03
+        # who may be named (I1): a consent file torn or withdrawn changes no index row, but changes the snapshot (IT2B-04)
         return (key, stat(self.vault.speakers / "calibration.json"), stat(self.vault.root / PEOPLE_DIR),
-                stat(self.vault.people), skipped)  # fmt: skip
+                stat(self.vault.people), skipped, self.store.naming_people())  # fmt: skip
 
     def refresh_people(self, now: float | None = None) -> bool:
         """Build and publish the snapshot; never raises. The generation is taken before any input is read, so a build
@@ -197,7 +198,7 @@ class SpeakerService:
         """The speaker files this build skipped (C2-02), as a count and five examples for /v1/issues: a sample, consent,
         calibration or transcript file that can't be read never stops People, and is never silent."""
         bad = sorted({rel for rel, _, unreadable in self.store.skipped_samples.values() if unreadable}
-                     | set(self.store.unreadable_consent.values()) | set(extra))  # fmt: skip
+                     | set(self.store.unreadable_consent.values()) | set(self.store.prune_failures.values()) | set(extra))  # fmt: skip
         value = json.dumps({"count": len(bad), "examples": bad[:5]}) if bad else None
         if self.db.meta("speaker_files_unreadable") != value:
             self.db.set_meta("speaker_files_unreadable", value)
@@ -460,13 +461,15 @@ class SpeakerService:
     def _label_list(self, conv_id: str, transcript: dict) -> list[dict]:
         segments = transcript.get("segments") or []
         labels = sorted({s["speaker"] for s in segments}, key=speaker_match._label_key)
-        states = self.store.labels(conv_id)
+        states = {} if self.store.move_pending(conv_id) else self.store.labels(conv_id)  # no names across generations
         people = {p["id"]: p for p in self.store.people()}
         clips = self._clips(conv_id, transcript)
         out = []
         for label in labels:
             st = states.get(label, {})
             person = people.get(st.get("person_id")) if st.get("person_id") else None
+            if person is not None and st.get("source") == "auto" and self.served_blocked(person["id"], bool(person["me"]), automatic=True):
+                person = None  # an automatic name the settings no longer allow, before the worker's relabel (Astra IT2B-05)
             text = next((s["text"] for s in segments if s["speaker"] == label), "")
             out.append({
                 "label": label,
@@ -644,8 +647,22 @@ class SpeakerService:
         if not clips.get(label) or not self.audio_available(row):
             return None
         audio = self.pipeline.conversation_audio(row)
-        all_clips = {lab: [Clip(a, b, i) for i, (a, b) in enumerate(spans)] for lab, spans in clips.items()}
-        voices = embed_voices(all_clips, audio.pcm, embedder)
+        # Only the label being confirmed is embedded (Astra IT2B-02): every other speaker's stored voice (vector, F0)
+        # is carried over unchanged, so a FROZEN co-participant gains and loses nothing, and if this embedding fails
+        # nothing is written or retired.
+        stored = {lab: old for lab, old in self.store.voices(row["id"]).items()
+                  if lab != label and lab in clips and (old.model, old.model_sha) == (embedder.model, embedder.model_sha)}
+        # speakers without a stored voice are embedded too (new evidence, nothing changed); stored ones are not
+        todo = {lab: [Clip(a, b, i) for i, (a, b) in enumerate(spans)] for lab, spans in clips.items() if lab not in stored}
+        fresh = embed_voices(todo, audio.pcm, embedder)
+        if label not in fresh or fresh[label].vector is None:
+            return None
+        voices = dict(fresh)
+        for lab, old in stored.items():
+            turns = max(1, int(old.turns or 1))
+            voices[lab] = LabelVoice(lab, [Clip(float(a), float(b), min(i, turns - 1)) for i, (a, b) in enumerate(old.clips)],
+                                         vector=old.vector, spread=old.spread, rms_db=old.rms_db, f0=old.f0,
+                                         f0_voiced=old.f0_voiced)  # fmt: skip
         # `label` is about to be confirmed for someone who passed the consent checks (`_sample_for`)
         keep = {label} | self.store.vector_labels(self.store.labels(row["id"]), set(voices), raw=True)
         name = voices_name(embedder, row["audio_sha"], row["transcript_sha"], clips)
@@ -707,7 +724,8 @@ class SpeakerService:
         with self._people_lock:
             snap = self._people
         wearer = {p["id"] for p in snap.people if p.get("me")}
-        kept = [x for x in (snap.suggestions or []) if not self.served_blocked(x.get("person_id"), x.get("person_id") in wearer)]
+        kept = [x for x in (snap.suggestions or [])
+                if not self.served_blocked(x.get("person_id"), x.get("person_id") in wearer, unknown=True)]
         out = {"suggestions": kept[:limit], "ready": snap.ready and not snap.stale,
                "generation": snap.generation, "as_of": iso_utc_epoch(snap.built_at) if snap.built_at else None}  # fmt: skip
         if snap.stale:
@@ -921,12 +939,14 @@ class SpeakerService:
             self._served_prefs = self.store.settings()
         return self.get_settings()
 
-    def served_blocked(self, person_id: str | None, me: bool, *, automatic: bool = False) -> bool:
+    def served_blocked(self, person_id: str | None, me: bool, *, automatic: bool = False, unknown: bool = False) -> bool:
         """Whether a served output must not name this person now, from the settings in memory (no file read, no
         query): the acknowledgment withdrawn for a non-wearer blocks everything; automatic naming off blocks only
         automatic names (`automatic`), not a hint or suggestion that asks the owner. The snapshots are built with
         the policy already (I1); this covers the moments between a settings change and the worker's rebuild."""
         prefs = self._served_prefs
+        if unknown and not prefs["unknown_voices_enabled"]:
+            return True  # an output drawn from unnamed voices, with unknown voices off (Carbon C2B-02)
         if not person_id:
             return False
         return (not me and not prefs["acknowledged_at"]) or (automatic and not prefs["auto_assign"])

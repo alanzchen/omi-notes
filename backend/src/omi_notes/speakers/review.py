@@ -284,8 +284,8 @@ class Review:
                     continue
                 item = self._label_item(*current, evidence=evidence)
                 asked = self.store.person(item["person_id"]) if item.get("person_id") else None
-                if asked is not None and self.service.served_blocked(asked["id"], bool(asked["me"]),
-                                                                     automatic=item.get("reasons") == ["auto"]):
+                if self.service.served_blocked(asked["id"] if asked else None, bool(asked["me"]) if asked else False,
+                                               automatic=item.get("reasons") == ["auto"], unknown=item.get("reasons") == ["possible"]):
                     continue  # a settings opt-out the worker hasn't rebuilt the queue for yet (I4)
             if item.get("playable") and item.get("clip"):
                 out.append(item)

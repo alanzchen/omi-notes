@@ -175,6 +175,7 @@ class SpeakerStore:
         # consent files by person, from the last People scan
         self.skipped_samples: dict[str, tuple[str, tuple | None, bool]] = {}
         self.unreadable_consent: dict[str, str] = {}
+        self.prune_failures: dict[str, str] = {}  # conversations whose vectors the last reconcile couldn't prune
         # (evidence_key, voice space): `rm_space` once per change, shared by renders, relabel and requests
         self._space_cache: tuple | None = None
         self._space_cache_lock = threading.Lock()
@@ -297,13 +298,13 @@ class SpeakerStore:
         allowed = self.naming_people(memo=memo)
         return [s for s in self.samples(model, model_sha) if s.person_id in allowed]
 
-    def ga_population(self, model: str, model_sha: str) -> list[tuple[str | None, bytes]]:
+    def ga_population(self, model: str, model_sha: str, memo: dict | None = None) -> list[tuple[str | None, bytes]]:
         """What GA is the mean of, as (conversation, vector bytes): the label population `vector_labels` allows now
         (the one consent rule: named for me or a consented person; any other label only with unknown-voice storage
         on and its raw audio still there; never a forgotten one), plus the eligible samples of consented people that
         aren't one of those voices already (a named label's sample is its voice: counted once)."""
         prefs, people = self.settings(), {r["id"]: r for r in self.people()}
-        memo: dict = {}  # person_policy, once per person in this pass
+        memo = {} if memo is None else memo  # person_policy, once per person in this pass
         by_conv: dict[str, dict[str, bytes]] = {}
         for r in self.db.query("SELECT conversation_id, label, vector FROM voices WHERE vector IS NOT NULL AND model=? AND model_sha=?",
                                (model, model_sha)):  # fmt: skip
@@ -1049,6 +1050,7 @@ class SpeakerStore:
         """Drop every stored vector the rule no longer allows. Idempotent and independent of how
         we got here (a setting change, raw deletion, forgetting, or a crash in the middle of one)."""
         pruned = 0
+        failed: dict[str, str] = {}
         memo: dict = {}  # person_policy, once per person in this pass
         with self.lock:  # never publish a voices file read before a concurrent forget
             for r in self.db.query("SELECT DISTINCT conversation_id FROM voices WHERE vector IS NOT NULL"):
@@ -1058,8 +1060,14 @@ class SpeakerStore:
                     "SELECT label FROM voices WHERE conversation_id=? AND vector IS NOT NULL", (conv_id,))}  # fmt: skip
                 keep = self.vector_labels(self.labels(conv_id), stored, raw=row is not None and self.raw_available(row), memo=memo)
                 if stored - keep:
-                    self.prune_vectors(conv_id, keep)
+                    try:  # one unreadable voices file never stops the others' pruning (Astra IT2B-06)
+                        self.prune_vectors(conv_id, keep)
+                    except (OSError, ValueError, KeyError, TypeError) as exc:
+                        failed[conv_id] = f"conversations/{conv_id}/voices"
+                        log.warning("could not prune the voices of %s (kept for the next pass): %s", conv_id, exc)
+                        continue
                     pruned += 1
+        self.prune_failures = failed  # what is still to do: relabel_pending stays set while any remain
         return pruned
 
     def voices(self, conv_id: str) -> dict[str, VoiceRow]:
@@ -1069,6 +1077,11 @@ class SpeakerStore:
                                  r["model_sha"], r["f0"], r["f0_voiced"] or 0, r["file"])
             for r in self.db.query("SELECT * FROM voices WHERE conversation_id=?", (conv_id,))
         }  # fmt: skip
+
+    def move_pending(self, conv_id: str) -> bool:
+        """The label states were made for another transcript than the conversation's current one."""
+        made_for, current = self.labels_transcript(conv_id), self.current_transcript_sha(conv_id)
+        return bool(made_for and current and made_for != current)
 
     def labels(self, conv_id: str) -> dict[str, dict]:
         return {
@@ -1331,7 +1344,10 @@ class SpeakerStore:
             self.index_labels(conv_id, data.get("labels") or {}, int(data.get("revision") or 0))
 
     def names(self, conv_id: str) -> dict[str, dict]:
-        """label → {person_id, name, me, source} for named labels."""
+        """label → {person_id, name, me, source} for named labels. None while the labels wait to move to a newer
+        transcript (a deferred move): a label number of one transcript says nothing about another's (Astra IT2B-01)."""
+        if self.move_pending(conv_id):
+            return {}
         out = {}
         for r in self.db.query(
             """SELECT l.label, l.person_id, l.source, p.name, p.me FROM speaker_labels l JOIN people p ON p.id = l.person_id

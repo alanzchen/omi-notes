@@ -91,7 +91,8 @@ def gather(pipeline) -> dict | None:
         return None
     store, db = pipeline.speakers, pipeline.db
     key = (embedder.model, embedder.model_sha)
-    samples = store.samples(*key)
+    memo: dict = {}  # person_policy, once per person in this pass
+    samples = store.naming_samples(*key, memo)  # naming eligibility (I1; Astra IT2B-03, Carbon C2B-03)
     me = store.me()
     prefs = store.settings()
     attested = sorted(p["id"] for p in store.people() if p["attested_at"])
@@ -103,7 +104,7 @@ def gather(pipeline) -> dict | None:
         voices = {lab: v for lab, v in store.voices(conv_id).items() if (v.model, v.model_sha) == key}
         if any(v.vector is not None for v in voices.values()):
             conversations[conv_id] = {"truth": labels, "voices": voices}
-    population = store.ga_population(*key)  # the same rule as matching's GA
+    population = store.ga_population(*key, memo=memo)  # the same rule as matching's GA
     stored = [(conv, np.frombuffer(v, dtype="<f4").astype(np.float32)) for conv, v in population]
     op = pipeline.operating
     return {"model": key, "samples": samples, "wearer": me["id"] if me else None,
