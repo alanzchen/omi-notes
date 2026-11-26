@@ -145,17 +145,17 @@ def test_c5_01_consent_content_that_isnt_an_object_is_unreadable_not_empty(tmp_p
     client, svc, store, gigi, conv_id, vfile = _gigi_named_automatically(tmp_path)
     (store.person_dir(gigi) / "consent.json").write_text(content)
     svc.warm(now=2100.0)
-    assert store.consent_unreadable(gigi) and gigi in store.unreadable_consent
+    assert store.person_policy(gigi, store.settings()) == "frozen" and gigi in store.unreadable_consent
     assert store.reconcile_vectors() == 0 and _stored(vfile) == {"S1"}
 
 
 def test_c5_01_a_missing_or_empty_object_consent_file_is_read_as_given(tmp_path):
     client, svc, store, gigi, conv_id, vfile = _gigi_named_automatically(tmp_path)
     path = store.person_dir(gigi) / "consent.json"
-    path.write_text("{}")  # readable: no attestation
-    assert store.consent_unreadable(gigi) is False
+    path.write_text("{}")  # readable: no attestation, a real withdrawal
+    assert store.person_policy(gigi, store.settings()) == "opted_out"
     path.unlink()  # missing: no consent
-    assert store.consent_unreadable(gigi) is False
+    assert store.person_policy(gigi, store.settings()) == "opted_out"
 
 
 def test_c5_02_a_skipped_sample_file_keeps_the_persons_automatic_names_and_vectors(tmp_path):

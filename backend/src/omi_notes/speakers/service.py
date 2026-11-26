@@ -150,8 +150,9 @@ class SpeakerService:
 
         from .store import PEOPLE_DIR
 
+        skipped = tuple(sorted((stem, bad) for stem, (_, _, bad) in self.store.skipped_samples.items()))  # D1-03
         return (key, stat(self.vault.speakers / "calibration.json"), stat(self.vault.root / PEOPLE_DIR),
-                stat(self.vault.people))  # fmt: skip
+                stat(self.vault.people), skipped)  # fmt: skip
 
     def refresh_people(self, now: float | None = None) -> bool:
         """Build and publish the snapshot; never raises. The generation is taken before any input is read, so a build
@@ -911,8 +912,8 @@ class SpeakerService:
             self.store.update_settings(**changes)
             self.store.reconcile_vectors()  # e.g. unknown voices off or the acknowledgment withdrawn
             self.store.samples_changed()
-            if "auto_assign" in changes and changes["auto_assign"] != before["auto_assign"]:
-                self.db.set_meta("relabel_pending", "1")
+            if any(k in changes and changes[k] != before[k] for k in ("auto_assign", "acknowledged_at")):
+                self.db.set_meta("relabel_pending", "1")  # automatic names follow an opt-out or opt-in (D1-02)
         return self.get_settings()
 
     # -- clips -----------------------------------------------------------------------------------

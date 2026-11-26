@@ -73,6 +73,12 @@ def consent_ok(person, prefs: dict) -> bool:
     return person is not None and bool(person["me"] or (prefs["acknowledged_at"] and person["attested_at"]))
 
 
+# `SpeakerStore.person_policy`: what derived voice data may do for a person (docs/proposals/unreadable-speaker-files.md)
+OPTED_OUT = "opted_out"  # a real opt-out: their automatic names and kept vectors go, whatever else is unreadable
+FROZEN = "frozen"  # a file of theirs can't be read: nothing automatic changes for them, either way
+NORMAL = "normal"
+
+
 def flag_open(flag: dict | None) -> bool:
     """A review flag the owner hasn't resolved for this evidence."""
     if not flag or not flag.get("reasons"):
@@ -246,6 +252,8 @@ class SpeakerStore:
         else:
             for p in found.values():
                 self.db.execute("UPDATE people SET attested_at=?, aliases_json=? WHERE id=?", (p["attested_at"], p["aliases_json"], p["id"]))
+        if any(known_consent.get(pid) != p["attested_at"] for pid, p in found.items() if pid in known_consent):
+            self.db.set_meta("relabel_pending", "1")  # consent given or withdrawn: automatic names follow (D1-02)
         return before != after
 
     def _name_from_samples(self, folder: Path) -> str | None:
@@ -280,7 +288,7 @@ class SpeakerStore:
         on and its raw audio still there; never a forgotten one), plus the eligible samples of consented people that
         aren't one of those voices already (a named label's sample is its voice: counted once)."""
         prefs, people = self.settings(), {r["id"]: r for r in self.people()}
-        memo: dict[str, bool] = {}  # consent_unreadable, once per person in this pass
+        memo: dict = {}  # person_policy, once per person in this pass
         by_conv: dict[str, dict[str, bytes]] = {}
         for r in self.db.query("SELECT conversation_id, label, vector FROM voices WHERE vector IS NOT NULL AND model=? AND model_sha=?",
                                (model, model_sha)):  # fmt: skip
@@ -448,8 +456,11 @@ class SpeakerStore:
         this person (history and all)."""
         records: dict[tuple[str, str], tuple[Path, dict]] = {}
         for path in sorted(self.vault.people.glob("*/samples/*.json")) if self.vault.people.exists() else []:
-            data = Vault.read_json(path) or {}
-            if data.get("state") == MOVED:
+            try:  # a file that can't be read never stops a forget (their own folder goes whole below)
+                data = Vault.read_json(path) or {}
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get("state") == MOVED:
                 records[(path.parent.parent.name, path.stem)] = (path, data)
 
         def reaches(key: tuple[str, str]) -> bool:
@@ -724,15 +735,16 @@ class SpeakerStore:
             self.db.execute("DELETE FROM samples")
             for data in readable:
                 self._index_sample(data)
-            if before != after:  # someone's usable samples changed (a file unreadable, or readable again): their
+            unreadable_now = {stem for stem, (_, _, bad) in skipped.items() if bad}
+            unreadable_then = {stem for stem, (_, _, bad) in self.skipped_samples.items() if bad}
+            if before != after or unreadable_now != unreadable_then:  # usable samples or unreadable files changed: their
                 self.db.set_meta("relabel_pending", "1")  # automatic names are evaluated again (C5-02)
         self.skipped_samples = skipped
         return len(readable)
 
-    def deferred_people(self) -> set[str]:
-        """People with a sample file that can't be read right now: their model is missing evidence, so relabel leaves
-        their automatic names as they are until it can be read (C5-02). A file that is readable but not a voiceprint
-        never fed a model, so it defers nobody."""
+    def frozen_by_samples(self) -> set[str]:
+        """People with a sample file that can't be read now (from the last reload): their model is missing evidence. A
+        readable file that isn't a voiceprint never fed a model, so it freezes nobody."""
         out = set()
         for rel, _, unreadable in self.skipped_samples.values():
             parts = Path(rel).parts
@@ -899,28 +911,83 @@ class SpeakerStore:
 
     def vector_labels(self, states: dict[str, dict], labels: set[str], *, raw: bool, prefs: dict | None = None,
                       people: dict | None = None, memo: dict | None = None) -> set[str]:  # fmt: skip
-        """Labels whose voice vector may be stored (docs/speaker-learning.md, "Privacy"): named for
-        me, or for someone with consent (acknowledged and attested); any other label only while
-        unknown voices are on and its raw audio exists. A forgotten label never."""
+        """Labels whose voice vector may be stored (docs/speaker-learning.md, "Privacy"), the only prune rule: named for
+        a person whose policy isn't OPTED_OUT (NORMAL: consented or the wearer; FROZEN: a file of theirs can't be read,
+        and an unreadable file never deletes); any other label only while unknown voices are on and its raw audio
+        exists. A forgotten label, or a person whose forget hasn't finished, never."""
         prefs = self.settings() if prefs is None else prefs
         people = {r["id"]: r for r in self.people()} if people is None else people
+        memo = {} if memo is None else memo
         keep = set()
         for label in labels:
             state = states.get(label) or {}
             if state.get("forgotten"):
                 continue
-            person = people.get(state.get("person_id"))
-            if person is not None and self.forgetting_path(person["id"]).exists():
+            pid = state.get("person_id")
+            if pid and self.forgetting_path(pid).exists():
                 continue  # their forget hasn't finished: nothing of their voice is kept
-            if consent_ok(person, prefs):
-                keep.add(label)
-            elif person is not None and prefs["acknowledged_at"] and self.consent_unreadable(person["id"], memo):
-                # an unreadable consent.json is never a reason to delete (C4-01): it stands in for that file only, so
-                # every condition outside it (the owner's acknowledgment) must still hold (C5-01)
+            if pid and self.person_policy(pid, prefs, memo, people) != OPTED_OUT:
                 keep.add(label)
             elif raw and prefs["unknown_voices_enabled"]:
-                keep.add(label)
+                keep.add(label)  # an unnamed voice (or an opted-out person's, now anonymous) while unknown voices are on
         return keep
+
+    def person_policy(self, person_id: str, prefs: dict, memo: dict | None = None, people: dict | None = None) -> str:
+        """The one decision about derived voice data for a person, ranked: OPTED_OUT (no person or forgetting; for a
+        non-wearer the acknowledgment withdrawn or a readable consent.json without attestation) > FROZEN (a non-wearer's
+        consent.json unreadable, or anyone's sample file unreadable: the wearer bypasses consent, never that) > NORMAL.
+        Read from the files, not the cached people.attested_at. Worker and mutation passes only (never a GET): `memo`
+        holds one answer per person and one samples sync per pass."""
+        memo = {} if memo is None else memo
+        if ("policy", person_id) in memo:
+            return memo[("policy", person_id)]
+        if "frozen_by_samples" not in memo:
+            self.sync_samples()  # a cold store learns which sample files can't be read before anything is decided
+            memo["frozen_by_samples"] = self.frozen_by_samples()
+        person = people.get(person_id) if people is not None else self.person(person_id)
+        if person is None or self.forgetting_path(person_id).exists():
+            policy = OPTED_OUT
+        elif person["me"]:
+            policy = NORMAL
+        elif not prefs["acknowledged_at"]:
+            policy = OPTED_OUT
+        else:
+            try:
+                policy = NORMAL if self.read_consent(person_id).get("attested_at") else OPTED_OUT
+            except (OSError, ValueError):
+                policy = FROZEN
+        if policy == NORMAL and person_id in memo["frozen_by_samples"]:
+            policy = FROZEN
+        memo[("policy", person_id)] = policy
+        return policy
+
+    def settle_states(self, current: dict[str, dict], proposed: dict[str, dict], prefs: dict,
+                      memo: dict | None = None) -> dict[str, dict]:  # fmt: skip
+        """The one filter on automatic label states, for relabel and identify alike (carried-over and vectorless states
+        too): an automatic name stays only while automatic naming is on and its person isn't OPTED_OUT; a FROZEN
+        person's automatic names are neither taken away nor given; a label that had no state gets none from a blocked
+        name (C6-03). User assignments are never touched here."""
+        memo = {} if memo is None else memo
+        out: dict[str, dict] = {}
+        for label in set(current) | set(proposed):
+            cur, final = current.get(label) or {}, dict(proposed.get(label) or {})
+
+            def auto(st):
+                return st.get("person_id") if st.get("source") == "auto" else None
+
+            def frozen(pid):
+                return pid and self.person_policy(pid, prefs, memo) == FROZEN
+
+            if prefs["auto_assign"] and (frozen(auto(cur)) or frozen(auto(final))) and auto(final) != auto(cur):
+                final = dict(cur)  # FROZEN: their automatic names stay as they are and they get no new one
+            if auto(final) and (not prefs["auto_assign"] or self.person_policy(auto(final), prefs, memo) == OPTED_OUT):
+                final |= {"person_id": None, "source": None}  # a real opt-out wins over anything else
+            if not cur and not (final.get("person_id") or final.get("not") or final.get("source") == "unknown"):
+                if auto(proposed.get(label) or {}):
+                    continue  # a blocked name on a label that had no state: nothing is written for it
+            out[label] = final
+        return out
+
 
     def read_consent(self, person_id: str) -> dict:
         """The person's consent.json: {} when there is none (no consent). Raises ValueError when it exists but isn't a
@@ -933,21 +1000,6 @@ class SpeakerStore:
         if not isinstance(data, dict):
             raise ValueError("consent.json is not a JSON object")
         return data
-
-    def consent_unreadable(self, person_id: str, memo: dict | None = None) -> bool:
-        """The person's consent.json exists but can't be read as an object: their consent is unknown, not withdrawn
-        (a forget or an opt-out removes the file or the person; it never leaves a torn one). `memo`: one answer per
-        person within one pass (C5-03)."""
-        if memo is not None and person_id in memo:
-            return memo[person_id]
-        try:
-            self.read_consent(person_id)
-            unreadable = False
-        except (OSError, ValueError):
-            unreadable = True
-        if memo is not None:
-            memo[person_id] = unreadable
-        return unreadable
 
     def raw_available(self, row) -> bool:
         """All raw audio under the conversation's speech still exists."""
@@ -965,7 +1017,7 @@ class SpeakerStore:
         """Drop every stored vector the rule no longer allows. Idempotent and independent of how
         we got here (a setting change, raw deletion, forgetting, or a crash in the middle of one)."""
         pruned = 0
-        memo: dict[str, bool] = {}  # consent_unreadable, once per person in this pass
+        memo: dict = {}  # person_policy, once per person in this pass
         with self.lock:  # never publish a voices file read before a concurrent forget
             for r in self.db.query("SELECT DISTINCT conversation_id FROM voices WHERE vector IS NOT NULL"):
                 conv_id = r["conversation_id"]

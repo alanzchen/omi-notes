@@ -60,7 +60,7 @@ from ..settings import Settings
 from ..spool import atomic_write_bytes
 from ..util import canonical_json, iso_utc_epoch, sha256_hex
 from ..speakers import match as speaker_match
-from ..speakers.store import SpeakerStore, voices_name
+from ..speakers.store import OPTED_OUT, SpeakerStore, voices_name
 from ..speakers.voices import cosine_distance, embed_voices, label_turns, select_clips, usable_spans
 from ..vault import Vault
 from . import prompt
@@ -844,20 +844,23 @@ class ConversationPipeline:
                 voices = self.speakers.read_voices(conv_id, name)
             current = self._carry_over(stored, old_voices, voices, labels, self.speakers.had_forgotten(conv_id)) if moved else stored
             states = current
+            prefs, memo = self.speakers.settings(), {}
             if voices is not None:
                 models = self.speakers.models(embedder.model, embedder.model_sha, self.operating)
                 if models:
                     # freshly embedded: every label's vector is in memory (the full recording mean)
-                    states = speaker_match.assign(voices, current, models, auto_assign=self.speakers.settings()["auto_assign"],
+                    states = speaker_match.assign(voices, current, models, auto_assign=prefs["auto_assign"],
                                                   op=self.operating, space=self.speakers.rm_space(embedder.model, embedder.model_sha),
                                                   full_rm=fresh)  # fmt: skip
+            # carried-over and vectorless states too: opt-outs win; FROZEN people are neither named anew nor dropped
+            states = self.speakers.settle_states(current, states, prefs, memo)
             if fresh:
-                keep = self.speakers.vector_labels(states, set(voices), raw=True)
+                keep = self.speakers.vector_labels(states, set(voices), raw=True, prefs=prefs, memo=memo)
                 self.speakers.write_voices(conv_id, name, embedder.model, embedder.model_sha, voices, keep)
             elif name is not None:  # written for states that never committed: apply the rule to these
                 self.speakers.index_voices(conv_id, name)
                 raw = self.speakers.raw_available(self._row(conv_id))
-                self.speakers.prune_vectors(conv_id, self.speakers.vector_labels(states, set(voices), raw=raw))
+                self.speakers.prune_vectors(conv_id, self.speakers.vector_labels(states, set(voices), raw=raw, prefs=prefs, memo=memo))
             if moved or name is not None or self.speakers.persisted(states) != self.speakers.persisted(stored):
                 # one commit: the states, their transcript, and the voices file they were made against
                 self.speakers.write_labels(conv_id, states, transcript_sha=transcript_sha, voices=name)
@@ -936,7 +939,9 @@ class ConversationPipeline:
             self.db.set_meta("relabel_pending", "1")
         if not names_changed and self.db.meta("relabel_pending") != "1":
             return []
+        self.speakers.reconcile()  # the samples index and the skipped files as on disk now, before any decision (C6-02)
         prefs = self.speakers.settings()
+        memo: dict = {}  # person_policy, once per person in this pass
         models_by_voice: dict[tuple[str, str], dict] = {}
         spaces: dict[tuple[str, str], object] = {}
         changed: list[str] = []
@@ -962,16 +967,7 @@ class ConversationPipeline:
             known = {r["id"] for r in self.speakers.people()}
             states = {label: (st if st.get("person_id") in known or not st.get("person_id") else
                               st | {"person_id": None, "source": None}) for label, st in states.items()}  # fmt: skip
-            # a person with a sample file that can't be read is judged on part of their evidence: their automatic names
-            # are neither dropped nor given until it can be read again (C5-02; the reload then marks a relabel)
-            deferred = self.speakers.deferred_people()
-            if deferred:
-                for label, st in list(states.items()):
-                    cur = current.get(label) or {}
-                    was = cur.get("source") == "auto" and cur.get("person_id") in deferred
-                    now_auto = st.get("source") == "auto" and st.get("person_id") in deferred
-                    if (was or now_auto) and st != cur:
-                        states[label] = cur if cur else st | {"person_id": None, "source": None}
+            states = self.speakers.settle_states(current, states, prefs, memo)  # opt-outs win; FROZEN people stay put
             differs = self.speakers.persisted(states) != self.speakers.persisted(current)
             if differs:
                 self.speakers.write_labels(conv_id, states)  # still tagged with the transcript they were made for
@@ -1126,7 +1122,9 @@ class ConversationPipeline:
             centres = {label: label_centre(v, list(vectors.values()), space.ga, full=False)[0] for label, v in vectors.items()}
             found = possible_names(vectors, self.speakers.labels(conv_id), space.centroids, background=centres)
             people = {r["id"]: (r["name"], bool(r["me"])) for r in self.speakers.people()}
-            return {label: people[pid] for label, pid in found.items() if pid in people}
+            prefs, memo = self.speakers.settings(), {}  # no hint toward someone who opted out (D1-02)
+            return {label: people[pid] for label, pid in found.items()
+                    if pid in people and self.speakers.person_policy(pid, prefs, memo) != OPTED_OUT}  # fmt: skip
         except Exception:
             log.exception("could not compute possible speaker names for %s", conv_id)
             return {}
