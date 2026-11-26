@@ -30,15 +30,17 @@ struct NoteRecordingSection: View {
                         .font(.caption).foregroundStyle(.secondary)
                     }
                 }
-                HStack(spacing: 28) {
-                    Spacer()
-                    Button { player.skip(by: -15) } label: { Image(systemName: "gobackward.15").font(.title3) }
-                        .accessibilityLabel("Back 15 seconds")
-                    Button { player.skip(by: 15) } label: { Image(systemName: "goforward.15").font(.title3) }
-                        .accessibilityLabel("Forward 15 seconds")
-                    Spacer()
+                if player.state == .ready {  // only once there is something to skip through (no greyed row before)
+                    HStack(spacing: 28) {
+                        Spacer()
+                        Button { player.skip(by: -15) } label: { Image(systemName: "gobackward.15").font(.title3) }
+                            .accessibilityLabel("Back 15 seconds")
+                        Button { player.skip(by: 15) } label: { Image(systemName: "goforward.15").font(.title3) }
+                            .accessibilityLabel("Forward 15 seconds")
+                        Spacer()
+                    }
+                    .buttonStyle(.borderless)
                 }
-                .buttonStyle(.borderless).disabled(player.state != .ready)
                 status
             }
             .padding(.vertical, 4)
@@ -101,9 +103,6 @@ struct NoteRecordingSection: View {
         case .idle:
             if let cue = player.cueNote {
                 Label(cue, systemImage: "sparkles").font(.caption).foregroundStyle(ValueStyle.recommended)
-            } else {
-                Text("Tap play to listen. The audio stays on your server and streams as you play.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
         case .loading:
             Text("Loading the recording…").font(.caption).foregroundStyle(.secondary)
