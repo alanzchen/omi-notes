@@ -385,8 +385,10 @@ class SpeakerStore:
         """Create (201 → True) or update (False) a person. The People note is created once;
         a new name renames it, `me` moves the flag (at most one person is "me")."""
         now = time.time() if now is None else now
-        self.scan_people()
         current = self.person(person_id)
+        if current is None or current["note_path"] is None:
+            self.scan_people()  # only for a person the index doesn't know yet: never two notes for one id
+            current = self.person(person_id)
         created = current is None or current["note_path"] is None
         if me:
             for other in self.db.query("SELECT * FROM people WHERE me=1 AND id<>?", (person_id,)):
@@ -410,7 +412,15 @@ class SpeakerStore:
                 self._set_front_line(path, "omi_me", "true" if me else "false")
         if attest:
             Vault.write_json(self.person_dir(person_id) / "consent.json", {"attested_at": now, "person_id": person_id})
-        self.scan_people()
+        # this person's row only (Astra IT2B-08): a same-name PUT reads no other note; the worker's reconcile re-scans
+        is_me = bool(me) if me is not None else bool(current["me"]) if current is not None else False
+        with self.db.tx() as conn:
+            if is_me:
+                conn.execute("UPDATE people SET me=0 WHERE me=1 AND id<>?", (person_id,))
+            conn.execute("""INSERT INTO people (id, name, me, note_path, aliases_json, attested_at) VALUES (?,?,?,?,?,?)
+                            ON CONFLICT(id) DO UPDATE SET name=excluded.name, me=excluded.me, note_path=excluded.note_path,
+                            attested_at=COALESCE(excluded.attested_at, people.attested_at)""",
+                         (person_id, path.stem, int(is_me), self.vault.relpath(path), "[]", now if attest else None))
         return created
 
     def _free_note_path(self, name: str) -> Path:

@@ -45,15 +45,19 @@ def _count_scans(monkeypatch) -> list:
 
 
 def test_a_correction_shows_at_once(client):
-    """A mutation rebuilds the snapshot before it answers: the phone's own change is in its next GET."""
+    """The phone's own change is in its next GET (2026-11-26 R5: a PUT person is served from a per-person overlay; the
+    worker's build makes it part of the snapshot)."""
     pid = str(uuid.uuid4())
     assert client.put(f"/v1/people/{pid}", json={"name": "Dana"}, headers=AUTH).status_code == 201
+    assert [p["name"] for p in _people(client)["people"]] == ["Dana"]
+    client.app.state.speakers.warm()
     got = _people(client)
     assert [p["name"] for p in got["people"]] == ["Dana"] and got["ready"] is True
     assert client.put(f"/v1/people/{pid}", json={"name": "Dana Lee"}, headers=AUTH).status_code == 200
+    assert [p["name"] for p in _people(client)["people"]] == ["Dana Lee"], "served at once"
+    client.app.state.speakers.warm()
     again = _people(client)
-    assert [p["name"] for p in again["people"]] == ["Dana Lee"]
-    assert again["generation"] > got["generation"]
+    assert [p["name"] for p in again["people"]] == ["Dana Lee"] and again["generation"] > got["generation"]
 
 
 def test_an_external_rename_shows_after_one_worker_reconcile_not_before(client):
@@ -86,6 +90,7 @@ def test_a_cold_start_serves_the_stored_copy_not_ready_without_a_scan(settings, 
     first = TestClient(create_app(settings, start_worker=False))
     pid = str(uuid.uuid4())
     assert first.put(f"/v1/people/{pid}", json={"name": "Gale"}, headers=AUTH).status_code == 201
+    first.app.state.speakers.warm()  # the worker's build writes the cache
     cache = first.app.state.db.path.parent / "people.json"
     assert json.loads(cache.read_text())["people"][0]["name"] == "Gale"
     assert not str(cache).startswith(str(first.app.state.vault.root)), "operational cache, never vault data"
@@ -137,6 +142,7 @@ def test_a_failed_rebuild_after_a_committed_mutation_is_not_ready_until_the_work
     speakers = client.app.state.speakers
     pid = str(uuid.uuid4())
     assert client.put(f"/v1/people/{pid}", json={"name": "Ivy"}, headers=AUTH).status_code == 201
+    speakers.warm()
 
     def broken(*a, **k):
         raise OSError("synthetic: index unreadable")
@@ -144,6 +150,8 @@ def test_a_failed_rebuild_after_a_committed_mutation_is_not_ready_until_the_work
     real = speakers._compute_suggestions  # a step only the snapshot build runs: the mutation itself succeeds
     monkeypatch.setattr(speakers, "_compute_suggestions", broken)
     assert client.put(f"/v1/people/{pid}", json={"name": "Ivy Ng"}, headers=AUTH).status_code == 200, "the change is durable"
+    # a mutation that still rebuilds in the request (a dismissal), whose build fails
+    assert client.post("/v1/speakers/suggestions/s-none/dismiss", headers=AUTH).status_code in (200, 204)
     stale = _people(client)
     assert stale["ready"] is False and stale["stale"] is True, "the old list is marked, never silently current"
     monkeypatch.setattr(speakers, "_compute_suggestions", real)
@@ -160,6 +168,7 @@ def test_the_cache_file_is_replaced_atomically(client, monkeypatch):
     monkeypatch.setattr(os, "replace", lambda a, b: (renames.append((str(a), str(b))), real(a, b))[1])
     pid = str(uuid.uuid4())
     assert client.put(f"/v1/people/{pid}", json={"name": "Jo"}, headers=AUTH).status_code == 201
+    client.app.state.speakers.warm()  # the worker's build writes the cache
     target = str(client.app.state.db.path.parent / "people.json")
     assert any(b == target and a != target for a, b in renames)
     assert not [p for p in Path(target).parent.iterdir() if p.name.startswith("people.json.")]

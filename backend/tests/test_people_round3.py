@@ -157,6 +157,7 @@ def test_c2_02_a_corrupt_consent_or_calibration_file_doesnt_stop_the_build(tmp_p
     path.write_text("{torn")
     pid2 = str(uuid.uuid4())
     assert client.put(f"/v1/people/{pid2}", json={"name": "Priya"}, headers=AUTH).status_code == 201
+    svc.warm(now=2000.0)  # the worker's build (a PUT person doesn't rebuild in the request)
     ans = client.get("/v1/people", headers=AUTH).json()
     assert ans["ready"] is True and sorted(p["name"] for p in ans["people"]) == ["Alan", "Priya"]
     assert _issue(client, "speaker_files_unreadable")["count"] == 1
@@ -200,8 +201,9 @@ def test_c2_02_a_failed_rebuild_after_put_person_answers_its_change_marked_stale
     monkeypatch.setattr(svc, "_compute_people", broken)
     pid2 = str(uuid.uuid4())
     r = client.put(f"/v1/people/{pid2}", json={"name": "Priya"}, headers=AUTH)
-    assert r.status_code == 201 and r.json()["name"] == "Priya" and r.json().get("stale") is True
-    assert client.get("/v1/people", headers=AUTH).json()["stale"] is True
+    # 2026-11-26 R5: no build runs in the request, so a broken build can't fail it; the change is served at once
+    assert r.status_code == 201 and r.json()["name"] == "Priya"
+    assert "Priya" in [p["name"] for p in client.get("/v1/people", headers=AUTH).json()["people"]]
 
 
 def test_c2_02_suggestions_carry_ready_and_stale(tmp_path):
@@ -261,4 +263,4 @@ def test_c2_05_put_person_computes_the_people_list_once(tmp_path, monkeypatch):
     real = svc._compute_people
     monkeypatch.setattr(svc, "_compute_people", lambda *a: calls.append(1) or real(*a))
     assert client.put(f"/v1/people/{uuid.uuid4()}", json={"name": "Una"}, headers=AUTH).status_code == 201
-    assert len(calls) == 1
+    assert len(calls) == 0, "2026-11-26 R5: a PUT person computes nothing population-wide; the worker builds"

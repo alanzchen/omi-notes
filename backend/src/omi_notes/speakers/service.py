@@ -89,6 +89,7 @@ class PeopleSnapshot:
     inputs: tuple | None
     ready: bool
     stale: bool = False
+    wearer: str | None = None  # the "me" person's id, so a suggestions page needn't scan people (Astra IT2B-07)
 
 
 class SpeakerService:
@@ -108,6 +109,7 @@ class SpeakerService:
         self._people_cache = self.db.path.parent / "people.json"  # operational cache beside the index, never vault data
         self._people = self._load_people_cache()
         self._served_prefs = self.store.settings()  # the settings served outputs apply at once (`served_blocked`)
+        self._people_overlay: dict[str, tuple[int, dict]] = {}  # PUT person read-your-write, until the worker rebuilds
 
     # -- people ----------------------------------------------------------------------------------
 
@@ -119,9 +121,16 @@ class SpeakerService:
         stored copy, or nothing) or the last post-mutation build failed (`stale`: the worker rebuilds it next tick).
         Older clients read only `people`."""
         with self._people_lock:
-            snap = self._people
+            snap, overlay = self._people, dict(self._people_overlay)
         people = [p | {"auto_active": False, "status_line": "自动命名已关闭"} if p.get("auto_active") and self.served_blocked(p["id"], p.get("me"), automatic=True)
                   else p for p in snap.people]  # fmt: skip
+        if overlay:  # a PUT person not yet in a published build (Astra IT2B-08): this person's fields, O(changed people)
+            seen = {p["id"] for p in people}
+            people = [p | overlay[p["id"]][1] if p["id"] in overlay else p for p in people]
+            people += [fields for pid, (_, fields) in overlay.items() if pid not in seen]
+            if any(fields.get("me") for _, fields in overlay.values()):
+                me_id = next(pid for pid, (_, fields) in overlay.items() if fields.get("me"))
+                people = [p | {"me": False} if p.get("me") and p["id"] != me_id else p for p in people]
         out = {"people": people, "ready": snap.ready and not snap.stale, "generation": snap.generation,
                "as_of": iso_utc_epoch(snap.built_at) if snap.built_at else None}  # fmt: skip
         if snap.stale:
@@ -134,6 +143,7 @@ class SpeakerService:
             if not isinstance(data["people"], list) or not isinstance(data.get("suggestions") or [], list):
                 raise ValueError("people.json: people is not a list")  # C2-04
             return PeopleSnapshot(people=list(data["people"]), suggestions=data.get("suggestions"), generation=0,
+                                  wearer=next((p.get("id") for p in data["people"] if isinstance(p, dict) and p.get("me")), None),
                                   built_at=float(data["built_at"]), inputs=None, ready=False)  # fmt: skip
         except (OSError, ValueError, KeyError, TypeError):
             return PeopleSnapshot(people=[], suggestions=None, generation=0, built_at=None, inputs=None, ready=False)
@@ -183,11 +193,13 @@ class SpeakerService:
                 self._mark_people_stale(gen)
                 return False
             built = PeopleSnapshot(people=people, suggestions=suggestions, generation=gen, built_at=time.time(),
-                                   inputs=inputs, ready=True)  # fmt: skip
+                                   inputs=inputs, ready=True, wearer=next((p["id"] for p in people if p["me"]), None))  # fmt: skip
             with self._people_lock:  # the file is written under the lock too, so it never goes back to an older build
                 if gen <= self._people.generation or gen <= self._people_floor:
                     return False
                 self._people = built
+                # a PUT person's overlay is served until a build that started after it publishes
+                self._people_overlay = {pid: (tag, f) for pid, (tag, f) in self._people_overlay.items() if tag >= gen}
                 try:
                     self._write_people_cache(built)
                 except OSError:
@@ -342,20 +354,19 @@ class SpeakerService:
         return result | {"request_id": request_id, "undo_token": request_id}
 
     def put_person(self, person_id: str, body: dict) -> tuple[int, dict]:
-        """The person as the snapshot rebuilt after the write shows them (computed once, C2-05). If that rebuild failed,
-        the write still stands: the answer is the stored row, marked stale (C2-02), never a 500."""
+        """Intent only (I4 for PUT person; Astra IT2B-08): the note and this person's index row are written, a relabel
+        is marked, and this person's fields are served from an overlay until the worker's next build publishes. No
+        global rebuild on the request: the snapshot rebuild is the worker's. The answer is the person as now served."""
         created = self._put_person_write(person_id, body)
+        row = self.store.person(person_id)
+        fields = {"id": person_id, "name": row["name"], "me": bool(row["me"]), "note_path": row["note_path"]}
         with self._people_lock:
-            snap = self._people
-        person = None if snap.stale else next((p for p in snap.people if p["id"] == person_id), None)
-        if person is None:
-            row = self.store.person(person_id)
-            person = {"id": person_id, "name": row["name"] if row else body["name"].strip(),
-                      "me": bool(row["me"]) if row else bool(body.get("me")), "note_path": row["note_path"] if row else None,
-                      "stale": True}  # fmt: skip
-        return (201 if created else 200), person
+            if fields["me"]:  # at most one wearer: the latest PUT wins in the overlay too
+                self._people_overlay = {pid: (tag, f | {"me": False}) for pid, (tag, f) in self._people_overlay.items()}
+            self._people_overlay[person_id] = (self._people_seq, fields)
+        served = next((p for p in self.people_answer()["people"] if p["id"] == person_id), fields)
+        return (201 if created else 200), served
 
-    @_rebuilds_people
     def _put_person_write(self, person_id: str, body: dict) -> bool:
         if not UUID_RE.match(person_id):
             raise ApiError(422, "invalid_person_id", "person id must be a lowercase UUID")
@@ -723,10 +734,13 @@ class SpeakerService:
         """GET /v1/speakers/suggestions: the slice plus the snapshot's ready/stale/generation/as_of, as /v1/people."""
         with self._people_lock:
             snap = self._people
-        wearer = {p["id"] for p in snap.people if p.get("me")}
-        kept = [x for x in (snap.suggestions or [])
-                if not self.served_blocked(x.get("person_id"), x.get("person_id") in wearer, unknown=True)]
-        out = {"suggestions": kept[:limit], "ready": snap.ready and not snap.stale,
+        kept = []
+        for x in snap.suggestions or []:  # O(limit) past the blocked ones: the snapshot knows the wearer
+            if len(kept) >= limit:
+                break
+            if not self.served_blocked(x.get("person_id"), x.get("person_id") == snap.wearer, unknown=True):
+                kept.append(x)
+        out = {"suggestions": kept, "ready": snap.ready and not snap.stale,
                "generation": snap.generation, "as_of": iso_utc_epoch(snap.built_at) if snap.built_at else None}  # fmt: skip
         if snap.stale:
             out["stale"] = True

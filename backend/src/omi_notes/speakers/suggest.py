@@ -23,6 +23,9 @@ SIGNIFICANT_SECONDS = 10.0
 MIN_CONVERSATIONS = 3
 MIN_DAYS = 2
 LIMIT = 5
+# Clustering is cubic in its input: at most this many unnamed voices, the most recent, are clustered per build (Astra
+# IT2B-08: the 20-result slice bounded the output, not the work). Older voices still name nobody until they recur.
+MAX_CLUSTER_INPUT = 80
 COOLDOWN = 7 * 86400
 
 
@@ -97,6 +100,7 @@ def suggestion_id(members: list[Candidate]) -> str:
 def suggestions(candidates: list[Candidate], models: dict[str, PersonModel], *, me_exists: bool,
                 dismissed: dict[str, float], now: float, limit: int = LIMIT, space=None) -> list[Suggestion]:  # fmt: skip
     pool = [c for c in candidates if c.seconds >= SIGNIFICANT_SECONDS]
+    pool = sorted(pool, key=lambda c: (c.day, c.conversation_id, c.label), reverse=True)[:MAX_CLUSTER_INPUT]
     found: list[Suggestion] = []
     for group in cluster([c.vector for c in pool]):
         members = [pool[i] for i in group]
