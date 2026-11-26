@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import OmiCapture
 import OmiProtocol
 
 /// The audio engine behind a note's recording (AVPlayer in the app; a fake in tests).
@@ -281,7 +282,7 @@ public final class NoteRecordingController {
         engine?.pause()
         isPlaying = false
         teardown()
-        log(.warning, "recording", "playback stopped: \(Self.redactingURLs(reason))")  // the cause stays in the log
+        log(.warning, "recording", "playback stopped: \(Self.failureClass(reason))")  // a class, never the reason's text
         state = .failed("Playback stopped.")  // the row's Retry button says what to do
     }
 
@@ -308,18 +309,37 @@ public final class NoteRecordingController {
         engine = nil
     }
 
-    /// An error for the log: its domain and code (or type), never its description, which can carry a URL.
+    /// An error for the log, as structure only (ASTRA-20261126-IT2A-01/02): the API case and HTTP status, or the
+    /// error domain and code, or its type. Never a description: one can carry a URL, percent-encoded or not.
     static func errorSummary(_ error: Error) -> String {
-        if error is URLError || (error as NSError).domain == NSURLErrorDomain || (error as NSError).domain == NSCocoaErrorDomain {
+        switch error {
+        case APIError.unauthorized: return "api unauthorized"
+        case APIError.http(let status, _): return "api http \(status)"
+        case APIError.transport: return "api transport"
+        case APIError.decoding: return "api decoding"
+        case APIError.notConfigured: return "api not configured"
+        default:
             let ns = error as NSError
-            return "\(ns.domain) \(ns.code)"
+            if error is URLError || ns.domain == NSURLErrorDomain || ns.domain == NSCocoaErrorDomain || ns.domain == "AVFoundationErrorDomain" {
+                return "\(ns.domain) \(ns.code)"
+            }
+            return String(describing: type(of: error))
         }
-        return String(describing: type(of: error))
     }
 
-    /// `text` with anything URL-shaped removed (the engine's own failure reasons may quote one).
-    static func redactingURLs(_ text: String) -> String {
-        text.replacingOccurrences(of: #"[a-zA-Z][a-zA-Z0-9+.-]*://\S+"#, with: "‹url›", options: .regularExpression)
+    /// The class of a playback failure for the log (ASTRA-20261126-IT2A-01): which of the engine's failures it was,
+    /// with an HTTP status when the reason names one. The reason's text never reaches the log.
+    static func failureClass(_ reason: String) -> String {
+        let status = reason.range(of: #"\bHTTP (\d{3})\b"#, options: .regularExpression)
+            .map { " http " + reason[$0].suffix(3) } ?? ""
+        let kind: String
+        if reason.hasPrefix("no audio arrived") { kind = "stall" }
+        else if reason.hasPrefix("the audio stopped arriving") { kind = "range ended" }
+        else if reason.hasPrefix("couldn't get the audio from the server") { kind = "range fetch" }
+        else if reason == "the player failed" { kind = "player" }
+        else if !status.isEmpty { kind = "server" }
+        else { kind = "player error" }
+        return kind + status
     }
 
     public static func unavailableMessage(_ reason: String?) -> String {

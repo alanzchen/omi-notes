@@ -315,7 +315,7 @@ final class SessionOwningEngine: RecordingEngine {
         played.controller.engineFailed("Error Domain=NSURLErrorDomain Code=-1005 https://host.example/v1/x")
         guard case .failed(let stopped) = played.controller.state else { Issue.record("not failed"); return }
         #expect(stopped == "Playback stopped.")
-        #expect(NoteRecordingController.redactingURLs("lost https://host.example/a?b=c here") == "lost ‹url› here")
+        #expect(NoteRecordingController.failureClass("couldn't get the audio from the server: HTTP 503 https://h/x") == "range fetch http 503")
         #expect(NoteRecordingController.errorSummary(URLError(.timedOut)) == "NSURLErrorDomain -1001")
     }
 }
