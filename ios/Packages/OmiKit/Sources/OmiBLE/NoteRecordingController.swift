@@ -165,7 +165,8 @@ public final class NoteRecordingController {
             guard gen == generation else { return false }  // a stale load's error belongs to nobody
             teardown()
             let timedOut = (error as? URLError)?.code == .timedOut
-            state = .failed(timedOut ? "Loading the recording timed out." : "Couldn't load the recording (\(error)).")
+            log(.warning, "recording", "load failed: \(Self.errorSummary(error))")  // the detail stays in the log, never on screen
+            state = .failed(timedOut ? "Loading the recording timed out." : "Couldn't load the recording.")
             return false
         }
     }
@@ -280,7 +281,8 @@ public final class NoteRecordingController {
         engine?.pause()
         isPlaying = false
         teardown()
-        state = .failed("Playback stopped (\(reason)). Tap Retry to try again.")
+        log(.warning, "recording", "playback stopped: \(Self.redactingURLs(reason))")  // the cause stays in the log
+        state = .failed("Playback stopped.")  // the row's Retry button says what to do
     }
 
     /// The engine's clock moved (periodic observer).
@@ -306,9 +308,24 @@ public final class NoteRecordingController {
         engine = nil
     }
 
+    /// An error for the log: its domain and code (or type), never its description, which can carry a URL.
+    static func errorSummary(_ error: Error) -> String {
+        if error is URLError || (error as NSError).domain == NSURLErrorDomain || (error as NSError).domain == NSCocoaErrorDomain {
+            let ns = error as NSError
+            return "\(ns.domain) \(ns.code)"
+        }
+        return String(describing: type(of: error))
+    }
+
+    /// `text` with anything URL-shaped removed (the engine's own failure reasons may quote one).
+    static func redactingURLs(_ text: String) -> String {
+        text.replacingOccurrences(of: #"[a-zA-Z][a-zA-Z0-9+.-]*://\S+"#, with: "‹url›", options: .regularExpression)
+    }
+
     public static func unavailableMessage(_ reason: String?) -> String {
         switch reason {
-        case "expired": return "This recording's audio has expired on the server, so it can't be played."
+        // raw audio is never deleted: `expired` means the server can't read it now (missing or unreadable files)
+        case "expired": return "The server can't read this recording's audio."
         case "no_audio": return "No audio was kept for this conversation."
         case "too_long": return "This recording is too long to play here (over 4 hours)."
         case "in_progress": return "Still recording; you can listen once it ends."

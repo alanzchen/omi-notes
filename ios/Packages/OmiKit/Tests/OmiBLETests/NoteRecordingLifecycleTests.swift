@@ -289,6 +289,35 @@ final class SessionOwningEngine: RecordingEngine {
         guard case .failed(let message) = seen else { Issue.record("after 0.6 s still \(seen)"); return }
         #expect(message.contains("timed out") && h.engines.isEmpty)
     }
+
+    /// 2026-11-26 R2 (F1, F14): never copy that contradicts behaviour or shows raw error text. Raw audio is kept for
+    /// good, so `expired` means the server can't read it; a failed load or playback says so plainly, and its cause (no
+    /// URL) goes to the log only.
+    @Test func failuresSayWhatHappenedInPlainWords() async {
+        let expired = NoteRecordingController.unavailableMessage("expired")
+        #expect(expired == "The server can't read this recording's audio." && !expired.contains("expired"))
+
+        let h = harness()
+        let tap = Task { await h.controller.toggle() }
+        await settle()
+        h.info.open(.failure(URLError(.cannotConnectToHost, userInfo: [NSURLErrorFailingURLStringErrorKey: "https://host.example/v1/x?token=abc"])))
+        await tap.value
+        guard case .failed(let message) = h.controller.state else { Issue.record("not failed"); return }
+        #expect(message == "Couldn't load the recording.")
+
+        let played = harness()
+        let again = Task { await played.controller.toggle() }
+        await settle()
+        played.info.open(.success(Self.info))
+        await settle()
+        played.engines[0].ready.open(.success(()))
+        await again.value
+        played.controller.engineFailed("Error Domain=NSURLErrorDomain Code=-1005 https://host.example/v1/x")
+        guard case .failed(let stopped) = played.controller.state else { Issue.record("not failed"); return }
+        #expect(stopped == "Playback stopped.")
+        #expect(NoteRecordingController.redactingURLs("lost https://host.example/a?b=c here") == "lost ‹url› here")
+        #expect(NoteRecordingController.errorSummary(URLError(.timedOut)) == "NSURLErrorDomain -1001")
+    }
 }
 
 extension JSONDecoder {
