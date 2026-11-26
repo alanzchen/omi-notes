@@ -30,7 +30,7 @@ from . import match as speaker_match
 from . import suggest as speaker_suggest
 from . import journal
 from .review import Review, status_line
-from .store import consent_ok, same_clips, sample_eligible, voices_name
+from .store import same_clips, sample_eligible, voices_name
 from ..vault import Vault
 from .voices import Clip, embed_voices
 
@@ -107,6 +107,7 @@ class SpeakerService:
         self._people_reconciled_at: float | None = None
         self._people_cache = self.db.path.parent / "people.json"  # operational cache beside the index, never vault data
         self._people = self._load_people_cache()
+        self._served_prefs = self.store.settings()  # the settings served outputs apply at once (`served_blocked`)
 
     # -- people ----------------------------------------------------------------------------------
 
@@ -119,7 +120,9 @@ class SpeakerService:
         Older clients read only `people`."""
         with self._people_lock:
             snap = self._people
-        out = {"people": snap.people, "ready": snap.ready and not snap.stale, "generation": snap.generation,
+        people = [p | {"auto_active": False, "status_line": "自动命名已关闭"} if p.get("auto_active") and self.served_blocked(p["id"], p.get("me"), automatic=True)
+                  else p for p in snap.people]  # fmt: skip
+        out = {"people": people, "ready": snap.ready and not snap.stale, "generation": snap.generation,
                "as_of": iso_utc_epoch(snap.built_at) if snap.built_at else None}  # fmt: skip
         if snap.stale:
             out["stale"] = True
@@ -239,9 +242,10 @@ class SpeakerService:
         """Today's answer, computed (a build; never a GET). `problems` collects files it skipped."""
         embedder = self.pipeline.providers.embedder
         key = (embedder.model, embedder.model_sha) if embedder else None
-        models = self.store.models(*key, self.pipeline.operating) if key else {}
+        models = self.store.models(*key, self.pipeline.operating) if key else {}  # naming people only (I1)
         auto_assign = self.store.settings()["auto_assign"]
         calibration = self.calibration_people(problems)
+        naming = self.store.naming_people()
         out = []
         for p in self.store.people():
             rows = [r for r in self.db.query("SELECT * FROM samples WHERE person_id=?", (p["id"],)) if sample_eligible(r)]
@@ -253,7 +257,8 @@ class SpeakerService:
                 "samples": len(rows), "sessions": len({r["session"] for r in rows if r["session"]}),
                 "auto_active": bool(model and model.active),
                 "voice_ready": bool(model and model.centroid is not None),
-                **counts, "status_line": status_line(model, counts["samples_active"], auto_assign),
+                **counts, "status_line": (status_line(model, counts["samples_active"], auto_assign)
+                                          if p["id"] in naming or not rows else "自动命名已关闭"),
                 "calibrated_at": calibration.get("computed_at"), "measured": measured,
             })  # fmt: skip
         return out
@@ -296,6 +301,7 @@ class SpeakerService:
     def warm(self, now: float | None = None) -> None:
         """Rebuild what changed since the last request (the review queue's order and, through it, the voice
         space) so requests only slice cached results; a no-op when nothing changed. Called by the worker."""
+        self._served_prefs = self.store.settings()  # each tick too: a settings file changed another way is served
         embedder = self.pipeline.providers.embedder
         if embedder is not None:
             try:
@@ -600,13 +606,9 @@ class SpeakerService:
         done = self.store.sample_for_request(request_id)
         if done is not None:
             return "exists", done["id"]
-        person = self.store.person(person_id)
         prefs = self.store.settings()
-        if not person["me"]:
-            if not prefs["acknowledged_at"]:
-                return "not_acknowledged", None
-            if not self.store.attested(person_id):
-                return "not_attested", None
+        if not self.store.may_gain(person_id, prefs):  # current, readable consent (I2), never the cached attestation
+            return ("not_acknowledged" if not prefs["acknowledged_at"] else "not_attested"), None
         embedder = self.pipeline.providers.embedder
         if embedder is None:
             return "no_model", None
@@ -704,7 +706,9 @@ class SpeakerService:
         """GET /v1/speakers/suggestions: the slice plus the snapshot's ready/stale/generation/as_of, as /v1/people."""
         with self._people_lock:
             snap = self._people
-        out = {"suggestions": list(snap.suggestions or [])[:limit], "ready": snap.ready and not snap.stale,
+        wearer = {p["id"] for p in snap.people if p.get("me")}
+        kept = [x for x in (snap.suggestions or []) if not self.served_blocked(x.get("person_id"), x.get("person_id") in wearer)]
+        out = {"suggestions": kept[:limit], "ready": snap.ready and not snap.stale,
                "generation": snap.generation, "as_of": iso_utc_epoch(snap.built_at) if snap.built_at else None}  # fmt: skip
         if snap.stale:
             out["stale"] = True
@@ -854,7 +858,7 @@ class SpeakerService:
                     if before.get("person_id") and self.store.person(before["person_id"]) is None:
                         skipped.add(conv_id)  # that person was forgotten since: never brought back
                         continue
-                    if withdrawn.get("samples") and not consent_ok(self.store.person(withdrawn["person_id"]), self.store.settings()):
+                    if withdrawn.get("samples") and not self.store.may_gain(withdrawn["person_id"]):  # I2
                         skipped.add(conv_id)  # their voiceprints come back only with their current consent
                         continue
                     if withdrawn.get("samples") and not self.store.can_restore(withdrawn["person_id"], withdrawn["samples"], key):
@@ -886,7 +890,6 @@ class SpeakerService:
         return {"acknowledged_at": prefs["acknowledged_at"], "unknown_voices_enabled": prefs["unknown_voices_enabled"],
                 "auto_assign": prefs["auto_assign"]}  # fmt: skip
 
-    @_rebuilds_people
     def put_settings(self, body: dict) -> dict:
         changes: dict = {}
         if "acknowledged_at" in body:
@@ -907,14 +910,26 @@ class SpeakerService:
                 if not isinstance(body[key], bool):
                     raise ApiError(422, "invalid_body", f"{key} must be a boolean")
                 changes[key] = body[key]
+        # intent only (I4, 2026-11-26): the settings file and a marked relabel. The worker's relabel pass prunes vectors
+        # and rebuilds the snapshots; until then every served output applies these settings itself (`served_blocked`)
         with self.store.lock:
             before = self.store.settings()
             self.store.update_settings(**changes)
-            self.store.reconcile_vectors()  # e.g. unknown voices off or the acknowledgment withdrawn
             self.store.samples_changed()
-            if any(k in changes and changes[k] != before[k] for k in ("auto_assign", "acknowledged_at")):
-                self.db.set_meta("relabel_pending", "1")  # automatic names follow an opt-out or opt-in (D1-02)
+            if any(k in changes and changes[k] != before[k] for k in ("auto_assign", "acknowledged_at", "unknown_voices_enabled")):
+                self.db.set_meta("relabel_pending", "1")
+            self._served_prefs = self.store.settings()
         return self.get_settings()
+
+    def served_blocked(self, person_id: str | None, me: bool, *, automatic: bool = False) -> bool:
+        """Whether a served output must not name this person now, from the settings in memory (no file read, no
+        query): the acknowledgment withdrawn for a non-wearer blocks everything; automatic naming off blocks only
+        automatic names (`automatic`), not a hint or suggestion that asks the owner. The snapshots are built with
+        the policy already (I1); this covers the moments between a settings change and the worker's rebuild."""
+        prefs = self._served_prefs
+        if not person_id:
+            return False
+        return (not me and not prefs["acknowledged_at"]) or (automatic and not prefs["auto_assign"])
 
     # -- clips -----------------------------------------------------------------------------------
 

@@ -151,7 +151,9 @@ class Importer:
         person = self.store.person(person_id)
         if person is None:
             return None
-        return (bool(person["me"]), person["attested_at"], self.store.settings()["acknowledged_at"], self.store.forget_count(person_id))
+        # the attestation as consent.json says now (I2): unreadable or withdrawn is none
+        attested = person["attested_at"] if self.store.attested(person_id) else None
+        return (bool(person["me"]), attested, self.store.settings()["acknowledged_at"], self.store.forget_count(person_id))
 
     def _range(self, fields: dict, total: float | None) -> tuple[float, float]:
         try:

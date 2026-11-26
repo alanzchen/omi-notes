@@ -30,7 +30,7 @@ from ..ingest import ApiError
 from ..notes.writer import remove
 from ..spool import fsync_dir
 from ..vault import Vault
-from .store import consent_ok
+
 from .voices import decode_vector
 
 log = logging.getLogger(__name__)
@@ -150,7 +150,7 @@ def _invalid(store, op: dict) -> str:
         if store.forget_count(person_id) != generation:
             return "a person's voice was forgotten since"
     target = gaining(op)
-    if target and not consent_ok(store.person(target), store.settings()):
+    if target and not store.may_gain(target):  # current, readable consent (I2), not the cached attestation
         return "consent was withdrawn since"
     return ""
 

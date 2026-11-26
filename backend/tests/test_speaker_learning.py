@@ -496,6 +496,7 @@ def test_turning_unknown_voices_off_deletes_their_vectors(env):
     path = next(Vault.open(settings).conversation_dir(row["id"]).glob("voices-*.json"))
     assert all("vector_b64" in v for v in json.loads(path.read_text())["labels"].values())
     client.put("/v1/speakers/settings", json={"unknown_voices_enabled": False}, headers=AUTH)
+    worker.pipeline.relabel(T0 + 9000)  # 2026-11-26 R3 (I4): the PUT records intent; the worker's relabel pass prunes
     assert not any("vector_b64" in v for v in json.loads(path.read_text())["labels"].values())
 
 

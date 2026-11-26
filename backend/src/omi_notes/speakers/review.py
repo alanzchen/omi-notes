@@ -35,7 +35,7 @@ from ..util import UUID_RE, iso_utc_epoch
 from ..vault import Vault
 from . import f0 as sample_f0
 from . import journal
-from .store import ACTIVE, MOVED, REMOVED, consent_ok, flag_open, sample_eligible
+from .store import ACTIVE, MOVED, REMOVED, flag_open, sample_eligible
 from .voices import cosine_distance, decode_vector
 
 log = logging.getLogger(__name__)
@@ -283,6 +283,10 @@ class Review:
                 if (current := self._label_still_open(value)) is None:
                     continue
                 item = self._label_item(*current, evidence=evidence)
+                asked = self.store.person(item["person_id"]) if item.get("person_id") else None
+                if asked is not None and self.service.served_blocked(asked["id"], bool(asked["me"]),
+                                                                     automatic=item.get("reasons") == ["auto"]):
+                    continue  # a settings opt-out the worker hasn't rebuilt the queue for yet (I4)
             if item.get("playable") and item.get("clip"):
                 out.append(item)
         for item in out:  # the person each item asks about, by name (the phone never shows a placeholder)
@@ -329,7 +333,8 @@ class Review:
         now = time.time() if now is None else now
         self.store.sync_samples()
         embedder = self.pipeline.providers.embedder
-        key = self.store.evidence_key(embedder.model, embedder.model_sha) if embedder else None
+        # who may be named is part of the key (I1): a consent file withdrawn or torn changes no index row
+        key = (self.store.evidence_key(embedder.model, embedder.model_sha), self.store.naming_people()) if embedder else None
         with self._cache_lock:
             cached = self._cache
             seen = self._reopen_seq  # reopens up to here are in the sample files this build reads
@@ -337,7 +342,7 @@ class Review:
             return cached[1]
         built = self._entries(now)
         evidence = self._evidence()
-        if key is not None and self.store.evidence_key(embedder.model, embedder.model_sha) == key:  # unchanged meanwhile
+        if key is not None and (self.store.evidence_key(embedder.model, embedder.model_sha), self.store.naming_people()) == key:
             with self._cache_lock:
                 self._cache = (key, built)
                 # an undo or restore that landed while this build ran stays at the front (ASTRA-20261113-IT3-01)
@@ -570,7 +575,7 @@ class Review:
         person = self.store.person(person_id)
         if person is None:
             raise ApiError(404, "not_found", f"unknown person {person_id}")
-        if not person["me"] and not (self.store.settings()["acknowledged_at"] and self.store.attested(person_id)):
+        if not self.store.may_gain(person_id):  # current, readable consent (I2)
             raise ApiError(409, "consent_required", "this person's voice can't be kept without the acknowledgment and their attestation")
 
     def _overlap_why(self, data: dict, person_id: str | None = None) -> str:
@@ -710,7 +715,7 @@ class Review:
         person = self.store.person(person_id)
         if person is None:
             return "that person was forgotten"
-        return "" if consent_ok(person, self.store.settings()) else "that person's consent is withdrawn"
+        return "" if self.store.may_gain(person_id) else "that person's consent is withdrawn"  # I2
 
     def _copies_unchanged(self, person_id: str | None, pairs: list) -> str:
         """Why the copies a move made can't simply be taken back ("" when they can): each still exists, counts,

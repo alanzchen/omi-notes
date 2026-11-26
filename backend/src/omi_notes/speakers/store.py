@@ -279,8 +279,23 @@ class SpeakerStore:
         return self.db.one("SELECT * FROM people WHERE me=1 ORDER BY name LIMIT 1")
 
     def models(self, model: str, model_sha: str, op: Operating):
+        """People's models for naming: built from `naming_samples` only (I1)."""
         me = self.me()
-        return build_models(self.samples(model, model_sha), op, wearer_id=me["id"] if me else None)
+        return build_models(self.naming_samples(model, model_sha), op, wearer_id=me["id"] if me else None)
+
+    def naming_people(self, prefs: dict | None = None, memo: dict | None = None) -> frozenset[str]:
+        """The people whose voice may name anything now: `person_policy` NORMAL. The one source of every
+        identity-derived output (I1, 2026-11-26): models (assignment, People auto_active, suggestions), the
+        voice space's centroids and GA (review and note hints), calibration. An OPTED_OUT person is named by
+        none of them, and a FROZEN one isn't named anew. Worker and mutation passes only, never a GET."""
+        prefs = self.settings() if prefs is None else prefs
+        memo = {} if memo is None else memo
+        return frozenset(r["id"] for r in self.people() if self.person_policy(r["id"], prefs, memo) == NORMAL)
+
+    def naming_samples(self, model: str, model_sha: str, memo: dict | None = None) -> list[Sample]:
+        """`samples` of the `naming_people` only (I1)."""
+        allowed = self.naming_people(memo=memo)
+        return [s for s in self.samples(model, model_sha) if s.person_id in allowed]
 
     def ga_population(self, model: str, model_sha: str) -> list[tuple[str | None, bytes]]:
         """What GA is the mean of, as (conversation, vector bytes): the label population `vector_labels` allows now
@@ -304,9 +319,9 @@ class SpeakerStore:
                     keep = self.vector_labels(states, set(stored), raw=True, prefs=prefs, people=people, memo=memo)
             kept[conv_id] = {stored[label] for label in keep}
             population += [(conv_id, stored[label]) for label in sorted(keep)]
-        for s in self.samples(model, model_sha):
+        for s in self.naming_samples(model, model_sha, memo):  # the current policy, not the cached attestation (I1)
             raw = np.asarray(s.vector, dtype="<f4").tobytes()
-            if consent_ok(people.get(s.person_id), prefs) and raw not in kept.get(s.session or "", set()):
+            if raw not in kept.get(s.session or "", set()):
                 population.append((s.session, raw))
         return population
 
@@ -344,12 +359,13 @@ class SpeakerStore:
         """GA (`ga_population`) and people's GA-centred centroids (`speakers.space`), in memory only; None without
         any vector. Computed once per `evidence_key` (it reads every stored voice: per note render it kept the
         server busy for hours after a relabel)."""
-        key = self.evidence_key(model, model_sha)
+        # who may be named is part of the key: a consent file withdrawn or torn changes no index row (I1)
+        key = (self.evidence_key(model, model_sha), self.naming_people())
         with self._space_cache_lock:
             if self._space_cache is not None and self._space_cache[0] == key:
                 return self._space_cache[1]
         space = self._rm_space(model, model_sha)
-        if self.evidence_key(model, model_sha) == key:  # nothing changed while it was built: safe to keep
+        if (self.evidence_key(model, model_sha), self.naming_people()) == key:  # unchanged while built: safe to keep
             with self._space_cache_lock:
                 self._space_cache = (key, space)
         return space
@@ -358,7 +374,7 @@ class SpeakerStore:
         from .space import build_space
 
         by_person: dict[str, list] = {}
-        for s in centroid_basis(self.samples(model, model_sha)):
+        for s in centroid_basis(self.naming_samples(model, model_sha)):
             by_person.setdefault(s.person_id, []).append(s.vector)
         vectors = [np.frombuffer(v, dtype="<f4").astype(np.float32) for _, v in self.ga_population(model, model_sha)]
         return build_space(vectors, by_person)
@@ -531,8 +547,24 @@ class SpeakerStore:
         return int(((Vault.read_json(self.settings_path) or {}).get("forgotten_voices") or {}).get(person_id) or 0)
 
     def attested(self, person_id: str) -> bool:
-        row = self.person(person_id)
-        return bool(row and row["attested_at"])
+        """The person's consent.json, read now, attests them (not the cached people.attested_at)."""
+        try:
+            return bool(self.read_consent(person_id).get("attested_at"))
+        except (OSError, ValueError):
+            return False  # unreadable: unknown, so no new gain
+
+    def may_gain(self, person_id: str, prefs: dict | None = None) -> bool:
+        """Whether NEW voice data (a sample, a stored vector, a voiceprint by assignment, move, restore, journal replay
+        or import) may be added for this person now (I2, 2026-11-26): the wearer, or a non-wearer with the owner's
+        acknowledgment and a readable consent.json that attests them. Unreadable or withdrawn consent refuses the gain
+        and deletes nothing. The one gate for every gain path."""
+        person = self.person(person_id)
+        if person is None or self.forgetting_path(person_id).exists():
+            return False
+        if person["me"]:
+            return True
+        prefs = self.settings() if prefs is None else prefs
+        return bool(prefs["acknowledged_at"]) and self.attested(person_id)
 
     # -- samples ---------------------------------------------------------------------------------
 

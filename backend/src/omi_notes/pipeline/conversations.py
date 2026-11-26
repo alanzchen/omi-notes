@@ -60,7 +60,7 @@ from ..settings import Settings
 from ..spool import atomic_write_bytes
 from ..util import canonical_json, iso_utc_epoch, sha256_hex
 from ..speakers import match as speaker_match
-from ..speakers.store import OPTED_OUT, SpeakerStore, voices_name
+from ..speakers.store import FROZEN, OPTED_OUT, SpeakerStore, voices_name
 from ..speakers.voices import cosine_distance, embed_voices, label_turns, select_clips, usable_spans
 from ..vault import Vault
 from . import prompt
@@ -842,9 +842,17 @@ class ConversationPipeline:
             old_voices = self.speakers.voices_of_labels(conv_id, previous, not_file=name) if moved else {}
             if name is not None and not fresh:  # a retried stage: finish it with the stored voices
                 voices = self.speakers.read_voices(conv_id, name)
-            current = self._carry_over(stored, old_voices, voices, labels, self.speakers.had_forgotten(conv_id)) if moved else stored
-            states = current
             prefs, memo = self.speakers.settings(), {}
+            # no destructive identity migration under uncertainty (I3, 2026-11-26): while a person named here is FROZEN
+            # (a file of theirs can't be read), the move keeps every confirmed name and the old voices generation
+            uncertain = moved and any(self.speakers.person_policy(st["person_id"], prefs, memo) == FROZEN
+                                      for st in stored.values() if st.get("person_id"))  # fmt: skip
+            current = self._carry_over(stored, old_voices, voices, labels, self.speakers.had_forgotten(conv_id)) if moved else stored
+            if uncertain:
+                for label, st in stored.items():
+                    if st.get("source") == "user" and st.get("person_id") not in {c.get("person_id") for c in current.values()}:
+                        current.setdefault(label, st)
+            states = current
             if voices is not None:
                 models = self.speakers.models(embedder.model, embedder.model_sha, self.operating)
                 if models:
@@ -864,7 +872,7 @@ class ConversationPipeline:
             if moved or name is not None or self.speakers.persisted(states) != self.speakers.persisted(stored):
                 # one commit: the states, their transcript, and the voices file they were made against
                 self.speakers.write_labels(conv_id, states, transcript_sha=transcript_sha, voices=name)
-            if moved or name is not None:
+            if (moved or name is not None) and not uncertain:
                 self.speakers.remove_other_voices(conv_id, name)  # nothing depends on the others now
 
     def move_labels(self, conv_id: str, transcript: dict) -> None:
@@ -975,6 +983,9 @@ class ConversationPipeline:
             named = any(s.get("person_id") for s in (states | current).values())
             if (differs or names_changed) and row["note_path"] and named:
                 self._set(conv_id, needs_render=1, next_attempt_at=None)
+        # the policy change behind this pass is applied to stored vectors too, whether or not any state changed (I4):
+        # before the pass is marked done, so a crash leaves it pending
+        self.speakers.reconcile_vectors()
         self.db.set_meta("relabel_pending", None)
         self.db.set_meta("rendered_names", names)
         return changed

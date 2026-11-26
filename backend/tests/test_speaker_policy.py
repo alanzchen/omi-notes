@@ -100,9 +100,9 @@ class Env:
         return {lab for lab, v in json.loads((vfile or self.vfile).read_text())["labels"].items() if "vector_b64" in v}
 
     def worker_pass(self, now=3000.0):
-        """What the worker does: relabel (when pending), then retention."""
+        """What the worker does for a policy change: its relabel pass, which reconciles stored vectors before it is
+        marked done (I4). No separate retention call here: that masked a relabel that never pruned (Carbon C1-04)."""
         self.svc.pipeline.relabel(now)
-        self.store.reconcile_vectors()
 
     def identify_new(self):
         conv_id, _ = self.conversation(named=False, sha="c")
@@ -220,21 +220,27 @@ def test_7_withdrawing_the_acknowledgment_wins_over_an_unreadable_file(tmp_path,
     assert e.identify_new() is None
 
 
-# 8. consent withdrawn ({} consent.json)
+# 8. consent withdrawn ({} consent.json), with a positive hint control (Astra IT1-05 / Carbon C1-04)
 @pytest.mark.parametrize("damage", [None, "sample"])
 def test_8_a_readable_consent_without_attestation_opts_out_names_vectors_and_hints(tmp_path, damage):
-    e = Env(tmp_path)
+    e = Env(tmp_path, unknown_voices=True, n_samples=4)
+    for _ in range(101):  # a real voice space (200 background voices): hints exist before the opt-out
+        e.conversation(named=False, extra_unnamed=True, sha="d")
+    target, _ = e.conversation(named=False, extra_unnamed=True, sha="d")
+    tsha = e.store.labels_transcript(target) or e.store.db.one("SELECT transcript_sha FROM conversations WHERE id=?", (target,))[0]
+    assert e.svc.pipeline.possible_voice_names(target, tsha).get("S1") == ("Gigi", False), "non-vacuous hint control"
     if damage:
         e.tear_sample()
         e.store.load_samples()
     e.store.db.set_meta("relabel_pending", None)
     e.tear_consent("{}")
-    e.svc.warm(now=2000.0)  # the worker's People scan sees the change
+    e.svc.warm(now=5000.0)  # the worker's People scan sees the change
     assert e.store.db.meta("relabel_pending") == "1", "the consent transition schedules the relabel"
     e.worker_pass()
-    assert e.name() is None and "S1" not in e.stored()
-    hints = e.svc.pipeline.possible_voice_names(e.conv, e.store.labels_transcript(e.conv))
-    assert all(name != "Gigi" for name, _ in hints.values())
+    assert e.name() is None
+    assert "S1" in e.stored(), "kept only as an anonymous unknown voice (unknown voices on, raw audio kept)"
+    hints = e.svc.pipeline.possible_voice_names(target, tsha)
+    assert all(name != "Gigi" for name, _ in hints.values()), hints
     assert e.identify_new() is None
 
 
@@ -243,7 +249,9 @@ def test_8_a_readable_consent_without_attestation_opts_out_names_vectors_and_hin
 def test_9_turning_automatic_naming_off_wins_over_an_unreadable_file(tmp_path, damage):
     e = Env(tmp_path)
     e.tear_consent() if damage == "consent" else (e.tear_sample(), e.store.load_samples())
+    e.store.db.set_meta("relabel_pending", None)  # not inherited from the setup (Carbon C1-04): the PUT must set it
     assert e.client.put("/v1/speakers/settings", json={"auto_assign": False}, headers=AUTH).status_code == 200
+    assert e.store.db.meta("relabel_pending") == "1"
     e.worker_pass()
     assert e.name() is None and "S1" not in e.stored()
 
