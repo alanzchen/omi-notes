@@ -86,12 +86,17 @@ struct ConversationDetailView: View {
                 }
                 ValueDetailSection(detail: detail, canPlay: model.canPlayRecordings && model.detailSavedAt[summary.id] == nil,
                                    onPlay: { h in play(h, proxy: proxy) }, onShow: { h in show(h, proxy: proxy) })
-                summarySection(detail)
+                // still open: the header's status is the one line; no empty Summary or Transcript card (F5)
+                let open = detail.entry.status == "open"
+                // a failed summary's cause is shown once, next to Retry (F4): no Summary card repeating it
+                if !(open && detail.summary == nil) && !(detail.summaryState == "failed" && retryOffered(detail)) {
+                    summarySection(detail)
+                }
                 if let s = detail.summary { details(s) }
                 myNotes(detail)
                 obsidianSection(detail)
                 speakersSection(detail)
-                transcriptSection(detail)
+                if !(open && detail.transcript == nil) { transcriptSection(detail) }
                 historySection(detail)
             } else if error == nil {
                 Section { HStack { ProgressView(); Text("Loading…").foregroundStyle(.secondary).padding(.leading, 6) } }
@@ -194,17 +199,25 @@ struct ConversationDetailView: View {
                 if let issue { Text(issue.message).font(.subheadline) }
                 RetryControl(model: model, conversationId: d.id, action: .keep)
             } footer: {
-                Text([speechLine(d), "Keeping it makes a transcript note with the speaker unknown; the audio stays on the server."]
-                    .compactMap { $0 }.joined(separator: " "))
+                if let line = speechLine(d) { Text(line) }
             }
-        } else if model.canRetry, issue?.canRetryFromPhone != false {
+        } else if retryOffered(d) {
             Section {
+                // the failure once, with its actual cause, beside what can be done about it (F4); the header says
+                // which step failed. A transcription failure's cause is already the header's line.
+                if d.summaryState == "failed", let cause = d.summaryError { Text(cause).font(.subheadline) }
                 RetryControl(model: model, conversationId: d.id)
                 if model.canDismiss, issue?.canDismissFromPhone == true { DismissControl(model: model, conversationId: d.id) }
-            } footer: {
-                Text("Redoes the step that failed. If a service's key or account is the problem, fix that on the server first. Dismissing only removes it from the list of problems.")
             }
         }
+    }
+
+    /// The failed note's Retry is offered (the branch `fixSection` shows when Keep isn't).
+    private func retryOffered(_ d: ConversationDetail) -> Bool {
+        guard d.entry.status == "failed", model.detailSavedAt[d.id] == nil else { return false }
+        let issue = model.issues.first { $0.code == "conversation_failed" && $0.conversationId == d.id }
+        if model.canKeep, issue?.canKeepFromPhone == true { return false }
+        return model.canRetry && issue?.canRetryFromPhone != false
     }
 
     /// Detected speech and the recording's length are different figures: say both.
