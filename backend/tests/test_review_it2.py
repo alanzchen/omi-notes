@@ -208,3 +208,16 @@ def test_review_serves_no_hint_for_a_person_whose_samples_were_all_removed(tmp_p
         r = e.client.post(f"/v1/samples/{row['id']}/remove", json={"request_id": f"rm-{row['id']}"}, headers=AUTH)
         assert r.status_code == 200, r.text
     assert _served(e) == []
+
+
+def test_a_dismissal_writes_the_settings_file_under_the_speaker_lock(tmp_path):
+    """IT4-04 part 3: dismiss reads, changes and writes settings.json; without the lock a concurrent settings change
+    (which holds it) can be lost."""
+    client, svc, store, pid, vec, conv, _ = _setup_person(tmp_path)
+    done = threading.Event()
+    with store.lock:  # someone else is changing speaker settings
+        worker = threading.Thread(target=lambda: (svc.dismiss("s-1"), done.set()))
+        worker.start()
+        assert not done.wait(0.3), "the dismissal wrote settings.json while the lock was held"
+    worker.join(5)
+    assert done.is_set() and "s-1" in store.settings()["dismissed"]

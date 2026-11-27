@@ -842,11 +842,12 @@ class SpeakerService:
 
     def dismiss(self, suggestion_id: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        prefs = self.store.settings()
-        dismissed = {k: v for k, v in prefs["dismissed"].items() if float(v) > now}
-        dismissed[suggestion_id] = now + speaker_suggest.COOLDOWN
-        self.store.update_settings(dismissed=dismissed)
-        self._hide_suggestion(suggestion_id)
+        with self.store.lock:  # a read-modify-write of settings.json, as every other settings change (Carbon IT4-04)
+            prefs = self.store.settings()
+            dismissed = {k: v for k, v in prefs["dismissed"].items() if float(v) > now}
+            dismissed[suggestion_id] = now + speaker_suggest.COOLDOWN
+            self.store.update_settings(dismissed=dismissed)
+            self._hide_suggestion(suggestion_id)
 
     def assign_suggestion(self, suggestion_id: str, body: dict, now: float | None = None) -> list[str]:
         now = time.time() if now is None else now
