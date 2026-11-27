@@ -1008,10 +1008,12 @@ class ConversationPipeline:
         """A label move a GET used to finish is the worker's (Carbon D1 invariant 1): moved now when the files allow,
         else kept deferred. Checked for every conversation once per process (a rebuilt index), then only deferred ones.
         Whether it is still pending."""
-        try:  # also a voices file a crash left unreferenced (`labels_to_move`)
-            transcript = json.loads((self.conv_dir(conv_id) / "transcript.json").read_text())
-            if self.speakers.labels_to_move(conv_id, transcript):
-                self.move_labels(conv_id, transcript)
+        # Only a move to a newer transcript (which the FROZEN deferral guards). A voices file a crash left unreferenced
+        # for the same transcript is the voices stage's retry to adopt, never this pass: adopting it retires the
+        # referenced generation, a FROZEN person's vector included.
+        try:
+            if self.speakers.move_pending(conv_id):
+                self.move_labels(conv_id, json.loads((self.conv_dir(conv_id) / "transcript.json").read_text()))
         except (OSError, ValueError) as exc:  # one conversation never stalls the pass
             log.warning("conversation %s: label move not finished (%s)", conv_id, exc)
         pending = self.speakers.move_pending(conv_id)
