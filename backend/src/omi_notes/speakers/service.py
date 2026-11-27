@@ -379,10 +379,12 @@ class SpeakerService:
                 if fields["me"]:  # at most one wearer: the latest PUT wins in the overlay too
                     self._people_overlay = {pid: (tag, f | {"me": False}) for pid, (tag, f) in self._people_overlay.items()}
                 # merged: a forgotten voice's zeroed fields stay until a build
-                self._people_overlay[person_id] = (self._people_seq, self._people_overlay.get(person_id, (0, {}))[1] | fields)
+                merged = self._people_overlay.get(person_id, (0, {}))[1] | fields
+                self._people_overlay[person_id] = (self._people_seq, merged)
                 self._forgotten.pop(person_id, None)
+        # a build (or a forget) may drop the entry once the lock is released (Carbon IT4-01): answer from what was written
         snap, overlay, _, wearer = self._view()
-        return (201 if created else 200), self._served_person((snap.by_id or {}).get(person_id, {}) | overlay[person_id][1], wearer)
+        return (201 if created else 200), self._served_person((snap.by_id or {}).get(person_id, {}) | overlay.get(person_id, (0, merged))[1], wearer)
 
     def _put_person_write(self, person_id: str, body: dict) -> bool:
         if not UUID_RE.match(person_id):

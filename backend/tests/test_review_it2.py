@@ -177,3 +177,22 @@ def test_one_unreadable_speakers_file_never_stops_pruning(tmp_path):
     svc.pipeline.relabel(9000.0)  # never raises for one conversation
     assert "vector_b64" not in json.loads(vfile.read_text())["labels"]["S1"], "the opted-out vector outlived the pass"
     assert store.db.meta("relabel_pending") == "1"  # the unreadable conversation is retried
+
+
+# -- Carbon IT4 (9dd046a) ---------------------------------------------------------------------------------------------
+
+
+def test_a_put_answers_even_if_a_build_drops_its_overlay_right_after_the_write(tmp_path, monkeypatch):
+    """IT4-01: a worker build (or a forget) may pop the overlay between the PUT's lock release and its answer."""
+    client, svc, store, pid, vec, conv, _ = _setup_person(tmp_path)
+    real = svc._view
+
+    def view_after_a_build():
+        with svc._people_lock:
+            svc._people_overlay.pop(pid, None)  # what a build that started after the write does when it publishes
+        return real()
+
+    monkeypatch.setattr(svc, "_view", view_after_a_build)
+    r = client.put(f"/v1/people/{pid}", json={"name": "Gigi Renamed"}, headers=AUTH)
+    assert r.status_code == 200, r.text  # the write is committed: never a 500
+    assert r.json()["name"] == "Gigi Renamed"
