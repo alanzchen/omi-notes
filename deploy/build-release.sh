@@ -16,13 +16,13 @@ case "${1:-}" in  # checks without building anything (backend/tests/test_deploy_
     --check-summary) tests_ok "$2"; exit ;;
     --index-schema) index_schema "$2"; exit ;;
 esac
-cd /Users/alan/Developer/omi-notes
+cd "$(dirname "$0")/.."  # this script's own tree (a detached worktree archives its own HEAD), not a fixed checkout
 [[ -z $(git status --porcelain -- backend contracts) ]] || { echo "backend has uncommitted changes" >&2; exit 1; }
 R=~/.local/share/omi-notes/releases
 CUR=$(~/.config/omi-notes/user-service.sh status 2>&1 | sed -nE 's/.*current: (.*)\/backend$/\1/p')
 REV=$(git rev-parse HEAD)  # once: the name, the archive and the manifest name the same commit (ASTRA-20261124-IT2-03)
 NAME=$(date +%Y%m%d-%H%M%S)-${REV:0:7}; NEW=$R/$NAME
-mkdir -p $NEW; git archive "$REV" backend contracts | tar -x -C $NEW
+mkdir -p $NEW; git archive "$REV" backend contracts deploy | tar -x -C $NEW  # deploy/: the gate's deploy-script tests run in the release
 mkdir -p $NEW/backend/models; ln $CUR/backend/models/*.onnx $NEW/backend/models/
 cd $NEW/backend
 UV_PYTHON=/opt/homebrew/opt/python@3.13/bin/python3.13 uv sync --frozen --extra diarization >/dev/null 2>&1

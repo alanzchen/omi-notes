@@ -9,6 +9,8 @@ from . import test_speaker_policy as owner
 @pytest.mark.parametrize("damage", [None, "sample"])
 def test_base_unfiltered_hint_method_cannot_name_an_opted_out_person(tmp_path,monkeypatch,damage):
     root=Path(__file__).resolve().parents[2]  # this repository
+    if subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=root, capture_output=True).returncode != 0:
+        pytest.skip("needs git history; covered by the in-repo run")  # the release tree has no .git
     src=subprocess.check_output(["git","show","f066723:backend/src/omi_notes/pipeline/conversations.py"],cwd=root,text=True,timeout=10)
     tree=ast.parse(src)
     cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=="ConversationPipeline")

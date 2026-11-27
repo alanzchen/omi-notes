@@ -5,8 +5,16 @@ from pathlib import Path
 import pytest
 from omi_notes.db import Database, QUEUE
 ROOT=Path(__file__).resolve().parents[2]  # this repository (Astra's pointed at her worktree)
+def _in_git_work_tree(path) -> bool:
+    return subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=path, capture_output=True).returncode == 0
+
+
+NO_GIT = "needs git history; covered by the in-repo run"  # the release tree (deploy/build-release.sh) has no .git
+
 
 def old_database():
+    if not _in_git_work_tree(ROOT):
+        pytest.skip(NO_GIT)
     src=subprocess.check_output(['git','show','d861a4e:backend/src/omi_notes/db.py'],cwd=ROOT,text=True)
     mod=types.ModuleType('omi_notes.counter_review_old_db'); mod.__package__='omi_notes'
     exec(compile(src,'d861a4e-db.py','exec'),mod.__dict__)
