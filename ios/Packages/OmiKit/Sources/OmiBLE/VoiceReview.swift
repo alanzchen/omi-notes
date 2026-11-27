@@ -413,7 +413,7 @@ public final class VoiceSamplesModel {
         do {
             let fresh = try await speakers.samples(personId: personId, state: state.rawValue)
             guard asked == generation else { return }
-            samples = fresh
+            samples = VoiceSample.newestSpokenFirst(fresh)
             loaded = true
         } catch {
             guard asked == generation else { return }

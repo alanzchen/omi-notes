@@ -50,8 +50,6 @@ struct VoicePersonView: View {
                         if samples.loaded, samples.samples.isEmpty {
                             Text("没有").foregroundStyle(.secondary).frame(maxWidth: .infinity)
                         }
-                    } footer: {
-                        if samples.tab == .removed { Text("移除的样本可以恢复。") }
                     }
                 }
                 if let error = samples.error ?? speakers.error ?? player.unavailable {
@@ -129,7 +127,8 @@ struct VoicePersonView: View {
 
     private func header(_ p: Person) -> some View {
         let health = VoiceHealth(p)
-        let calibrated = speakers.serverSupportsVoiceCalibration ? VoicesHub.shortTime(p.calibratedAt) : nil
+        // the last calibration says something only about a voice it had samples of
+        let calibrated = speakers.serverSupportsVoiceCalibration && (p.samples ?? 0) > 0 ? VoicesHub.shortTime(p.calibratedAt) : nil
         let measured = VoicesHub.measuredLine(p, calibrationSupported: speakers.serverSupportsVoiceCalibration)
         return VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 14) {
@@ -232,7 +231,7 @@ struct VoicePersonView: View {
     /// "5s · 10-09"
     private func meta(_ s: VoiceSample) -> String {
         let seconds = (s.clip?.seconds ?? s.seconds).map { "\(Int($0.rounded()))s" }
-        let when = VoicesHub.shortTime(s.clip?.startedAt ?? s.conversation?.startedAt ?? s.createdAt)
+        let when = VoicesHub.shortTime(s.spokenAt)
         return [seconds, when].compactMap { $0 }.joined(separator: " · ")
     }
 

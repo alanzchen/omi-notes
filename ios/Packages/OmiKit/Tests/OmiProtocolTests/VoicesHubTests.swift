@@ -111,6 +111,24 @@ import Testing
         #expect(m.compactLine == "35 段 · 误认 ≤ 9%")
     }
 
+    @Test func measuredOmitsBoundsThatSayNothing() throws {
+        // "认出 ≥ 0%" and "误认 ≤ 100%" are true of any model: shown, they read as a broken one
+        let zero = try decode(MeasuredPerformance.self, #"{"conversations":4,"found_at_least":0.003,"negative_conversations":7,"wrong_at_most":0.318}"#)
+        #expect(zero.compactLine == "7 段 · 误认 ≤ 32%")
+        let none = try decode(MeasuredPerformance.self, #"{"conversations":2,"found_at_least":0.0,"negative_conversations":1,"wrong_at_most":0.9995}"#)
+        #expect(none.compactLine == nil)
+    }
+
+    @Test func samplesListNewestSpokenFirst() throws {
+        // the server orders by when a sample was added; the page lists by when it was said (what the row shows)
+        let raw = #"[{"id":"a","created_at":"2026-11-26T05:00:00Z","clip":{"id":"c1","started_at":"2026-11-23T10:00:00Z"}},"#
+            + #"{"id":"b","created_at":"2026-11-26T04:00:00Z","clip":{"id":"c2","started_at":"2026-11-25T10:00:00Z"}},"#
+            + #"{"id":"c","created_at":"2026-11-24T09:00:00Z"},"#
+            + #"{"id":"d","created_at":"2026-11-26T03:00:00Z","clip":{"id":"c4","started_at":"2026-11-25T10:00:00Z"}}]"#
+        let samples = try decode([VoiceSample].self, raw)
+        #expect(VoiceSample.newestSpokenFirst(samples).map(\.id) == ["b", "d", "c", "a"])
+    }
+
     @Test func measuredWithoutCountsShowsNothing() throws {
         let empty = try decode(MeasuredPerformance.self, #"{"conversations":0,"negative_conversations":0}"#)
         #expect(empty.compactLine == nil)
@@ -140,7 +158,7 @@ import Testing
         #expect(VoicesHub.measuredLine(unknown, calibrationSupported: true) == nil)
         var active = inactive
         active.autoActive = true
-        #expect(VoicesHub.measuredLine(active, calibrationSupported: true) == "243 段 · 认出 ≥ 0% · 误认 ≤ 14%")
+        #expect(VoicesHub.measuredLine(active, calibrationSupported: true) == "30 段 · 误认 ≤ 14%")  // the 0% found bound says nothing
     }
 
     // MARK: Hub

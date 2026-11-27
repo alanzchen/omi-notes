@@ -18,8 +18,6 @@ struct UnknownVoicesView: View {
                 ForEach(speakers.suggestions) { card($0) }
                 if speakers.suggestions.isEmpty {
                     Text("没有反复出现的陌生声音").font(.subheadline).foregroundStyle(.secondary).padding(.top, 40)
-                } else {
-                    Text("忽略的声音 7 天内不再询问。").font(.footnote).foregroundStyle(.secondary)
                 }
                 if let error = speakers.error ?? player.unavailable {
                     Text(error).font(.footnote).foregroundStyle(.secondary)

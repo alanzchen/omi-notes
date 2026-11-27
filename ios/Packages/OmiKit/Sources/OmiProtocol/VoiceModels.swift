@@ -30,13 +30,14 @@ public struct MeasuredPerformance: Codable, Equatable, Hashable, Sendable {
     /// "35 段 · 认出 ≥ 71% · 误认 ≤ 8%": the held-out conversations and only the bounds they support,
     /// each rounded the conservative way. nil when nothing was counted or no bound exists.
     public var compactLine: String? {
-        let found = (conversations ?? 0) > 0 ? foundAtLeast : nil
-        let wrong = (negativeConversations ?? 0) > 0 ? wrongAtMost : nil
+        // a bound that holds for any model ("认出 ≥ 0%", "误认 ≤ 100%") says nothing and reads as a broken one
+        let found = (conversations ?? 0) > 0 ? foundAtLeast.map { Int(($0 * 100 + 1e-9).rounded(.down)) }.flatMap { $0 > 0 ? $0 : nil } : nil
+        let wrong = (negativeConversations ?? 0) > 0 ? wrongAtMost.map { Int(($0 * 100 - 1e-9).rounded(.up)) }.flatMap { $0 < 100 ? $0 : nil } : nil
         guard found != nil || wrong != nil else { return nil }
         let held = (found != nil ? conversations ?? 0 : 0) + (wrong != nil ? negativeConversations ?? 0 : 0)
         var parts = ["\(held) 段"]
-        if let found { parts.append("认出 ≥ \(Int((found * 100 + 1e-9).rounded(.down)))%") }
-        if let wrong { parts.append("误认 ≤ \(Int((wrong * 100 - 1e-9).rounded(.up)))%") }
+        if let found { parts.append("认出 ≥ \(found)%") }
+        if let wrong { parts.append("误认 ≤ \(wrong)%") }
         return parts.joined(separator: " · ")
     }
 }
@@ -46,6 +47,24 @@ public struct SampleFlag: Decodable, Equatable, Hashable, Sendable {
     public var reasons: [String]?
     /// Still waiting for an answer (a confirmed flag stays with `open: false`).
     public var open: Bool?
+}
+
+extension VoiceSample {
+    /// When it was said: its clip's start, else its conversation's, else when it was added.
+    public var spokenAt: String? { clip?.startedAt ?? conversation?.startedAt ?? createdAt }
+
+    /// The page's order: newest said first (the server sends newest added first); ties and undated keep its order.
+    public static func newestSpokenFirst(_ samples: [VoiceSample]) -> [VoiceSample] {
+        let at = samples.map { $0.spokenAt.flatMap(ISO8601UTC.parse) }
+        return samples.indices.sorted { a, b in
+            switch (at[a], at[b]) {
+            case let (x?, y?) where x != y: x > y
+            case (_?, nil): true
+            case (nil, _?): false
+            default: a < b
+            }
+        }.map { samples[$0] }
+    }
 }
 
 /// One voice sample of a person (`GET /v1/people/{id}/samples`).
