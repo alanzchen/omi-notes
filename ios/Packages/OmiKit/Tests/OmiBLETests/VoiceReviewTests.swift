@@ -332,6 +332,26 @@ final class VoicesHubStub: URLProtocol, @unchecked Sendable {
         #expect(sent("GET", "/samples").last?.query == "state=removed")
     }
 
+    @Test func samplesLoadNewestSaidFirstAndActionsKeepTheirIdentity() async throws {
+        // the server sends newest added first; the page lists newest said first (Carbon C1-02)
+        let dated = #"""
+        {"samples":[
+          {"id":"old","person_id":"p-alan","state":"active","revision":1,"created_at":"2026-11-26T05:00:00Z",
+           "clip":{"id":"sample.old.0","started_at":"2026-11-21T10:00:00Z"}},
+          {"id":"new","person_id":"p-alan","state":"active","revision":4,"created_at":"2026-11-26T04:00:00Z",
+           "clip":{"id":"sample.new.0","started_at":"2026-11-25T10:00:00Z"}},
+          {"id":"mid","person_id":"p-alan","state":"active","revision":2,"created_at":"2026-11-24T09:00:00Z"}]}
+        """#
+        let m = VoiceSamplesModel(speakers: try speakers(), personId: "p-alan", tab: .active)
+        VoicesHubStub.routes["GET /v1/people/p-alan/samples"] = [(200, dated)]
+        VoicesHubStub.routes["POST /v1/samples/new/remove"] = [(200, #"{"sample":{"id":"new","state":"removed","revision":5},"request_id":"r","undo_token":"t"}"#)]
+        await m.load()
+        #expect(m.samples.map(\.id) == ["new", "mid", "old"])
+        #expect(await m.remove(m.samples[0]))
+        #expect(sent("POST", "/samples/new/remove").first?.body["expected_revision"] as? Int == 4)
+        #expect(m.samples.map(\.id) == ["mid", "old"])
+    }
+
     @Test func removeIsRestorableAndUndoable() async throws {
         let m = VoiceSamplesModel(speakers: try speakers(), personId: "p-alan", tab: .active)
         VoicesHubStub.routes["GET /v1/people/p-alan/samples"] = [(200, Self.samples)]

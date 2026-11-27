@@ -114,7 +114,7 @@ import Testing
     @Test func measuredOmitsBoundsThatSayNothing() throws {
         // "认出 ≥ 0%" and "误认 ≤ 100%" are true of any model: shown, they read as a broken one
         let zero = try decode(MeasuredPerformance.self, #"{"conversations":4,"found_at_least":0.003,"negative_conversations":7,"wrong_at_most":0.318}"#)
-        #expect(zero.compactLine == "7 段 · 误认 ≤ 32%")
+        #expect(zero.compactLine == nil)  // positives held out, none shown found: no reassuring wrong-only line (C1-01)
         let none = try decode(MeasuredPerformance.self, #"{"conversations":2,"found_at_least":0.0,"negative_conversations":1,"wrong_at_most":0.9995}"#)
         #expect(none.compactLine == nil)
     }
@@ -127,6 +127,32 @@ import Testing
             + #"{"id":"d","created_at":"2026-11-26T03:00:00Z","clip":{"id":"c4","started_at":"2026-11-25T10:00:00Z"}}]"#
         let samples = try decode([VoiceSample].self, raw)
         #expect(VoiceSample.newestSpokenFirst(samples).map(\.id) == ["b", "d", "c", "a"])
+    }
+
+    @Test func aSilentModelGetsNoReassuringLine() throws {
+        // positives were held out but the found bound rounds to 0%: a model that names nobody has no false positives,
+        // so the wrong bound alone would read as a good model (Carbon C1-01)
+        let silent = try decode(MeasuredPerformance.self, #"{"conversations":213,"found_at_least":0.0,"negative_conversations":30,"wrong_at_most":0.133}"#)
+        #expect(silent.compactLine == nil)
+        let missing = try decode(MeasuredPerformance.self, #"{"conversations":6,"negative_conversations":30,"wrong_at_most":0.133}"#)
+        #expect(missing.compactLine == nil)
+        // no positives held out: recall wasn't measured, the false-positive bound stands alone
+        let untested = try decode(MeasuredPerformance.self, #"{"conversations":0,"negative_conversations":35,"wrong_at_most":0.0821}"#)
+        #expect(untested.compactLine == "35 段 · 误认 ≤ 9%")
+    }
+
+    @Test func aWrongBoundOfAboutAllIsDroppedAndTheFoundBoundKept() throws {
+        let m = try decode(MeasuredPerformance.self, #"{"conversations":12,"found_at_least":0.62,"negative_conversations":3,"wrong_at_most":0.9901}"#)
+        #expect(m.compactLine == "12 段 · 认出 ≥ 62%")
+    }
+
+    @Test func whenSaidFallsBackPastAnUnreadableClipTime() throws {
+        let raw = #"[{"id":"conv","created_at":"2026-11-20T00:00:00Z","clip":{"id":"c","started_at":"not a time"},"#
+            + #""conversation":{"id":"x","started_at":"2026-11-24T08:00:00Z"}},"#
+            + #"{"id":"undated"},{"id":"added","created_at":"2026-11-22T00:00:00Z"}]"#
+        let samples = try decode([VoiceSample].self, raw)
+        #expect(samples[0].spokenAt == "2026-11-24T08:00:00Z")  // a malformed clip time never hides the conversation's
+        #expect(VoiceSample.newestSpokenFirst(samples).map(\.id) == ["conv", "added", "undated"])  // undated last
     }
 
     @Test func measuredWithoutCountsShowsNothing() throws {
@@ -158,7 +184,9 @@ import Testing
         #expect(VoicesHub.measuredLine(unknown, calibrationSupported: true) == nil)
         var active = inactive
         active.autoActive = true
-        #expect(VoicesHub.measuredLine(active, calibrationSupported: true) == "30 段 · 误认 ≤ 14%")  // the 0% found bound says nothing
+        #expect(VoicesHub.measuredLine(active, calibrationSupported: true) == nil)  // 213 positives, 0% found: no line (C1-01)
+        active.measured = try decode(MeasuredPerformance.self, #"{"conversations":213,"found_at_least":0.71,"negative_conversations":30,"wrong_at_most":0.133}"#)
+        #expect(VoicesHub.measuredLine(active, calibrationSupported: true) == "243 段 · 认出 ≥ 71% · 误认 ≤ 14%")
     }
 
     // MARK: Hub

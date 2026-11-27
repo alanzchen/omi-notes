@@ -31,8 +31,11 @@ public struct MeasuredPerformance: Codable, Equatable, Hashable, Sendable {
     /// each rounded the conservative way. nil when nothing was counted or no bound exists.
     public var compactLine: String? {
         // a bound that holds for any model ("认出 ≥ 0%", "误认 ≤ 100%") says nothing and reads as a broken one
-        let found = (conversations ?? 0) > 0 ? foundAtLeast.map { Int(($0 * 100 + 1e-9).rounded(.down)) }.flatMap { $0 > 0 ? $0 : nil } : nil
-        let wrong = (negativeConversations ?? 0) > 0 ? wrongAtMost.map { Int(($0 * 100 - 1e-9).rounded(.up)) }.flatMap { $0 < 100 ? $0 : nil } : nil
+        let found = (conversations ?? 0) > 0 ? foundAtLeast.flatMap { $0.isFinite ? Int(($0 * 100 + 1e-9).rounded(.down)) : nil }.flatMap { $0 > 0 ? $0 : nil } : nil
+        let wrong = (negativeConversations ?? 0) > 0 ? wrongAtMost.flatMap { $0.isFinite ? Int(($0 * 100 - 1e-9).rounded(.up)) : nil }.flatMap { $0 < 100 ? $0 : nil } : nil
+        // Positives were held out but none is shown as found: a model that names nobody also names nobody wrongly, so
+        // the wrong bound alone would read as a good one (Carbon C1-01). No line, rather than a reassuring one.
+        if (conversations ?? 0) > 0 && found == nil { return nil }
         guard found != nil || wrong != nil else { return nil }
         let held = (found != nil ? conversations ?? 0 : 0) + (wrong != nil ? negativeConversations ?? 0 : 0)
         var parts = ["\(held) 段"]
@@ -51,7 +54,10 @@ public struct SampleFlag: Decodable, Equatable, Hashable, Sendable {
 
 extension VoiceSample {
     /// When it was said: its clip's start, else its conversation's, else when it was added.
-    public var spokenAt: String? { clip?.startedAt ?? conversation?.startedAt ?? createdAt }
+    public var spokenAt: String? {
+        // each candidate parsed first: a malformed clip time never hides the conversation's (Carbon C1-03)
+        [clip?.startedAt, conversation?.startedAt, createdAt].compactMap { $0 }.first { ISO8601UTC.parse($0) != nil }
+    }
 
     /// The page's order: newest said first (the server sends newest added first); ties and undated keep its order.
     public static func newestSpokenFirst(_ samples: [VoiceSample]) -> [VoiceSample] {
