@@ -555,7 +555,10 @@ class SpeakerService:
             self.store.sync_conversation(conv_id)  # an earlier attempt may have failed after its file write
             # recovery first: it may change this label (and its revision); everything below reads after it
             self.store.reconcile()
-            self._conversation(conv_id)
+            shown = self._conversation(conv_id)["speakers_revision"]
+            # a move to another transcript makes a revision read before it stale (Carbon IT2-03); adopting this
+            # transcript's own voices file (crash recovery, same labels) doesn't
+            same_transcript = not self.store.move_pending(conv_id)
             transcript = self._transcript(conv_id)
             self.pipeline.move_labels(conv_id, transcript)  # states of an earlier transcript don't apply
             if self.store.move_pending(conv_id):  # deferred (a FROZEN person): never one transcript's label on another's
@@ -572,7 +575,7 @@ class SpeakerService:
             if done is not None:  # a retry of an applied request: finish its work, answer with the current state
                 self.db.set_meta("relabel_pending", "1")
                 return Outcome(row["speakers_revision"], self._label_list(conv_id, transcript), [], done.get("sample", "none"))
-            if expected != row["speakers_revision"]:  # one read before a label move is stale (Carbon IT2-03)
+            if expected != row["speakers_revision"] and not (same_transcript and expected == shown):
                 raise ApiError(409, "stale_revision", f"speakers are at revision {row['speakers_revision']}")
             for pid in (person_id, not_person):
                 if pid is not None and self.store.person(pid) is None:
