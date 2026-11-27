@@ -283,10 +283,15 @@ class Review:
                 if (current := self._label_still_open(value)) is None:
                     continue
                 item = self._label_item(*current, evidence=evidence)
-                asked = self.store.person(item["person_id"]) if item.get("person_id") else None
-                if self.service.served_blocked(asked["id"] if asked else None, bool(asked["me"]) if asked else False,
-                                               automatic=item.get("reasons") == ["auto"], unknown=item.get("reasons") == ["possible"]):
-                    continue  # a settings opt-out the worker hasn't rebuilt the queue for yet (I4)
+            # samples and labels alike (Carbon IT2-02): a person forgotten, or whose voice was, since the build, or a
+            # settings opt-out the worker hasn't rebuilt the queue for yet (I4), is never asked about
+            pid = item.get("person_id")
+            asked = self.store.person(pid) if pid else None
+            if pid and (asked is None or self.db.one("SELECT 1 FROM samples WHERE person_id=? LIMIT 1", (pid,)) is None):
+                continue
+            if self.service.served_blocked(pid, bool(asked["me"]) if asked else False,
+                                           automatic=item.get("reasons") == ["auto"], unknown=item.get("reasons") == ["possible"]):
+                continue
             if item.get("playable") and item.get("clip"):
                 out.append(item)
         for item in out:  # the person each item asks about, by name (the phone never shows a placeholder)

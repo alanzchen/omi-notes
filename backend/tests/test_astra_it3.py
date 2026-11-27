@@ -257,7 +257,8 @@ def test_ryw_name_a_voice(tmp_path, monkeypatch):
 def test_ryw_forget(tmp_path, monkeypatch):
     client, svc, store, pid, vec, conv, _ = _setup_person(tmp_path, source="user")
     calls = _no_request_builds(svc, monkeypatch)
-    assert client.delete(f"/v1/people/{pid}", headers=AUTH).status_code == 200
+    # the note deleted too: gone (with the note kept the card stays, without a voice: test_review_it2)
+    assert client.delete(f"/v1/people/{pid}?delete_note=true", headers=AUTH).status_code == 200
     assert pid not in _people(client)
     assert _names(client, conv)["S1"] is None
     samples = client.get(f"/v1/people/{pid}/samples", headers=AUTH)  # 404, or nothing left of their voice

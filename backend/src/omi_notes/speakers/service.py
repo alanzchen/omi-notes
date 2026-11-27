@@ -41,6 +41,9 @@ PEOPLE_RECONCILE_SECONDS = 300.0
 # legacy suggestions kept in the snapshot: the endpoint's largest page
 SUGGESTIONS_KEPT = 20
 EXCERPT_CHARS = 140
+# A person card's voice fields with no voice behind them (a forgotten voice, or a stored card the index can't vouch for)
+NO_VOICE = {"samples": 0, "sessions": 0, "samples_active": 0, "samples_flagged": 0, "samples_removed": 0, "review_count": 0,
+            "auto_active": False, "voice_ready": False, "measured": None, "status_line": None}
 CLIP_TEXT_CHARS = 240
 
 
@@ -129,16 +132,22 @@ class SpeakerService:
         return p
 
     def _load_people_cache(self) -> PeopleSnapshot:
+        """The stored snapshot, served until this process's first build (not ready). It is never authoritative over the
+        index for privacy (Carbon IT2-01): who exists, their name and "me" come from `people`, a person without sample
+        rows has no voice fields, automatic naming shows off and no suggestion is served until a build decides them."""
         try:
             data = json.loads(self._people_cache.read_text())
             if not isinstance(data["people"], list) or not isinstance(data.get("suggestions") or [], list):
                 raise ValueError("people.json: people is not a list")  # C2-04
-            return PeopleSnapshot(people=list(data["people"]), suggestions=data.get("suggestions"), generation=0,
-                                  by_id={p.get("id"): p for p in data["people"] if isinstance(p, dict)},
-                                  wearer=next((p.get("id") for p in data["people"] if isinstance(p, dict) and p.get("me")), None),
-                                  built_at=float(data["built_at"]), inputs=None, ready=False)  # fmt: skip
+            stored, built_at = {p.get("id"): p for p in data["people"] if isinstance(p, dict)}, float(data["built_at"])
         except (OSError, ValueError, KeyError, TypeError):
-            return PeopleSnapshot(people=[], suggestions=None, generation=0, built_at=None, inputs=None, ready=False)
+            stored, built_at = None, None
+        voiced = {r[0] for r in self.db.query("SELECT DISTINCT person_id FROM samples")}
+        people = [(stored or {}).get(r["id"], {}) | {"id": r["id"], "name": r["name"], "me": bool(r["me"]), "note_path": r["note_path"]}
+                  | ({"auto_active": False, "status_line": None} if r["id"] in voiced else NO_VOICE)
+                  for r in self.db.query("SELECT id, name, me, note_path FROM people ORDER BY me DESC, name")] if stored is not None else []
+        return PeopleSnapshot(people=people, suggestions=None, generation=0, by_id={p["id"]: p for p in people},
+                              wearer=next((p["id"] for p in people if p["me"]), None), built_at=built_at, inputs=None, ready=False)
 
     def _people_inputs(self) -> tuple:
         """What the snapshot depends on, cheaply (worker only): the evidence digest (samples, labels, people, consent,
@@ -362,16 +371,18 @@ class SpeakerService:
         """Intent only (I4 for PUT person; Astra IT2B-08): the note and this person's index row are written, a relabel
         is marked, and this person's fields are served from an overlay until the worker's next build publishes. No
         global rebuild on the request: the snapshot rebuild is the worker's. The answer is the person as now served."""
-        created = self._put_person_write(person_id, body)
-        row = self.store.person(person_id)
-        fields = {"id": person_id, "name": row["name"], "me": bool(row["me"]), "note_path": row["note_path"]}
-        with self._people_lock:
-            if fields["me"]:  # at most one wearer: the latest PUT wins in the overlay too
-                self._people_overlay = {pid: (tag, f | {"me": False}) for pid, (tag, f) in self._people_overlay.items()}
-            self._people_overlay[person_id] = (self._people_seq, fields)
-            self._forgotten.pop(person_id, None)
-        snap, _, _, wearer = self._view()
-        return (201 if created else 200), self._served_person((snap.by_id or {}).get(person_id, {}) | fields, wearer)
+        with self.store.lock:  # the overlay too (Carbon IT2-01): a forget can't land between the write and it
+            created = self._put_person_write(person_id, body)
+            row = self.store.person(person_id)
+            fields = {"id": person_id, "name": row["name"], "me": bool(row["me"]), "note_path": row["note_path"]}
+            with self._people_lock:
+                if fields["me"]:  # at most one wearer: the latest PUT wins in the overlay too
+                    self._people_overlay = {pid: (tag, f | {"me": False}) for pid, (tag, f) in self._people_overlay.items()}
+                # merged: a forgotten voice's zeroed fields stay until a build
+                self._people_overlay[person_id] = (self._people_seq, self._people_overlay.get(person_id, (0, {}))[1] | fields)
+                self._forgotten.pop(person_id, None)
+        snap, overlay, _, wearer = self._view()
+        return (201 if created else 200), self._served_person((snap.by_id or {}).get(person_id, {}) | overlay[person_id][1], wearer)
 
     def _put_person_write(self, person_id: str, body: dict) -> bool:
         if not UUID_RE.match(person_id):
@@ -421,9 +432,14 @@ class SpeakerService:
             self.store.forget_voice(person_id, delete_note=delete_note)
             self.store.samples_changed()
             self.db.set_meta("relabel_pending", "1")
-            with self._people_lock:  # gone from every served answer now; the worker's next build agrees
+            kept = self.store.person(person_id)  # the note kept: the person stays, with no voice (Carbon IT2-01)
+            with self._people_lock:  # served now; the worker's next build agrees
                 self._people_overlay.pop(person_id, None)
-                self._forgotten[person_id] = self._people_seq
+                if kept is None:
+                    self._forgotten[person_id] = self._people_seq
+                else:
+                    self._people_overlay[person_id] = (self._people_seq, NO_VOICE | {
+                        "id": person_id, "name": kept["name"], "me": bool(kept["me"]), "note_path": kept["note_path"]})
         return affected
 
     # -- conversation speakers -------------------------------------------------------------------
@@ -539,11 +555,11 @@ class SpeakerService:
             self.store.sync_conversation(conv_id)  # an earlier attempt may have failed after its file write
             # recovery first: it may change this label (and its revision); everything below reads after it
             self.store.reconcile()
-            # a pending label move is the worker's, so a GET may have shown the revision before it: that one is accepted
-            # (the move changes no decision); one from before recovery is stale
-            shown = self._conversation(conv_id)["speakers_revision"]
+            self._conversation(conv_id)
             transcript = self._transcript(conv_id)
             self.pipeline.move_labels(conv_id, transcript)  # states of an earlier transcript don't apply
+            if self.store.move_pending(conv_id):  # deferred (a FROZEN person): never one transcript's label on another's
+                raise ApiError(409, "recovery_pending", "this conversation's speakers are waiting to move to its new transcript")
             row = self._conversation(conv_id)
             if label not in {s["speaker"] for s in transcript.get("segments") or []}:
                 raise ApiError(404, "not_found", f"conversation has no speaker {label}")
@@ -556,7 +572,7 @@ class SpeakerService:
             if done is not None:  # a retry of an applied request: finish its work, answer with the current state
                 self.db.set_meta("relabel_pending", "1")
                 return Outcome(row["speakers_revision"], self._label_list(conv_id, transcript), [], done.get("sample", "none"))
-            if expected not in (row["speakers_revision"], shown):
+            if expected != row["speakers_revision"]:  # one read before a label move is stale (Carbon IT2-03)
                 raise ApiError(409, "stale_revision", f"speakers are at revision {row['speakers_revision']}")
             for pid in (person_id, not_person):
                 if pid is not None and self.store.person(pid) is None:
