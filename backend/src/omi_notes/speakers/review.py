@@ -287,7 +287,9 @@ class Review:
             # settings opt-out the worker hasn't rebuilt the queue for yet (I4), is never asked about
             pid = item.get("person_id")
             asked = self.store.person(pid) if pid else None
-            if pid and (asked is None or self.db.one("SELECT 1 FROM samples WHERE person_id=? LIMIT 1", (pid,)) is None):
+            # an eligible (active) sample: a removed or moved one teaches nothing (`sample_eligible`, Carbon IT4-02)
+            if pid and (asked is None or self.db.one("SELECT 1 FROM samples WHERE person_id=? AND COALESCE(state, 'active')='active' "
+                                                     "LIMIT 1", (pid,)) is None):
                 continue
             if self.service.served_blocked(pid, bool(asked["me"]) if asked else False,
                                            automatic=item.get("reasons") == ["auto"], unknown=item.get("reasons") == ["possible"]):

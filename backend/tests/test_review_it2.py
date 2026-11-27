@@ -196,3 +196,15 @@ def test_a_put_answers_even_if_a_build_drops_its_overlay_right_after_the_write(t
     r = client.put(f"/v1/people/{pid}", json={"name": "Gigi Renamed"}, headers=AUTH)
     assert r.status_code == 200, r.text  # the write is committed: never a 500
     assert r.json()["name"] == "Gigi Renamed"
+
+
+def test_review_serves_no_hint_for_a_person_whose_samples_were_all_removed(tmp_path, monkeypatch):
+    """IT4-02: a removed (or moved) sample teaches nothing (`sample_eligible`), so a hint about a person with no active
+    sample left is stale, as one about a forgotten voice is."""
+    e = Env(tmp_path, unknown_voices=True)
+    _review_with(e, monkeypatch, [("label", {"person_id": e.gigi, "reasons": ["possible"]})])
+    assert _served(e) == [("label", e.gigi)]
+    for row in e.store.db.query("SELECT id FROM samples WHERE person_id=?", (e.gigi,)):
+        r = e.client.post(f"/v1/samples/{row['id']}/remove", json={"request_id": f"rm-{row['id']}"}, headers=AUTH)
+        assert r.status_code == 200, r.text
+    assert _served(e) == []
