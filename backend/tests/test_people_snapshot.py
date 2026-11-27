@@ -150,8 +150,7 @@ def test_a_failed_rebuild_after_a_committed_mutation_is_not_ready_until_the_work
     real = speakers._compute_suggestions  # a step only the snapshot build runs: the mutation itself succeeds
     monkeypatch.setattr(speakers, "_compute_suggestions", broken)
     assert client.put(f"/v1/people/{pid}", json={"name": "Ivy Ng"}, headers=AUTH).status_code == 200, "the change is durable"
-    # a mutation that still rebuilds in the request (a dismissal), whose build fails
-    assert client.post("/v1/speakers/suggestions/s-none/dismiss", headers=AUTH).status_code in (200, 204)
+    speakers.warm()  # no mutation builds in its request (Carbon D1): the worker's build after it fails
     stale = _people(client)
     assert stale["ready"] is False and stale["stale"] is True, "the old list is marked, never silently current"
     monkeypatch.setattr(speakers, "_compute_suggestions", real)

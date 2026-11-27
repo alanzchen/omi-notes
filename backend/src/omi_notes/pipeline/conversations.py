@@ -303,6 +303,8 @@ class ConversationPipeline:
         self.vad_label = vad_label
         self.vad_warning = vad_warning
         self._move_retries: dict[str, tuple[int, float]] = {}
+        self._moves_deferred: set[str] = set()  # label moves the worker retries (`_finish_move`)
+        self._moves_checked = False
         self._status_written: tuple[float, str] | None = None
         self._stub_written: dict[str, float] = {}
         self._class_rank: dict[str, int] = {}  # conversation → summarizing priority (recording class), this process
@@ -851,6 +853,8 @@ class ConversationPipeline:
                              for st in stored.values() if st.get("person_id")):  # fmt: skip
                 log.info("conversation %s: label move deferred (a named person's files can't be read)",
                          conv_id)
+                self._moves_deferred.add(conv_id)  # the worker's relabel pass retries it (never a GET)
+                self.db.set_meta("relabel_pending", "1")
                 if fresh and voices is not None:  # new evidence is kept as its own generation; nothing is retired
                     self.speakers.write_voices(conv_id, name, embedder.model, embedder.model_sha, voices,
                                                self.speakers.vector_labels(stored, set(voices), raw=True, prefs=prefs, memo=memo))
@@ -964,6 +968,8 @@ class ConversationPipeline:
             if row is None:
                 continue
             self.speakers.sync_labels_index(conv_id)  # never overwrite the file with a stale index
+            if (conv_id in self._moves_deferred or not self._moves_checked) and self._finish_move(conv_id):
+                continue  # still deferred: its states wait for the move, not reassigned under the old labels
             voices = self.speakers.voices(conv_id)
             current = self.speakers.labels(conv_id)
             key = next(((v.model, v.model_sha) for v in voices.values()), None)
@@ -987,15 +993,30 @@ class ConversationPipeline:
             named = any(s.get("person_id") for s in (states | current).values())
             if (differs or names_changed) and row["note_path"] and named:
                 self._set(conv_id, needs_render=1, next_attempt_at=None)
+        self._moves_checked = True
         # the policy change behind this pass is applied to stored vectors too, whether or not any state changed (I4):
         # before the pass is marked done, so a crash leaves it pending
         self.speakers.reconcile_vectors()
-        if self.speakers.prune_failures:  # pending only for what failed; the rest was pruned (Astra IT2B-06)
+        if self.speakers.prune_failures or self._moves_deferred:  # pending only for what is left (Astra IT2B-06)
             self.db.set_meta("rendered_names", names)
             return changed
         self.db.set_meta("relabel_pending", None)
         self.db.set_meta("rendered_names", names)
         return changed
+
+    def _finish_move(self, conv_id: str) -> bool:
+        """A label move a GET used to finish is the worker's (Carbon D1 invariant 1): moved now when the files allow,
+        else kept deferred. Checked for every conversation once per process (a rebuilt index), then only deferred ones.
+        Whether it is still pending."""
+        try:  # also a voices file a crash left unreferenced (`labels_to_move`)
+            transcript = json.loads((self.conv_dir(conv_id) / "transcript.json").read_text())
+            if self.speakers.labels_to_move(conv_id, transcript):
+                self.move_labels(conv_id, transcript)
+        except (OSError, ValueError) as exc:  # one conversation never stalls the pass
+            log.warning("conversation %s: label move not finished (%s)", conv_id, exc)
+        pending = self.speakers.move_pending(conv_id)
+        (self._moves_deferred.add if pending else self._moves_deferred.discard)(conv_id)
+        return pending
 
     def voice_names(self, conv_id: str) -> dict[str, tuple[str, bool]]:
         return {label: (v["name"], v["me"]) for label, v in self.speakers.names(conv_id).items()}

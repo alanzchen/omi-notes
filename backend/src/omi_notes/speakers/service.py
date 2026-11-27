@@ -8,7 +8,6 @@ vectors are kept only with the separate opt-in, and only while the conversation'
 
 from __future__ import annotations
 
-import functools
 import io
 import json
 import logging
@@ -30,7 +29,7 @@ from . import match as speaker_match
 from . import suggest as speaker_suggest
 from . import journal
 from .review import Review, status_line
-from .store import same_clips, sample_eligible, voices_name
+from .store import FROZEN, same_clips, sample_eligible, voices_name
 from ..vault import Vault
 from .voices import Clip, LabelVoice, embed_voices
 
@@ -53,31 +52,6 @@ class Outcome:
     sample: str  # created | exists | not_acknowledged | not_attested | no_audio | none
 
 
-def _rebuilds_people(method):
-    """A mutation that can change what GET /v1/people (or the legacy suggestions) shows: once it returns or raises, the
-    snapshot is rebuilt in the same request (a write may pay the cost; a GET may not). Nested mutations rebuild once."""
-
-    @functools.wraps(method)
-    def wrapper(self, *args, **kwargs):
-        depth = getattr(self._people_depth, "n", 0)
-        self._people_depth.n = depth + 1
-        try:
-            result = method(self, *args, **kwargs)
-        except BaseException:
-            # it may have changed something before failing (a journaled operation finishes later): the snapshot
-            # can't be called current, and no build runs inside a failed request; the worker rebuilds it
-            if depth == 0:
-                self._mark_people_stale()
-            raise
-        finally:
-            self._people_depth.n = depth
-        if depth == 0:
-            self.refresh_people()
-        return result
-
-    return wrapper
-
-
 @dataclass(frozen=True)
 class PeopleSnapshot:
     """What GET /v1/people and GET /v1/speakers/suggestions serve. `generation` is taken when its build started."""
@@ -90,6 +64,8 @@ class PeopleSnapshot:
     ready: bool
     stale: bool = False
     wearer: str | None = None  # the "me" person's id, so a suggestions page needn't scan people (Astra IT2B-07)
+    by_id: dict | None = None  # people by id: one person's answer without copying every card (Astra IT3-06)
+    calibration_stale: bool | None = None  # computed by the build (the GET never gathers calibration inputs)
 
 
 class SpeakerService:
@@ -104,12 +80,16 @@ class SpeakerService:
         self._people_lock = threading.Lock()
         self._people_seq = 0  # the last generation handed to a build
         self._people_floor = 0  # builds that started at or before a failed post-mutation build can't publish
-        self._people_depth = threading.local()
         self._people_reconciled_at: float | None = None
         self._people_cache = self.db.path.parent / "people.json"  # operational cache beside the index, never vault data
         self._people = self._load_people_cache()
         self._served_prefs = self.store.settings()  # the settings served outputs apply at once (`served_blocked`)
-        self._people_overlay: dict[str, tuple[int, dict]] = {}  # PUT person read-your-write, until the worker rebuilds
+        # Read-your-write overlays (metadata and suppression only, never identity math), each tagged with the generation
+        # current at its mutation and dropped once a build that started after it publishes: a PUT person's fields, a
+        # forgotten person, a suggestion dismissed or acted on.
+        self._people_overlay: dict[str, tuple[int, dict]] = {}
+        self._forgotten: dict[str, int] = {}
+        self._hidden_suggestions: dict[str, int] = {}
 
     # -- people ----------------------------------------------------------------------------------
 
@@ -120,22 +100,33 @@ class SpeakerService:
         """GET /v1/people: the published snapshot, never a scan. `ready` false: no build in this process yet (the
         stored copy, or nothing) or the last post-mutation build failed (`stale`: the worker rebuilds it next tick).
         Older clients read only `people`."""
-        with self._people_lock:
-            snap, overlay = self._people, dict(self._people_overlay)
-        people = [p | {"auto_active": False, "status_line": "自动命名已关闭"} if p.get("auto_active") and self.served_blocked(p["id"], p.get("me"), automatic=True)
-                  else p for p in snap.people]  # fmt: skip
-        if overlay:  # a PUT person not yet in a published build (Astra IT2B-08): this person's fields, O(changed people)
-            seen = {p["id"] for p in people}
-            people = [p | overlay[p["id"]][1] if p["id"] in overlay else p for p in people]
-            people += [fields for pid, (_, fields) in overlay.items() if pid not in seen]
-            if any(fields.get("me") for _, fields in overlay.values()):
-                me_id = next(pid for pid, (_, fields) in overlay.items() if fields.get("me"))
-                people = [p | {"me": False} if p.get("me") and p["id"] != me_id else p for p in people]
+        snap, overlay, forgotten, wearer = self._view()
+        people = [p for p in snap.people if p["id"] not in forgotten and p["id"] not in overlay]
+        people += [(snap.by_id or {}).get(pid, {}) | f for pid, (_, f) in overlay.items()]
+        people = [self._served_person(p, wearer) for p in people]
         out = {"people": people, "ready": snap.ready and not snap.stale, "generation": snap.generation,
                "as_of": iso_utc_epoch(snap.built_at) if snap.built_at else None}  # fmt: skip
         if snap.stale:
             out["stale"] = True
         return out
+
+    def _view(self) -> tuple:
+        """The snapshot and the overlays, read together, and the one wearer they imply (Astra IT3-03): the latest PUT
+        that set "me", else the snapshot's wearer unless a PUT cleared it or it was forgotten since."""
+        with self._people_lock:
+            snap, overlay, forgotten = self._people, dict(self._people_overlay), set(self._forgotten)
+        mine = [(tag, pid) for pid, (tag, f) in overlay.items() if f.get("me")]
+        wearer = max(mine)[1] if mine else snap.wearer
+        if wearer in forgotten or (not mine and wearer in overlay):
+            wearer = None
+        return snap, overlay, forgotten, wearer
+
+    def _served_person(self, p: dict, wearer: str | None) -> dict:
+        """A card as served: "me" is the effective wearer, then the settings in memory (`served_blocked`)."""
+        p = p | {"me": p["id"] == wearer}
+        if p.get("auto_active") and self.served_blocked(p["id"], p["me"], automatic=True):
+            p |= {"auto_active": False, "status_line": "自动命名已关闭"}
+        return p
 
     def _load_people_cache(self) -> PeopleSnapshot:
         try:
@@ -143,6 +134,7 @@ class SpeakerService:
             if not isinstance(data["people"], list) or not isinstance(data.get("suggestions") or [], list):
                 raise ValueError("people.json: people is not a list")  # C2-04
             return PeopleSnapshot(people=list(data["people"]), suggestions=data.get("suggestions"), generation=0,
+                                  by_id={p.get("id"): p for p in data["people"] if isinstance(p, dict)},
                                   wearer=next((p.get("id") for p in data["people"] if isinstance(p, dict) and p.get("me")), None),
                                   built_at=float(data["built_at"]), inputs=None, ready=False)  # fmt: skip
         except (OSError, ValueError, KeyError, TypeError):
@@ -187,19 +179,23 @@ class SpeakerService:
                 inputs = self._people_inputs()
                 people = self._compute_people(problems)
                 suggestions = self._compute_suggestions(time.time() if now is None else now, problems=problems)
+                calibration_stale = self._calibration_stale()
                 self._publish_problems(problems)
             except Exception:
                 log.exception("could not build the people snapshot (generation %s)", gen)
                 self._mark_people_stale(gen)
                 return False
             built = PeopleSnapshot(people=people, suggestions=suggestions, generation=gen, built_at=time.time(),
-                                   inputs=inputs, ready=True, wearer=next((p["id"] for p in people if p["me"]), None))  # fmt: skip
+                                   inputs=inputs, ready=True, wearer=next((p["id"] for p in people if p["me"]), None),
+                                   by_id={p["id"]: p for p in people}, calibration_stale=calibration_stale)  # fmt: skip
             with self._people_lock:  # the file is written under the lock too, so it never goes back to an older build
                 if gen <= self._people.generation or gen <= self._people_floor:
                     return False
                 self._people = built
-                # a PUT person's overlay is served until a build that started after it publishes
+                # an overlay is served until a build that started after its mutation publishes
                 self._people_overlay = {pid: (tag, f) for pid, (tag, f) in self._people_overlay.items() if tag >= gen}
+                self._forgotten = {pid: tag for pid, tag in self._forgotten.items() if tag >= gen}
+                self._hidden_suggestions = {sid: tag for sid, tag in self._hidden_suggestions.items() if tag >= gen}
                 try:
                     self._write_people_cache(built)
                 except OSError:
@@ -276,7 +272,6 @@ class SpeakerService:
             })  # fmt: skip
         return out
 
-    @_rebuilds_people
     def import_enrollment(self, person_id: str, fields: dict, upload) -> tuple[int, dict]:
         """`POST /v1/people/{id}/enrollments/import` (`speakers.imports`)."""
         from .imports import Importer
@@ -300,14 +295,26 @@ class SpeakerService:
             return {}
 
     def calibration(self) -> dict:
-        """`GET /v1/speakers/calibration`: the last published calibration and whether its inputs changed since."""
+        """`GET /v1/speakers/calibration`: the last published calibration and whether its inputs changed since, as the
+        worker's last build found (no inputs gathered on the request)."""
+        from .calibration import Calibrator
+
+        current = Calibrator(self.pipeline).current()
+        pending = self.db.meta("calibrate_pending") is not None
+        with self._people_lock:
+            stale = self._people.calibration_stale
+        return {"calibration": current, "stale": current is None or pending or bool(stale), "pending": pending}
+
+    def _calibration_stale(self) -> bool | None:
         from .calibration import Calibrator
 
         calibrator = Calibrator(self.pipeline)
-        current = calibrator.current()
-        return {"calibration": current,
-                "stale": current is None or current.get("fingerprint") != calibrator.fingerprint(),
-                "pending": self.db.meta("calibrate_pending") is not None}  # fmt: skip
+        try:
+            current = calibrator.current()
+            return current is None or current.get("fingerprint") != calibrator.fingerprint()
+        except Exception:  # an unreadable input: not known to be current
+            log.exception("could not compare the calibration with its inputs")
+            return True
 
     # -- review and samples (`speakers.review`) ---------------------------------------------------
 
@@ -330,14 +337,12 @@ class SpeakerService:
     def review_items(self, limit: int, offset: int = 0) -> dict:
         return self.review.page(limit, offset)
 
-    @_rebuilds_people
     def review_decide(self, item_id: str, body: dict) -> dict:
         return self.review.decide(item_id, body)
 
     def person_samples(self, person_id: str, state: str | None) -> list[dict]:
         return self.review.person_samples(person_id, state)
 
-    @_rebuilds_people
     def sample_action(self, sample_id: str, action: str, body: dict) -> dict:
         if not UUID_RE.match(sample_id):
             raise ApiError(404, "not_found", "unknown sample")
@@ -364,8 +369,9 @@ class SpeakerService:
             if fields["me"]:  # at most one wearer: the latest PUT wins in the overlay too
                 self._people_overlay = {pid: (tag, f | {"me": False}) for pid, (tag, f) in self._people_overlay.items()}
             self._people_overlay[person_id] = (self._people_seq, fields)
-        served = next((p for p in self.people_answer()["people"] if p["id"] == person_id), fields)
-        return (201 if created else 200), served
+            self._forgotten.pop(person_id, None)
+        snap, _, _, wearer = self._view()
+        return (201 if created else 200), self._served_person((snap.by_id or {}).get(person_id, {}) | fields, wearer)
 
     def _put_person_write(self, person_id: str, body: dict) -> bool:
         if not UUID_RE.match(person_id):
@@ -385,7 +391,6 @@ class SpeakerService:
             self.store.samples_changed()  # consent or the wearer may have changed: recalibrate
         return created
 
-    @_rebuilds_people
     def forget(self, person_id: str, *, delete_note: bool) -> list[str]:
         with self.store.lock:
             if self.store.person(person_id) is None and not self.store.person_dir(person_id).exists():
@@ -416,6 +421,9 @@ class SpeakerService:
             self.store.forget_voice(person_id, delete_note=delete_note)
             self.store.samples_changed()
             self.db.set_meta("relabel_pending", "1")
+            with self._people_lock:  # gone from every served answer now; the worker's next build agrees
+                self._people_overlay.pop(person_id, None)
+                self._forgotten[person_id] = self._people_seq
         return affected
 
     # -- conversation speakers -------------------------------------------------------------------
@@ -449,19 +457,10 @@ class SpeakerService:
         return self.store.raw_available(row)
 
     def conversation_speakers(self, conv_id: str) -> dict:
-        self._conversation(conv_id)
-        self.store.reconcile()  # the revision shown is the one after recovery (what a change will be checked against)
-        transcript = self._transcript(conv_id)
-        # the recovery a change runs first, when there is any (checked without waiting for the lock), so the
-        # revision shown is the one a change will meet; decided again under the lock on the transcript then
-        # current (a reprocess may have published a newer one meanwhile), never on the copy read before
-        if self.store.labels_to_move(conv_id, transcript):
-            with self.store.lock:
-                transcript = self._transcript(conv_id)
-                if self.store.labels_to_move(conv_id, transcript):
-                    self.store.sync_conversation(conv_id)
-                    self.pipeline.move_labels(conv_id, transcript)
+        """Side-effect free (Astra IT3-05): recovery and label moves are the worker's; while a move is pending the labels
+        are served without names (`_label_list`), and a change accepts the revision shown here (`assign`)."""
         row = self._conversation(conv_id)
+        transcript = self._transcript(conv_id)
         return {
             "revision": row["speakers_revision"],
             "transcript_sha": row["transcript_sha"],
@@ -473,7 +472,8 @@ class SpeakerService:
         segments = transcript.get("segments") or []
         labels = sorted({s["speaker"] for s in segments}, key=speaker_match._label_key)
         states = {} if self.store.move_pending(conv_id) else self.store.labels(conv_id)  # no names across generations
-        people = {p["id"]: p for p in self.store.people()}
+        ids = sorted({st["person_id"] for st in states.values() if st.get("person_id")})
+        people = {p["id"]: p for p in self.db.query(f"SELECT * FROM people WHERE id IN ({','.join('?' * len(ids))})", ids)}
         clips = self._clips(conv_id, transcript)
         out = []
         for label in labels:
@@ -520,7 +520,6 @@ class SpeakerService:
                         "text": text[:CLIP_TEXT_CHARS] + ("…" if len(text) > CLIP_TEXT_CHARS else "")})  # fmt: skip
         return out
 
-    @_rebuilds_people
     def assign(self, conv_id: str, label: str, body: dict) -> Outcome:
         person_id = body.get("person_id")
         not_person = body.get("not_person_id")
@@ -540,7 +539,9 @@ class SpeakerService:
             self.store.sync_conversation(conv_id)  # an earlier attempt may have failed after its file write
             # recovery first: it may change this label (and its revision); everything below reads after it
             self.store.reconcile()
-            self._conversation(conv_id)
+            # a pending label move is the worker's, so a GET may have shown the revision before it: that one is accepted
+            # (the move changes no decision); one from before recovery is stale
+            shown = self._conversation(conv_id)["speakers_revision"]
             transcript = self._transcript(conv_id)
             self.pipeline.move_labels(conv_id, transcript)  # states of an earlier transcript don't apply
             row = self._conversation(conv_id)
@@ -555,7 +556,7 @@ class SpeakerService:
             if done is not None:  # a retry of an applied request: finish its work, answer with the current state
                 self.db.set_meta("relabel_pending", "1")
                 return Outcome(row["speakers_revision"], self._label_list(conv_id, transcript), [], done.get("sample", "none"))
-            if expected != row["speakers_revision"]:
+            if expected not in (row["speakers_revision"], shown):
                 raise ApiError(409, "stale_revision", f"speakers are at revision {row['speakers_revision']}")
             for pid in (person_id, not_person):
                 if pid is not None and self.store.person(pid) is None:
@@ -610,9 +611,10 @@ class SpeakerService:
             return Outcome(revision, self._label_list(conv_id, transcript), relabeled, sample)
 
     def _relabel(self, exclude: set[str] = frozenset()) -> list[str]:
-        """Re-run the assignment everywhere (people/samples changed); the conversations it relabeled."""
+        """People's voices changed: the assignment everywhere is re-run by the worker's next pass (never on a request;
+        the phone doesn't read `relabeled_conversations`). Nothing is relabeled here."""
         self.db.set_meta("relabel_pending", "1")
-        return sorted(set(self.pipeline.relabel(time.time())) - set(exclude))
+        return []
 
     def _sample_for(self, row, transcript: dict, label: str, person_id: str, request_id: str) -> tuple[str, str | None]:
         """A confirmed voiceprint from this label (deduplicated by request_id), if consented:
@@ -658,24 +660,33 @@ class SpeakerService:
         if not clips.get(label) or not self.audio_available(row):
             return None
         audio = self.pipeline.conversation_audio(row)
-        # Only the label being confirmed is embedded (Astra IT2B-02): every other speaker's stored voice (vector, F0)
-        # is carried over unchanged, so a FROZEN co-participant gains and loses nothing, and if this embedding fails
+        # Only the label being confirmed is embedded (Astra IT2B-02, IT3-01): every other speaker's stored voice (vector,
+        # F0) is carried over unchanged, so a FROZEN co-participant gains and loses nothing, and if this embedding fails
         # nothing is written or retired.
-        stored = {lab: old for lab, old in self.store.voices(row["id"]).items()
-                  if lab != label and lab in clips and (old.model, old.model_sha) == (embedder.model, embedder.model_sha)}
-        # speakers without a stored voice are embedded too (new evidence, nothing changed); stored ones are not
-        todo = {lab: [Clip(a, b, i) for i, (a, b) in enumerate(spans)] for lab, spans in clips.items() if lab not in stored}
+        model = (embedder.model, embedder.model_sha)
+        existing = {lab: old for lab, old in self.store.voices(row["id"]).items() if lab != label and lab in clips}
+        prefs, memo, states = self.store.settings(), {}, self.store.labels(row["id"])
+        frozen = any(st.get("person_id") and self.store.person_policy(st["person_id"], prefs, memo) == FROZEN
+                     for lab, st in states.items() if lab != label)  # fmt: skip
+        # A new generation would hold one model's vectors: with a bystander embedded by another model, or a FROZEN
+        # bystander (whose evidence is neither re-embedded nor moved), none is written and the generation stays.
+        new_generation = not frozen and all((old.model, old.model_sha) == model for old in existing.values())
+        # speakers without any stored voice are embedded too when a generation is written (new evidence, nothing changed)
+        todo = {lab: [Clip(a, b, i) for i, (a, b) in enumerate(spans)] for lab, spans in clips.items()
+                if lab == label or (new_generation and lab not in existing)}  # fmt: skip
         fresh = embed_voices(todo, audio.pcm, embedder)
         if label not in fresh or fresh[label].vector is None:
             return None
+        if not new_generation:
+            return fresh[label]  # the sample's evidence, in memory; the stored generation is untouched
         voices = dict(fresh)
-        for lab, old in stored.items():
+        for lab, old in existing.items():
             turns = max(1, int(old.turns or 1))
             voices[lab] = LabelVoice(lab, [Clip(float(a), float(b), min(i, turns - 1)) for i, (a, b) in enumerate(old.clips)],
                                          vector=old.vector, spread=old.spread, rms_db=old.rms_db, f0=old.f0,
                                          f0_voiced=old.f0_voiced)  # fmt: skip
         # `label` is about to be confirmed for someone who passed the consent checks (`_sample_for`)
-        keep = {label} | self.store.vector_labels(self.store.labels(row["id"]), set(voices), raw=True)
+        keep = {label} | self.store.vector_labels(states, set(voices), raw=True, prefs=prefs, memo=memo)
         name = voices_name(embedder, row["audio_sha"], row["transcript_sha"], clips)
         self.store.write_voices(row["id"], name, embedder.model, embedder.model_sha, voices, keep)
         self.store.reference_voices(row["id"], name)
@@ -731,20 +742,38 @@ class SpeakerService:
         return self.suggestions_answer(limit)["suggestions"]
 
     def suggestions_answer(self, limit: int) -> dict:
-        """GET /v1/speakers/suggestions: the slice plus the snapshot's ready/stale/generation/as_of, as /v1/people."""
+        """GET /v1/speakers/suggestions: the slice plus the snapshot's ready/stale/generation/as_of, as /v1/people. The
+        overlays apply first (a dismissed or acted-on suggestion, a forgotten person, the current wearer), then policy."""
+        snap, _, forgotten, wearer = self._view()
         with self._people_lock:
-            snap = self._people
+            hidden = set(self._hidden_suggestions)
         kept = []
-        for x in snap.suggestions or []:  # O(limit) past the blocked ones: the snapshot knows the wearer
+        for x in snap.suggestions or []:  # O(limit) past the blocked ones
             if len(kept) >= limit:
                 break
-            if not self.served_blocked(x.get("person_id"), x.get("person_id") == snap.wearer, unknown=True):
-                kept.append(x)
+            pid = x.get("person_id")
+            if x["id"] not in hidden and pid not in forgotten and not self.served_blocked(pid, pid == wearer, unknown=True):
+                kept.append({k: v for k, v in x.items() if k != "members"})
         out = {"suggestions": kept, "ready": snap.ready and not snap.stale,
                "generation": snap.generation, "as_of": iso_utc_epoch(snap.built_at) if snap.built_at else None}  # fmt: skip
         if snap.stale:
             out["stale"] = True
         return out
+
+    def _built_suggestion(self, suggestion_id: str) -> dict:
+        """A suggestion the last build published and nobody acted on since; its members come from the build (the
+        request never clusters)."""
+        snap, _, forgotten, _ = self._view()
+        with self._people_lock:
+            hidden = set(self._hidden_suggestions)
+        found = next((x for x in snap.suggestions or [] if x.get("id") == suggestion_id and x.get("members")), None)
+        if found is None or suggestion_id in hidden or found.get("person_id") in forgotten:
+            raise ApiError(404, "not_found", "the suggestion no longer exists")
+        return found
+
+    def _hide_suggestion(self, suggestion_id: str) -> None:
+        with self._people_lock:
+            self._hidden_suggestions[suggestion_id] = self._people_seq
 
     def _compute_suggestions(self, now: float, limit: int = SUGGESTIONS_KEPT, problems: list[str] | None = None) -> list[dict]:
         found, _ = self._suggestions(now)
@@ -769,7 +798,8 @@ class SpeakerService:
                         "conversation": self._context(rep.conversation_id),
                         "clips": [c | {"conversation_id": rep.conversation_id} for c in clips],
                         "other_day": self._other_day(s, rep),
-                        "scope": [self._context(c) for c in sorted({m.conversation_id for m in s.members})]})  # fmt: skip
+                        "scope": [self._context(c) for c in sorted({m.conversation_id for m in s.members})],
+                        "members": [[m.conversation_id, m.label] for m in s.members]})  # fmt: skip
         return out
 
     def _context(self, conv_id: str) -> dict:
@@ -789,15 +819,14 @@ class SpeakerService:
                 return clips[0] | {"conversation_id": m.conversation_id, "conversation": self._context(m.conversation_id)}
         return None
 
-    @_rebuilds_people
     def dismiss(self, suggestion_id: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
         prefs = self.store.settings()
         dismissed = {k: v for k, v in prefs["dismissed"].items() if float(v) > now}
         dismissed[suggestion_id] = now + speaker_suggest.COOLDOWN
         self.store.update_settings(dismissed=dismissed)
+        self._hide_suggestion(suggestion_id)
 
-    @_rebuilds_people
     def assign_suggestion(self, suggestion_id: str, body: dict, now: float | None = None) -> list[str]:
         now = time.time() if now is None else now
         person_id, request_id = body.get("person_id"), body.get("request_id")
@@ -806,22 +835,18 @@ class SpeakerService:
         if not isinstance(request_id, str) or not request_id:
             raise ApiError(422, "invalid_body", "request_id is required")
         with self.store.lock:
-            found, _ = self._suggestions(now)
-            suggestion = next((s for s in found if s.id == suggestion_id), None)
-            if suggestion is None:
-                raise ApiError(404, "not_found", "the suggestion no longer exists")
+            members = self._open_members(self._built_suggestion(suggestion_id))
             if self.store.person(person_id) is None:
                 raise ApiError(404, "not_found", f"unknown person {person_id}")
             touched = []
-            for member in suggestion.members:
-                row = self.db.one("SELECT * FROM conversations WHERE id=?", (member.conversation_id,))
-                self.assign(member.conversation_id, member.label,
-                            {"person_id": person_id, "expected_revision": row["speakers_revision"],
-                             "request_id": f"{request_id}:{member.conversation_id}:{member.label}"})  # fmt: skip
-                touched.append(member.conversation_id)
-            return sorted(set(touched) | set(self._relabel()))
+            for conv_id, label in members:
+                row = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
+                self.assign(conv_id, label, {"person_id": person_id, "expected_revision": row["speakers_revision"],
+                                             "request_id": f"{request_id}:{conv_id}:{label}"})  # fmt: skip
+                touched.append(conv_id)
+            self._hide_suggestion(suggestion_id)
+            return sorted(set(touched))
 
-    @_rebuilds_people
     def keep_unknown_suggestion(self, suggestion_id: str, body: dict, now: float | None = None) -> list[str]:
         """The owner keeps this recurring voice unknown, in every conversation it covers: durable
         (speakers.json), unlike the 7-day `dismiss`."""
@@ -830,18 +855,25 @@ class SpeakerService:
         if not isinstance(request_id, str) or not request_id:
             raise ApiError(422, "invalid_body", "request_id is required")
         with self.store.lock:
-            found, _ = self._suggestions(now)
-            suggestion = next((s for s in found if s.id == suggestion_id), None)
-            if suggestion is None:
-                raise ApiError(404, "not_found", "the suggestion no longer exists")
-            for member in suggestion.members:
-                row = self.db.one("SELECT * FROM conversations WHERE id=?", (member.conversation_id,))
-                self.assign(member.conversation_id, member.label,
-                            {"person_id": None, "keep_unknown": True, "expected_revision": row["speakers_revision"],
-                             "request_id": f"{request_id}:{member.conversation_id}:{member.label}"})  # fmt: skip
-            return sorted({m.conversation_id for m in suggestion.members})
+            members = self._open_members(self._built_suggestion(suggestion_id))
+            for conv_id, label in members:
+                row = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
+                self.assign(conv_id, label, {"person_id": None, "keep_unknown": True, "expected_revision": row["speakers_revision"],
+                                             "request_id": f"{request_id}:{conv_id}:{label}"})  # fmt: skip
+            self._hide_suggestion(suggestion_id)
+            return sorted({c for c, _ in members})
 
-    @_rebuilds_people
+    def _open_members(self, suggestion: dict) -> list[tuple[str, str]]:
+        """The suggestion's voices still unnamed and not kept unknown (a decision since the build stands)."""
+        out = []
+        for conv_id, label in suggestion["members"]:
+            state = self.store.labels(conv_id).get(label) or {}
+            if not state.get("person_id") and state.get("source") != "unknown":
+                out.append((conv_id, label))
+        if not out:
+            raise ApiError(404, "not_found", "the suggestion no longer exists")
+        return out
+
     def undo(self, body: dict) -> dict:
         """Put back what one naming request (a label, or every label of a suggestion) changed, label
         by label, only where that change still stands; voiceprints it created are removed, the

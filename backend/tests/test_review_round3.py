@@ -355,10 +355,12 @@ def test_correcting_a_label_removes_the_mistaken_sample(env):
     me = new_person(client, "Alan", me=True)
     assert name_label(client, row["id"], "S1", bob).json()["sample"] == "created"
     assert name_label(client, row["id"], "S1", me).json()["sample"] == "created"
+    client.app.state.speakers.warm()  # counts follow the worker's next build (Carbon D1)
     people = {p["name"]: p for p in client.get("/v1/people", headers=AUTH).json()["people"]}
     assert people["Bob"]["samples"] == 0 and people["Alan"]["samples"] == 1
     assert not list(worker.vault.person_dir(bob).glob("samples/*.json"))
     name_label(client, row["id"], "S1", None)
+    client.app.state.speakers.warm()
     people = {p["name"]: p for p in client.get("/v1/people", headers=AUTH).json()["people"]}
     assert people["Alan"]["samples"] == 0
 
@@ -630,6 +632,7 @@ def active_me(client, worker) -> tuple[str, list[dict]]:
         row = talk(client, worker, dialogue(ALAN, RAVI, seed=day), day=day)
         assert name_label(client, row["id"], "S1", me).json()["sample"] == "created"
         rows.append(row)
+    client.app.state.speakers.warm()  # model health follows the worker's next build
     assert {p["name"]: p for p in client.get("/v1/people", headers=AUTH).json()["people"]}["Alan"]["auto_active"]
     return me, rows
 
@@ -640,6 +643,7 @@ def test_taking_back_a_confirmation_withdraws_automatic_names_it_enabled(env):
     fresh = talk(client, worker, dialogue(ALAN, PRIYA, seed=40), day=1)
     assert labels(client, fresh["id"])["S1"]["person_id"] == me
     name_label(client, rows[0]["id"], "S1", None)  # Alan now has two confirmations: not active
+    worker.pipeline.relabel(T0 + 2000)  # other conversations: the worker's next pass, never the request (Carbon D1)
     assert labels(client, fresh["id"])["S1"]["person_id"] is None
 
 
@@ -752,7 +756,7 @@ def test_relabeling_never_moves_labels_to_a_transcript_they_were_not_made_for(en
     worker.providers._stt = LaterStt()  # Priya's voice becomes S1
     worker.db.execute("UPDATE conversations SET reprocess_request = reprocess_request + 1, force_restt = 1 WHERE id=?", (row["id"],))
     worker.tick(T0 + 800)
-    assert calls["n"] == 1
+    assert calls["n"] >= 1  # the crash happened (the worker's pass may finish the move by voice in the same tick)
     db = open_index(settings, Vault.open(settings), force_rebuild=True)
     fresh = Worker(settings, db)
     fresh.providers._embedder, fresh.providers._llm = FakeEmbedder(), CountingLlm()
@@ -918,6 +922,7 @@ def test_a_confirmation_can_be_taken_back_after_its_voice_moved_to_another_label
     worker.tick(T0 + 810)
     assert labels(client, row["id"])["S2"]["person_id"] == bob
     assert name_label(client, row["id"], "S2", None, not_person_id=bob).status_code == 200  # "not Bob"
+    client.app.state.speakers.warm()
     people = {p["name"]: p for p in client.get("/v1/people", headers=AUTH).json()["people"]}
     assert people["Bob"]["samples"] == 0, "the repudiated sample was taken back"
 

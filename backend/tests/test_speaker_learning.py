@@ -344,6 +344,7 @@ def test_naming_me_relabels_from_cache_and_later_recognizes_me(env):
     for day in (5, 4):
         row = talk(client, worker, dialogue(ALAN, RAVI, seed=day), day=day)
         assert name_label(client, row["id"], "S1", me).json()["sample"] == "created"
+    client.app.state.speakers.warm()  # counts and model health follow the worker's next build (Carbon D1)
     people = {p["name"]: p for p in client.get("/v1/people", headers=AUTH).json()["people"]}
     assert people["Alan"]["samples"] == 3 and people["Alan"]["auto_active"] is True and people["Alan"]["me"] is True
     fresh = talk(client, worker, dialogue(ALAN, PRIYA, seed=40), day=1)
@@ -466,6 +467,7 @@ def test_unknown_voices_suggestions_and_pruning(env):
     # A suggestion the user names: every member label is assigned (samples only with consent).
     settings_file["dismissed"] = {}
     Vault.write_json(settings.vault_dir / "_omi" / "speakers" / "settings.json", settings_file)
+    client.app.state.speakers.warm()  # an edit outside the API reaches the served list with the worker's next build
     ravi = new_person(client, "Ravi", attest_knows=True)
     client.put("/v1/speakers/settings", json={"acknowledged_at": "2026-09-27T10:00:00Z"}, headers=AUTH)
     r = client.post(f"/v1/speakers/suggestions/{s['id']}/assign", json={"person_id": ravi, "request_id": "sug-1"},

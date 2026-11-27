@@ -781,10 +781,12 @@ def test_startup_reconciles_a_stale_or_missing_calibration(env):
     worker.db.set_meta("calibrate_pending", None)
     path = settings.vault_dir / "_omi" / "speakers" / "calibration.json"
     Vault.write_json(path, json.loads(path.read_text()) | {"fingerprint": "other"})
+    client.app.state.speakers.warm()  # staleness is what the worker's last build found (the GET gathers nothing)
     assert client.get("/v1/speakers/calibration", headers=AUTH).json()["stale"] is True
     worker.calibrator.reconcile()
     assert worker.db.meta("calibrate_pending") is not None
     assert worker.calibrator.run(T0 + 1)
+    client.app.state.speakers.warm()
     assert client.get("/v1/speakers/calibration", headers=AUTH).json()["stale"] is False
 
 

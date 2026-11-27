@@ -33,7 +33,8 @@ def test_a_sample_index_rebuild_never_overwrites_a_concurrent_remove(env, monkey
         return real(data)
 
     monkeypatch.setattr(store, "_index_sample", slow)
-    reader = threading.Thread(target=lambda: client.get(f"/v1/conversations/{rows[1]['id']}/speakers", headers=AUTH))
+    # the recovery a worker pass or a mutation runs (a GET no longer rebuilds the index at all, Carbon D1)
+    reader = threading.Thread(target=store.reconcile)
     reader.start()
     assert paused.wait(timeout=5)
 

@@ -386,13 +386,14 @@ class SpeakerStore:
         a new name renames it, `me` moves the flag (at most one person is "me")."""
         now = time.time() if now is None else now
         current = self.person(person_id)
-        if current is None or current["note_path"] is None:
-            self.scan_people()  # only for a person the index doesn't know yet: never two notes for one id
+        # a person the index doesn't know yet, or whose indexed note now names someone else (Astra IT3-04): one scan
+        if current is None or current["note_path"] is None or not self._note_is(current["note_path"], person_id):
+            self.scan_people()  # never two notes for one id, never another person's note edited
             current = self.person(person_id)
         created = current is None or current["note_path"] is None
         if me:
             for other in self.db.query("SELECT * FROM people WHERE me=1 AND id<>?", (person_id,)):
-                if other["note_path"]:
+                if other["note_path"] and self._note_is(other["note_path"], other["id"]):
                     self._set_front_line(self.vault.root / other["note_path"], "omi_me", "false")
         if created:
             path = self._free_note_path(name)
@@ -422,6 +423,13 @@ class SpeakerStore:
                             attested_at=COALESCE(excluded.attested_at, people.attested_at)""",
                          (person_id, path.stem, int(is_me), self.vault.relpath(path), "[]", now if attest else None))
         return created
+
+    def _note_is(self, note_path: str, person_id: str) -> bool:
+        """The note at this indexed path still belongs to this person (one file's frontmatter)."""
+        try:
+            return read_frontmatter((self.vault.root / note_path).read_text(encoding="utf-8")).get("omi_person_id") == person_id
+        except (OSError, UnicodeDecodeError):
+            return False
 
     def _free_note_path(self, name: str) -> Path:
         stem = sanitize_title(name, limit=60)
@@ -936,6 +944,10 @@ class SpeakerStore:
             return False
         path = self.conv_dir(conv_id) / row["file"]
         data = Vault.read_json(path) or {}
+        # valid JSON of the wrong shape is unreadable too: refused here, so the caller isolates it (Astra IT3-02)
+        if not isinstance(data, dict) or not isinstance(data.get("labels") or {}, dict) \
+                or not all(isinstance(e, dict) for e in (data.get("labels") or {}).values()):
+            raise ValueError(f"{row['file']}: not a voices object")
         changed = False
         for label, entry in (data.get("labels") or {}).items():
             if label not in keep and entry.pop("vector_b64", None) is not None:

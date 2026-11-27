@@ -318,7 +318,8 @@ def test_q3_and_q4_never_consented_person_cannot_be_named_and_request_cost(tmp_p
     rec_calls = calls[0]
     print("IT5_COST_PROBE:", {"calibration_get_ms_500_unconsented": cal_ms, "calibration_cu_calls": cal_calls,
                               "reconcile_ms_500_unconsented": rec_ms, "reconcile_cu_calls": rec_calls})
-    assert cal_calls == 1 and rec_calls == 1  # current policy reads Bob once; wearer Alan bypasses consent
+    # the GET reads no consent (the worker compares calibration inputs, Carbon D1); the worker reads Bob once
+    assert cal_calls == 0 and rec_calls == 1
     client.app.state.db.close()
 
 

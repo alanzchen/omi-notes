@@ -166,7 +166,8 @@ def test_it5_reproducers_rechecked_on_0227082(tmp_path: Path, monkeypatch: pytes
     st3.reconcile_vectors()
     rec_rc = rc_calls[0]
     print("IT6_MEMO_COST:", {"calibration_ms": cal_ms, "calibration_read_consent_calls": cal_rc, "reconcile_read_consent_calls": rec_rc})
-    assert cal_rc == 2 and rec_rc == 2  # one read each for Gigi and Bob; policy now checks both rather than only cached-unconsented Bob
+    # the GET reads no consent (Carbon D1); the worker reads one each for Gigi and Bob
+    assert cal_rc == 0 and rec_rc == 2
     c3.app.state.db.close()
 
 
