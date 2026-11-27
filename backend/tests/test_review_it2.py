@@ -160,3 +160,20 @@ def test_no_assignment_is_written_while_its_label_move_is_deferred(tmp_path):
     assert r.status_code == 409 and r.json()["error"] == "recovery_pending", r.text
     assert e.store.labels_transcript(e.conv) == old_sha
     assert json.loads((e.store.conv_dir(e.conv) / "speakers.json").read_text())["transcript_sha"] == old_sha
+
+
+# -- IT2-05 part 1: one unreadable speakers file never stops the relabel pass before pruning --------------------------
+
+
+def test_one_unreadable_speakers_file_never_stops_pruning(tmp_path):
+    from .test_carbon_it1_20261126 import _add_conv
+
+    client, svc, store, pid, vec, conv, vfile = _setup_person(tmp_path)  # Gigi auto-named, her vector stored
+    bad = str(uuid.uuid4())
+    _add_conv(store, bad, vec, start=500.0, sha_char="b")  # sorts before Gigi's conversation's id or not: either way
+    (store.conv_dir(bad) / "speakers.json").write_text("{torn")
+    assert client.put("/v1/speakers/settings", json={"acknowledged_at": None}, headers=AUTH).status_code == 200
+    store.db.set_meta("relabel_pending", "1")
+    svc.pipeline.relabel(9000.0)  # never raises for one conversation
+    assert "vector_b64" not in json.loads(vfile.read_text())["labels"]["S1"], "the opted-out vector outlived the pass"
+    assert store.db.meta("relabel_pending") == "1"  # the unreadable conversation is retried

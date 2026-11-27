@@ -961,43 +961,48 @@ class ConversationPipeline:
         models_by_voice: dict[tuple[str, str], dict] = {}
         spaces: dict[tuple[str, str], object] = {}
         changed: list[str] = []
+        failed: list[str] = []
         conv_ids = [r["conversation_id"] for r in self.db.query(
             "SELECT DISTINCT conversation_id FROM voices UNION SELECT DISTINCT conversation_id FROM speaker_labels")]  # fmt: skip
         for conv_id in conv_ids:
-            row = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
-            if row is None:
-                continue
-            self.speakers.sync_labels_index(conv_id)  # never overwrite the file with a stale index
-            if (conv_id in self._moves_deferred or not self._moves_checked) and self._finish_move(conv_id):
-                continue  # still deferred: its states wait for the move, not reassigned under the old labels
-            voices = self.speakers.voices(conv_id)
-            current = self.speakers.labels(conv_id)
-            key = next(((v.model, v.model_sha) for v in voices.values()), None)
-            if key is not None:
-                if key not in models_by_voice:
-                    models_by_voice[key] = self.speakers.models(*key, self.operating)
-                    spaces[key] = self.speakers.rm_space(*key)
-                # stored voices: only the consented labels' vectors (a partial recording mean)
-                states = speaker_match.assign(voices, current, models_by_voice[key], auto_assign=prefs["auto_assign"],
-                                              op=self.operating, space=spaces[key])  # fmt: skip
-            else:
-                states = current
-            known = {r["id"] for r in self.speakers.people()}
-            states = {label: (st if st.get("person_id") in known or not st.get("person_id") else
-                              st | {"person_id": None, "source": None}) for label, st in states.items()}  # fmt: skip
-            states = self.speakers.settle_states(current, states, prefs, memo)  # opt-outs win; FROZEN people stay put
-            differs = self.speakers.persisted(states) != self.speakers.persisted(current)
-            if differs:
-                self.speakers.write_labels(conv_id, states)  # still tagged with the transcript they were made for
-                changed.append(conv_id)
-            named = any(s.get("person_id") for s in (states | current).values())
-            if (differs or names_changed) and row["note_path"] and named:
-                self._set(conv_id, needs_render=1, next_attempt_at=None)
+            try:  # one conversation that can't be read never stops the pass before pruning (Carbon IT2-05)
+                row = self.db.one("SELECT * FROM conversations WHERE id=?", (conv_id,))
+                if row is None:
+                    continue
+                self.speakers.sync_labels_index(conv_id)  # never overwrite the file with a stale index
+                if (conv_id in self._moves_deferred or not self._moves_checked) and self._finish_move(conv_id):
+                    continue  # still deferred: its states wait for the move, not reassigned under the old labels
+                voices = self.speakers.voices(conv_id)
+                current = self.speakers.labels(conv_id)
+                key = next(((v.model, v.model_sha) for v in voices.values()), None)
+                if key is not None:
+                    if key not in models_by_voice:
+                        models_by_voice[key] = self.speakers.models(*key, self.operating)
+                        spaces[key] = self.speakers.rm_space(*key)
+                    # stored voices: only the consented labels' vectors (a partial recording mean)
+                    states = speaker_match.assign(voices, current, models_by_voice[key], auto_assign=prefs["auto_assign"],
+                                                  op=self.operating, space=spaces[key])  # fmt: skip
+                else:
+                    states = current
+                known = {r["id"] for r in self.speakers.people()}
+                states = {label: (st if st.get("person_id") in known or not st.get("person_id") else
+                                  st | {"person_id": None, "source": None}) for label, st in states.items()}  # fmt: skip
+                states = self.speakers.settle_states(current, states, prefs, memo)  # opt-outs win; FROZEN people stay put
+                differs = self.speakers.persisted(states) != self.speakers.persisted(current)
+                if differs:
+                    self.speakers.write_labels(conv_id, states)  # still tagged with the transcript they were made for
+                    changed.append(conv_id)
+                named = any(s.get("person_id") for s in (states | current).values())
+                if (differs or names_changed) and row["note_path"] and named:
+                    self._set(conv_id, needs_render=1, next_attempt_at=None)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                failed.append(conv_id)
+                log.warning("relabel: conversation %s skipped, retried next pass (%s)", conv_id, exc)
         self._moves_checked = True
         # the policy change behind this pass is applied to stored vectors too, whether or not any state changed (I4):
         # before the pass is marked done, so a crash leaves it pending
         self.speakers.reconcile_vectors()
-        if self.speakers.prune_failures or self._moves_deferred:  # pending only for what is left (Astra IT2B-06)
+        if self.speakers.prune_failures or self._moves_deferred or failed:  # pending only for what is left (IT2B-06)
             self.db.set_meta("rendered_names", names)
             return changed
         self.db.set_meta("relabel_pending", None)
