@@ -1941,7 +1941,9 @@ class ConversationPipeline:
         content = render_status(snapshot, self.tz)
         if self._status_written is None or self._status_written[1] != content:
             write_if_changed(self.settings.vault_dir / "_status.md", content)
-            self._status_written = (now if now is not None else time.time(), content)
+        # the minute counts from this build, changed or not: from the last change, an unchanged status was rebuilt every
+        # tick (ring ranges over every ring record: ~40% of a core idle in production, 2026-11-27)
+        self._status_written = (now if now is not None else time.time(), content)
 
     def conflict_copies(self, now: float | None = None) -> list[str]:
         """Notes carrying a conversation's id at a path that is not its note (sync conflict copies);
