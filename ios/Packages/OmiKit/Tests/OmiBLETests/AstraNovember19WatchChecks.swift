@@ -22,12 +22,9 @@ import Testing
   let held=try #require(box.segments().first?.file)
   try original.prefix(1).write(to:p.file)
   try? box.add(segmentFile:p.file,segment:p.segment)
-  // staged (not tonight's scope): Astra's "pre-existing defensive limit" — publish doesn't check a replacement against
-  // its manifest; the app's producer makes the manifest from the closed file just before (REPORT 2026-11-19 R3)
+  // 2026-11-28: publish checks a replacement against its manifest first (no longer a known issue)
   let now=try Data(contentsOf:held)
-  withKnownIssue("publish doesn't validate a replacement against its manifest (staged)") {
-   #expect(now==original,"a replacement must match the manifest before replacing good audio")
-  }
+  #expect(now==original,"a replacement must match the manifest before replacing good audio")
  }
  @Test func quarantineDoesNotRetireItsDurableInboxUntilDestinationConfirmed() throws {
   let p=try WatchReceiptDurabilityTests().part();defer {try? FileManager.default.removeItem(at:p.root);try? FileManager.default.removeItem(at:p.file)}
@@ -82,4 +79,27 @@ extension RetryFlowTests {
         #expect(!lines.contains { $0.message.contains("zebra") }, "never the query text")
     }
 }
+}
+
+/// 2026-11-28 R1: a replacement only takes a part's place after it matches the part's manifest (size and SHA-256).
+@Suite(.serialized) struct WatchReplacementChecks {
+    @Test func aMatchingReAddOfAPublishedPartIsStillAccepted() throws {
+        // a part published the way build 66 publishes it, then the same bytes offered again (e.g. after a relaunch)
+        let p = try WatchReceiptDurabilityTests().part(); let box = WatchOutbox(root: p.root.appendingPathComponent("watch"))
+        defer { try? FileManager.default.removeItem(at: p.root); try? FileManager.default.removeItem(at: p.file) }
+        let original = try Data(contentsOf: p.file); try box.add(segmentFile: p.file, segment: p.segment)
+        try original.write(to: p.file)
+        try box.add(segmentFile: p.file, segment: p.segment)
+        #expect(try Data(contentsOf: try #require(box.segments().first?.file)) == original)
+    }
+
+    @Test func aMismatchedFirstAddPublishesNothingAndLeavesTheSourceInPlace() throws {
+        let p = try WatchReceiptDurabilityTests().part(); let box = WatchOutbox(root: p.root.appendingPathComponent("watch"))
+        defer { try? FileManager.default.removeItem(at: p.root); try? FileManager.default.removeItem(at: p.file) }
+        let original = try Data(contentsOf: p.file)
+        try original.prefix(100).write(to: p.file)
+        #expect(throws: (any Error).self) { try box.add(segmentFile: p.file, segment: p.segment) }
+        #expect(box.segments().isEmpty, "never a part whose bytes don't match its manifest")
+        #expect(try Data(contentsOf: p.file) == original.prefix(100), "the source is kept, never deleted")
+    }
 }

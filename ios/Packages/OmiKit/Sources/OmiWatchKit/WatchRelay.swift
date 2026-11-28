@@ -409,6 +409,13 @@ public final class WatchOutbox: @unchecked Sendable {
 
     /// Called with `lock` held.
     private func publish(segmentFile: URL, segment: WatchSegment) throws {
+        // only a file that matches its own manifest takes a part's place: a truncated or damaged replacement never
+        // destroys the good copy, and no part is published with bytes its manifest doesn't describe (2026-11-28). The
+        // file stays where it is (the recorder keeps it).
+        let size = (try? FileManager.default.attributesOfItem(atPath: segmentFile.path)[.size] as? Int) ?? -1
+        guard size == segment.bytes, (try? Files.sha256(segmentFile)) == segment.sha256 else {
+            throw DurableFileError(operation: "verify (size or SHA-256 differs from its manifest)", url: segmentFile, code: EINVAL)
+        }
         let intent = segmentsDir.appendingPathComponent("\(segment.id).intent")
         try Files.durableWrite(WatchWire.encode(segment), to: intent)
         let audio = segmentsDir.appendingPathComponent("\(segment.id).m4a")
