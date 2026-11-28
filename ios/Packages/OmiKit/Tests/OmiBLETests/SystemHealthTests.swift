@@ -52,7 +52,9 @@ import OmiWatchKit
         let h = health(s, .unreachable("offline"), nil)
         #expect(h.level == .delayed)
         #expect(step(h, .phone).level == .delayed && step(h, .phone).title == "Audio is waiting to upload" && step(h, .phone).detail == "Stored safely on this phone.")
-        #expect(step(h, .server).level == .delayed && step(h, .server).fix == .openServer)
+        // one way to fix an unreachable address, and the server (why audio waits) leads the card (2026-11-28 F1, F3)
+        #expect(step(h, .server).level == .delayed && step(h, .server).fix == .changeServer)
+        #expect(h.headline == "Can't reach your server")
     }
 
     @Test func rejectedTokenNeedsAction() {

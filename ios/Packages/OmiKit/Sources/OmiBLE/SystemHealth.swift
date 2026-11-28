@@ -35,6 +35,8 @@ public struct SystemHealth: Equatable, Sendable {
         case resumeRecording, collectPendantAudio
         /// Devices, to add a pendant or set up the Apple Watch.
         case openDevices
+        /// Server → Change server: the server can't be reached at its address (it may have moved).
+        case changeServer
     }
 
     public struct Step: Equatable, Sendable, Identifiable {
@@ -78,7 +80,9 @@ public struct SystemHealth: Equatable, Sendable {
                      self.server(server, status: status, statusAt: statusAt, now: now, issues: issues),
                      notes(status, statusAt: statusAt, now: now)]
         let worst = steps.map(\.level).max() ?? .unknown
-        let lead = steps.first { $0.level == worst }!
+        // an unreachable server is why audio waits: it leads, not the waiting (2026-11-28, ux-lane F1)
+        let cutOff = if case .unreachable = server { true } else { false }
+        let lead = (cutOff ? steps.first { $0.area == .server && $0.level == worst } : nil) ?? steps.first { $0.level == worst }!
         switch worst {
         case .normal:
             return SystemHealth(level: .normal, headline: "Connected; no reported problems", detail: steps.last?.title, steps: steps)
@@ -247,7 +251,8 @@ public struct SystemHealth: Equatable, Sendable {
         case .unauthorized:
             return step(.needsAction, "The server rejected this phone", "Pair again with a fresh code from your server.", .openServer)
         case .unreachable:
-            return step(.delayed, "Can't reach your server", "Recordings wait on this phone. If you use Tailscale, check it's connected.", .openServer)
+            // no guessed cause (it may have moved, not only Tailscale): one way to fix the address (ux-lane F3, F4)
+            return step(.delayed, "Can't reach your server", "Recordings wait on this phone.", .changeServer)
         case .unknown, .checking, .reachable:
             break
         }

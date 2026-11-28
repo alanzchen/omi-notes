@@ -126,6 +126,9 @@ struct RootView: View {
         case .resumeRecording: model.engine.setRecordingPaused(false)
         case .collectPendantAudio: model.engine.collectPendantAudioNow()
         case .openDevices: tab = .devices
+        case .changeServer:
+            serverPath = NavigationPath([ServerView.Page.connection])
+            tab = .server
         }
     }
 }
