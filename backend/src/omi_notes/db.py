@@ -425,6 +425,9 @@ CREATE TABLE IF NOT EXISTS samples (
     f0 REAL
 );
 CREATE INDEX IF NOT EXISTS samples_person ON samples(person_id);
+-- Review.page's per-item "still has an active sample" check (Astra RECON-07): one seek, not the removed history.
+-- Additive: created in place on open, ignored by older builds.
+CREATE INDEX IF NOT EXISTS samples_person_active ON samples(person_id) WHERE COALESCE(state, 'active') = 'active';
 CREATE INDEX IF NOT EXISTS samples_request ON samples(request_id);
 CREATE TABLE IF NOT EXISTS voices (
     conversation_id TEXT NOT NULL,

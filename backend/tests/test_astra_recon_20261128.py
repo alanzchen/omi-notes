@@ -94,3 +94,15 @@ def test_a_rename_is_not_lost_for_a_conversation_that_failed_in_the_pass(tmp_pat
     torn.write_text("{torn")
     svc.pipeline.relabel(9010.0)
     assert store.db.one("SELECT needs_render FROM conversations WHERE id=?", (bad,))[0] == 1, "its rename is still owed"
+
+
+def test_the_review_active_sample_check_reads_only_active_samples(tmp_path):
+    """RECON-07: Review.page's check that a person still has an active sample (per served item) scanned their whole
+    removed-sample history through samples_person. A partial index on active samples makes it one seek."""
+    from omi_notes.db import Database
+
+    db = Database(tmp_path / "index.sqlite3")
+    plan = " ".join(str(tuple(r)) for r in db.query(
+        "EXPLAIN QUERY PLAN SELECT 1 FROM samples WHERE person_id=? AND COALESCE(state, 'active')='active' LIMIT 1", ("p",)))
+    assert "samples_person_active" in plan, plan
+    db.close()
