@@ -547,7 +547,8 @@ public final class LiveCaptureRecorder {
         manifestDirty = true
         commitManifest()
         _ = ensureJournal()
-        retirement.retire(journalURL, kind: .chunk(captureId: m.captureId, sequence: seq), outbox: env.outbox, category: "capture")
+        retirement.retire(journalURL, kind: .chunk(captureId: m.captureId, sequence: seq), ledger: m.publicationLedger == true,
+                          outbox: env.outbox, category: "capture")
         log(.info, "capture", "chunk \(seq) of \(m.captureId) closed (\(reason.rawValue), \(count) records, \(item.size) B)")
         onChunkFinalized?(item)
         return true
@@ -758,7 +759,8 @@ public final class RingCaptureWriter {
         chunkCount = 0
         manifestDirty = true
         commitManifest()
-        retirement.retire(journalURL, kind: .chunk(captureId: m.captureId, sequence: seq), outbox: env.outbox, category: "ring")
+        retirement.retire(journalURL, kind: .chunk(captureId: m.captureId, sequence: seq), ledger: m.publicationLedger == true,
+                          outbox: env.outbox, category: "ring")
         log(.info, "ring", "ring chunk \(seq) of \(m.captureId) closed (\(reason.rawValue), \(entries.count) records from seq \(first))")
         onChunkFinalized?(item)
     }
@@ -952,7 +954,7 @@ public enum CaptureRecovery {
         if outbox.contains(.seal(captureId: m.captureId)) {
             // sealed earlier: a seal is no evidence for its chunks; every journal is accounted for first (IT3-01)
             // and the seal itself, where it actually is (ASTRA-20261118-IT4-02)
-            let unaccounted = accountForJournals(in: dir, captureId: m.captureId, outbox: outbox)
+            let unaccounted = accountForJournals(in: dir, captureId: m.captureId, ledger: m.publicationLedger == true, outbox: outbox)
                 ?? { do { try outbox.account(.seal(captureId: m.captureId)) { nil }; return nil } catch { return error } }()
             if let error = unaccounted {
                 report.skipped.append(dir.lastPathComponent)
@@ -1040,7 +1042,7 @@ public enum CaptureRecovery {
             let sealData = try ContractJSON.encode(seal)
             try outbox.write(sealData, kind: .seal(captureId: m.captureId))
             // every journal in the folder, those below the manifest's sequence included, and the seal (IT3-01)
-            let unaccounted = accountForJournals(in: dir, captureId: m.captureId, outbox: outbox)
+            let unaccounted = accountForJournals(in: dir, captureId: m.captureId, ledger: m.publicationLedger == true, outbox: outbox)
                 ?? { do { try outbox.account(.seal(captureId: m.captureId)) { sealData }; return nil } catch { return error } }()
             if let unaccounted {
                 log(.warning, "recovery", "\(m.captureId) sealed; its journals kept: not every chunk is accounted for (\(unaccounted.localizedDescription))")
@@ -1098,12 +1100,15 @@ public enum CaptureRecovery {
 
     /// Accounts for every non-empty journal in a capture's folder by its own chunk (`Outbox.account`), whatever its sequence;
     /// returns the first error, nil when all are accounted for. A sealed capture or a counter is no evidence (IT3-01).
-    static func accountForJournals(in dir: URL, captureId: String, outbox: Outbox) -> Error? {
+    static func accountForJournals(in dir: URL, captureId: String, ledger: Bool, outbox: Outbox) -> Error? {
         var first: Error?
+        let records = ledger ? PublicationLedger.read(dir) : nil  // once per capture (ASTRA-20261128-R1-04)
         for url in FileIO.contents(of: dir) where url.pathExtension == "journal" && FileIO.fileSize(url) > 0 {
             guard let seq = CaptureManifest.journalSequence(url.lastPathComponent) else { continue }
             do {
-                try outbox.account(.chunk(captureId: captureId, sequence: seq)) { FrozenChunk.rebuild(journal: url) }
+                try outbox.account(.chunk(captureId: captureId, sequence: seq)) {
+                    FrozenChunk.rebuild(journal: url, from: ledger ? .ledger(records) : .header)
+                }
             } catch {
                 first = first ?? error
             }
@@ -1131,7 +1136,12 @@ enum FrozenChunk {
     }
 
     /// The chunk's envelope from its frozen journal and saved header; nil when either is missing or they don't match.
-    static func rebuild(journal: URL) -> Data? { load(journal: journal)?.envelope }
+    /// Where a journal's published header comes from: its capture's ledger (records parsed once by the caller; nil:
+    /// missing or unreadable), or for a capture from a build up to 66 its saved header. Decided by the manifest, never
+    /// by what happens to be on disk: a flagged capture without its ledger has no usable record (ASTRA-20261128-R1-01).
+    enum Source { case ledger([Int: EnvelopeHeader]?), header }
+
+    static func rebuild(journal: URL, from source: Source) -> Data? { load(journal: journal, from: source)?.envelope }
 
     /// The payload a journal publishes: ring records, or the valid prefix of BLE records.
     static func payload(_ raw: Data, source: CaptureSource) -> Data {
@@ -1174,15 +1184,14 @@ enum FrozenChunk {
         return judge(try? JSONDecoder().decode(EnvelopeHeader.self, from: json))
     }
 
-    /// The recorded header and the envelope it rebuilds (the ledger when the folder has one, else the saved header);
-    /// nil when there is no usable record or it doesn't match the journal.
-    static func load(journal: URL) -> (header: EnvelopeHeader, envelope: Data)? {
+    /// The recorded header and the envelope it rebuilds; nil when there is no usable record or it doesn't match the journal.
+    static func load(journal: URL, from source: Source) -> (header: EnvelopeHeader, envelope: Data)? {
         guard let raw = try? Data(contentsOf: journal) else { return nil }
-        let dir = journal.deletingLastPathComponent()
         let header: EnvelopeHeader?
-        if FileIO.exists(PublicationLedger.url(dir)), let seq = CaptureManifest.journalSequence(journal.lastPathComponent) {
-            if case .record(let h) = PublicationLedger.lookup(seq, in: dir) { header = h } else { header = nil }
-        } else {
+        switch source {
+        case .ledger(let records):
+            header = CaptureManifest.journalSequence(journal.lastPathComponent).flatMap { records?[$0] }
+        case .header:
             header = (try? Data(contentsOf: headerURL(journal))).flatMap { try? JSONDecoder().decode(EnvelopeHeader.self, from: $0) }
         }
         guard let header else { return nil }
@@ -1210,11 +1219,33 @@ enum PublicationLedger {
     static func append(_ header: EnvelopeHeader, in dir: URL) throws {
         var line = try Envelope.headerJSON(header)
         line.append(0x0A)
-        let fd = open(url(dir).path, O_WRONLY | O_APPEND)  // never O_CREAT
+        let fd = open(url(dir).path, O_RDWR | O_APPEND)  // never O_CREAT
         guard fd >= 0 else { throw FileIOError.posix("open publication ledger", errno) }
         defer { close(fd) }
+        try dropTornTail(fd)
         try FileIO.writeAll(fd: fd, data: line)
         if fcntl(fd, F_FULLFSYNC) != 0, fsync(fd) != 0 { throw FileIOError.posix("fsync publication ledger", errno) }
+    }
+
+    /// A failed append can leave an unterminated last line. It was never committed (an append counts only once its
+    /// newline is synced, and nothing is published before that), so it is cut before the next append, which would
+    /// otherwise run on from it and make the whole ledger unreadable (ASTRA-20261128-R1-02). Only bytes after the last
+    /// newline go; a tail longer than any header can't be an append and is refused. The ledger holds no audio.
+    static func dropTornTail(_ fd: Int32) throws {
+        var st = stat()
+        guard fstat(fd, &st) == 0 else { throw FileIOError.posix("stat publication ledger", errno) }
+        let size = Int(st.st_size)
+        guard size > 0 else { return }
+        let window = min(size, 64 * 1024)
+        var tail = [UInt8](repeating: 0, count: window)
+        guard pread(fd, &tail, window, off_t(size - window)) == window else { throw FileIOError.posix("read publication ledger", errno) }
+        guard tail.last != 0x0A else { return }
+        guard let newline = tail.lastIndex(of: 0x0A) ?? (window == size ? -1 : nil) else {
+            throw FileIOError.posix("publication ledger tail too long to be one append", EINVAL)
+        }
+        guard ftruncate(fd, off_t(size - window + newline + 1)) == 0 else { throw FileIOError.posix("truncate publication ledger tail", errno) }
+        if fcntl(fd, F_FULLFSYNC) != 0, fsync(fd) != 0 { throw FileIOError.posix("fsync publication ledger", errno) }
+        log(.warning, "capture", "publication ledger: cut an unfinished record (\(window - newline - 1) B)")
     }
 
     enum Lookup: Equatable { case record(EnvelopeHeader), none, unknown }
@@ -1223,13 +1254,20 @@ enum PublicationLedger {
     /// outbox write comes after) and is ignored; a ledger that is missing or unreadable, or any other line that doesn't
     /// decode: unknown.
     static func lookup(_ seq: Int, in dir: URL) -> Lookup {
-        guard let data = try? Data(contentsOf: url(dir)) else { return .unknown }
-        var found: EnvelopeHeader?
+        guard let records = read(dir) else { return .unknown }
+        return records[seq].map { .record($0) } ?? .none
+    }
+
+    /// Every chunk's last record, parsed once; nil when the ledger is missing, unreadable, or a complete line doesn't
+    /// decode. A torn last line (an append that never finished) is ignored.
+    static func read(_ dir: URL) -> [Int: EnvelopeHeader]? {
+        guard let data = try? Data(contentsOf: url(dir)) else { return nil }
+        var records: [Int: EnvelopeHeader] = [:]
         for line in data.split(separator: 0x0A, omittingEmptySubsequences: false).dropLast() {
-            guard let h = try? JSONDecoder().decode(EnvelopeHeader.self, from: Data(line)) else { return .unknown }
-            if h.chunkSequence == seq { found = h }
+            guard let h = try? JSONDecoder().decode(EnvelopeHeader.self, from: Data(line)) else { return nil }
+            records[h.chunkSequence] = h
         }
-        return found.map { .record($0) } ?? .none
+        return records
     }
 }
 
@@ -1239,22 +1277,29 @@ enum PublicationLedger {
 /// (ASTRA-20261118-IT2-01, IT3-01/02). Work scales with the journals kept, not the outbox. A failure is logged once
 /// until everything kept is accounted for.
 struct JournalRetirement {
-    private(set) var kept: [(journal: URL, kind: OutboxKind)] = []
+    private(set) var kept: [(journal: URL, kind: OutboxKind, ledger: Bool)] = []
     private var failureLogged = false
 
     /// Adds a rotated journal and accounts for everything kept.
-    mutating func retire(_ journal: URL, kind: OutboxKind, outbox: Outbox, category: String) {
-        kept.append((journal, kind))
+    mutating func retire(_ journal: URL, kind: OutboxKind, ledger: Bool, outbox: Outbox, category: String) {
+        kept.append((journal, kind, ledger))
         _ = settle(outbox: outbox, category: category)
     }
 
     /// Accounts for every kept journal (and `seal`, when given): removes those accounted for; returns the first error.
     mutating func settle(outbox: Outbox, category: String, seal: (OutboxKind, Data)? = nil) -> Error? {
-        var remaining: [(journal: URL, kind: OutboxKind)] = []
+        var remaining: [(journal: URL, kind: OutboxKind, ledger: Bool)] = []
         var first: Error?
+        var parsed: [URL: [Int: EnvelopeHeader]?] = [:]  // each capture's ledger read once per pass (R1-04)
         for entry in kept {
             do {
-                try outbox.account(entry.kind) { FrozenChunk.rebuild(journal: entry.journal) }
+                try outbox.account(entry.kind) {
+                    guard entry.ledger else { return FrozenChunk.rebuild(journal: entry.journal, from: .header) }
+                    let dir = entry.journal.deletingLastPathComponent()
+                    let records = parsed[dir] ?? PublicationLedger.read(dir)
+                    parsed[dir] = records
+                    return FrozenChunk.rebuild(journal: entry.journal, from: .ledger(records))
+                }
                 try? FileManager.default.removeItem(at: entry.journal)
                 try? FileManager.default.removeItem(at: FrozenChunk.headerURL(entry.journal))
             } catch {
