@@ -1,8 +1,7 @@
-// ASTRA-20261119-IT3-01 (omi-notes-reviews/nightly-2026-11-19-it3/swift/AstraR3RecoveryVariants.swift), copied with
-// one change: the two variants that still fail (missing / unreadable header with no successor journal) run under
-// `withKnownIssue`, so the residual stays visible without a third Capture.swift patch tonight (stop rule, R5). The
-// design that would close it is in build/deployment/nightly/2026-11-19/REPORT.md (R5 §3). Payload stays byte-identical
-// in both; only the rebuilt chunk's metadata (end offset) differs.
+// ASTRA-20261119-IT3-01 (omi-notes-reviews/nightly-2026-11-19-it3/swift/AstraR3RecoveryVariants.swift), copied
+// unchanged in substance. The missing / unreadable header variants ran under `withKnownIssue` from 11-19 to 11-28; the
+// publication ledger closes them (build/deployment/nightly/2026-11-28/round1/DESIGN.md), so all four are plain
+// expectations now.
 import Foundation
 import Testing
 @testable import OmiCapture
@@ -38,10 +37,8 @@ import OmiProtocol
    let a=try Envelope.parse(original),b=try Envelope.parse(rebuilt)
    print("NO SUCCESSOR \(variant): old=\(a.header.chunkEndOffsetUs) new=\(b.header.chunkEndOffsetUs) samePayload=\(a.payload==b.payload)")
    #expect(a.payload==b.payload)  // the audio itself is never changed
-   withKnownIssue("ASTRA-20261119-IT3-01: no durable publication record; recovery infers from the successor's absence",
-                  isIntermittent: false) {
-    #expect(rebuilt==original,"uncertain published identity must not be re-derived")
-   } when: { variant=="missing" || variant=="unreadable" }
+   // 2026-11-28: closed by the capture's publication ledger (published.jsonl), no longer a known issue
+   #expect(rebuilt==original,"uncertain published identity must not be re-derived")
   } else {#expect(try Data(contentsOf:journal)==raw)}
  }
  @Test func aNeverPublishedOpenJournalStillRecovers() throws {

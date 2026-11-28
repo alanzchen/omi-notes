@@ -31,6 +31,9 @@ public struct CaptureManifest: Codable, Equatable, Sendable {
     public var openChunkSequence: Int
     public var openChunkStartOffsetUs: Int64
     public var ring: Ring?
+    /// Written by builds after 66: the capture keeps a publication ledger (`PublicationLedger`), the only record a
+    /// published chunk's identity is taken from. nil (older captures): the saved header and the successor rule.
+    public var publicationLedger: Bool? = nil
 
     public var anchorWall: Date { Date(timeIntervalSince1970: Double(anchorWallMs) / 1000) }
     public func wallDate(offsetUs: Int64) -> Date { anchorWall.addingTimeInterval(Double(offsetUs) / 1_000_000) }
@@ -261,8 +264,9 @@ public final class LiveCaptureRecorder {
             hardwareRevision: meta.hardwareRevision, codecId: meta.codec?.rawValue,
             captureStartedAt: ISO8601UTC.format(a.wall), anchorWallMs: Int64(a.wall.timeIntervalSince1970 * 1000),
             timezone: env.timezone, offlineStorage: meta.offlineStorage, appVersion: env.appVersion,
-            openChunkSequence: 0, openChunkStartOffsetUs: 0, ring: nil)
+            openChunkSequence: 0, openChunkStartOffsetUs: 0, ring: nil, publicationLedger: true)
         do {
+            try PublicationLedger.create(in: d)
             try env.saveManifest(m, in: d)
             journal = try AppendFile(url: d.appendingPathComponent(CaptureManifest.journalName(0)))
         } catch {
@@ -522,6 +526,7 @@ public final class LiveCaptureRecorder {
                 chunkSequence: seq, codecId: codec, startUs: start, endUs: end,
                 recordCount: scan.records.count, payloadBytes: payload.count, ringInfo: nil)
             let body = try Envelope.build(header: header, payload: payload)
+            try PublicationLedger.record(header, for: m, in: dir)  // no publication without its record
             FrozenChunk.save(header, beside: journalURL)  // what a lost output is rebuilt from
             item = try env.outbox.write(body, kind: .chunk(captureId: m.captureId, sequence: seq))
             count = scan.records.count
@@ -619,8 +624,10 @@ public final class RingCaptureWriter {
             openChunkStartOffsetUs: 0,
             ring: .init(
                 infoReadSeq: ctx.info.readSeq, infoWriteSeq: ctx.info.writeSeq, dropped: ctx.info.dropped,
-                generation: ctx.generation, rtcValid: ctx.rtcValid, coversUntil: ISO8601UTC.format(ctx.coversUntil)))
+                generation: ctx.generation, rtcValid: ctx.rtcValid, coversUntil: ISO8601UTC.format(ctx.coversUntil)),
+            publicationLedger: true)
         do {
+            try PublicationLedger.create(in: d)
             try env.saveManifest(m, in: d)
             journal = try AppendFile(url: d.appendingPathComponent(CaptureManifest.journalName(0)))
         } catch {
@@ -739,6 +746,7 @@ public final class RingCaptureWriter {
             recordCount: entries.count, payloadBytes: payload.count,
             ringInfo: RingChunkInfo(firstSequence: first, readSeq: ring.infoReadSeq, writeSeq: ring.infoWriteSeq, dropped: ring.dropped))
         let body = try Envelope.build(header: header, payload: payload)
+        try PublicationLedger.record(header, for: m, in: dir)  // no publication without its record
         FrozenChunk.save(header, beside: journalURL)  // what a lost output is rebuilt from
         let item = try env.outbox.write(body, kind: .chunk(captureId: m.captureId, sequence: seq))
         // Published: freeze the segment, move on, then commit the manifest (retried if it fails).
@@ -987,11 +995,13 @@ public enum CaptureRecovery {
                 return false
             }
         }
-        if !raw.isEmpty, let frozen = FrozenChunk.load(journal: journalURL) {
+        let published: FrozenChunk.Publication = raw.isEmpty ? .never
+            : FrozenChunk.state(journal: journalURL, raw: raw, source: m.source, ledger: m.publicationLedger == true)
+        if case .frozen(let header, let envelope) = published {
             // published before a manifest commit was lost: the chunk keeps the identity it was published with (its
-            // frozen header), never one derived again from the stale manifest (ASTRA-20261118-IT4-01)
+            // recorded header), never one derived again from the stale manifest (ASTRA-20261118-IT4-01, IT3-01)
             do {
-                try outbox.write(frozen.envelope, kind: .chunk(captureId: m.captureId, sequence: seq))
+                try outbox.write(envelope, kind: .chunk(captureId: m.captureId, sequence: seq))
             } catch {
                 log(.error, "recovery", "could not republish chunk \(seq) of \(m.captureId): \(error)")
                 return false
@@ -999,14 +1009,14 @@ public enum CaptureRecovery {
             if m.source == .deviceRing, let last = RingJournal.scan(raw).entries.last?.seq, let ring = m.ring {
                 report.ringDurable.append(RingDurableMark(deviceId: m.deviceId, generation: ring.generation, seq: last))
             }
-            endUs = frozen.header.chunkEndOffsetUs
+            endUs = header.chunkEndOffsetUs
             m.openChunkSequence = seq + 1
-        } else if !raw.isEmpty, FrozenChunk.wasPublished(journal: journalURL, raw: raw, source: m.source) {
-            // published under a header that can't be used now (gone, unreadable, or not matching its journal): its
-            // identity must not come back with metadata derived from the stale manifest (ASTRA-20261119-IT1-02); the
+        } else if case .unknown = published {
+            // published, or can't be told: its record is missing, unreadable or doesn't match its journal. Its identity
+            // must not come back with metadata derived from the stale manifest (ASTRA-20261119-IT1-02, IT3-01); the
             // journal stays as it is, with its audio, and is looked at again on the next launch
             report.skipped.append(dir.lastPathComponent)
-            log(.error, "recovery", "chunk \(seq) of \(m.captureId) was published but its saved header can't be used; journal kept")
+            log(.error, "recovery", "chunk \(seq) of \(m.captureId) may have been published but its record can't be used; journal kept")
             return false
         } else if !raw.isEmpty {
             do {
@@ -1060,6 +1070,7 @@ public enum CaptureRecovery {
                 chunkSequence: seq, codecId: codec, startUs: m.openChunkStartOffsetUs, endUs: endUs,
                 recordCount: entries.count, payloadBytes: payload.count,
                 ringInfo: RingChunkInfo(firstSequence: first, readSeq: ring.infoReadSeq, writeSeq: ring.infoWriteSeq, dropped: ring.dropped))
+            try PublicationLedger.record(header, for: m, in: dir)
             FrozenChunk.save(header, beside: dir.appendingPathComponent(CaptureManifest.journalName(seq)))
             try env.outbox.write(try Envelope.build(header: header, payload: payload), kind: .chunk(captureId: m.captureId, sequence: seq))
             if let last = entries.last?.seq {
@@ -1075,6 +1086,7 @@ public enum CaptureRecovery {
             let header = m.header(
                 chunkSequence: seq, codecId: codec, startUs: m.openChunkStartOffsetUs, endUs: endUs,
                 recordCount: scan.records.count, payloadBytes: payload.count, ringInfo: nil)
+            try PublicationLedger.record(header, for: m, in: dir)
             FrozenChunk.save(header, beside: dir.appendingPathComponent(CaptureManifest.journalName(seq)))
             try env.outbox.write(try Envelope.build(header: header, payload: payload), kind: .chunk(captureId: m.captureId, sequence: seq))
             if scan.validLength != raw.count {
@@ -1127,28 +1139,97 @@ enum FrozenChunk {
             : Data(raw.prefix(BLERecord.scan(raw).validLength))
     }
 
-    /// Whether a journal with no usable header was nevertheless published (ASTRA-20261119-IT1-02). A header is saved just
-    /// before publication and a published journal no longer grows, so: a readable header for fewer bytes than the
-    /// journal now holds belongs to a publication that failed (the journal went on): not published. No header: published
-    /// only if the next chunk's journal exists (a rotation opens it after publishing). Anything else (an unreadable
-    /// header, or one for more bytes than the journal holds) can't be told apart: taken as published, never re-derived.
-    static func wasPublished(journal: URL, raw: Data, source: CaptureSource) -> Bool {
-        let header = headerURL(journal)
-        guard let json = try? Data(contentsOf: header) else {
-            guard let seq = CaptureManifest.journalSequence(journal.lastPathComponent) else { return true }
-            return FileIO.exists(journal.deletingLastPathComponent().appendingPathComponent(CaptureManifest.journalName(seq + 1)))
+    /// What the records say about a journal's chunk (ASTRA-20261119-IT1-02, IT3-01; DESIGN 2026-11-28).
+    enum Publication { case frozen(EnvelopeHeader, Data), unknown, never }
+
+    /// The chunk's record: the capture's ledger when it keeps one (`ledger`), else (builds up to 66) the saved header,
+    /// then the successor rule. A record for exactly the journal's payload rebuilds that envelope; one for fewer bytes
+    /// belongs to a publication that failed (the journal went on): never published; anything else, a record that can't
+    /// be read, or a ledger that is gone: unknown (kept, never derived).
+    static func state(journal: URL, raw: Data, source: CaptureSource, ledger: Bool) -> Publication {
+        func judge(_ h: EnvelopeHeader?) -> Publication {
+            guard let h else { return .unknown }
+            let p = payload(raw, source: h.source)
+            if h.payloadBytes == p.count, let envelope = try? Envelope.build(header: h, payload: p) { return .frozen(h, envelope) }
+            return h.payloadBytes < p.count ? .never : .unknown
         }
-        guard let h = try? JSONDecoder().decode(EnvelopeHeader.self, from: json) else { return true }
-        return h.payloadBytes >= payload(raw, source: source).count
+        let dir = journal.deletingLastPathComponent()
+        guard let seq = CaptureManifest.journalSequence(journal.lastPathComponent) else { return .unknown }
+        if ledger {
+            switch PublicationLedger.lookup(seq, in: dir) {
+            case .record(let h): return judge(h)
+            case .none: return .never
+            case .unknown: return .unknown
+            }
+        }
+        let json: Data
+        do {
+            json = try Data(contentsOf: headerURL(journal))
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            // no header (a build up to 66 saved it best effort): published only if the next chunk's journal exists
+            return FileIO.exists(dir.appendingPathComponent(CaptureManifest.journalName(seq + 1))) ? .unknown : .never
+        } catch {
+            return .unknown  // unreadable is not absent (2026-11-28)
+        }
+        return judge(try? JSONDecoder().decode(EnvelopeHeader.self, from: json))
     }
 
-    /// The saved header and the envelope it rebuilds; nil when either is missing or they don't match.
+    /// The recorded header and the envelope it rebuilds (the ledger when the folder has one, else the saved header);
+    /// nil when there is no usable record or it doesn't match the journal.
     static func load(journal: URL) -> (header: EnvelopeHeader, envelope: Data)? {
-        guard let json = try? Data(contentsOf: headerURL(journal)), let header = try? JSONDecoder().decode(EnvelopeHeader.self, from: json),
-              let raw = try? Data(contentsOf: journal) else { return nil }
+        guard let raw = try? Data(contentsOf: journal) else { return nil }
+        let dir = journal.deletingLastPathComponent()
+        let header: EnvelopeHeader?
+        if FileIO.exists(PublicationLedger.url(dir)), let seq = CaptureManifest.journalSequence(journal.lastPathComponent) {
+            if case .record(let h) = PublicationLedger.lookup(seq, in: dir) { header = h } else { header = nil }
+        } else {
+            header = (try? Data(contentsOf: headerURL(journal))).flatMap { try? JSONDecoder().decode(EnvelopeHeader.self, from: $0) }
+        }
+        guard let header else { return nil }
         let payload = payload(raw, source: header.source)
         guard payload.count == header.payloadBytes, let envelope = try? Envelope.build(header: header, payload: payload) else { return nil }
         return (header, envelope)
+    }
+}
+
+/// A capture's publication ledger (`published.jsonl`, ASTRA-20261119-IT3-01): one line with a chunk's envelope header,
+/// appended and synced before the chunk is published, so a published identity is read back, never inferred. Created
+/// (empty, synced) with the capture; never recreated once gone: a lost ledger means "unknown", and its journals are kept.
+enum PublicationLedger {
+    static let fileName = "published.jsonl"
+    static func url(_ dir: URL) -> URL { dir.appendingPathComponent(fileName) }
+
+    static func create(in dir: URL) throws { try FileIO.atomicWrite(Data(), to: url(dir), requireDirectorySync: true) }
+
+    /// Before publishing, for a capture that keeps a ledger; a failure stops the publication (retried next tick).
+    static func record(_ header: EnvelopeHeader, for m: CaptureManifest, in dir: URL) throws {
+        guard m.publicationLedger == true else { return }
+        try append(header, in: dir)
+    }
+
+    static func append(_ header: EnvelopeHeader, in dir: URL) throws {
+        var line = try Envelope.headerJSON(header)
+        line.append(0x0A)
+        let fd = open(url(dir).path, O_WRONLY | O_APPEND)  // never O_CREAT
+        guard fd >= 0 else { throw FileIOError.posix("open publication ledger", errno) }
+        defer { close(fd) }
+        try FileIO.writeAll(fd: fd, data: line)
+        if fcntl(fd, F_FULLFSYNC) != 0, fsync(fd) != 0 { throw FileIOError.posix("fsync publication ledger", errno) }
+    }
+
+    enum Lookup: Equatable { case record(EnvelopeHeader), none, unknown }
+
+    /// The last record for `seq`. A torn last line is an append that never finished (its chunk wasn't published, the
+    /// outbox write comes after) and is ignored; a ledger that is missing or unreadable, or any other line that doesn't
+    /// decode: unknown.
+    static func lookup(_ seq: Int, in dir: URL) -> Lookup {
+        guard let data = try? Data(contentsOf: url(dir)) else { return .unknown }
+        var found: EnvelopeHeader?
+        for line in data.split(separator: 0x0A, omittingEmptySubsequences: false).dropLast() {
+            guard let h = try? JSONDecoder().decode(EnvelopeHeader.self, from: Data(line)) else { return .unknown }
+            if h.chunkSequence == seq { found = h }
+        }
+        return found.map { .record($0) } ?? .none
     }
 }
 

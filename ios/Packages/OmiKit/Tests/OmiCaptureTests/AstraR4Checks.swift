@@ -70,6 +70,9 @@ import OmiProtocol
         else if variant == "invalid-json" {try Data("{".utf8).write(to:header)}
         else { var h=try JSONDecoder().decode(EnvelopeHeader.self,from:Data(contentsOf:header));h.payloadBytes += 1;try Envelope.headerJSON(h).write(to:header) }
         allow(t.dirs.outboxPending)
+        // the header-only rule this check was written for is the rule of captures from builds up to 66 (no publication
+        // ledger); a capture with a ledger rebuilds the identical envelope instead (AstraIT3RecoveryVariants, 2026-11-28)
+        try PublicationLedgerTests().makeBuild66(dir)
         _ = CaptureRecovery.run(env:TestEnv(root:t.dirs.root).env,codecFallback:{_ in 21})
         #expect(try Data(contentsOf:journal) == original)
         #expect(!FileIO.exists(output))
