@@ -997,6 +997,8 @@ class ConversationPipeline:
                     self._set(conv_id, needs_render=1, next_attempt_at=None)
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 failed.append(conv_id)
+                if names_changed:  # its note still owes the new names: rendered later (the render retries), never lost (RECON-03)
+                    self._set(conv_id, needs_render=1, next_attempt_at=None)
                 log.warning("relabel: conversation %s skipped, retried next pass (%s)", conv_id, exc)
         self._moves_checked = True
         # the policy change behind this pass is applied to stored vectors too, whether or not any state changed (I4):

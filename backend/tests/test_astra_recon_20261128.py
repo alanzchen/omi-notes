@@ -74,3 +74,23 @@ def test_forgotten_voice_retaining_note_has_no_cached_suggestion(tmp_path):
     after=client.get('/v1/speakers/suggestions',headers=CARBON_AUTH).json()['suggestions']
     print("FORGOTTEN_CACHED_SUGGESTIONS",after)
     assert all(s.get("person_id") != old for s in after), "forget kept-note still exposes person's forgotten identity in cached suggestion"
+
+
+def test_a_rename_is_not_lost_for_a_conversation_that_failed_in_the_pass(tmp_path):
+    """RECON-03: _relabel advanced rendered_names past a conversation that failed in that pass, so its note was never
+    re-rendered with the new name. Its own note is now marked for rendering (retried by the render path), without
+    marking every note again on every pass."""
+    from .test_carbon_it1_20261126 import _setup_person
+
+    client, svc, store, pid, vec, conv, _ = _setup_person(tmp_path, source="user")
+    bad = str(uuid.uuid4())
+    _add_conv(store, bad, vec, person_id=pid, source="user", start=500.0, sha_char="b")
+    store.db.execute("UPDATE conversations SET note_path='notes/bad.md', needs_render=0 WHERE id=?", (bad,))
+    store.db.set_meta("relabel_pending", "1")
+    svc.pipeline.relabel(9000.0)
+    store.db.execute("UPDATE conversations SET needs_render=0 WHERE id=?", (bad,))
+    assert client.put(f"/v1/people/{pid}", json={"name": "Gigi Renamed"}, headers=CARBON_AUTH).status_code == 200
+    torn = store.conv_dir(bad) / "speakers.json"
+    torn.write_text("{torn")
+    svc.pipeline.relabel(9010.0)
+    assert store.db.one("SELECT needs_render FROM conversations WHERE id=?", (bad,))[0] == 1, "its rename is still owed"
