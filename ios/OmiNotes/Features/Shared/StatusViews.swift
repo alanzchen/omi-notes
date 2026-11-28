@@ -108,7 +108,7 @@ struct HealthCard: View {
 
             if expanded {
                 ForEach(health.steps) { step in StepRow(step: step, onFix: onFix) }
-            } else if let fix = health.steps.first(where: { $0.level == health.level })?.fix, health.level >= .delayed {
+            } else if let fix = health.fix, health.level >= .delayed {  // the headline's own fix
                 Button(fix.title) { onFix(fix) }.buttonStyle(.borderedProminent).controlSize(.small)
             }
         }

@@ -52,6 +52,8 @@ public struct SystemHealth: Equatable, Sendable {
     public var headline: String
     public var detail: String?
     public var steps: [Step]
+    /// The headline step's fix: the collapsed card's one button (nil below `delayed`).
+    public var fix: Fix? = nil
 
     /// Starting and resetting pass on their own; off, not allowed or unsupported need someone.
     public static func bluetoothPassing(_ why: String) -> Bool { why == "starting" || why == "resetting" }
@@ -90,7 +92,7 @@ public struct SystemHealth: Equatable, Sendable {
             return SystemHealth(level: .working, headline: s.connection == .streaming ? "Recording; notes are catching up" : lead.title,
                                 detail: lead.title, steps: steps)
         default:
-            return SystemHealth(level: worst, headline: lead.title, detail: lead.detail, steps: steps)
+            return SystemHealth(level: worst, headline: lead.title, detail: lead.detail, steps: steps, fix: lead.fix)
         }
     }
 

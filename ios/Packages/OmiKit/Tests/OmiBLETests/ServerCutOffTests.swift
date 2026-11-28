@@ -20,6 +20,7 @@ import OmiProtocol
         let health = SystemHealth.evaluate(snapshot: waiting(), server: .unreachable("Could not connect to the server."),
                                            status: nil, statusAt: nil, now: now)
         #expect(health.headline == "Can't reach your server", "why audio waits, not that it waits")
+        #expect(health.fix == .changeServer, "the collapsed card's button is the headline step's fix, not Retry")
         let server = try #require(health.steps.first { $0.area == .server })
         #expect(server.fix == .changeServer)
         #expect(server.detail == "Recordings wait on this phone.", "no guessed cause: \(server.detail ?? "")")
