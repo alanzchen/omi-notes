@@ -93,6 +93,8 @@ class SpeakerService:
         self._people_overlay: dict[str, tuple[int, dict]] = {}
         self._forgotten: dict[str, int] = {}
         self._hidden_suggestions: dict[str, int] = {}
+        # a person whose voice was forgotten, card kept or not: never named by a suggestion until a later build (RECON-02)
+        self._voice_forgotten: dict[str, int] = {}
 
     # -- people ----------------------------------------------------------------------------------
 
@@ -205,6 +207,7 @@ class SpeakerService:
                 self._people_overlay = {pid: (tag, f) for pid, (tag, f) in self._people_overlay.items() if tag >= gen}
                 self._forgotten = {pid: tag for pid, tag in self._forgotten.items() if tag >= gen}
                 self._hidden_suggestions = {sid: tag for sid, tag in self._hidden_suggestions.items() if tag >= gen}
+                self._voice_forgotten = {pid: tag for pid, tag in self._voice_forgotten.items() if tag >= gen}
                 try:
                     self._write_people_cache(built)
                 except OSError:
@@ -437,6 +440,7 @@ class SpeakerService:
             kept = self.store.person(person_id)  # the note kept: the person stays, with no voice (Carbon IT2-01)
             with self._people_lock:  # served now; the worker's next build agrees
                 self._people_overlay.pop(person_id, None)
+                self._voice_forgotten[person_id] = self._people_seq  # the voice, separately from the card (RECON-02)
                 if kept is None:
                     self._forgotten[person_id] = self._people_seq
                 else:
@@ -768,6 +772,7 @@ class SpeakerService:
         snap, _, forgotten, wearer = self._view()
         with self._people_lock:
             hidden = set(self._hidden_suggestions)
+            forgotten = forgotten | set(self._voice_forgotten)
         kept = []
         for x in snap.suggestions or []:  # O(limit) past the blocked ones
             if len(kept) >= limit:
@@ -787,6 +792,7 @@ class SpeakerService:
         snap, _, forgotten, _ = self._view()
         with self._people_lock:
             hidden = set(self._hidden_suggestions)
+            forgotten = forgotten | set(self._voice_forgotten)
         found = next((x for x in snap.suggestions or [] if x.get("id") == suggestion_id and x.get("members")), None)
         if found is None or suggestion_id in hidden or found.get("person_id") in forgotten:
             raise ApiError(404, "not_found", "the suggestion no longer exists")
@@ -820,7 +826,8 @@ class SpeakerService:
                         "clips": [c | {"conversation_id": rep.conversation_id} for c in clips],
                         "other_day": self._other_day(s, rep),
                         "scope": [self._context(c) for c in sorted({m.conversation_id for m in s.members})],
-                        "members": [[m.conversation_id, m.label] for m in s.members]})  # fmt: skip
+                        # each voice with the transcript it was heard in: a label number means nothing in another one
+                        "members": [[m.conversation_id, m.label, self._transcript_sha(m.conversation_id)] for m in s.members]})  # fmt: skip
         return out
 
     def _context(self, conv_id: str) -> dict:
@@ -885,10 +892,21 @@ class SpeakerService:
             self._hide_suggestion(suggestion_id)
             return sorted({c for c, _ in members})
 
+    def _transcript_sha(self, conv_id: str) -> str | None:
+        row = self.db.one("SELECT transcript_sha FROM conversations WHERE id=?", (conv_id,))
+        return row["transcript_sha"] if row else None
+
     def _open_members(self, suggestion: dict) -> list[tuple[str, str]]:
-        """The suggestion's voices still unnamed and not kept unknown (a decision since the build stands)."""
+        """The suggestion's voices still unnamed and not kept unknown (a decision since the build stands), each still in
+        the transcript the build heard it in: after a re-transcription the same label number can be another voice, so a
+        member of another transcript (or without one recorded) is dropped before anything is written (Astra RECON-01)."""
         out = []
-        for conv_id, label in suggestion["members"]:
+        for member in suggestion["members"]:
+            if len(member) != 3:
+                continue
+            conv_id, label, heard_in = member
+            if not heard_in or self._transcript_sha(conv_id) != heard_in or self.store.move_pending(conv_id):
+                continue
             state = self.store.labels(conv_id).get(label) or {}
             if not state.get("person_id") and state.get("source") != "unknown":
                 out.append((conv_id, label))
